@@ -1,96 +1,69 @@
-# Codex-Gated Repository Template
+# Chaop Control Plane [ British English | 简体中文 ]
 
-This template starts a repository with the Codex review gate workflow already on
-the default branch. It also includes a modular CI generator for adding
-project-specific formatter, linter, test, and benchmark entrypoints after a
-repository is created from the template.
+## British English
 
-## Included
+Chaop is a Cloudflare-first control-plane prototype for coordinating local Codex app-server work across multiple machines.
 
-- `.github/workflows/codex-review-gate.yml`
-- `.gitignore`
-- `scripts/setup-ci.mjs`
-- this README
+Current slice:
 
-The workflow writes the `codex/review-gate` status check and requests a controlled
-Codex review marker for each ready pull request head. It pins
-`JoeyTeng/codex-review-gate-action` to the v1.2.1 commit SHA so privileged
-`pull_request_target` runs do not depend on a movable tag.
+- Lit/Vite browser GUI with Operations Map, Operations Task Board, Thread Command Centre, and Budget Reliability Board views.
+- Cloudflare Worker route skeleton with Cloudflare Access JWT validation, connector bootstrap tokens, browser Origin checks, Durable Object binding, D1 binding, and R2 binding.
+- Shared TypeScript protocol package for connector, thread, task, command, and budget data.
+- Rust placeholder connector crate for local connector configuration and command lifecycle scaffolding.
+- Initial D1 schema migration at `migrations/d1/0001_initial.sql`.
 
-## Generate Project CI
+This is still a local implementation slice. It does not yet persist command lifecycle rows in D1, relay commands through the Durable Object, or execute commands through the Rust connector.
 
-Run the setup script from a new repository created from this template:
+Start locally:
 
 ```bash
-node scripts/setup-ci.mjs
+pnpm install --store-dir .pnpm-store
+pnpm dev:worker
+pnpm dev:web
 ```
 
-With no arguments, the script opens an interactive selector. For repeatable setup,
-pass modules explicitly:
+The committed Worker config is production-safe. The local `dev:worker` script builds the protocol package, applies local D1 migrations, and injects `CHAOP_DEV_ALLOW_INSECURE=true`; do not use that setting in production.
+
+Documentation entrypoints:
+
+- `docs/deployment-guide.md`
+- `docs/ux-visual-directions.md`
+- `docs/PROJECT_STATE.md`
+- `docs/PROJECT_TODO.md`
+- `docs/project_journal/2026/06/2026-06-09-control-plane-v1-plan-a1c9e2.md`
+
+Before real deployment, provide the Cloudflare account, zone, Access, domain, API token, and connector bootstrap values listed in `docs/deployment-guide.md`.
+
+## 简体中文
+
+Chaop 是一个 Cloudflare-first 控制面原型，用于协调多台机器上的本地 Codex app-server 工作。
+
+当前切片：
+
+- Lit/Vite 浏览器 GUI，包含 Operations Map、Operations Task Board、Thread Command Centre 和 Budget Reliability Board 视图。
+- Cloudflare Worker route skeleton，包含 Cloudflare Access JWT 校验、connector bootstrap token、Browser Origin 检查、Durable Object binding、D1 binding 和 R2 binding。
+- 共享 TypeScript protocol package，用于 connector、thread、task、command 和 budget 数据。
+- Rust placeholder connector crate，用于本地 connector 配置和 command lifecycle 脚手架。
+- 初始 D1 schema migration：`migrations/d1/0001_initial.sql`。
+
+这仍然是本地实现切片。它还不会把 command lifecycle 写入 D1，不会通过 Durable Object relay command，也不会通过 Rust connector 执行 command。
+
+本地启动：
 
 ```bash
-node scripts/setup-ci.mjs --tool js-ts --tool python --tool docker --tool markdown
-node scripts/setup-ci.mjs --all --benchmark --dry-run
+pnpm install --store-dir .pnpm-store
+pnpm dev:worker
+pnpm dev:web
 ```
 
-The script writes `.github/workflows/ci.yml` plus the selected tool configs. It is
-idempotent when generated files have not changed. If a target file already exists
-with different content, the script refuses to overwrite it unless `--force` is
-provided. Use `--dry-run` to inspect planned writes first.
+已提交的 Worker 配置保持生产安全。本地 `dev:worker` 脚本会构建 protocol package、应用本地 D1 migrations，并注入 `CHAOP_DEV_ALLOW_INSECURE=true`；不要在生产环境使用这个设置。
 
-Supported modules:
+文档入口：
 
-- `js-ts`: pnpm, ESLint, Prettier, Vite, and Vitest.
-- `python`: uv, Ruff, Pyright, and pytest.
-- `swift`: swift-format, SwiftLint, and `swift test`.
-- `go`: `gofmt`, `go vet`, and `go test`.
-- `rust`: `cargo fmt`, `cargo clippy`, and `cargo test`.
-- `github-actions`: actionlint.
-- `bash`: shfmt, shellcheck, and `bash -n`.
-- `markdown`: Prettier and markdownlint-cli2.
-- `docker`: hadolint and `docker buildx build --check`.
+- `docs/deployment-guide.md`
+- `docs/ux-visual-directions.md`
+- `docs/PROJECT_STATE.md`
+- `docs/PROJECT_TODO.md`
+- `docs/project_journal/2026/06/2026-06-09-control-plane-v1-plan-a1c9e2.md`
 
-`--benchmark` creates `scripts/benchmark.sh` only. It does not create or enable a
-benchmark workflow, and benchmark commands are not part of the default PR gate.
-The script includes benchmark entries for JavaScript/TypeScript, Python, Go, and
-Rust when those modules are selected.
-
-## After Creating a Repository
-
-1. Add the project source, tests, and license.
-2. Run `node scripts/setup-ci.mjs` and commit the generated CI/tooling files.
-3. Install or lock generated dependencies where applicable, such as `pnpm install`
-   for JavaScript/TypeScript or Markdown modules.
-4. Confirm `.github/workflows/codex-review-gate.yml` is present on the default
-   branch before requiring the status check.
-5. Enable the required status check with the bootstrap helper from
-   `JoeyTeng/codex-review-gate`:
-
-```bash
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
-```
-
-The helper defaults to dry-run. It refuses to require `codex/review-gate` until
-the workflow exists on the repository default branch.
-
-## Optional Repository Variables
-
-- `CODEX_REVIEW_GATE_RUNNER_LABELS`: JSON runner label array. Defaults to
-  `["ubuntu-slim"]`; use `["ubuntu-latest"]` when `ubuntu-slim` is unavailable.
-- `CODEX_REVIEW_GATE_AUTO_RETRY=false`: disables scheduled retry jobs before a
-  runner is allocated.
-- `CODEX_REVIEW_GATE_EVENT_MODE`: `standard`, `comment-only`, or `full`.
-- `CODEX_REVIEW_GATE_BOT_LOGINS`: comma-separated additional Codex bot logins.
-- `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS`: clean completion buffer.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY`: set to `false` to disable
-  same-head recovery after resolved Codex findings.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`: `head` or `fresh`.
-
-## Template Maintenance
-
-Run the generator tests with Node's built-in test runner:
-
-```bash
-node --test test/setup-ci.node-test.mjs
-```
+真实部署前，请先提供 `docs/deployment-guide.md` 中列出的 Cloudflare account、zone、Access、域名、API token 和 connector bootstrap 配置值。

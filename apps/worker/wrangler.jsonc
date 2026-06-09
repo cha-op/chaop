@@ -1,0 +1,42 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "chaop-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-09",
+  "vars": {
+    "CHAOP_DEV_ALLOW_INSECURE": "false",
+    "CHAOP_API_DOMAIN": "api.example.com",
+    "CHAOP_GUI_DOMAIN": "app.example.com",
+    "CHAOP_DAILY_BUDGET_UNITS": "100",
+    "CHAOP_4H_SOFT_BUDGET_UNITS": "20",
+    "CHAOP_4H_HARD_BUDGET_UNITS": "35"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "chaop-control",
+      "database_id": "replace-with-d1-database-id",
+      "migrations_dir": "../../migrations/d1"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARTIFACTS",
+      "bucket_name": "chaop-artifacts"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WORKSPACE_DO",
+        "class_name": "WorkspaceDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["WorkspaceDO"]
+    }
+  ]
+}

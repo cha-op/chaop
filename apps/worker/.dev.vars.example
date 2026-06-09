@@ -1,0 +1,4 @@
+CHAOP_DEV_ALLOW_INSECURE=true
+AGENT_BOOTSTRAP_SECRET=local-dev-bootstrap-secret
+ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
+ACCESS_AUD=replace-with-access-aud
