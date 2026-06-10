@@ -13,4 +13,5 @@
 - 本地索引：可生成 `docs/project_journal/INDEX.md`，但不要提交。
 
 ## 全局阻塞项
-- 在真实部署切片运行前，需要先提供 Cloudflare 账号、Access、域名和密钥配置。
+- 真实部署仍依赖 Cloudflare account、Access、domain、API token、bootstrap secret、connector 和 D1 配置。
+- 部署实例值必须留在本仓库之外；tracked docs 保持通用模板，实例值保存在本地已忽略文件或私有部署仓库/subrepo。

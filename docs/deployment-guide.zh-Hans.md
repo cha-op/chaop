@@ -67,6 +67,16 @@ CLOUDFLARE_API_TOKEN=
 AGENT_BOOTSTRAP_SECRET=
 ```
 
+### 部署实例值
+
+不要把部署实例值提交到本仓库，即使它们不是 API secret。这里包括 Cloudflare account ID、zone ID、Access AUD、个人或私有主机名、允许访问的邮箱、connector hostname，以及本地 workspace path。
+
+部署实例值应保存在以下位置之一：
+
+- 本地已忽略文件，例如 `.env.cloudflare.local`；
+- 密码管理器；
+- 私有部署仓库或私有部署 subrepo。
+
 除非你指定其他名称，第一轮实现会从资源前缀推导资源名：
 
 ```text
@@ -80,13 +90,36 @@ Durable Object class: WorkspaceDO
 
 使用有范围限制的 Cloudflare API token，不要使用全局 API key。
 
-第一轮切片需要 token 具备足够权限来：
+第一轮切片需要 token 具备这些 dashboard 权限组：
 
-- 部署 Worker；
-- 创建或绑定 D1；
-- 创建或绑定 R2；
-- 为 API 域名配置 Worker route；
-- 读取 Wrangler 需要的 account/zone 元数据。
+所选 Cloudflare account 上的权限：
+
+```text
+Workers Scripts: Edit
+D1: Edit
+Workers R2 Storage: Edit
+Account Settings: Read
+```
+
+所选 Cloudflare zone 上的权限：
+
+```text
+Workers Routes: Edit
+Zone: Read
+DNS: Edit
+```
+
+Cloudflare 的 API permission reference 可能把 dashboard 里的 `Edit` 显示成 `Write`；这轮配置里可以把它们视为同一类权限。如果你没有看到名为 “Worker deploy” 的入口，请使用 `Workers Scripts: Edit`；它对应 Worker script 部署权限组。
+
+这里包含 `DNS: Edit`，是因为 Worker Custom Domain 会为主机名创建 DNS 记录。如果你之后决定完全手动配置 DNS，并且不让 Wrangler 管理 Custom Domain，可以再收窄这个权限。
+
+可选权限：
+
+```text
+Workers Tail: Read
+```
+
+只有你想用同一个 token 运行 `wrangler tail` 时才需要添加。
 
 如果 Cloudflare Access 通过 dashboard 手动配置，Wrangler 部署 token 不需要 Access 应用管理权限。
 
@@ -203,7 +236,16 @@ Application AUD
 Allowed email addresses or groups
 ```
 
+在 Cloudflare Zero Trust dashboard 里：
+
+1. 创建 self-hosted application，并添加 GUI public hostname。
+2. 为 API hostname 上的 Browser API traffic 添加 path-scoped public hostname，覆盖 `/api/bootstrap`、`/api/usage-summary`、`/api/commands` 和 `/ws/browser`。
+3. 添加 Allow policy，使用 `Emails` include selector 填入 operator email addresses；如果已经配置 identity-provider groups，也可以有意识地改用 Access group selector。
+4. 把 application AUD 复制到 `ACCESS_AUD`。
+
 Worker 必须为 Browser HTTP 和 WebSocket 请求校验 `Cf-Access-Jwt-Assertion`。Cloudflare 文档说明 Access 会在请求 header 中传递这个 token，浏览器请求也可能带有 `CF_Authorization` cookie。Worker 应优先使用 header。
+
+在当前实现里，Cloudflare Access policy 是 Browser 用户允许列表的事实来源。`CHAOP_ACCESS_ALLOWED_EMAILS` 和 `CHAOP_ACCESS_ALLOWED_GROUPS` 现在用于记录部署意图，也为后续 Worker 级 allowlist 预留，但 Worker 暂时还不会执行它们。
 
 除非后续决定为 connector 使用 Access service token，不要把 `/api/agent/bootstrap` 或 `/ws/agent` 放到这个 Browser Access application 后面。
 
@@ -248,7 +290,7 @@ chmod 700 ~/.chaop
 
 ### 我需要你提供什么
 
-下一轮实现时，非密钥值可以直接发在对话里；密钥请放到我们约定的安全渠道。
+下一轮实现时，部署实例值不要放进本仓库。非密钥实例值放进私有部署仓库或本地已忽略 env 文件；密钥请放到我们约定的安全渠道。
 
 最低必需集合：
 

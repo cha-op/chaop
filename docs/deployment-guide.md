@@ -67,6 +67,16 @@ CLOUDFLARE_API_TOKEN=
 AGENT_BOOTSTRAP_SECRET=
 ```
 
+### Deployment-instance values
+
+Do not commit deployment-instance values to this repository, even when they are not API secrets. This includes Cloudflare account IDs, zone IDs, Access AUDs, personal or private hostnames, allowlisted email addresses, connector hostnames, and local workspace paths.
+
+Keep deployment-instance values in one of these places:
+
+- a local ignored file such as `.env.cloudflare.local`;
+- a password manager;
+- a private deployment repository or private deployment subrepo.
+
 The first implementation pass will derive resource names from the prefix unless you override them:
 
 ```text
@@ -80,13 +90,36 @@ Durable Object class: WorkspaceDO
 
 Use a scoped Cloudflare API token, not the global API key.
 
-For the first slice, the token needs enough access to:
+For the first slice, the token needs these dashboard permission groups:
 
-- deploy the Worker;
-- create or bind D1;
-- create or bind R2;
-- configure the Worker route for the API domain;
-- read the account/zone metadata needed by Wrangler.
+Account permissions on the selected Cloudflare account:
+
+```text
+Workers Scripts: Edit
+D1: Edit
+Workers R2 Storage: Edit
+Account Settings: Read
+```
+
+Zone permissions on the selected Cloudflare zone:
+
+```text
+Workers Routes: Edit
+Zone: Read
+DNS: Edit
+```
+
+Cloudflare's API permission reference may show `Write` where the dashboard shows `Edit`; treat those as the same permission family for this setup. If you do not see an entry named "Worker deploy", use `Workers Scripts: Edit` instead; that is the Worker script deployment permission group.
+
+`DNS: Edit` is included because Worker Custom Domains create DNS records for the hostname. If you choose to configure every DNS record manually and avoid Wrangler-managed Custom Domains, you can narrow that later.
+
+Optional permission:
+
+```text
+Workers Tail: Read
+```
+
+Add this only if you want the same token to run `wrangler tail`.
 
 If Cloudflare Access is configured manually in the dashboard, the Wrangler deploy token does not need Access application administration rights.
 
@@ -203,7 +236,16 @@ Application AUD
 Allowed email addresses or groups
 ```
 
+Use the Cloudflare Zero Trust dashboard:
+
+1. Create a self-hosted application and add the GUI public hostname.
+2. Add path-scoped public hostnames for browser API traffic on the API hostname, covering `/api/bootstrap`, `/api/usage-summary`, `/api/commands`, and `/ws/browser`.
+3. Add an Allow policy with the `Emails` include selector for the operator email addresses, or use a deliberate Access group selector once identity-provider groups are configured.
+4. Copy the application AUD into `ACCESS_AUD`.
+
 The Worker must validate `Cf-Access-Jwt-Assertion` for Browser HTTP and WebSocket requests. Cloudflare documents that Access passes this token in the request header, and browser requests may also include a `CF_Authorization` cookie. The Worker should prefer the header.
+
+For the current implementation, Cloudflare Access policy is the source of truth for allowed Browser users. `CHAOP_ACCESS_ALLOWED_EMAILS` and `CHAOP_ACCESS_ALLOWED_GROUPS` document the deployment intent and are available for a later Worker-level allowlist, but the Worker does not enforce them yet.
 
 Do not put `/api/agent/bootstrap` or `/ws/agent` behind this Browser Access application unless we later decide to use Access service tokens for connectors.
 
@@ -248,7 +290,7 @@ Then place the bootstrap secret in `~/.chaop/bootstrap.secret` with file permiss
 
 ### What I need from you
 
-For the next implementation pass, send the non-secret values directly in the thread and put the secrets in the secure channel we agree on.
+For the next implementation pass, keep deployment-instance values outside this repository. Put non-secret instance values in the private deployment repository or local ignored env file, and put secrets in the secure channel we agree on.
 
 Minimum required set:
 

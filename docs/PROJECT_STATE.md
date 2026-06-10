@@ -13,4 +13,5 @@
 - Local journal index: optional generated `docs/project_journal/INDEX.md`; do not commit it.
 
 ## Global Blockers
-- Cloudflare account, Access, domain, and secret configuration must be supplied before a real deployment slice can run.
+- Real deployment still depends on Cloudflare account, Access, domain, API token, bootstrap secret, connector, and D1 configuration.
+- Deployment-instance values must stay outside this repository; keep tracked docs generic and store instance values in an ignored local file or private deployment repository/subrepo.

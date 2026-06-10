@@ -60,7 +60,8 @@ superseded_by:
 - 已应用最终 review 修复：browser API 和 browser WebSocket route 现在会在产生副作用前拒绝不允许的 origin；connector ID 加入随机后缀，避免同名 connector 覆盖 metadata/token；`migrations/d1/*.sql` 已显式抵消用户全局 `*.sql` ignore 规则；本地 Worker dev 脚本会注入 insecure dev auth 且不会触发 Wrangler skills prompt；README/source-note 文档已澄清当前切片状态和文档入口。
 - 已应用最终 re-check 修复：app-level dev 脚本现在会在启动 Vite 或 Wrangler 前先构建 `@chaop/protocol`；Worker dev 会应用本地 D1 migrations 并注入仅用于本地的 bootstrap secret；本地 insecure agent bootstrap 会返回当前本地 Worker WebSocket URL，而不是示例生产 API 域名。
 - 2026-06-10 已应用宽复查后续修复：connector token 查询通过 migration `0002` 新增 D1 `token_hash` 索引；web command 提交使用 simple `text/plain` JSON body，以规避当前切片里 Cloudflare Access 的 preflight 风险；web placeholder command 不再硬编码 connector target；D1 已绑定时 Worker command creation 会按 workspace membership、`can_execute` 和 offline status 校验传入的 connector target；Thread Command Centre 会显示 command accepted/failed 反馈。
-- 真实 Cloudflare 部署仍阻塞于 account、domain、Access、API token 和 bootstrap secret 等配置值。
+- 部署实例值不得 tracked 到本仓库。主仓库文档保持通用模板，branch history 需要重写以移除曾经提交的实例值；具体部署值记录到私有部署仓库/subrepo 或本地已忽略 env 文件。
+- 真实 Cloudflare 部署仍阻塞于私有部署实例配置、API token、bootstrap secret、第一台 connector 详情，以及 D1 database UUID。
 
 ## 证据
 - 来源文档：`docs/design-starter.md`、`docs/cost-aware.md`。
