@@ -4,13 +4,14 @@ import {
   groupTasksByState,
   TASK_STATE_LABELS,
   type BootstrapPayload,
+  type CommandSummary,
   type ConnectorSummary,
   type TaskState,
   type TaskSummary,
   type ThreadEvent,
   type ThreadSummary
 } from "@chaop/protocol";
-import { createPlaceholderCommand, loadBootstrap } from "./api.js";
+import { createCommand, loadBootstrap } from "./api.js";
 
 type View = "operations-map" | "task-board" | "thread-centre" | "budget-board";
 
@@ -26,6 +27,9 @@ export class ChaopApp extends LitElement {
 
   @state()
   private commandPrompt = "Summarise the current failure pattern and next action.";
+
+  @state()
+  private commandType: CommandSummary["type"] = "placeholder";
 
   @state()
   private commandState: "idle" | "submitting" | "accepted" | "failed" = "idle";
@@ -251,12 +255,21 @@ export class ChaopApp extends LitElement {
               }}
             ></textarea>
           </label>
-          <button class="primary-action" type="button" @click=${this.submitCommand}>
-            ${this.commandState === "submitting" ? "Submitting..." : "Run placeholder command"}
+          <div class="mode-control" role="group" aria-label="Execution mode">
+            ${this.commandModeButton("placeholder", "Placeholder")}
+            ${this.commandModeButton("codex", "Codex exec")}
+          </div>
+          <button
+            class="primary-action"
+            type="button"
+            ?disabled=${this.commandState === "submitting" || this.commandPrompt.trim().length === 0}
+            @click=${this.submitCommand}
+          >
+            ${this.commandState === "submitting" ? "Submitting..." : `Run ${formatCommandType(this.commandType)} command`}
           </button>
           ${this.commandState === "accepted"
             ? html`<p class="command-status success">
-                Placeholder command accepted${this.lastCommandId ? `: ${this.lastCommandId}` : ""}.
+                ${formatCommandType(this.commandType)} command accepted${this.lastCommandId ? `: ${this.lastCommandId}` : ""}.
               </p>`
             : nothing}
           ${this.commandState === "failed"
@@ -287,14 +300,15 @@ export class ChaopApp extends LitElement {
         <aside class="panel">
           <div class="section-heading">
             <h2>Lease</h2>
-            <span>Placeholder target</span>
+            <span>${formatCommandType(this.commandType)} target</span>
           </div>
           <dl class="facts">
             <div><dt>Mode</dt><dd>Interactive</dd></div>
+            <div><dt>Execution</dt><dd>${formatCommandType(command?.type ?? this.commandType)}</dd></div>
             <div><dt>Target</dt><dd>${command?.target_connector_id ?? "Auto-selected"}</dd></div>
             <div><dt>Command state</dt><dd>${command?.state ?? "No live command"}</dd></div>
             <div><dt>Policy</dt><dd>Realtime events, summary logs</dd></div>
-            <div><dt>Approval</dt><dd>Stubbed for next slice</dd></div>
+            <div><dt>Approval</dt><dd>Connector-gated</dd></div>
             <div><dt>Artifacts</dt><dd>Entry point only</dd></div>
           </dl>
         </aside>
@@ -335,10 +349,11 @@ export class ChaopApp extends LitElement {
   private readonly submitCommand = async (): Promise<void> => {
     this.commandState = "submitting";
     try {
-      const response = await createPlaceholderCommand({
+      const response = await createCommand({
         workspace_id: "workspace-api",
         thread_id: "thread-orders-500",
         task_id: "task-orders-500",
+        type: this.commandType,
         prompt: this.commandPrompt
       });
       this.lastCommandId = response.command.id;
@@ -353,6 +368,21 @@ export class ChaopApp extends LitElement {
 
   private eventsForThread(threadId: string): ThreadEvent[] {
     return this.data!.events.filter((event) => event.thread_id === threadId);
+  }
+
+  private commandModeButton(type: CommandSummary["type"], label: string) {
+    return html`
+      <button
+        type="button"
+        class=${this.commandType === type ? "active" : ""}
+        ?disabled=${this.commandState === "submitting"}
+        @click=${() => {
+          this.commandType = type;
+        }}
+      >
+        ${label}
+      </button>
+    `;
   }
 }
 
@@ -384,6 +414,10 @@ function viewQuestion(view: View): string {
 
 function formatMode(mode: string): string {
   return mode.replaceAll("_", " ");
+}
+
+function formatCommandType(type: CommandSummary["type"]): string {
+  return type === "codex" ? "Codex exec" : "Placeholder";
 }
 
 function eventCopy(eventName: string): string {

@@ -19,9 +19,7 @@ export async function loadBootstrap(): Promise<BootstrapPayload> {
   }
 }
 
-export async function createPlaceholderCommand(
-  request: CreateCommandRequest
-): Promise<CreateCommandResponse> {
+export async function createCommand(request: CreateCommandRequest): Promise<CreateCommandResponse> {
   const response = await fetch(apiUrl("/api/commands"), {
     method: "POST",
     credentials: "include",

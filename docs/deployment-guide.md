@@ -4,15 +4,15 @@
 
 ### Purpose
 
-This guide explains how to prepare the Cloudflare and connector configuration for the first deployment slice of the Codex app-server control plane.
+This guide explains how to prepare the Cloudflare and connector configuration for the first deployment slice of the Codex control plane.
 
-The first slice is Cloudflare-first, but it still uses a placeholder Rust connector. It prepares the control-loop shape before connecting to the real Codex app-server:
+The first slice is Cloudflare-first. The Rust connector supports placeholder execution by default and can opt in to local `codex exec` execution through private connector configuration:
 
 ```text
 Browser GUI -> Cloudflare Access -> Worker / Durable Object -> D1 / R2 -> Rust connector -> Worker / Durable Object -> Browser GUI
 ```
 
-Current implementation status: the repository has a placeholder control-loop implementation. It can persist placeholder command lifecycle rows in D1, dispatch pending commands through the Durable Object, and receive placeholder lifecycle events from the Rust connector. It does not yet execute real Codex app-server work, and R2 artifact capture is still reserved for a later slice.
+Current implementation status: the repository can persist command lifecycle rows in D1, dispatch pending commands through the Durable Object, and receive lifecycle events from the Rust connector. It can run local Codex CLI work only when the connector has `execution.mode = "codex_exec"` in private configuration. It does not yet use the experimental Codex app-server protocol, and R2 artefact capture is still reserved for a later slice.
 
 Keep secrets out of Git. Share sensitive values only through a local ignored file, a password manager, or direct `wrangler secret put` commands.
 
@@ -298,7 +298,7 @@ The implementation may store non-secret config in Wrangler vars, but secrets sta
 
 ### Prepare the first connector
 
-The placeholder connector will need a local config file with:
+The connector needs a local config file with:
 
 ```toml
 connector_name = "mac-studio"
@@ -310,7 +310,36 @@ spool_db = "/Users/you/.chaop/connector-spool.sqlite"
 
 [bootstrap]
 secret_file = "/Users/you/.chaop/bootstrap.secret"
+
+[execution]
+mode = "placeholder"
+codex_command = "codex"
+codex_sandbox = "read-only"
+codex_timeout_seconds = 300
+codex_output_max_bytes = 262144
 ```
+
+`mode = "placeholder"` is the safe default. To run real local Codex CLI work, set this only in a private deployment config:
+
+```toml
+[execution]
+mode = "codex_exec"
+codex_command = "codex"
+codex_sandbox = "read-only"
+codex_timeout_seconds = 300
+codex_output_max_bytes = 262144
+```
+
+Optional execution settings:
+
+```toml
+codex_profile = "default"
+codex_model = "gpt-5.5"
+extra_args = ["--skip-git-repo-check"]
+```
+
+Only add optional settings when the local Codex CLI needs them. `codex_exec` can consume Codex/OpenAI allowance or API budget; set the alerts in [Cost Model](cost-aware.md) before leaving it running unattended.
+Prompts are passed to Codex over stdin, not command-line arguments. Keep the timeout and output cap in place unless there is a specific operator reason to widen them.
 
 Create local files outside the repository:
 
@@ -323,7 +352,7 @@ Then place the bootstrap secret in `~/.chaop/bootstrap.secret` with file permiss
 
 After the Worker is deployed, run connector bootstrap to exchange the bootstrap secret for a connector token. Store the returned connector token at the `token_file` path in the connector config. The Worker stores only the token hash in D1.
 
-Run the placeholder connector loop with:
+Run the connector loop with:
 
 ```bash
 cargo run -p chaop-agent -- --config /path/to/agent.toml --connect

@@ -210,6 +210,7 @@ export type CreateCommandRequest = {
   workspace_id: string;
   thread_id?: string | undefined;
   task_id?: string | undefined;
+  type?: CommandSummary["type"] | undefined;
   prompt: string;
   target_connector_id?: string | undefined;
 };

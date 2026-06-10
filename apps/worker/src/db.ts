@@ -127,7 +127,7 @@ export async function ensureConnectorInventory(
     `INSERT INTO tasks (
        id, workspace_id, thread_id, title, category_id, state, connector_id,
        assigned_agent, realtime_mode, budget_state, created_at, updated_at
-     ) VALUES (?, ?, ?, 'Run placeholder command through local connector', 'maintenance', 'idle', ?, 'chaop-agent', 'realtime', 'normal', ?, ?)
+     ) VALUES (?, ?, ?, 'Run command through local connector', 'maintenance', 'idle', ?, 'chaop-agent', 'realtime', 'normal', ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        workspace_id = excluded.workspace_id,
        thread_id = excluded.thread_id,
@@ -154,15 +154,16 @@ export async function createCommandInDb(
 
   await ensureUser(env, user);
 
+  const commandType = request.type ?? "placeholder";
   const targetConnectorId =
-    request.target_connector_id ?? (await chooseConnectorForWorkspace(env, request.workspace_id));
+    request.target_connector_id ?? (await chooseConnectorForWorkspace(env, request.workspace_id, commandType));
 
   if (request.target_connector_id && !targetConnectorId) {
     throw new CommandTargetError("Target connector not available");
   }
 
   if (targetConnectorId) {
-    await assertConnectorCanExecute(env, targetConnectorId, request.workspace_id);
+    await assertConnectorCanExecute(env, targetConnectorId, request.workspace_id, commandType);
   }
 
   const now = new Date().toISOString();
@@ -171,7 +172,7 @@ export async function createCommandInDb(
     workspace_id: request.workspace_id,
     thread_id: request.thread_id,
     task_id: request.task_id,
-    type: "placeholder",
+    type: commandType,
     prompt: request.prompt,
     state: "pending",
     target_connector_id: targetConnectorId,
@@ -207,7 +208,7 @@ export async function createCommandInDb(
       command_id: command.id,
       kind: "command.accepted",
       priority: "P1",
-      summary: "Control plane accepted the placeholder command."
+      summary: `Control plane accepted the ${command.type} command.`
     });
   }
 
@@ -248,6 +249,7 @@ export async function pendingCommandsForConnector(
              AND wc.connector_id = ?
              AND wc.can_execute = 1
              AND c.status <> 'offline'
+             AND (cmd.type <> 'codex' OR c.capabilities_json LIKE '%"codex_exec"%')
          )
        ORDER BY created_at ASC
        LIMIT 1`
@@ -504,29 +506,40 @@ async function listRecentEvents(env: Env): Promise<ThreadEvent[]> {
   }));
 }
 
-async function chooseConnectorForWorkspace(env: Env, workspaceId: string): Promise<string | undefined> {
+async function chooseConnectorForWorkspace(
+  env: Env,
+  workspaceId: string,
+  commandType: CommandSummary["type"]
+): Promise<string | undefined> {
   const row = await env.DB!.prepare(
     `SELECT c.id
      FROM connectors c
      INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
      WHERE wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+       AND (? <> 'codex' OR c.capabilities_json LIKE '%"codex_exec"%')
      ORDER BY c.last_seen_at DESC, c.updated_at DESC
      LIMIT 1`
   )
-    .bind(workspaceId)
+    .bind(workspaceId, commandType)
     .first<{ id: string }>();
   return row?.id;
 }
 
-async function assertConnectorCanExecute(env: Env, connectorId: string, workspaceId: string): Promise<void> {
+async function assertConnectorCanExecute(
+  env: Env,
+  connectorId: string,
+  workspaceId: string,
+  commandType: CommandSummary["type"]
+): Promise<void> {
   const connector = await env.DB!.prepare(
     `SELECT c.id
      FROM connectors c
      INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
      WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+       AND (? <> 'codex' OR c.capabilities_json LIKE '%"codex_exec"%')
      LIMIT 1`
   )
-    .bind(connectorId, workspaceId)
+    .bind(connectorId, workspaceId, commandType)
     .first<{ id: string }>();
   if (!connector) {
     throw new CommandTargetError("Target connector not available");

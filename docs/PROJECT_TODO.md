@@ -7,4 +7,5 @@
 - [done] Collect Cloudflare account, Access, domain, Wrangler, and connector bootstrap configuration for the first real deployment slice in a private deployment repository/subrepo or local ignored env file, not in tracked main-repo docs.
 - [done] Harden the Cloudflare-first placeholder connector control loop from local skeleton to deploy-ready command dispatch, D1 persistence, Durable Object relay, and connector lifecycle reporting.
 - [done] Run a deployed placeholder E2E smoke using private Cloudflare config, Access service-token auth, and the first local connector.
-- [pending] Replace placeholder connector execution with real Codex app-server command execution.
+- [done] Add opt-in local Codex CLI command execution behind private connector configuration.
+- [pending] Replace the Codex CLI adapter with real Codex app-server protocol execution.

@@ -1,4 +1,6 @@
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, ExecutionMode};
+use crate::executor::{codex_exec_result_events, codex_exec_started_event};
+use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
 use serde::Deserialize;
 use serde_json::json;
@@ -30,7 +32,17 @@ struct CommandDispatch {
 #[derive(Debug, Deserialize)]
 struct CommandPayload {
     id: String,
+    #[serde(rename = "type", default)]
+    command_type: CommandType,
     prompt: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CommandType {
+    #[default]
+    Placeholder,
+    Codex,
 }
 
 pub fn run_connector(
@@ -57,7 +69,9 @@ pub fn run_connector(
         let message = socket.read()?;
         match message {
             Message::Text(text) => {
-                if handle_text_message(&mut socket, text.as_ref())? && run_mode == RunMode::Once {
+                if handle_text_message(&mut socket, text.as_ref(), config)?
+                    && run_mode == RunMode::Once
+                {
                     socket.close(None)?;
                     return Ok(());
                 }
@@ -72,6 +86,7 @@ pub fn run_connector(
 fn handle_text_message(
     socket: &mut AgentSocket,
     text: &str,
+    config: &AgentConfig,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
     if envelope.kind != "command.dispatch" {
@@ -79,7 +94,52 @@ fn handle_text_message(
     }
 
     let dispatch: CommandDispatch = serde_json::from_value(envelope.payload)?;
-    for event in placeholder_event_stream(&dispatch.command.prompt) {
+    if dispatch.command.command_type == CommandType::Codex
+        && config.execution.mode == ExecutionMode::CodexExec
+    {
+        dispatch_events(
+            socket,
+            &dispatch.command,
+            vec![codex_exec_started_event(&config.workspace_root)],
+        )?;
+        let events = codex_exec_result_events(
+            &config.execution,
+            &config.workspace_root,
+            &dispatch.command.prompt,
+        );
+        dispatch_events(socket, &dispatch.command, events)?;
+        return Ok(true);
+    }
+
+    dispatch_events(socket, &dispatch.command, command_events(&dispatch.command))?;
+    Ok(true)
+}
+
+fn command_events(command: &CommandPayload) -> Vec<ConnectorEvent> {
+    match command.command_type {
+        CommandType::Placeholder => placeholder_event_stream(&command.prompt),
+        CommandType::Codex => vec![
+            ConnectorEvent {
+                kind: "command.started".to_owned(),
+                priority: "P1".to_owned(),
+                summary: "Connector received a Codex command, but codex_exec is disabled."
+                    .to_owned(),
+            },
+            ConnectorEvent {
+                kind: "command.failed".to_owned(),
+                priority: "P1".to_owned(),
+                summary: "Codex exec is disabled in this connector config.".to_owned(),
+            },
+        ],
+    }
+}
+
+fn dispatch_events(
+    socket: &mut AgentSocket,
+    command: &CommandPayload,
+    events: Vec<ConnectorEvent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for event in events {
         if event.kind == "command.accepted" {
             continue;
         }
@@ -87,7 +147,7 @@ fn handle_text_message(
             json!({
                 "kind": "agent.event",
                 "payload": {
-                    "command_id": dispatch.command.id,
+                    "command_id": command.id,
                     "kind": event.kind,
                     "priority": event.priority,
                     "summary": event.summary
@@ -96,9 +156,9 @@ fn handle_text_message(
             .to_string()
             .into(),
         ))?;
-        wait_for_ack(socket, &dispatch.command.id, &event.kind)?;
+        wait_for_ack(socket, &command.id, &event.kind)?;
     }
-    Ok(true)
+    Ok(())
 }
 
 fn configure_socket(socket: &mut AgentSocket) -> std::io::Result<()> {
@@ -159,5 +219,53 @@ fn set_socket_read_timeout(
             stream.get_ref().set_read_timeout(timeout)
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandPayload, CommandType, command_events};
+
+    #[test]
+    fn placeholder_commands_use_placeholder_stream() {
+        let command = CommandPayload {
+            id: "command-1".to_owned(),
+            command_type: CommandType::Placeholder,
+            prompt: "check status".to_owned(),
+        };
+
+        let events = command_events(&command);
+
+        assert_eq!(
+            events.first().map(|event| event.kind.as_str()),
+            Some("command.accepted")
+        );
+        assert_eq!(
+            events.last().map(|event| event.summary.as_str()),
+            Some("Placeholder command completed successfully.")
+        );
+    }
+
+    #[test]
+    fn codex_commands_fail_when_execution_is_disabled() {
+        let command = CommandPayload {
+            id: "command-1".to_owned(),
+            command_type: CommandType::Codex,
+            prompt: "Say exactly: chaop-smoke".to_owned(),
+        };
+
+        let events = command_events(&command);
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["command.started", "command.failed"]
+        );
+        assert_eq!(
+            events.last().map(|event| event.summary.as_str()),
+            Some("Codex exec is disabled in this connector config.")
+        );
     }
 }

@@ -1,30 +1,32 @@
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PlaceholderEvent {
+pub struct ConnectorEvent {
     pub kind: String,
     pub priority: String,
     pub summary: String,
 }
 
-pub fn placeholder_event_stream(prompt: &str) -> Vec<PlaceholderEvent> {
+pub type PlaceholderEvent = ConnectorEvent;
+
+pub fn placeholder_event_stream(prompt: &str) -> Vec<ConnectorEvent> {
     vec![
-        PlaceholderEvent {
+        ConnectorEvent {
             kind: "command.accepted".to_owned(),
             priority: "P1".to_owned(),
             summary: format!("Accepted placeholder command: {}", prompt.trim()),
         },
-        PlaceholderEvent {
+        ConnectorEvent {
             kind: "command.started".to_owned(),
             priority: "P1".to_owned(),
             summary: "Connector acquired the placeholder lease.".to_owned(),
         },
-        PlaceholderEvent {
+        ConnectorEvent {
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
             summary: "Summary stream is current; full log detail is deferred.".to_owned(),
         },
-        PlaceholderEvent {
+        ConnectorEvent {
             kind: "command.finished".to_owned(),
             priority: "P1".to_owned(),
             summary: "Placeholder command completed successfully.".to_owned(),

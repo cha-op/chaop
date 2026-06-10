@@ -119,7 +119,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         workspace_id: commandRequest.workspace_id,
         thread_id: commandRequest.thread_id,
         task_id: commandRequest.task_id,
-        type: "placeholder",
+        type: commandRequest.type ?? "placeholder",
         prompt: commandRequest.prompt,
         state: "pending",
         target_connector_id: commandRequest.target_connector_id,
@@ -306,6 +306,7 @@ function isCreateCommandRequest(value: unknown): value is CreateCommandRequest {
     isNonEmptyString(value.prompt) &&
     optionalString(value.thread_id) &&
     optionalString(value.task_id) &&
+    optionalCommandType(value.type) &&
     optionalString(value.target_connector_id)
   );
 }
@@ -320,6 +321,10 @@ function isNonEmptyString(value: unknown): value is string {
 
 function optionalString(value: unknown): value is string | undefined {
   return value === undefined || typeof value === "string";
+}
+
+function optionalCommandType(value: unknown): value is CreateCommandRequest["type"] {
+  return value === undefined || value === "placeholder" || value === "codex";
 }
 
 function stableConnectorId(name: string, hostname: string): string {

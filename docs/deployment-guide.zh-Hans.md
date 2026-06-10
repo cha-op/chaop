@@ -4,15 +4,15 @@
 
 ### 目的
 
-本文说明如何为 Codex app-server 控制面的第一轮部署切片准备 Cloudflare 和 connector 配置。
+本文说明如何为 Codex 控制面的第一轮部署切片准备 Cloudflare 和 connector 配置。
 
-第一轮切片采用 Cloudflare-first，但 Rust connector 仍然先使用 placeholder 实现。目标是在接入真实 Codex app-server 前先准备控制闭环形态：
+第一轮切片采用 Cloudflare-first。Rust connector 默认支持 placeholder execution，也可以通过私有 connector 配置显式开启本机 `codex exec` 执行：
 
 ```text
 Browser GUI -> Cloudflare Access -> Worker / Durable Object -> D1 / R2 -> Rust connector -> Worker / Durable Object -> Browser GUI
 ```
 
-当前实现状态：仓库已经有 placeholder 控制闭环实现。它可以把 placeholder command lifecycle 写入 D1，通过 Durable Object dispatch pending command，并接收 Rust connector 发回的 placeholder lifecycle events。它还不会执行真实 Codex app-server 工作，R2 artifact capture 也仍然保留给后续切片。
+当前实现状态：仓库可以把 command lifecycle 写入 D1，通过 Durable Object dispatch pending command，并接收 Rust connector 发回的 lifecycle events。只有当私有 connector 配置包含 `execution.mode = "codex_exec"` 时，它才会执行本机 Codex CLI 工作。它暂时还没有接入 experimental Codex app-server protocol，R2 artefact capture 也仍然保留给后续切片。
 
 不要把密钥提交到 Git。敏感值只通过本地忽略文件、密码管理器，或者直接执行 `wrangler secret put` 来提供。
 
@@ -298,7 +298,7 @@ pnpm wrangler secret put ACCESS_TEAM_DOMAIN
 
 ### 准备第一台 connector
 
-placeholder connector 需要一个本地配置文件：
+connector 需要一个本地配置文件：
 
 ```toml
 connector_name = "mac-studio"
@@ -310,7 +310,36 @@ spool_db = "/Users/you/.chaop/connector-spool.sqlite"
 
 [bootstrap]
 secret_file = "/Users/you/.chaop/bootstrap.secret"
+
+[execution]
+mode = "placeholder"
+codex_command = "codex"
+codex_sandbox = "read-only"
+codex_timeout_seconds = 300
+codex_output_max_bytes = 262144
 ```
+
+`mode = "placeholder"` 是安全默认值。要运行真实本机 Codex CLI 工作，只在私有部署配置里这样设置：
+
+```toml
+[execution]
+mode = "codex_exec"
+codex_command = "codex"
+codex_sandbox = "read-only"
+codex_timeout_seconds = 300
+codex_output_max_bytes = 262144
+```
+
+可选执行设置：
+
+```toml
+codex_profile = "default"
+codex_model = "gpt-5.5"
+extra_args = ["--skip-git-repo-check"]
+```
+
+只有本机 Codex CLI 确实需要时才加入可选设置。`codex_exec` 可能消耗 Codex/OpenAI 额度或 API budget；让它无人值守运行前，请先按 [成本模型](cost-aware.zh-Hans.md) 设置告警。
+Prompt 会通过 stdin 传给 Codex，不放在命令行参数里。除非有明确运维理由，不要放宽 timeout 和 output cap。
 
 在仓库外创建本地文件目录：
 
@@ -323,7 +352,7 @@ chmod 700 ~/.chaop
 
 Worker 部署后，执行 connector bootstrap，用 bootstrap secret 换取 connector token。把返回的 connector token 存到 connector config 中 `token_file` 指向的位置。Worker 只会在 D1 中保存 token hash。
 
-运行 placeholder connector loop：
+运行 connector loop：
 
 ```bash
 cargo run -p chaop-agent -- --config /path/to/agent.toml --connect

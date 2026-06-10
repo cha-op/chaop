@@ -349,6 +349,46 @@ test("command creation returns accepted placeholder command", async () => {
   assert.equal(body.command.state, "pending");
 });
 
+test("command creation preserves requested codex command type", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain; charset=utf-8"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Say exactly: chaop-smoke"
+      })
+    }),
+    devEnv
+  );
+  const body = (await response.json()) as { command: { type: string; state: string } };
+
+  assert.equal(response.status, 202);
+  assert.equal(body.command.type, "codex");
+  assert.equal(body.command.state, "pending");
+});
+
+test("command creation rejects unknown command type", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        type: "shell",
+        prompt: "Summarise current errors"
+      })
+    }),
+    devEnv
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid command payload" });
+});
+
 test("command creation accepts executable target connectors when D1 is bound", async () => {
   const envWithExecutableConnector: Env = {
     ...devEnv,
@@ -370,6 +410,54 @@ test("command creation accepts executable target connectors when D1 is bound", a
 
   assert.equal(response.status, 202);
   assert.equal(body.command.target_connector_id, "connector-online");
+});
+
+test("command creation preserves codex type for capable target connectors when D1 is bound", async () => {
+  const envWithExecutableConnector: Env = {
+    ...devEnv,
+    DB: commandTargetDb({ id: "connector-online" })
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Say exactly: chaop-smoke",
+        target_connector_id: "connector-online"
+      })
+    }),
+    envWithExecutableConnector
+  );
+  const body = (await response.json()) as { command: { target_connector_id?: string; type: string } };
+
+  assert.equal(response.status, 202);
+  assert.equal(body.command.type, "codex");
+  assert.equal(body.command.target_connector_id, "connector-online");
+});
+
+test("command creation rejects codex target connectors without codex_exec capability", async () => {
+  const envWithPlaceholderConnector: Env = {
+    ...devEnv,
+    DB: commandTargetDb({ id: "connector-online" }, { supportsCodex: false })
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Say exactly: chaop-smoke",
+        target_connector_id: "connector-online"
+      })
+    }),
+    envWithPlaceholderConnector
+  );
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), { error: "Target connector not available" });
 });
 
 test("command creation rejects unavailable target connectors when D1 is bound", async () => {
@@ -409,7 +497,11 @@ test("command creation rejects missing prompt", async () => {
   assert.deepEqual(await response.json(), { error: "Invalid command payload" });
 });
 
-function commandTargetDb(row: { id: string } | null): D1Database {
+function commandTargetDb(
+  row: { id: string } | null,
+  options: { supportsCodex?: boolean } = {}
+): D1Database {
+  const supportsCodex = options.supportsCodex ?? true;
   return {
     prepare(sql: string) {
       if (/INSERT INTO users/.test(sql)) {
@@ -429,12 +521,17 @@ function commandTargetDb(row: { id: string } | null): D1Database {
         assert.match(sql, /wc\.workspace_id = \?/);
         assert.match(sql, /wc\.can_execute = 1/);
         assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /capabilities_json LIKE/);
         return {
-          bind(connectorId: string, workspaceId: string) {
+          bind(connectorId: string, workspaceId: string, commandType: string) {
             assert.equal(connectorId.startsWith("connector-"), true);
             assert.equal(workspaceId, "workspace-api");
+            assert.equal(commandType === "placeholder" || commandType === "codex", true);
             return {
               async first() {
+                if (commandType === "codex" && !supportsCodex) {
+                  return null;
+                }
                 return row;
               }
             };
