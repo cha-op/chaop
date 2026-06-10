@@ -12,7 +12,7 @@ The first slice is Cloudflare-first, but it still uses a placeholder Rust connec
 Browser GUI -> Cloudflare Access -> Worker / Durable Object -> D1 / R2 -> Rust connector -> Worker / Durable Object -> Browser GUI
 ```
 
-Current implementation status: the repository has local skeletons, bindings, schema, authentication checks, sample data, and placeholder command acceptance. It does not yet persist command lifecycle rows in D1, relay commands through the Durable Object, or execute commands through the Rust connector. Treat those behaviours as the next deployment slice, not as completed production behaviour.
+Current implementation status: the repository has a placeholder control-loop implementation. It can persist placeholder command lifecycle rows in D1, dispatch pending commands through the Durable Object, and receive placeholder lifecycle events from the Rust connector. It does not yet execute real Codex app-server work, and R2 artifact capture is still reserved for a later slice.
 
 Keep secrets out of Git. Share sensitive values only through a local ignored file, a password manager, or direct `wrangler secret put` commands.
 
@@ -65,6 +65,8 @@ Provide these secrets through a secure channel only:
 ```text
 CLOUDFLARE_API_TOKEN=
 AGENT_BOOTSTRAP_SECRET=
+CF_ACCESS_CLIENT_ID=
+CF_ACCESS_CLIENT_SECRET=
 ```
 
 ### Deployment-instance values
@@ -125,6 +127,35 @@ If Cloudflare Access is configured manually in the dashboard, the Wrangler deplo
 
 If Access should also be automated later, create a separate Access administration token instead of widening the deployment token.
 
+### Create an Access service token for smoke tests
+
+For command-line E2E smoke tests, create a Cloudflare Access service token and add it to the Access application policy for the browser-facing API routes.
+
+Use the Zero Trust dashboard:
+
+1. Go to Access service tokens.
+2. Create a token for operator or CI smoke tests.
+3. Copy the client ID and client secret once.
+4. Add an Access policy that allows this service token on the Browser API application.
+
+Store the values outside the repository:
+
+```text
+CF_ACCESS_CLIENT_ID=...
+CF_ACCESS_CLIENT_SECRET=...
+```
+
+Treat both values as secrets. A service token request should pass these headers:
+
+```bash
+curl \
+  -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+  https://api.example.com/api/bootstrap
+```
+
+The Worker accepts Access JWTs that contain either a user email or a service-token identity claim. Service-token identities are mapped to synthetic `@service.chaop.local` users for smoke-test auditability.
+
 ### Local configuration file
 
 After the repo contains the deployment scripts, create a local ignored file such as:
@@ -145,6 +176,8 @@ CHAOP_API_DOMAIN=api.example.com
 VITE_CHAOP_API_BASE_URL=https://api.example.com
 ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
 ACCESS_AUD=...
+CF_ACCESS_CLIENT_ID=...
+CF_ACCESS_CLIENT_SECRET=...
 CHAOP_ACCESS_ALLOWED_EMAILS=you@example.com
 CHAOP_ACCESS_ALLOWED_GROUPS=
 CHAOP_FIRST_CONNECTOR_NAME=mac-studio
@@ -288,6 +321,20 @@ chmod 700 ~/.chaop
 
 Then place the bootstrap secret in `~/.chaop/bootstrap.secret` with file permissions readable only by your user.
 
+After the Worker is deployed, run connector bootstrap to exchange the bootstrap secret for a connector token. Store the returned connector token at the `token_file` path in the connector config. The Worker stores only the token hash in D1.
+
+Run the placeholder connector loop with:
+
+```bash
+cargo run -p chaop-agent -- --config /path/to/agent.toml --connect
+```
+
+For a one-command smoke test, use:
+
+```bash
+cargo run -p chaop-agent -- --config /path/to/agent.toml --connect --run-once
+```
+
 ### What I need from you
 
 For the next implementation pass, keep deployment-instance values outside this repository. Put non-secret instance values in the private deployment repository or local ignored env file, and put secrets in the secure channel we agree on.
@@ -304,6 +351,8 @@ ACCESS_TEAM_DOMAIN
 ACCESS_AUD
 CLOUDFLARE_API_TOKEN
 AGENT_BOOTSTRAP_SECRET
+CF_ACCESS_CLIENT_ID
+CF_ACCESS_CLIENT_SECRET
 CHAOP_FIRST_CONNECTOR_NAME
 CHAOP_FIRST_WORKSPACE_ROOT
 ```
@@ -312,7 +361,9 @@ CHAOP_FIRST_WORKSPACE_ROOT
 
 - If Wrangler cannot authenticate, check `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
 - If the Browser gets `403`, check the Access application AUD, team domain, and allowed user policy.
+- If service-token smoke tests get `401` from the Worker with an identity error, check that the Access policy allows the service token and that the service-token headers reach the API route.
 - If Browser command submission fails before reaching the Worker, check whether the request has become a CORS preflight and either keep the simple request shape or allow `OPTIONS /api/*` through Cloudflare Access.
 - If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether the Worker route excludes Browser Access.
+- If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
 - If D1 migration fails, confirm the D1 database UUID is present in the Worker config.
 - If R2 writes fail, confirm the bucket exists and the Worker binding name matches the implementation.

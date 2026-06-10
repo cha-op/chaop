@@ -42,8 +42,6 @@ superseded_by:
 - 文档集合应包括使用指南、快速上手、FAQ、故障排查、部署指南、架构文档、成本模型，以及后续新增的运维手册。
 
 ## 下一步
-- 评审本地实现切片，并修复评审发现的问题。
-- 在运行第一轮真实部署前，准备 Cloudflare 和 connector 配置值。
 - 在后续切片中将 placeholder connector 执行替换为真实 Codex app-server 集成。
 
 ## 2026-06-09 交接记录
@@ -61,7 +59,14 @@ superseded_by:
 - 已应用最终 re-check 修复：app-level dev 脚本现在会在启动 Vite 或 Wrangler 前先构建 `@chaop/protocol`；Worker dev 会应用本地 D1 migrations 并注入仅用于本地的 bootstrap secret；本地 insecure agent bootstrap 会返回当前本地 Worker WebSocket URL，而不是示例生产 API 域名。
 - 2026-06-10 已应用宽复查后续修复：connector token 查询通过 migration `0002` 新增 D1 `token_hash` 索引；web command 提交使用 simple `text/plain` JSON body，以规避当前切片里 Cloudflare Access 的 preflight 风险；web placeholder command 不再硬编码 connector target；D1 已绑定时 Worker command creation 会按 workspace membership、`can_execute` 和 offline status 校验传入的 connector target；Thread Command Centre 会显示 command accepted/failed 反馈。
 - 部署实例值不得 tracked 到本仓库。主仓库文档保持通用模板，branch history 需要重写以移除曾经提交的实例值；具体部署值记录到私有部署仓库/subrepo 或本地已忽略 env 文件。
-- 真实 Cloudflare 部署仍阻塞于私有部署实例配置、API token、bootstrap secret、第一台 connector 详情，以及 D1 database UUID。
+- 2026-06-10 控制闭环实现更新：Browser bootstrap 可以从 D1 读取已持久化的 command/event state；`POST /api/commands` 会写入 placeholder command 和 accepted event；`WorkspaceDO` 会把 pending command dispatch 给匹配的 agent WebSocket；agent lifecycle events 会更新 command/task state 并追加 thread events；web Thread Command Centre 会显示已接受 command 和返回的 timeline。
+- 2026-06-10 connector 更新：`chaop-agent --connect --run-once` 会读取本地 connector token，连接 Worker WebSocket，处理 `command.dispatch`，并发出 placeholder `started`、`output` 和 `finished` event stream。
+- 2026-06-10 认证更新：不含 email claim 的 Cloudflare Access service-token JWT 会被接受为 synthetic service identity，用于 operator smoke tests；带 email 的 Access JWT 仍映射为正常 user identity。
+- 本地验证已通过：`pnpm --filter @chaop/worker test`、`pnpm typecheck`、`cargo fmt --check`、`cargo test --workspace` 和 `pnpm test`。
+- 2026-06-10 deployed placeholder E2E smoke 已通过：使用私有 Cloudflare 配置、Access service-token auth 和第一台本地 connector。最终 command 进入 `succeeded`，bootstrap timeline 包含 `command.accepted`、`command.started`、`command.output` 和 `command.finished`。
+- 已应用 internal review 后续修复：connector dispatch 每次只 lease 一个 pending command，保证 `--run-once` 安全；untargeted command leasing 现在会校验 workspace connector membership 和 execution permission；重复 bootstrap 会把同名同 host 的旧 connector 标记为 offline；bootstrap summary 会隐藏 offline stale connectors。
+- 已应用第二轮 internal review 后续修复：常驻 connector idle 时不再继承 acknowledgement read timeout；expired leases 可以被重新领取；lease update 会检查实际是否 claim 到该行后再 dispatch，避免并发 socket 重复执行同一 command。
+- 修复后再次跑通 deployed smoke，并确认常驻 connector idle 超过原先 10 秒 timeout 窗口后仍保持连接。
 
 ## 证据
 - 来源文档：`docs/design-starter.md`、`docs/cost-aware.md`。

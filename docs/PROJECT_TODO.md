@@ -4,5 +4,7 @@
 
 - [done] Adopt all generated visual directions as complementary v1 views: Operations Map, Operations Task Board, Thread Command Centre, and Budget Reliability Board.
 - [in_progress] Expand user-facing documentation with English canonical files and paired Simplified Chinese `*.zh-Hans.md` files.
-- [in_progress] Collect Cloudflare account, Access, domain, Wrangler, and connector bootstrap configuration for the first real deployment slice in a private deployment repository/subrepo or local ignored env file, not in tracked main-repo docs.
-- [in_progress] Harden the Cloudflare-first placeholder connector control loop from local skeleton to deploy-ready configuration after real Cloudflare values are supplied.
+- [done] Collect Cloudflare account, Access, domain, Wrangler, and connector bootstrap configuration for the first real deployment slice in a private deployment repository/subrepo or local ignored env file, not in tracked main-repo docs.
+- [done] Harden the Cloudflare-first placeholder connector control loop from local skeleton to deploy-ready command dispatch, D1 persistence, Durable Object relay, and connector lifecycle reporting.
+- [done] Run a deployed placeholder E2E smoke using private Cloudflare config, Access service-token auth, and the first local connector.
+- [pending] Replace placeholder connector execution with real Codex app-server command execution.

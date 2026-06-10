@@ -3,6 +3,8 @@
   "name": "chaop-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-06-09",
+  "workers_dev": false,
+  "preview_urls": false,
   "vars": {
     "CHAOP_DEV_ALLOW_INSECURE": "false",
     "CHAOP_API_DOMAIN": "api.example.com",

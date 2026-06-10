@@ -2,18 +2,25 @@ import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import type { Env } from "./types.js";
 
 export type AuthResult =
-  | { ok: true; email: string }
+  | { ok: true; user: BrowserIdentity }
   | { ok: false; status: number; message: string };
 
 export type AgentAuthResult =
   | { ok: true; connectorId: string }
   | { ok: false; status: number; message: string };
 
+export type BrowserIdentity = {
+  id: string;
+  email: string;
+  name: string;
+};
+
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
 export async function authenticateBrowser(request: Request, env: Env): Promise<AuthResult> {
   if (env.CHAOP_DEV_ALLOW_INSECURE === "true") {
-    return { ok: true, email: request.headers.get("x-chaop-dev-user") ?? "dev@example.com" };
+    const email = request.headers.get("x-chaop-dev-user") ?? "dev@example.com";
+    return { ok: true, user: userIdentity(email) };
   }
 
   const accessJwt = request.headers.get("cf-access-jwt-assertion");
@@ -31,11 +38,11 @@ export async function authenticateBrowser(request: Request, env: Env): Promise<A
       issuer: teamDomain,
       audience: env.ACCESS_AUD
     });
-    const email = emailFromPayload(payload);
-    if (!email) {
+    const user = identityFromAccessPayload(payload);
+    if (!user) {
       return { ok: false, status: 401, message: "Missing Cloudflare Access user identity" };
     }
-    return { ok: true, email };
+    return { ok: true, user };
   } catch {
     return { ok: false, status: 403, message: "Invalid Cloudflare Access JWT" };
   }
@@ -201,6 +208,42 @@ function normaliseTeamDomain(teamDomain: string): string {
 function emailFromPayload(payload: JWTPayload): string | undefined {
   const email = payload.email;
   return typeof email === "string" && email.includes("@") ? email : undefined;
+}
+
+export function identityFromAccessPayload(payload: JWTPayload): BrowserIdentity | undefined {
+  const email = emailFromPayload(payload);
+  if (email) {
+    return userIdentity(email);
+  }
+
+  const serviceTokenName =
+    stringClaim(payload, "common_name") ??
+    stringClaim(payload, "name") ??
+    stringClaim(payload, "sub");
+  if (!serviceTokenName) {
+    return undefined;
+  }
+
+  const slug = serviceTokenName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "service-token";
+  return {
+    id: `access-service-${slug}`,
+    email: `${slug}@service.chaop.local`,
+    name: `Access service token: ${serviceTokenName}`
+  };
+}
+
+function userIdentity(email: string): BrowserIdentity {
+  const normalised = email.toLowerCase();
+  return {
+    id: `user-${normalised.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`,
+    email: normalised,
+    name: normalised.split("@")[0] ?? normalised
+  };
+}
+
+function stringClaim(payload: JWTPayload, key: string): string | undefined {
+  const value = payload[key];
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
 async function tokenSignature(connectorId: string, secret: string): Promise<string> {

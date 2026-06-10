@@ -7,6 +7,7 @@ import {
   type ConnectorSummary,
   type TaskState,
   type TaskSummary,
+  type ThreadEvent,
   type ThreadSummary
 } from "@chaop/protocol";
 import { createPlaceholderCommand, loadBootstrap } from "./api.js";
@@ -28,6 +29,9 @@ export class ChaopApp extends LitElement {
 
   @state()
   private commandState: "idle" | "submitting" | "accepted" | "failed" = "idle";
+
+  @state()
+  private lastCommandId?: string;
 
   @state()
   private loadError?: string;
@@ -226,6 +230,10 @@ export class ChaopApp extends LitElement {
   private renderThreadCentre() {
     const thread = this.data!.threads[0];
     if (!thread) return nothing;
+    const events = this.eventsForThread(thread.id);
+    const command = this.lastCommandId
+      ? this.data!.running_commands.find((item) => item.id === this.lastCommandId)
+      : this.data!.running_commands[0];
 
     return html`
       <section class="page-grid thread-grid">
@@ -247,21 +255,33 @@ export class ChaopApp extends LitElement {
             ${this.commandState === "submitting" ? "Submitting..." : "Run placeholder command"}
           </button>
           ${this.commandState === "accepted"
-            ? html`<p class="command-status success">Placeholder command accepted.</p>`
+            ? html`<p class="command-status success">
+                Placeholder command accepted${this.lastCommandId ? `: ${this.lastCommandId}` : ""}.
+              </p>`
             : nothing}
           ${this.commandState === "failed"
             ? html`<p class="command-status failed">Command request failed.</p>`
             : nothing}
           <div class="timeline">
-            ${["command.accepted", "command.started", "command.output", "command.finished"].map(
-              (eventName, index) => html`
-                <div class="event-row">
-                  <span>${String(index + 1).padStart(2, "0")}</span>
-                  <strong>${eventName}</strong>
-                  <p>${eventCopy(eventName)}</p>
-                </div>
-              `
-            )}
+            ${events.length > 0
+              ? events.map(
+                  (event, index) => html`
+                    <div class="event-row">
+                      <span>${String(index + 1).padStart(2, "0")}</span>
+                      <strong>${event.kind}</strong>
+                      <p>${event.summary}</p>
+                    </div>
+                  `
+                )
+              : ["command.accepted", "command.started", "command.output", "command.finished"].map(
+                  (eventName, index) => html`
+                    <div class="event-row">
+                      <span>${String(index + 1).padStart(2, "0")}</span>
+                      <strong>${eventName}</strong>
+                      <p>${eventCopy(eventName)}</p>
+                    </div>
+                  `
+                )}
           </div>
         </section>
         <aside class="panel">
@@ -271,7 +291,8 @@ export class ChaopApp extends LitElement {
           </div>
           <dl class="facts">
             <div><dt>Mode</dt><dd>Interactive</dd></div>
-            <div><dt>Target</dt><dd>Unassigned</dd></div>
+            <div><dt>Target</dt><dd>${command?.target_connector_id ?? "Auto-selected"}</dd></div>
+            <div><dt>Command state</dt><dd>${command?.state ?? "No live command"}</dd></div>
             <div><dt>Policy</dt><dd>Realtime events, summary logs</dd></div>
             <div><dt>Approval</dt><dd>Stubbed for next slice</dd></div>
             <div><dt>Artifacts</dt><dd>Entry point only</dd></div>
@@ -314,17 +335,25 @@ export class ChaopApp extends LitElement {
   private readonly submitCommand = async (): Promise<void> => {
     this.commandState = "submitting";
     try {
-      await createPlaceholderCommand({
+      const response = await createPlaceholderCommand({
         workspace_id: "workspace-api",
         thread_id: "thread-orders-500",
         task_id: "task-orders-500",
         prompt: this.commandPrompt
       });
+      this.lastCommandId = response.command.id;
       this.commandState = "accepted";
+      await this.load();
+      window.setTimeout(() => void this.load(), 1_000);
+      window.setTimeout(() => void this.load(), 2_500);
     } catch {
       this.commandState = "failed";
     }
   };
+
+  private eventsForThread(threadId: string): ThreadEvent[] {
+    return this.data!.events.filter((event) => event.thread_id === threadId);
+  }
 }
 
 function viewFromHash(): View {

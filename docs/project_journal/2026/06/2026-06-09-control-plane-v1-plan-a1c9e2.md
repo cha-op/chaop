@@ -42,8 +42,6 @@ superseded_by:
 - The documentation set should include usage guide, quick start, FAQ, troubleshooting, deployment guide, architecture, cost model, and any operational runbooks added later.
 
 ## Next Steps
-- Review the local implementation slice and harden any findings.
-- Prepare Cloudflare and connector configuration values before running the first real deployment.
 - Replace placeholder connector execution with real Codex app-server integration in a later slice.
 
 ## 2026-06-09 Handoff
@@ -61,7 +59,14 @@ superseded_by:
 - Final re-check fixes applied: app-level dev scripts now build `@chaop/protocol` before starting Vite or Wrangler; Worker dev applies local D1 migrations and injects a local-only bootstrap secret; and local insecure agent bootstrap returns the current local Worker WebSocket URL instead of the sample production API domain.
 - Wide review follow-up fixes applied on 2026-06-10: connector token lookup gets a D1 `token_hash` index through migration `0002`; web command submission uses a simple `text/plain` JSON body to avoid Cloudflare Access preflight in the current slice; the web placeholder command no longer hardcodes a connector target; Worker command creation validates supplied connector targets against workspace membership, `can_execute`, and offline status when D1 is bound; and the Command Centre displays accepted/failed command feedback.
 - Deployment-instance values must not be tracked in this repository. Keep the main docs generic, rewrite branch history to remove any committed instance values, and record concrete deployment values in a private deployment repository/subrepo or local ignored env file.
-- Real Cloudflare deployment remains blocked on private deployment-instance configuration, API token, bootstrap secret, first connector details, and D1 database UUID.
+- 2026-06-10 control-loop implementation update: Browser bootstrap can load persisted command/event state from D1; `POST /api/commands` writes a placeholder command and accepted event; `WorkspaceDO` dispatches pending commands to the matching agent WebSocket; agent lifecycle events update command/task state and append thread events; and the web Thread Command Centre shows the accepted command and returned timeline.
+- 2026-06-10 connector update: `chaop-agent --connect --run-once` reads the local connector token, connects to the Worker WebSocket, handles `command.dispatch`, and emits the placeholder `started`, `output`, and `finished` event stream.
+- 2026-06-10 auth update: Cloudflare Access service-token JWTs without email claims are accepted as synthetic service identities for operator smoke tests, while email-bearing Access JWTs still map to normal user identities.
+- Local validation passed for `pnpm --filter @chaop/worker test`, `pnpm typecheck`, `cargo fmt --check`, `cargo test --workspace`, and `pnpm test`.
+- Deployed placeholder E2E smoke passed on 2026-06-10 using private Cloudflare configuration, Access service-token auth, and the first local connector. The resulting command reached `succeeded` and the bootstrap timeline included `command.accepted`, `command.started`, `command.output`, and `command.finished`.
+- Internal review follow-up fixes applied: connector dispatch leases one pending command at a time for `--run-once` safety; untargeted command leasing now checks workspace connector membership and execution permission; repeat bootstrap marks older same-name/same-host connectors offline; and bootstrap summaries hide offline stale connectors.
+- Second internal review follow-up fixes applied: long-lived connectors no longer inherit the acknowledgement read timeout while idle; expired leases can be reclaimed; and lease updates now check whether the row was actually claimed before dispatching, preventing duplicate execution from concurrent sockets.
+- Post-fix deployed smoke passed again, and an idle long-lived connector stayed connected beyond the previous 10-second timeout window.
 
 ## Evidence
 - Source documents: `docs/design-starter.md`, `docs/cost-aware.md`.

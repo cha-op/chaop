@@ -170,6 +170,28 @@ export function fallbackBootstrap(): BootstrapPayload {
       }
     ],
     running_commands: [],
+    events: [
+      {
+        id: "event-placeholder-accepted",
+        thread_id: "thread-orders-500",
+        command_id: "command-placeholder",
+        seq: 1,
+        kind: "command.accepted",
+        priority: "P1",
+        summary: "Control plane accepted the placeholder command.",
+        created_at: "2026-06-09T21:58:01.000Z"
+      },
+      {
+        id: "event-placeholder-output",
+        thread_id: "thread-orders-500",
+        command_id: "command-placeholder",
+        seq: 2,
+        kind: "command.output",
+        priority: "P2",
+        summary: "Summary stream is current; full log detail is deferred.",
+        created_at: "2026-06-09T21:58:02.000Z"
+      }
+    ],
     budget: {
       state: "conservative",
       daily_used_pct: 75,

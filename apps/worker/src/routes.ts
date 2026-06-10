@@ -11,6 +11,12 @@ import {
   authenticateBrowser,
   issueAgentToken
 } from "./auth.js";
+import {
+  CommandTargetError,
+  createCommandInDb,
+  ensureConnectorInventory,
+  loadBootstrapFromDb
+} from "./db.js";
 import { budget, sampleBootstrap } from "./sample-data.js";
 import type { Env } from "./types.js";
 
@@ -30,7 +36,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
     const auth = await authenticateBrowser(request, env);
     if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
-    return json(request, env, sampleBootstrap(auth.email));
+    const bootstrap = await loadBootstrapFromDb(env, auth.user);
+    return json(request, env, bootstrap ?? sampleBootstrap(auth.user.email));
   }
 
   if (request.method === "GET" && url.pathname === "/api/usage-summary") {
@@ -54,14 +61,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
     const registration = payload.value;
     const connectorId = stableConnectorId(registration.connector_name, registration.hostname);
+    const token = await issueAgentToken(connectorId, env, {
+      connectorName: registration.connector_name,
+      hostname: registration.hostname,
+      workspaceRoot: registration.workspace_root,
+      capabilities: registration.capabilities
+    });
+    await ensureConnectorInventory(env, connectorId, registration);
     const response: AgentBootstrapResponse = {
       connector_id: connectorId,
-      token: await issueAgentToken(connectorId, env, {
-        connectorName: registration.connector_name,
-        hostname: registration.hostname,
-        workspaceRoot: registration.workspace_root,
-        capabilities: registration.capabilities
-      }),
+      token,
       control_url: connectorControlUrl(url, env),
       reporting_policy: {
         policy_version: 1,
@@ -86,20 +95,22 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return json(request, env, { error: "Invalid command payload" }, 400);
     }
     const commandRequest = payload.value;
-    if (commandRequest.target_connector_id && env.DB) {
-      const connector = await env.DB.prepare(
-        `SELECT c.id
-         FROM connectors c
-         INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
-         WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
-         LIMIT 1`
-      )
-        .bind(commandRequest.target_connector_id, commandRequest.workspace_id)
-        .first<{ id: string }>();
-      if (!connector) {
-        return json(request, env, { error: "Target connector not available" }, 404);
+
+    if (env.DB) {
+      try {
+        const { response, targetConnectorId } = await createCommandInDb(env, auth.user, commandRequest);
+        if (targetConnectorId) {
+          await dispatchPendingCommand(env, targetConnectorId);
+        }
+        return json(request, env, response, 202);
+      } catch (error) {
+        if (error instanceof CommandTargetError) {
+          return json(request, env, { error: error.message }, error.status);
+        }
+        throw error;
       }
     }
+
     const now = new Date().toISOString();
     const response: CreateCommandResponse = {
       accepted: true,
@@ -254,6 +265,17 @@ function connectorControlUrl(url: URL, env: Env): string {
 
 function isLocalHost(host: string): boolean {
   return /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
+}
+
+async function dispatchPendingCommand(env: Env, connectorId: string): Promise<void> {
+  if (!env.WORKSPACE_DO) return;
+
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  await stub.fetch("https://workspace-do/internal/dispatch-pending", {
+    method: "POST",
+    body: JSON.stringify({ connector_id: connectorId })
+  });
 }
 
 async function readJson(

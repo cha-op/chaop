@@ -187,6 +187,7 @@ export type BootstrapPayload = {
   tasks: TaskSummary[];
   task_categories: TaskCategory[];
   running_commands: CommandSummary[];
+  events: ThreadEvent[];
   budget: BudgetSummary;
   server_time: string;
 };
@@ -216,6 +217,21 @@ export type CreateCommandRequest = {
 export type CreateCommandResponse = {
   command: CommandSummary;
   accepted: boolean;
+};
+
+export type CommandDispatch = {
+  command: CommandSummary;
+};
+
+export type AgentCommandEvent = {
+  command_id: string;
+  kind:
+    | "command.started"
+    | "command.output"
+    | "command.finished"
+    | "command.failed";
+  priority: ThreadEvent["priority"];
+  summary: string;
 };
 
 export type ThrottleNotice = {

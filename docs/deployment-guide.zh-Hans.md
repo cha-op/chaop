@@ -12,7 +12,7 @@
 Browser GUI -> Cloudflare Access -> Worker / Durable Object -> D1 / R2 -> Rust connector -> Worker / Durable Object -> Browser GUI
 ```
 
-当前实现状态：仓库已经有本地骨架、binding、schema、认证检查、sample data 和 placeholder command acceptance。它还不会把 command lifecycle 写入 D1，不会通过 Durable Object relay command，也不会通过 Rust connector 执行 command。请把这些行为视为下一轮部署切片，而不是已经完成的生产行为。
+当前实现状态：仓库已经有 placeholder 控制闭环实现。它可以把 placeholder command lifecycle 写入 D1，通过 Durable Object dispatch pending command，并接收 Rust connector 发回的 placeholder lifecycle events。它还不会执行真实 Codex app-server 工作，R2 artifact capture 也仍然保留给后续切片。
 
 不要把密钥提交到 Git。敏感值只通过本地忽略文件、密码管理器，或者直接执行 `wrangler secret put` 来提供。
 
@@ -65,6 +65,8 @@ CHAOP_BURST_EVENTS_PER_MINUTE=600
 ```text
 CLOUDFLARE_API_TOKEN=
 AGENT_BOOTSTRAP_SECRET=
+CF_ACCESS_CLIENT_ID=
+CF_ACCESS_CLIENT_SECRET=
 ```
 
 ### 部署实例值
@@ -125,6 +127,35 @@ Workers Tail: Read
 
 如果后续要自动化 Access 配置，应单独创建 Access 管理 token，而不是扩大部署 token 的权限。
 
+### 创建用于 smoke test 的 Access service token
+
+命令行 E2E smoke test 需要创建一个 Cloudflare Access service token，并把它加入面向 Browser API 路径的 Access application policy。
+
+在 Zero Trust dashboard 中：
+
+1. 进入 Access service tokens。
+2. 创建一个用于 operator 或 CI smoke tests 的 token。
+3. 只在创建时复制 client ID 和 client secret。
+4. 在 Browser API application 的 Access policy 中允许这个 service token。
+
+把值保存在仓库外：
+
+```text
+CF_ACCESS_CLIENT_ID=...
+CF_ACCESS_CLIENT_SECRET=...
+```
+
+这两个值都按 secret 处理。Service token request 应带上这些 headers：
+
+```bash
+curl \
+  -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+  https://api.example.com/api/bootstrap
+```
+
+Worker 会接受包含 user email 或 service-token identity claim 的 Access JWT。Service-token identity 会映射成 synthetic `@service.chaop.local` user，方便 smoke test 审计。
+
 ### 本地配置文件
 
 等仓库里有部署脚本后，创建一个本地忽略文件，例如：
@@ -145,6 +176,8 @@ CHAOP_API_DOMAIN=api.example.com
 VITE_CHAOP_API_BASE_URL=https://api.example.com
 ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
 ACCESS_AUD=...
+CF_ACCESS_CLIENT_ID=...
+CF_ACCESS_CLIENT_SECRET=...
 CHAOP_ACCESS_ALLOWED_EMAILS=you@example.com
 CHAOP_ACCESS_ALLOWED_GROUPS=
 CHAOP_FIRST_CONNECTOR_NAME=mac-studio
@@ -288,6 +321,20 @@ chmod 700 ~/.chaop
 
 然后把 bootstrap secret 放入 `~/.chaop/bootstrap.secret`，并确保只有当前用户可以读取。
 
+Worker 部署后，执行 connector bootstrap，用 bootstrap secret 换取 connector token。把返回的 connector token 存到 connector config 中 `token_file` 指向的位置。Worker 只会在 D1 中保存 token hash。
+
+运行 placeholder connector loop：
+
+```bash
+cargo run -p chaop-agent -- --config /path/to/agent.toml --connect
+```
+
+如果只跑一个 command 的 smoke test，使用：
+
+```bash
+cargo run -p chaop-agent -- --config /path/to/agent.toml --connect --run-once
+```
+
 ### 我需要你提供什么
 
 下一轮实现时，部署实例值不要放进本仓库。非密钥实例值放进私有部署仓库或本地已忽略 env 文件；密钥请放到我们约定的安全渠道。
@@ -304,6 +351,8 @@ ACCESS_TEAM_DOMAIN
 ACCESS_AUD
 CLOUDFLARE_API_TOKEN
 AGENT_BOOTSTRAP_SECRET
+CF_ACCESS_CLIENT_ID
+CF_ACCESS_CLIENT_SECRET
 CHAOP_FIRST_CONNECTOR_NAME
 CHAOP_FIRST_WORKSPACE_ROOT
 ```
@@ -312,7 +361,9 @@ CHAOP_FIRST_WORKSPACE_ROOT
 
 - 如果 Wrangler 无法认证，检查 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`。
 - 如果 Browser 返回 `403`，检查 Access application AUD、team domain 和允许访问的用户策略。
+- 如果 service-token smoke tests 收到 Worker 返回的身份类 `401`，检查 Access policy 是否允许该 service token，以及 service-token headers 是否能到达 API route。
 - 如果 Browser command submission 在到达 Worker 前失败，检查请求是否已经变成 CORS preflight；要么保持 simple request 形态，要么允许 `OPTIONS /api/*` 通过 Cloudflare Access。
 - 如果 connector 返回 `401`，检查 `AGENT_BOOTSTRAP_SECRET`，并确认 Worker route 没有被 Browser Access 拦截。
+- 如果 connector 已连接但一直收不到 command，检查 connector bootstrap 是否已经写入 workspace membership，command 是否 target 到可执行 connector，以及已部署 Worker 是否绑定 `WorkspaceDO`。
 - 如果 D1 migration 失败，确认 D1 database UUID 已写入 Worker 配置。
 - 如果 R2 写入失败，确认 bucket 已创建，并且 Worker binding 名称与实现一致。

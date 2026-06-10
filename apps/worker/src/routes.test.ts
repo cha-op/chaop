@@ -412,21 +412,77 @@ test("command creation rejects missing prompt", async () => {
 function commandTargetDb(row: { id: string } | null): D1Database {
   return {
     prepare(sql: string) {
-      assert.match(sql, /workspace_connectors/);
-      assert.match(sql, /wc\.workspace_id = \?/);
-      assert.match(sql, /wc\.can_execute = 1/);
-      assert.match(sql, /c\.status <> 'offline'/);
-      return {
-        bind(connectorId: string, workspaceId: string) {
-          assert.equal(connectorId.startsWith("connector-"), true);
-          assert.equal(workspaceId, "workspace-api");
-          return {
-            async first() {
-              return row;
-            }
-          };
-        }
-      };
+      if (/INSERT INTO users/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT c\.id/.test(sql) && /WHERE c\.id = \?/.test(sql)) {
+        assert.match(sql, /workspace_connectors/);
+        assert.match(sql, /wc\.workspace_id = \?/);
+        assert.match(sql, /wc\.can_execute = 1/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        return {
+          bind(connectorId: string, workspaceId: string) {
+            assert.equal(connectorId.startsWith("connector-"), true);
+            assert.equal(workspaceId, "workspace-api");
+            return {
+              async first() {
+                return row;
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO commands/.test(sql) || /INSERT INTO events/.test(sql) || /UPDATE threads/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT last_seq/.test(sql)) {
+        return {
+          bind(threadId: string) {
+            assert.equal(threadId, "thread-orders-500");
+            return {
+              async first() {
+                return { last_seq: 0 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT COUNT\(\*\) AS active_count/.test(sql) || /UPDATE connectors/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async first() {
+                return { active_count: 0 };
+              },
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
     }
   } as unknown as D1Database;
 }

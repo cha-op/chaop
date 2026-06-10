@@ -9,10 +9,10 @@ Current slice:
 - Lit/Vite browser GUI with Operations Map, Operations Task Board, Thread Command Centre, and Budget Reliability Board views.
 - Cloudflare Worker route skeleton with Cloudflare Access JWT validation, connector bootstrap tokens, browser Origin checks, Durable Object binding, D1 binding, and R2 binding.
 - Shared TypeScript protocol package for connector, thread, task, command, and budget data.
-- Rust placeholder connector crate for local connector configuration and command lifecycle scaffolding.
+- Rust placeholder connector crate that can connect to the Worker, receive a command dispatch, and emit placeholder lifecycle events.
 - Initial D1 schema migration set under `migrations/d1/`.
 
-This is still a local implementation slice. It does not yet persist command lifecycle rows in D1, relay commands through the Durable Object, or execute commands through the Rust connector.
+This is still a placeholder implementation slice. It now persists placeholder command lifecycle rows in D1, relays pending commands through the Durable Object, and closes the loop with the Rust connector. It does not yet execute real Codex app-server work.
 
 Start locally:
 
@@ -32,4 +32,4 @@ Documentation entrypoints use British English at the canonical paths. Simplified
 - `docs/PROJECT_TODO.md`
 - `docs/project_journal/2026/06/2026-06-09-control-plane-v1-plan-a1c9e2.md`
 
-Before real deployment, provide the Cloudflare account, zone, Access, domain, API token, and connector bootstrap values listed in `docs/deployment-guide.md`.
+Before real deployment, provide the Cloudflare account, zone, Access, domain, API token, service-token, and connector bootstrap values listed in `docs/deployment-guide.md`.
