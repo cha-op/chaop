@@ -10,19 +10,16 @@ supersedes: []
 superseded_by:
 ---
 
-# Control Plane V1 Planning Slice [ British English | 简体中文 ]
+[ British English | [简体中文](2026-06-09-control-plane-v1-plan-a1c9e2.zh-Hans.md) ]
 
-## Summary [ British English ]
+# Control Plane V1 Planning Slice
+
+## Summary
 - V1 will start with a Cloudflare-first end-to-end control loop: Browser GUI, Worker, Durable Object, D1, R2 bindings, and a Rust placeholder connector.
 - The first UX slice prioritises dashboard status, agents/workspaces, thread detail, command submission, event streaming, and cost-state visibility.
 - The implementation must follow the project journal workflow. Ordinary workstream state belongs in this journal; repo-wide pointers belong in `docs/PROJECT_STATE.md`; cross-workstream backlog belongs in `docs/PROJECT_TODO.md`.
 
-## 摘要 [ 简体中文 ]
-- 第一版从 Cloudflare-first 的端到端控制闭环开始：Browser GUI、Worker、Durable Object、D1、R2 绑定，以及 Rust placeholder connector。
-- 第一轮 UX 切片优先覆盖 dashboard 状态、agents/workspaces、thread 详情、command 提交、事件流，以及成本状态可见性。
-- 后续实现必须按 project journal 工作流维护。普通工作流状态写入本 journal；仓库级恢复入口写入 `docs/PROJECT_STATE.md`；跨工作流待办写入 `docs/PROJECT_TODO.md`。
-
-## Current Decisions [ British English ]
+## Current Decisions
 - UX slice: Control Loop.
 - Visual process: use the generated directions as complementary product views instead of choosing only one.
 - Deployment model: Cloudflare-first.
@@ -37,47 +34,22 @@ superseded_by:
 - UX focus rule: each view has one primary job; shared signals stay compact and secondary unless they are the core job of that view.
 - Approval, artifacts, and full log upload: protocol and UI entry points only in the first slice; real flows are deferred.
 
-## 当前决策 [ 简体中文 ]
-- UX 切片：控制闭环。
-- 视觉流程：将已生成的方向作为互补产品视图使用，而不是只选择其中一个。
-- 部署模型：Cloudflare-first。
-- Browser 认证：Cloudflare Access。
-- Agent 认证：bootstrap secret 签发每个 connector 的 token；D1 保存 token hash。
-- Agent 入口：`/api/agent/bootstrap` 和 `/ws/agent` 由 Worker 校验机器 token；Browser 路径继续由 Cloudflare Access 保护。
-- 域名形态：GUI 和 API 使用分离域名。
-- 资源创建：优先使用 Wrangler 自动化，并让配置由代码控制。
-- 初始数据：connector 注册时先记录 connector identity；host 和 workspace 记录延后到 inventory 切片。
-- Command 执行深度：先实现 Rust placeholder connector，不接真实 Codex app-server。
-- 成本 UX 深度：状态标记加 daily 和 4-hour 简要用量摘要。
-- UX 聚焦规则：每个视图只有一个主要任务；共享信号保持紧凑和辅助，除非它们就是该视图的核心任务。
-- Approval、artifact 和完整日志上传：第一切片只保留协议和 UI 入口，真实流程延后。
-
-## Documentation Requirement [ British English ]
-- User-facing documentation must be bilingual and visibly labelled as `[ British English | 简体中文 ]`.
-- British English is the default language; Simplified Chinese is the alternative.
-- Chinese sections must be written with Chinese characters for Chinese readers, not romanised text.
+## Documentation Requirement
+- User-facing documentation uses English canonical files at the default paths.
+- Paired Simplified Chinese documents use the same basename with a `.zh-Hans.md` suffix.
+- The language switch belongs near the top of each paired document as `[ British English | 简体中文 ]` links; it must not be part of the title.
+- English is written in British English. Simplified Chinese documents use Chinese characters for Chinese readers, not romanised text.
 - The documentation set should include usage guide, quick start, FAQ, troubleshooting, deployment guide, architecture, cost model, and any operational runbooks added later.
 
-## 文档要求 [ 简体中文 ]
-- 面向用户的文档必须维护双语版本，并明确显示为 `[ British English | 简体中文 ]`。
-- 默认语言为英式英语，备选语言为简体中文。
-- 中文章节必须使用汉字书写，方便汉语使用者阅读，不使用拼音替代。
-- 文档集合应包括使用指南、快速上手、FAQ、故障排查、部署指南、架构文档、成本模型，以及后续新增的运维手册。
-
-## Next Steps [ British English ]
+## Next Steps
 - Review the local implementation slice and harden any findings.
 - Prepare Cloudflare and connector configuration values before running the first real deployment.
 - Replace placeholder connector execution with real Codex app-server integration in a later slice.
 
-## 下一步 [ 简体中文 ]
-- 评审本地实现切片，并修复评审发现的问题。
-- 在运行第一轮真实部署前，准备 Cloudflare 和 connector 配置值。
-- 在后续切片中将 placeholder connector 执行替换为真实 Codex app-server 集成。
-
-## 2026-06-09 Handoff [ British English ]
+## 2026-06-09 Handoff
 - Generated three visual directions: `Operations Map`, `Thread Command Centre`, and `Budget Reliability Board`.
-- Added a bilingual deployment guide with Cloudflare, Wrangler, Access, domain, budget, and connector bootstrap configuration instructions.
-- Added a bilingual visual direction summary.
+- Added a deployment guide with Cloudflare, Wrangler, Access, domain, budget, and connector bootstrap configuration instructions.
+- Added a visual direction summary.
 - Revised the UX decision so all visual directions become first-class views.
 - Added `Operations Task Board` as a task-focused Operations sub-view with user-defined categories and swimlanes for `Running`, `Idle`, `Waiting for approval`, `Waiting for input`, `Throttled`, and `Done`.
 - Added the view-focus rule: one view, one primary job, with cross-cutting signals kept secondary.
@@ -85,37 +57,14 @@ superseded_by:
 - Local validation passed for `pnpm test`, `pnpm build`, `cargo fmt --check`, SQLite parsing of `migrations/d1/0001_initial.sql`, Wrangler deploy dry-run, Wrangler D1 local migration discovery, project journal validation, setup-ci node tests, Chromium headless screenshots for Operations Map and Operations Task Board, and a local Worker `POST /api/commands` smoke check through dev auth plus Origin guard.
 - Review fixes applied: Cloudflare Access JWT validation now verifies JWT signature/audience/normalised issuer via Access JWKS; production agent bootstrap issues random connector tokens and stores only SHA-256 token hashes in D1; development-only agent tokens are signed and only accepted when insecure dev mode is enabled; malformed agent tokens return stable 401; Lit renders into light DOM so global CSS applies; production bootstrap failures no longer silently show sample data; the Worker config explicitly points Wrangler at `migrations/d1`; and the D1 migration now has first-pass FK/CHECK constraints.
 - Follow-up review fixes applied: production web fetches now use `VITE_CHAOP_API_BASE_URL` for split GUI/API domains; Worker JSON responses include allowlisted credentialed CORS headers; deployment guide Access variable names now match Worker runtime names; and Worker routes reject malformed JSON or missing required request fields with 400.
-- Final review fixes applied: browser API and browser WebSocket routes now reject disallowed origins before side effects; connector IDs include a random suffix to prevent same-name metadata/token takeover; `migrations/d1/*.sql` is explicitly re-included against the user's global `*.sql` ignore rule; the local Worker dev script injects insecure dev auth without triggering Wrangler's skills prompt; and README/source-note docs now clarify the current slice status and bilingual documentation entrypoints.
+- Final review fixes applied: browser API and browser WebSocket routes now reject disallowed origins before side effects; connector IDs include a random suffix to prevent same-name metadata/token takeover; `migrations/d1/*.sql` is explicitly re-included against the user's global `*.sql` ignore rule; the local Worker dev script injects insecure dev auth without triggering Wrangler's skills prompt; and README/source-note docs now clarify the current slice status and documentation entrypoints.
 - Final re-check fixes applied: app-level dev scripts now build `@chaop/protocol` before starting Vite or Wrangler; Worker dev applies local D1 migrations and injects a local-only bootstrap secret; and local insecure agent bootstrap returns the current local Worker WebSocket URL instead of the sample production API domain.
 - Wide review follow-up fixes applied on 2026-06-10: connector token lookup gets a D1 `token_hash` index through migration `0002`; web command submission uses a simple `text/plain` JSON body to avoid Cloudflare Access preflight in the current slice; the web placeholder command no longer hardcodes a connector target; Worker command creation validates supplied connector targets against workspace membership, `can_execute`, and offline status when D1 is bound; and the Command Centre displays accepted/failed command feedback.
 - Real Cloudflare deployment remains blocked on account, domain, Access, API token, and bootstrap secret values.
 
-## 2026-06-09 交接记录 [ 简体中文 ]
-- 已生成三个视觉方向：`Operations Map`、`Thread Command Centre` 和 `Budget Reliability Board`。
-- 已新增双语部署指南，覆盖 Cloudflare、Wrangler、Access、域名、预算和 connector bootstrap 配置。
-- 已新增双语视觉方向摘要。
-- 已调整 UX 决策：所有视觉方向都作为第一版一等视图纳入。
-- 已新增 `Operations Task Board`，作为 Operations 下任务聚焦的子视图，支持用户自定义分类，并按 `Running`、`Idle`、`Waiting for approval`、`Waiting for input`、`Throttled` 和 `Done` 分 swimlane。
-- 已新增视图聚焦规则：一个视图只服务一个主要任务，跨视图共享信号保持辅助地位。
-- 已实现第一轮本地骨架：pnpm/Vite/Lit web app、Cloudflare Worker route skeleton、WorkspaceDO skeleton、共享协议包、D1 migration 和 Rust placeholder connector。
-- 本地验证已通过：`pnpm test`、`pnpm build`、`cargo fmt --check`、`migrations/d1/0001_initial.sql` 的 SQLite 解析、Wrangler deploy dry-run、Wrangler D1 本地 migration 发现检查、project journal 校验、setup-ci node tests、Operations Map 和 Operations Task Board 的 Chromium headless 截图检查，以及经过 dev auth 和 Origin guard 的本地 Worker `POST /api/commands` smoke check。
-- 已应用 review 修复：Cloudflare Access JWT 现在通过 Access JWKS 校验签名、audience 和标准化后的 issuer；生产 agent bootstrap 会签发随机 connector token，且 D1 只保存 SHA-256 token hash；开发专用 agent token 会签名，并且只在 insecure dev mode 开启时接受；畸形 agent token 稳定返回 401；Lit 使用 light DOM 以确保全局 CSS 生效；生产环境 bootstrap 失败不再静默展示 sample data；Worker 配置已显式指向 `migrations/d1`；D1 migration 已加入第一轮 FK/CHECK 约束。
-- 已应用后续 review 修复：生产 web fetch 现在使用 `VITE_CHAOP_API_BASE_URL` 支持 GUI/API 分离域名；Worker JSON response 会附带 allowlist 后的 credentialed CORS headers；部署指南中的 Access 变量名已与 Worker runtime 名称一致；Worker route 会对畸形 JSON 或缺少必填字段的 request 返回 400。
-- 已应用最终 review 修复：browser API 和 browser WebSocket route 现在会在产生副作用前拒绝不允许的 origin；connector ID 加入随机后缀，避免同名 connector 覆盖 metadata/token；`migrations/d1/*.sql` 已显式抵消用户全局 `*.sql` ignore 规则；本地 Worker dev 脚本会注入 insecure dev auth 且不会触发 Wrangler skills prompt；README/source-note 文档已澄清当前切片状态和双语文档入口。
-- 已应用最终 re-check 修复：app-level dev 脚本现在会在启动 Vite 或 Wrangler 前先构建 `@chaop/protocol`；Worker dev 会应用本地 D1 migrations 并注入仅用于本地的 bootstrap secret；本地 insecure agent bootstrap 会返回当前本地 Worker WebSocket URL，而不是示例生产 API 域名。
-- 2026-06-10 已应用宽复查后续修复：connector token 查询通过 migration `0002` 新增 D1 `token_hash` 索引；web command 提交使用 simple `text/plain` JSON body，以规避当前切片里 Cloudflare Access 的 preflight 风险；web placeholder command 不再硬编码 connector target；D1 已绑定时 Worker command creation 会按 workspace membership、`can_execute` 和 offline status 校验传入的 connector target；Thread Command Centre 会显示 command accepted/failed 反馈。
-- 真实 Cloudflare 部署仍阻塞于 account、domain、Access、API token 和 bootstrap secret 等配置值。
-
-## Evidence [ British English ]
+## Evidence
 - Source documents: `docs/design-starter.md`, `docs/cost-aware.md`.
 - Deployment guide: `docs/deployment-guide.md`.
 - Visual direction summary: `docs/ux-visual-directions.md`.
 - Implementation entrypoints: `apps/web`, `apps/worker`, `packages/protocol`, `crates/agent`, `migrations/d1/0001_initial.sql`.
 - Planning outcome recorded on 2026-06-09.
-
-## 证据 [ 简体中文 ]
-- 来源文档：`docs/design-starter.md`、`docs/cost-aware.md`。
-- 部署指南：`docs/deployment-guide.md`。
-- 视觉方向摘要：`docs/ux-visual-directions.md`。
-- 实现入口：`apps/web`、`apps/worker`、`packages/protocol`、`crates/agent`、`migrations/d1/0001_initial.sql`。
-- 计划结果记录于 2026-06-09。
