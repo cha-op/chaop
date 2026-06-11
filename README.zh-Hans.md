@@ -31,6 +31,7 @@ pnpm dev:web
 - `docs/ux-visual-directions.zh-Hans.md`
 - `docs/PROJECT_STATE.zh-Hans.md`
 - `docs/PROJECT_TODO.zh-Hans.md`
+- `docs/project_journal/2026/06/2026-06-11-thread-centre-realtime-c4d8a2.zh-Hans.md`
 - `docs/project_journal/2026/06/2026-06-10-codex-cli-execution-b7f2c1.zh-Hans.md`
 - `docs/project_journal/2026/06/2026-06-09-control-plane-v1-plan-a1c9e2.zh-Hans.md`
 

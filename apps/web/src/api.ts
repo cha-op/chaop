@@ -37,6 +37,18 @@ export async function createCommand(request: CreateCommandRequest): Promise<Crea
   return (await response.json()) as CreateCommandResponse;
 }
 
+export function browserSocketUrl(): string {
+  const baseUrl = import.meta.env.VITE_CHAOP_API_BASE_URL?.replace(/\/+$/, "");
+  if (baseUrl) {
+    const url = new URL("/ws/browser", baseUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
+  }
+
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/ws/browser`;
+}
+
 function apiUrl(path: string): string {
   const baseUrl = import.meta.env.VITE_CHAOP_API_BASE_URL?.replace(/\/+$/, "") ?? "";
   return `${baseUrl}${path}`;

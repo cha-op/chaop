@@ -32,8 +32,6 @@ export async function loadBootstrapFromDb(
     return undefined;
   }
 
-  await ensureUser(env, user);
-
   const [
     connectors,
     workspaces,
@@ -287,8 +285,8 @@ export async function recordAgentEvent(
   env: Env,
   connectorId: string,
   event: AgentCommandEvent
-): Promise<void> {
-  if (!env.DB) return;
+): Promise<ThreadEvent | undefined> {
+  if (!env.DB) return undefined;
 
   const command = await env.DB.prepare(
     `SELECT id, workspace_id, thread_id, task_id, target_connector_id
@@ -305,8 +303,8 @@ export async function recordAgentEvent(
       target_connector_id: string | null;
     }>();
 
-  if (!command) return;
-  if (command.target_connector_id && command.target_connector_id !== connectorId) return;
+  if (!command) return undefined;
+  if (command.target_connector_id && command.target_connector_id !== connectorId) return undefined;
 
   const now = new Date().toISOString();
   const nextState = commandStateForEvent(event.kind);
@@ -334,16 +332,16 @@ export async function recordAgentEvent(
     }
   }
 
-  if (command.thread_id) {
-    await appendEvent(env, {
+  const threadEvent = command.thread_id
+    ? await appendEvent(env, {
       workspace_id: command.workspace_id,
       thread_id: command.thread_id,
       command_id: command.id,
       kind: event.kind,
       priority: event.priority,
       summary: event.summary
-    });
-  }
+    })
+    : undefined;
 
   await env.DB.prepare(
     `UPDATE connectors
@@ -353,6 +351,7 @@ export async function recordAgentEvent(
     .bind(now, now, connectorId)
     .run();
   await updateConnectorActivity(env, connectorId);
+  return threadEvent;
 }
 
 async function ensureUser(env: Env, user: BrowserIdentity): Promise<void> {
@@ -549,7 +548,7 @@ async function assertConnectorCanExecute(
 async function appendEvent(
   env: Env,
   input: EventInput
-): Promise<void> {
+): Promise<ThreadEvent | undefined> {
   const current = await env.DB!.prepare(
     `SELECT last_seq
      FROM threads
@@ -559,24 +558,34 @@ async function appendEvent(
     .bind(input.thread_id)
     .first<{ last_seq: number }>();
 
-  if (!current) return;
+  if (!current) return undefined;
 
   const seq = current.last_seq + 1;
   const now = new Date().toISOString();
+  const event: ThreadEvent = {
+    id: `event-${cryptoRandomId().slice(0, 16)}`,
+    thread_id: input.thread_id,
+    command_id: input.command_id ?? undefined,
+    seq,
+    kind: input.kind,
+    priority: input.priority,
+    summary: input.summary,
+    created_at: now
+  };
   await env.DB!.prepare(
     `INSERT INTO events (id, workspace_id, thread_id, command_id, seq, kind, priority, summary, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
-      `event-${cryptoRandomId().slice(0, 16)}`,
+      event.id,
       input.workspace_id,
-      input.thread_id,
-      input.command_id ?? null,
-      seq,
-      input.kind,
-      input.priority,
-      input.summary,
-      now
+      event.thread_id,
+      event.command_id ?? null,
+      event.seq,
+      event.kind,
+      event.priority,
+      event.summary,
+      event.created_at
     )
     .run();
   await env.DB!.prepare(
@@ -586,6 +595,7 @@ async function appendEvent(
   )
     .bind(seq, now, input.thread_id)
     .run();
+  return event;
 }
 
 async function updateConnectorActivity(env: Env, connectorId: string): Promise<void> {

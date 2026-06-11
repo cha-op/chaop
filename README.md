@@ -31,6 +31,7 @@ Documentation entrypoints use British English at the canonical paths. Simplified
 - `docs/ux-visual-directions.md`
 - `docs/PROJECT_STATE.md`
 - `docs/PROJECT_TODO.md`
+- `docs/project_journal/2026/06/2026-06-11-thread-centre-realtime-c4d8a2.md`
 - `docs/project_journal/2026/06/2026-06-10-codex-cli-execution-b7f2c1.md`
 - `docs/project_journal/2026/06/2026-06-09-control-plane-v1-plan-a1c9e2.md`
 

@@ -11,9 +11,16 @@ import {
   type ThreadEvent,
   type ThreadSummary
 } from "@chaop/protocol";
-import { createCommand, loadBootstrap } from "./api.js";
+import { browserSocketUrl, createCommand, loadBootstrap } from "./api.js";
 
 type View = "operations-map" | "task-board" | "thread-centre" | "budget-board";
+type RealtimeState = "connecting" | "live" | "polling";
+type RealtimeThreadEventPayload = {
+  event: ThreadEvent;
+};
+
+const FALLBACK_POLL_MS = 10_000;
+const SOCKET_RECONNECT_MS = 3_000;
 
 @customElement("chaop-app")
 export class ChaopApp extends LitElement {
@@ -40,6 +47,15 @@ export class ChaopApp extends LitElement {
   @state()
   private loadError?: string;
 
+  @state()
+  private realtimeState: RealtimeState = "connecting";
+
+  private socket: WebSocket | undefined;
+
+  private pollTimer: number | undefined;
+
+  private reconnectTimer: number | undefined;
+
   override createRenderRoot(): HTMLElement {
     return this;
   }
@@ -48,11 +64,16 @@ export class ChaopApp extends LitElement {
     super.connectedCallback();
     this.view = viewFromHash();
     window.addEventListener("hashchange", this.onHashChange);
-    void this.load();
+    void this.load().then(() => {
+      if (this.data) {
+        this.connectRealtime();
+      }
+    });
   }
 
   override disconnectedCallback(): void {
     window.removeEventListener("hashchange", this.onHashChange);
+    this.disconnectRealtime();
     super.disconnectedCallback();
   }
 
@@ -123,6 +144,7 @@ export class ChaopApp extends LitElement {
           <span>${viewQuestion(this.view)}</span>
         </div>
         <div class="topbar-status">
+          <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
           <span class="chip ${budget.state}">4h ${budget.four_hour_used_pct}%</span>
           <span class="chip ${budget.state}">Day ${budget.daily_used_pct}%</span>
           <span class="identity">${this.data!.user.email}</span>
@@ -233,7 +255,7 @@ export class ChaopApp extends LitElement {
 
   private renderThreadCentre() {
     const thread = this.data!.threads[0];
-    if (!thread) return nothing;
+    if (!thread) return this.renderEmptyThreadCentre();
     const events = this.eventsForThread(thread.id);
     const command = this.lastCommandId
       ? this.data!.running_commands.find((item) => item.id === this.lastCommandId)
@@ -277,10 +299,10 @@ export class ChaopApp extends LitElement {
             : nothing}
           <div class="timeline">
             ${events.length > 0
-              ? events.map(
-                  (event, index) => html`
+            ? events.map(
+                  (event) => html`
                     <div class="event-row">
-                      <span>${String(index + 1).padStart(2, "0")}</span>
+                      <span>${String(event.seq).padStart(2, "0")}</span>
                       <strong>${event.kind}</strong>
                       <p>${event.summary}</p>
                     </div>
@@ -310,6 +332,32 @@ export class ChaopApp extends LitElement {
             <div><dt>Policy</dt><dd>Realtime events, summary logs</dd></div>
             <div><dt>Approval</dt><dd>Connector-gated</dd></div>
             <div><dt>Artifacts</dt><dd>Entry point only</dd></div>
+          </dl>
+        </aside>
+      </section>
+    `;
+  }
+
+  private renderEmptyThreadCentre() {
+    return html`
+      <section class="page-grid thread-grid">
+        <section class="panel primary empty-state">
+          <div class="section-heading">
+            <h2>No thread selected</h2>
+            <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
+          </div>
+          <p>Waiting for connector activity.</p>
+        </section>
+        <aside class="panel">
+          <div class="section-heading">
+            <h2>Lease</h2>
+            <span>Idle</span>
+          </div>
+          <dl class="facts">
+            <div><dt>Mode</dt><dd>Idle</dd></div>
+            <div><dt>Execution</dt><dd>No live command</dd></div>
+            <div><dt>Target</dt><dd>Auto-selected</dd></div>
+            <div><dt>Command state</dt><dd>Waiting</dd></div>
           </dl>
         </aside>
       </section>
@@ -357,17 +405,21 @@ export class ChaopApp extends LitElement {
         prompt: this.commandPrompt
       });
       this.lastCommandId = response.command.id;
+      this.upsertCommand(response.command);
       this.commandState = "accepted";
       await this.load();
-      window.setTimeout(() => void this.load(), 1_000);
-      window.setTimeout(() => void this.load(), 2_500);
     } catch {
       this.commandState = "failed";
     }
   };
 
   private eventsForThread(threadId: string): ThreadEvent[] {
-    return this.data!.events.filter((event) => event.thread_id === threadId);
+    return this.data!.events
+      .filter((event) => event.thread_id === threadId)
+      .sort((left, right) => {
+        if (left.seq !== right.seq) return right.seq - left.seq;
+        return right.created_at.localeCompare(left.created_at);
+      });
   }
 
   private commandModeButton(type: CommandSummary["type"], label: string) {
@@ -383,6 +435,128 @@ export class ChaopApp extends LitElement {
         ${label}
       </button>
     `;
+  }
+
+  private connectRealtime(): void {
+    if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    window.clearTimeout(this.reconnectTimer);
+    this.realtimeState = "connecting";
+
+    try {
+      const socket = new WebSocket(browserSocketUrl());
+      this.socket = socket;
+      socket.addEventListener("open", () => {
+        if (this.socket !== socket) return;
+        this.realtimeState = "live";
+        this.stopFallbackPolling();
+      });
+      socket.addEventListener("message", (event) => this.handleRealtimeMessage(event));
+      socket.addEventListener("close", () => this.handleRealtimeDisconnect(socket));
+      socket.addEventListener("error", () => this.handleRealtimeDisconnect(socket));
+    } catch {
+      this.startFallbackPolling();
+      this.scheduleRealtimeReconnect();
+    }
+  }
+
+  private disconnectRealtime(): void {
+    window.clearTimeout(this.reconnectTimer);
+    this.stopFallbackPolling();
+    const socket = this.socket;
+    this.socket = undefined;
+    socket?.close();
+  }
+
+  private handleRealtimeDisconnect(socket: WebSocket): void {
+    if (this.socket !== socket) return;
+    this.socket = undefined;
+    this.startFallbackPolling();
+    this.scheduleRealtimeReconnect();
+  }
+
+  private handleRealtimeMessage(event: MessageEvent): void {
+    const envelope = parseEnvelope(event.data);
+    if (!envelope) return;
+    if (envelope.kind === "thread.event" && isRealtimeThreadEventPayload(envelope.payload)) {
+      this.applyThreadEvent(envelope.payload.event);
+    }
+  }
+
+  private scheduleRealtimeReconnect(): void {
+    window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = window.setTimeout(() => this.connectRealtime(), SOCKET_RECONNECT_MS);
+  }
+
+  private startFallbackPolling(): void {
+    this.realtimeState = "polling";
+    if (this.pollTimer !== undefined) return;
+    void this.load();
+    this.pollTimer = window.setInterval(() => void this.load(), FALLBACK_POLL_MS);
+  }
+
+  private stopFallbackPolling(): void {
+    if (this.pollTimer === undefined) return;
+    window.clearInterval(this.pollTimer);
+    this.pollTimer = undefined;
+  }
+
+  private applyThreadEvent(event: ThreadEvent): void {
+    if (!this.data) return;
+    const events = this.data.events.filter((item) => item.id !== event.id);
+    events.push(event);
+    this.data = {
+      ...this.data,
+      events,
+      running_commands: this.updateCommandsForEvent(this.data.running_commands, event),
+      threads: this.updateThreadsForEvent(this.data.threads, event),
+      tasks: this.updateTasksForEvent(this.data.tasks, event)
+    };
+  }
+
+  private upsertCommand(command: CommandSummary): void {
+    if (!this.data) return;
+    this.data = {
+      ...this.data,
+      running_commands: [
+        command,
+        ...this.data.running_commands.filter((item) => item.id !== command.id)
+      ]
+    };
+  }
+
+  private updateCommandsForEvent(commands: CommandSummary[], event: ThreadEvent): CommandSummary[] {
+    if (!event.command_id) return commands;
+    const state = commandStateForEvent(event.kind);
+    if (!state) return commands;
+
+    return commands.map((command) =>
+      command.id === event.command_id
+        ? { ...command, state, updated_at: event.created_at }
+        : command
+    );
+  }
+
+  private updateThreadsForEvent(threads: ThreadSummary[], event: ThreadEvent): ThreadSummary[] {
+    return threads.map((thread) =>
+      thread.id === event.thread_id
+        ? { ...thread, last_seq: Math.max(thread.last_seq, event.seq), updated_at: event.created_at }
+        : thread
+    );
+  }
+
+  private updateTasksForEvent(tasks: TaskSummary[], event: ThreadEvent): TaskSummary[] {
+    if (!event.command_id) return tasks;
+    const command = this.data?.running_commands.find((item) => item.id === event.command_id);
+    if (!command?.task_id) return tasks;
+    const state = taskStateForEvent(event.kind);
+    if (!state) return tasks;
+
+    return tasks.map((task) =>
+      task.id === command.task_id ? { ...task, state, updated_at: event.created_at } : task
+    );
   }
 }
 
@@ -418,6 +592,53 @@ function formatMode(mode: string): string {
 
 function formatCommandType(type: CommandSummary["type"]): string {
   return type === "codex" ? "Codex exec" : "Placeholder";
+}
+
+function realtimeLabel(state: RealtimeState): string {
+  return {
+    connecting: "Connecting",
+    live: "Live",
+    polling: "Polling 10s"
+  }[state];
+}
+
+function commandStateForEvent(kind: ThreadEvent["kind"]): CommandSummary["state"] | undefined {
+  if (kind === "command.started") return "running";
+  if (kind === "command.finished") return "succeeded";
+  if (kind === "command.failed") return "failed";
+  return undefined;
+}
+
+function taskStateForEvent(kind: ThreadEvent["kind"]): TaskSummary["state"] | undefined {
+  if (kind === "command.started") return "running";
+  if (kind === "command.finished" || kind === "command.failed") return "done";
+  return undefined;
+}
+
+function parseEnvelope(value: unknown): { kind?: string; payload?: unknown } | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return typeof parsed === "object" && parsed !== null ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isRealtimeThreadEventPayload(value: unknown): value is RealtimeThreadEventPayload {
+  if (typeof value !== "object" || value === null) return false;
+  const event = (value as { event?: unknown }).event;
+  if (typeof event !== "object" || event === null) return false;
+  const record = event as Record<string, unknown>;
+  return (
+    typeof record.id === "string" &&
+    typeof record.thread_id === "string" &&
+    typeof record.seq === "number" &&
+    typeof record.kind === "string" &&
+    typeof record.priority === "string" &&
+    typeof record.summary === "string" &&
+    typeof record.created_at === "string"
+  );
 }
 
 function eventCopy(eventName: string): string {

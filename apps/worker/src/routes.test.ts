@@ -129,6 +129,22 @@ test("browser bootstrap returns focused v1 data in dev mode", async () => {
   assert.equal(body.task_categories.length, 5);
 });
 
+test("browser bootstrap does not write the user row when D1 is bound", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/bootstrap"),
+    {
+      ...devEnv,
+      DB: readOnlyBootstrapDb()
+    }
+  );
+  const body = (await response.json()) as { connectors: unknown[]; tasks: unknown[]; task_categories: unknown[] };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.connectors.length, 0);
+  assert.equal(body.tasks.length, 0);
+  assert.equal(body.task_categories.length, 5);
+});
+
 test("agent bootstrap rejects invalid secret", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/agent/bootstrap", { method: "POST", body: "{}" }),
@@ -496,6 +512,22 @@ test("command creation rejects missing prompt", async () => {
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: "Invalid command payload" });
 });
+
+function readOnlyBootstrapDb(): D1Database {
+  return {
+    prepare(sql: string) {
+      assert.doesNotMatch(sql, /INSERT INTO users/);
+      return {
+        bind() {
+          return this;
+        },
+        async all() {
+          return { results: [] };
+        }
+      };
+    }
+  } as unknown as D1Database;
+}
 
 function commandTargetDb(
   row: { id: string } | null,

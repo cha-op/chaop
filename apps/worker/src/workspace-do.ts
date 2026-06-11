@@ -1,4 +1,4 @@
-import { createEnvelope, type AgentCommandEvent, type CommandDispatch } from "@chaop/protocol";
+import { createEnvelope, type AgentCommandEvent, type CommandDispatch, type ThreadEvent } from "@chaop/protocol";
 import { pendingCommandsForConnector, recordAgentEvent } from "./db.js";
 import type { Env } from "./types.js";
 
@@ -94,7 +94,7 @@ export class WorkspaceDO implements DurableObject {
     }
 
     if (message.kind === "agent.event" && isAgentCommandEvent(message.payload)) {
-      await recordAgentEvent(this.env, connectorId, message.payload);
+      const event = await recordAgentEvent(this.env, connectorId, message.payload);
       ws.send(
         JSON.stringify(
           createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
@@ -103,6 +103,9 @@ export class WorkspaceDO implements DurableObject {
           })
         )
       );
+      if (event) {
+        this.broadcastToBrowsers(threadEventMessage(event));
+      }
       if (message.payload.kind === "command.finished" || message.payload.kind === "command.failed") {
         await this.sendPendingCommands(ws, connectorId);
       }
@@ -110,6 +113,12 @@ export class WorkspaceDO implements DurableObject {
     }
 
     ws.send(JSON.stringify(createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, { received: text.length })));
+  }
+
+  private broadcastToBrowsers(message: string): void {
+    for (const socket of this.ctx.getWebSockets("browser")) {
+      socket.send(message);
+    }
   }
 
   private async sendPendingCommands(ws: WebSocket, connectorId: string): Promise<void> {
@@ -128,6 +137,15 @@ export class WorkspaceDO implements DurableObject {
       );
     }
   }
+}
+
+export function threadEventMessage(event: ThreadEvent): string {
+  return JSON.stringify(
+    createEnvelope("thread.event", { type: "worker", id: "workspace-do-global" }, { event }, {
+      thread_id: event.thread_id,
+      command_id: event.command_id
+    })
+  );
 }
 
 function parseMessage(text: string): { kind?: string; payload?: unknown } | undefined {

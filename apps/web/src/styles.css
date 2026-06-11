@@ -159,6 +159,15 @@ main {
   min-height: 560px;
 }
 
+.empty-state {
+  align-content: start;
+}
+
+.empty-state p {
+  margin: 0;
+  color: #475569;
+}
+
 .section-heading {
   display: flex;
   justify-content: space-between;
@@ -207,7 +216,8 @@ h2 {
 
 .status.online,
 .chip.realtime,
-.chip.normal {
+.chip.normal,
+.chip.live {
   background: #dcfce7;
   color: #166534;
 }
@@ -215,7 +225,9 @@ h2 {
 .status.degraded,
 .chip.summary,
 .chip.cost_saving,
-.chip.conservative {
+.chip.conservative,
+.chip.connecting,
+.chip.polling {
   background: #fef3c7;
   color: #92400e;
 }
