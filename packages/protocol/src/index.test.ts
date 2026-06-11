@@ -33,6 +33,7 @@ function task(id: string, state: TaskSummary["state"]): TaskSummary {
   return {
     id,
     workspace_id: "workspace-1",
+    thread_id: `thread-${id}`,
     title: id,
     category_id: "incident",
     state,

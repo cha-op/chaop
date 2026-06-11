@@ -2,6 +2,7 @@ import type {
   BootstrapPayload,
   BudgetSummary,
   ConnectorSummary,
+  HostSessionSummary,
   TaskCategory,
   TaskSummary,
   ThreadEvent,
@@ -97,16 +98,70 @@ export const threads: ThreadSummary[] = [
     last_seq: 3,
     updated_at: "2026-06-09T21:42:00.000Z",
     realtime_mode: "cost_saving"
+  },
+  {
+    id: "thread-inventory",
+    workspace_id: "workspace-api",
+    title: "Sync workspace inventory",
+    state: "idle",
+    last_seq: 0,
+    updated_at: "2026-06-09T21:40:00.000Z",
+    realtime_mode: "summary"
+  },
+  {
+    id: "thread-shell-approval",
+    workspace_id: "workspace-api",
+    title: "Await shell approval",
+    state: "active",
+    last_seq: 0,
+    updated_at: "2026-06-09T21:36:00.000Z",
+    realtime_mode: "realtime"
+  },
+  {
+    id: "thread-budget-telemetry",
+    workspace_id: "workspace-api",
+    title: "Budget compacted telemetry",
+    state: "active",
+    last_seq: 0,
+    updated_at: "2026-06-09T21:30:00.000Z",
+    realtime_mode: "throttled"
   }
 ];
 
 export const tasks: TaskSummary[] = [
   task("task-orders-500", "Investigate 500 errors on /api/orders", "incident", "running", "thread-orders-500"),
   task("task-pr-readiness", "Review PR readiness logs", "release", "waiting_for_input", "thread-pr-readiness"),
-  task("task-inventory", "Sync workspace inventory", "maintenance", "idle"),
+  task("task-inventory", "Sync workspace inventory", "maintenance", "idle", "thread-inventory"),
   task("task-deploy-guide", "Generate deployment guide", "research", "done", "thread-deploy-guide"),
-  task("task-shell-approval", "Await shell approval", "maintenance", "waiting_for_approval"),
-  task("task-budget-telemetry", "Budget compacted telemetry", "personal", "throttled")
+  task("task-shell-approval", "Await shell approval", "maintenance", "waiting_for_approval", "thread-shell-approval"),
+  task("task-budget-telemetry", "Budget compacted telemetry", "personal", "throttled", "thread-budget-telemetry")
+];
+
+export const hostSessions: HostSessionSummary[] = [
+  {
+    id: "host-session-sample-attached",
+    connector_id: "connector-mac-studio",
+    hostname: "mac-studio.local",
+    workspace_id: "workspace-api",
+    session_id: "019d3109-210d-7492-be2b-902b10993a3d",
+    title: "Investigate 500 errors on /api/orders",
+    title_source: "metadata",
+    cwd: "/Users/you/Program/api-control-plane",
+    updated_at: "2026-06-09T21:58:00.000Z",
+    attached_task_id: "task-orders-500",
+    attached_thread_id: "thread-orders-500"
+  },
+  {
+    id: "host-session-sample-unattached",
+    connector_id: "connector-mac-studio",
+    hostname: "mac-studio.local",
+    workspace_id: "workspace-api",
+    session_id: "019e3152-ab17-7ce1-90e8-664c715fe952",
+    title: "Evaluate Telegram bot options",
+    title_source: "history",
+    cwd: "/Users/you/Program/bot-lab",
+    updated_at: "2026-06-09T20:18:00.000Z"
+  }
 ];
 
 export const budget: BudgetSummary = {
@@ -153,6 +208,7 @@ export function sampleBootstrap(email = "operator@example.com"): BootstrapPayloa
     workspaces,
     threads,
     tasks,
+    host_sessions: hostSessions,
     task_categories: taskCategories,
     running_commands: [],
     events,
@@ -166,7 +222,7 @@ function task(
   title: string,
   category_id: string,
   state: TaskSummary["state"],
-  thread_id?: string
+  thread_id: string
 ): TaskSummary {
   return {
     id,

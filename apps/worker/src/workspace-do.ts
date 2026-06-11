@@ -1,5 +1,12 @@
-import { createEnvelope, type AgentCommandEvent, type CommandDispatch, type ThreadEvent } from "@chaop/protocol";
-import { pendingCommandsForConnector, recordAgentEvent } from "./db.js";
+import {
+  createEnvelope,
+  type AgentCommandEvent,
+  type AgentHostSessionsReport,
+  type CommandDispatch,
+  type HostSessionSummary,
+  type ThreadEvent
+} from "@chaop/protocol";
+import { pendingCommandsForConnector, recordAgentEvent, recordHostSessions } from "./db.js";
 import type { Env } from "./types.js";
 
 export class WorkspaceDO implements DurableObject {
@@ -93,6 +100,22 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    if (message.kind === "agent.host_sessions" && isAgentHostSessionsReport(message.payload)) {
+      const hostSessions = await recordHostSessions(this.env, connectorId, message.payload);
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            kind: "agent.host_sessions",
+            count: hostSessions.length
+          })
+        )
+      );
+      if (hostSessions.length > 0) {
+        this.broadcastToBrowsers(hostSessionsMessage(hostSessions));
+      }
+      return;
+    }
+
     if (message.kind === "agent.event" && isAgentCommandEvent(message.payload)) {
       const event = await recordAgentEvent(this.env, connectorId, message.payload);
       ws.send(
@@ -148,6 +171,12 @@ export function threadEventMessage(event: ThreadEvent): string {
   );
 }
 
+export function hostSessionsMessage(hostSessions: HostSessionSummary[]): string {
+  return JSON.stringify(
+    createEnvelope("host_sessions.updated", { type: "worker", id: "workspace-do-global" }, { host_sessions: hostSessions })
+  );
+}
+
 function parseMessage(text: string): { kind?: string; payload?: unknown } | undefined {
   try {
     const value = JSON.parse(text) as unknown;
@@ -168,5 +197,26 @@ function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
       record.kind === "command.failed") &&
     (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
     typeof record.summary === "string"
+  );
+}
+
+function isAgentHostSessionsReport(value: unknown): value is AgentHostSessionsReport {
+  if (typeof value !== "object" || value === null) return false;
+  const sessions = (value as { sessions?: unknown }).sessions;
+  return Array.isArray(sessions) && sessions.every(isAgentHostSession);
+}
+
+function isAgentHostSession(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.session_id === "string" &&
+    typeof record.title === "string" &&
+    (record.title_source === "metadata" ||
+      record.title_source === "app_server" ||
+      record.title_source === "history" ||
+      record.title_source === "fallback") &&
+    (record.cwd === undefined || typeof record.cwd === "string") &&
+    typeof record.updated_at === "string"
   );
 }

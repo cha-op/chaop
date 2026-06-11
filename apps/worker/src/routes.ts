@@ -1,5 +1,6 @@
 import {
   createEnvelope,
+  type AttachHostSessionRequest,
   type AgentBootstrapRequest,
   type AgentBootstrapResponse,
   type CreateCommandRequest,
@@ -13,9 +14,13 @@ import {
 } from "./auth.js";
 import {
   CommandTargetError,
+  NotFoundError,
+  archiveTaskInDb,
+  attachHostSessionInDb,
   createCommandInDb,
   ensureConnectorInventory,
-  loadBootstrapFromDb
+  loadBootstrapFromDb,
+  unarchiveTaskInDb
 } from "./db.js";
 import { budget, sampleBootstrap } from "./sample-data.js";
 import type { Env } from "./types.js";
@@ -128,6 +133,59 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
     };
     return json(request, env, response, 202);
+  }
+
+  const taskArchiveMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/(archive|unarchive)$/);
+  if (request.method === "POST" && taskArchiveMatch) {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+
+    const taskId = decodeURIComponent(taskArchiveMatch[1] ?? "");
+    try {
+      const task = taskArchiveMatch[2] === "archive"
+        ? await archiveTaskInDb(env, taskId)
+        : await unarchiveTaskInDb(env, taskId);
+      return json(request, env, { task }, 200);
+    } catch (error) {
+      if (error instanceof NotFoundError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      throw error;
+    }
+  }
+
+  const attachHostSessionMatch = url.pathname.match(/^\/api\/host-sessions\/([^/]+)\/attach$/);
+  if (request.method === "POST" && attachHostSessionMatch) {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+
+    const payload = await readOptionalJson(request);
+    if (!payload.ok) {
+      return json(request, env, { error: payload.message }, 400);
+    }
+    if (!isAttachHostSessionRequest(payload.value)) {
+      return json(request, env, { error: "Invalid host session attach payload" }, 400);
+    }
+
+    try {
+      const response = await attachHostSessionInDb(
+        env,
+        decodeURIComponent(attachHostSessionMatch[1] ?? ""),
+        payload.value.connector_id
+      );
+      return json(request, env, response, 201);
+    } catch (error) {
+      if (error instanceof NotFoundError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      throw error;
+    }
   }
 
   if (url.pathname === "/ws/browser") {
@@ -288,6 +346,20 @@ async function readJson(
   }
 }
 
+async function readOptionalJson(
+  request: Request
+): Promise<{ ok: true; value: unknown } | { ok: false; message: string }> {
+  const text = await request.text();
+  if (text.trim().length === 0) {
+    return { ok: true, value: {} };
+  }
+  try {
+    return { ok: true, value: JSON.parse(text) as unknown };
+  } catch {
+    return { ok: false, message: "Invalid JSON request body" };
+  }
+}
+
 function isAgentBootstrapRequest(value: unknown): value is AgentBootstrapRequest {
   return (
     isRecord(value) &&
@@ -309,6 +381,10 @@ function isCreateCommandRequest(value: unknown): value is CreateCommandRequest {
     optionalCommandType(value.type) &&
     optionalString(value.target_connector_id)
   );
+}
+
+function isAttachHostSessionRequest(value: unknown): value is AttachHostSessionRequest {
+  return isRecord(value) && optionalString(value.connector_id);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

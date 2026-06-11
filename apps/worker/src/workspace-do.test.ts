@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { threadEventMessage } from "./workspace-do.js";
+import { hostSessionsMessage, threadEventMessage } from "./workspace-do.js";
 
 test("threadEventMessage wraps agent events for browser realtime consumers", () => {
   const message = threadEventMessage({
@@ -26,4 +26,28 @@ test("threadEventMessage wraps agent events for browser realtime consumers", () 
   assert.equal(envelope.payload?.event?.id, "event-1");
   assert.equal(envelope.payload?.event?.seq, 7);
   assert.equal(envelope.payload?.event?.summary, "Codex: done");
+});
+
+test("hostSessionsMessage wraps connector inventory updates for browser consumers", () => {
+  const message = hostSessionsMessage([
+    {
+      id: "host-session-1",
+      connector_id: "connector-1",
+      hostname: "mac-studio.local",
+      workspace_id: "workspace-api",
+      session_id: "session-1",
+      title: "Metadata title",
+      title_source: "metadata",
+      cwd: "/Users/you/Program/project",
+      updated_at: "2026-06-11T10:00:00.000Z"
+    }
+  ]);
+  const envelope = JSON.parse(message) as {
+    kind: string;
+    payload?: { host_sessions?: Array<{ session_id?: string; title_source?: string }> };
+  };
+
+  assert.equal(envelope.kind, "host_sessions.updated");
+  assert.equal(envelope.payload?.host_sessions?.[0]?.session_id, "session-1");
+  assert.equal(envelope.payload?.host_sessions?.[0]?.title_source, "metadata");
 });

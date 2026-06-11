@@ -1,11 +1,14 @@
 import type {
   AgentBootstrapRequest,
   AgentCommandEvent,
+  AgentHostSessionsReport,
+  AttachHostSessionResponse,
   BootstrapPayload,
   CommandSummary,
   ConnectorSummary,
   CreateCommandRequest,
   CreateCommandResponse,
+  HostSessionSummary,
   TaskCategory,
   TaskSummary,
   ThreadEvent,
@@ -24,6 +27,10 @@ export class CommandTargetError extends Error {
   readonly status = 404;
 }
 
+export class NotFoundError extends Error {
+  readonly status = 404;
+}
+
 export async function loadBootstrapFromDb(
   env: Env,
   user: BrowserIdentity
@@ -36,6 +43,7 @@ export async function loadBootstrapFromDb(
     connectors,
     workspaces,
     threads,
+    hostSessions,
     categories,
     tasks,
     runningCommands,
@@ -44,6 +52,7 @@ export async function loadBootstrapFromDb(
     listConnectors(env),
     listWorkspaces(env),
     listThreads(env),
+    listHostSessions(env),
     listTaskCategories(env),
     listTasks(env),
     listRecentCommands(env),
@@ -55,12 +64,231 @@ export async function loadBootstrapFromDb(
     connectors,
     workspaces,
     threads,
+    host_sessions: hostSessions,
     task_categories: categories,
     tasks,
     running_commands: runningCommands,
     events,
     budget,
     server_time: new Date().toISOString()
+  };
+}
+
+export async function recordHostSessions(
+  env: Env,
+  connectorId: string,
+  report: AgentHostSessionsReport
+): Promise<HostSessionSummary[]> {
+  if (!env.DB) return [];
+
+  const connector = await env.DB.prepare(
+    `SELECT hostname
+     FROM connectors
+     WHERE id = ?
+     LIMIT 1`
+  )
+    .bind(connectorId)
+    .first<{ hostname: string }>();
+  if (!connector) return [];
+
+  const workspace = await env.DB.prepare(
+    `SELECT workspace_id
+     FROM workspace_connectors
+     WHERE connector_id = ?
+     ORDER BY last_indexed_at DESC
+     LIMIT 1`
+  )
+    .bind(connectorId)
+    .first<{ workspace_id: string }>();
+  const workspaceId = workspace?.workspace_id ?? DEFAULT_WORKSPACE_ID;
+  const now = new Date().toISOString();
+  const upserted: HostSessionSummary[] = [];
+
+  for (const session of report.sessions.slice(0, 200)) {
+    const id = hostSessionId(connectorId, session.session_id);
+    await env.DB.prepare(
+      `INSERT INTO host_sessions (
+         id, connector_id, hostname, workspace_id, session_id, title, title_source,
+         cwd, discovered_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(connector_id, session_id) DO UPDATE SET
+         hostname = excluded.hostname,
+         workspace_id = excluded.workspace_id,
+         title = excluded.title,
+         title_source = excluded.title_source,
+         cwd = excluded.cwd,
+         updated_at = excluded.updated_at`
+    )
+      .bind(
+        id,
+        connectorId,
+        connector.hostname,
+        workspaceId,
+        session.session_id,
+        session.title,
+        session.title_source,
+        session.cwd ?? null,
+        now,
+        session.updated_at
+      )
+      .run();
+    const stored = await findHostSession(env, session.session_id, connectorId);
+    if (stored) {
+      upserted.push(stored);
+    }
+  }
+
+  await env.DB.prepare(
+    `UPDATE connectors
+     SET last_seen_at = ?, updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(now, now, connectorId)
+    .run();
+
+  return upserted;
+}
+
+export async function archiveTaskInDb(env: Env, taskId: string): Promise<TaskSummary> {
+  const task = await loadTask(env, taskId);
+  if (!task) {
+    throw new NotFoundError("Task not found");
+  }
+
+  const now = new Date().toISOString();
+  await env.DB!.prepare(
+    `UPDATE tasks
+     SET archived_at = ?, updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(now, now, task.id)
+    .run();
+  await env.DB!.prepare(
+    `UPDATE threads
+     SET state = 'archived', updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(now, task.thread_id)
+    .run();
+
+  return {
+    ...task,
+    archived_at: now,
+    updated_at: now
+  };
+}
+
+export async function unarchiveTaskInDb(env: Env, taskId: string): Promise<TaskSummary> {
+  const task = await loadTask(env, taskId);
+  if (!task) {
+    throw new NotFoundError("Task not found");
+  }
+
+  const now = new Date().toISOString();
+  const threadState = task.state === "running" ? "active" : "idle";
+  await env.DB!.prepare(
+    `UPDATE tasks
+     SET archived_at = NULL, updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(now, task.id)
+    .run();
+  await env.DB!.prepare(
+    `UPDATE threads
+     SET state = ?, updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(threadState, now, task.thread_id)
+    .run();
+
+  return {
+    ...task,
+    archived_at: undefined,
+    updated_at: now
+  };
+}
+
+export async function attachHostSessionInDb(
+  env: Env,
+  sessionId: string,
+  connectorId?: string
+): Promise<AttachHostSessionResponse> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for host session attachment");
+  }
+
+  const hostSession = await findHostSession(env, sessionId, connectorId);
+  if (!hostSession) {
+    throw new NotFoundError("Host session not found");
+  }
+
+  if (hostSession.attached_task_id && hostSession.attached_thread_id) {
+    const [task, thread] = await Promise.all([
+      loadTask(env, hostSession.attached_task_id),
+      loadThread(env, hostSession.attached_thread_id)
+    ]);
+    if (task && thread) {
+      return { host_session: hostSession, task, thread };
+    }
+  }
+
+  const now = new Date().toISOString();
+  const threadId = stableScopedId("thread-host", hostSession.connector_id, hostSession.session_id);
+  const taskId = stableScopedId("task-host", hostSession.connector_id, hostSession.session_id);
+
+  await env.DB.prepare(
+    `INSERT INTO threads (id, workspace_id, title, state, realtime_mode, last_seq, created_at, updated_at)
+     VALUES (?, ?, ?, 'idle', 'realtime', 0, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       title = excluded.title,
+       state = CASE WHEN state = 'archived' THEN state ELSE 'idle' END,
+       realtime_mode = excluded.realtime_mode,
+       updated_at = excluded.updated_at`
+  )
+    .bind(threadId, hostSession.workspace_id, hostSession.title, now, now)
+    .run();
+
+  await env.DB.prepare(
+    `INSERT INTO tasks (
+       id, workspace_id, thread_id, title, category_id, state, connector_id,
+       assigned_agent, realtime_mode, budget_state, archived_at, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, 'maintenance', 'idle', ?, 'chaop-agent', 'realtime', 'normal', NULL, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       workspace_id = excluded.workspace_id,
+       thread_id = excluded.thread_id,
+       title = excluded.title,
+       connector_id = excluded.connector_id,
+       assigned_agent = excluded.assigned_agent,
+       realtime_mode = excluded.realtime_mode,
+       budget_state = excluded.budget_state,
+       archived_at = NULL,
+       updated_at = excluded.updated_at`
+  )
+    .bind(taskId, hostSession.workspace_id, threadId, hostSession.title, hostSession.connector_id, now, now)
+    .run();
+
+  await env.DB.prepare(
+    `UPDATE host_sessions
+     SET attached_task_id = ?, attached_thread_id = ?, updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(taskId, threadId, now, hostSession.id)
+    .run();
+
+  const [task, thread] = await Promise.all([loadTask(env, taskId), loadThread(env, threadId)]);
+  if (!task || !thread) {
+    throw new NotFoundError("Attached task or thread not found");
+  }
+
+  return {
+    host_session: {
+      ...hostSession,
+      attached_task_id: taskId,
+      attached_thread_id: threadId,
+      updated_at: now
+    },
+    task,
+    thread
   };
 }
 
@@ -449,6 +677,19 @@ async function listThreads(env: Env): Promise<ThreadSummary[]> {
   return rows.map((row) => ({ ...row }));
 }
 
+async function listHostSessions(env: Env): Promise<HostSessionSummary[]> {
+  const rows = await allRows<HostSessionRow>(
+    env.DB!.prepare(
+      `SELECT id, connector_id, hostname, workspace_id, session_id, title, title_source,
+        cwd, updated_at, attached_task_id, attached_thread_id
+       FROM host_sessions
+       ORDER BY updated_at DESC
+       LIMIT 200`
+    )
+  );
+  return rows.map(hostSessionFromRow);
+}
+
 async function listTaskCategories(env: Env): Promise<TaskCategory[]> {
   const rows = await allRows<TaskCategory>(
     env.DB!.prepare(
@@ -464,17 +705,75 @@ async function listTasks(env: Env): Promise<TaskSummary[]> {
   const rows = await allRows<TaskRow>(
     env.DB!.prepare(
       `SELECT id, workspace_id, thread_id, title, category_id, state, connector_id,
-        assigned_agent, realtime_mode, budget_state, updated_at
+        assigned_agent, realtime_mode, budget_state, archived_at, updated_at
        FROM tasks
        ORDER BY updated_at DESC`
     )
   );
   return rows.map((row) => ({
     ...row,
-    thread_id: row.thread_id ?? undefined,
     connector_id: row.connector_id ?? undefined,
-    assigned_agent: row.assigned_agent ?? undefined
+    assigned_agent: row.assigned_agent ?? undefined,
+    archived_at: row.archived_at ?? undefined
   }));
+}
+
+async function loadTask(env: Env, taskId: string): Promise<TaskSummary | undefined> {
+  const row = await env.DB!.prepare(
+    `SELECT id, workspace_id, thread_id, title, category_id, state, connector_id,
+      assigned_agent, realtime_mode, budget_state, archived_at, updated_at
+     FROM tasks
+     WHERE id = ?
+     LIMIT 1`
+  )
+    .bind(taskId)
+    .first<TaskRow>();
+  return row
+    ? {
+      ...row,
+      connector_id: row.connector_id ?? undefined,
+      assigned_agent: row.assigned_agent ?? undefined,
+      archived_at: row.archived_at ?? undefined
+    }
+    : undefined;
+}
+
+async function loadThread(env: Env, threadId: string): Promise<ThreadSummary | undefined> {
+  const row = await env.DB!.prepare(
+    `SELECT id, workspace_id, title, state, last_seq, updated_at, realtime_mode
+     FROM threads
+     WHERE id = ?
+     LIMIT 1`
+  )
+    .bind(threadId)
+    .first<ThreadRow>();
+  return row ? { ...row } : undefined;
+}
+
+async function findHostSession(
+  env: Env,
+  sessionId: string,
+  connectorId?: string
+): Promise<HostSessionSummary | undefined> {
+  const statement = connectorId
+    ? env.DB!.prepare(
+      `SELECT id, connector_id, hostname, workspace_id, session_id, title, title_source,
+        cwd, updated_at, attached_task_id, attached_thread_id
+       FROM host_sessions
+       WHERE session_id = ? AND connector_id = ?
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    ).bind(sessionId, connectorId)
+    : env.DB!.prepare(
+      `SELECT id, connector_id, hostname, workspace_id, session_id, title, title_source,
+        cwd, updated_at, attached_task_id, attached_thread_id
+       FROM host_sessions
+       WHERE session_id = ?
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    ).bind(sessionId);
+  const row = await statement.first<HostSessionRow>();
+  return row ? hostSessionFromRow(row) : undefined;
 }
 
 async function listRecentCommands(env: Env): Promise<CommandSummary[]> {
@@ -630,6 +929,22 @@ function commandFromRow(row: CommandRow): CommandSummary {
   };
 }
 
+function hostSessionFromRow(row: HostSessionRow): HostSessionSummary {
+  return {
+    id: row.id,
+    connector_id: row.connector_id,
+    hostname: row.hostname,
+    workspace_id: row.workspace_id,
+    session_id: row.session_id,
+    title: row.title,
+    title_source: row.title_source,
+    cwd: row.cwd ?? undefined,
+    updated_at: row.updated_at,
+    attached_task_id: row.attached_task_id ?? undefined,
+    attached_thread_id: row.attached_thread_id ?? undefined
+  };
+}
+
 function categorySortOrder(category: TaskCategory): number {
   return taskCategories.findIndex((item) => item.id === category.id) * 10;
 }
@@ -657,6 +972,18 @@ function cryptoRandomId(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function hostSessionId(connectorId: string, sessionId: string): string {
+  return stableScopedId("host-session", connectorId, sessionId);
+}
+
+function stableScopedId(prefix: string, connectorId: string, sessionId: string): string {
+  return `${prefix}-${slugPart(sessionId)}-${slugPart(connectorId).slice(-16)}`;
+}
+
+function slugPart(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64) || "unknown";
+}
+
 type ConnectorRow = {
   id: string;
   name: string;
@@ -677,10 +1004,20 @@ type WorkspaceRow = {
 
 type ThreadRow = ThreadSummary;
 
-type TaskRow = Omit<TaskSummary, "thread_id" | "connector_id" | "assigned_agent"> & {
-  thread_id: string | null;
+type TaskRow = Omit<TaskSummary, "thread_id" | "connector_id" | "assigned_agent" | "archived_at"> & {
+  thread_id: string;
   connector_id: string | null;
   assigned_agent: string | null;
+  archived_at: string | null;
+};
+
+type HostSessionRow = Omit<
+  HostSessionSummary,
+  "cwd" | "attached_task_id" | "attached_thread_id"
+> & {
+  cwd: string | null;
+  attached_task_id: string | null;
+  attached_thread_id: string | null;
 };
 
 type CommandRow = Omit<CommandSummary, "thread_id" | "task_id" | "target_connector_id"> & {

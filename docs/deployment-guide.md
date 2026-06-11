@@ -12,7 +12,7 @@ The first slice is Cloudflare-first. The Rust connector supports placeholder exe
 Browser GUI -> Cloudflare Access -> Worker / Durable Object -> D1 / R2 -> Rust connector -> Worker / Durable Object -> Browser GUI
 ```
 
-Current implementation status: the repository can persist command lifecycle rows in D1, dispatch pending commands through the Durable Object, and receive lifecycle events from the Rust connector. It can run local Codex CLI work only when the connector has `execution.mode = "codex_exec"` in private configuration. It does not yet use the experimental Codex app-server protocol, and R2 artefact capture is still reserved for a later slice.
+Current implementation status: the repository can persist command lifecycle rows in D1, dispatch pending commands through the Durable Object, receive lifecycle events from the Rust connector, and attach local Codex sessions as task/thread views. It can run local Codex CLI work only when the connector has `execution.mode = "codex_exec"` in private configuration. It can optionally read Codex app-server `Thread.name` values for session titles, but it does not yet use the experimental app-server protocol for execution. R2 artefact capture is still reserved for a later slice.
 
 Keep secrets out of Git. Share sensitive values only through a local ignored file, a password manager, or direct `wrangler secret put` commands.
 
@@ -317,6 +317,13 @@ codex_command = "codex"
 codex_sandbox = "read-only"
 codex_timeout_seconds = 300
 codex_output_max_bytes = 262144
+
+[session_inventory]
+enabled = true
+max_sessions = 100
+app_server_timeout_seconds = 2
+# codex_home = "/Users/you/.codex"
+# app_server_url = "ws://127.0.0.1:9876"
 ```
 
 `mode = "placeholder"` is the safe default. To run real local Codex CLI work, set this only in a private deployment config:
@@ -340,6 +347,8 @@ extra_args = ["--skip-git-repo-check"]
 
 Only add optional settings when the local Codex CLI needs them. `codex_exec` can consume Codex/OpenAI allowance or API budget; set the alerts in [Cost Model](cost-aware.md) before leaving it running unattended.
 Prompts are passed to Codex over stdin, not command-line arguments. Keep the timeout and output cap in place unless there is a specific operator reason to widen them.
+
+Session inventory is enabled by default. The connector reads local Codex metadata from `CODEX_HOME` or `~/.codex`, reports session id, title, cwd, update time, and title source, and does not upload rollout transcripts. Title resolution prefers metadata or rollout titles, then optional app-server `Thread.name`, then the first local history prompt, and finally a cwd/session-id fallback. Set `app_server_url` only if you already run `codex app-server` with a local WebSocket listener and want Chaop to use app-server titles. Keep `app_server_timeout_seconds` short so a stopped app-server cannot block connector startup.
 
 Create local files outside the repository:
 
@@ -394,5 +403,6 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - If Browser command submission fails before reaching the Worker, check whether the request has become a CORS preflight and either keep the simple request shape or allow `OPTIONS /api/*` through Cloudflare Access.
 - If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether the Worker route excludes Browser Access.
 - If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
+- If Host Sessions is empty, check that the connector was restarted after this slice, `session_inventory.enabled` is true, and the connector user can read `CODEX_HOME` or `~/.codex`.
 - If D1 migration fails, confirm the D1 database UUID is present in the Worker config.
 - If R2 writes fail, confirm the bucket exists and the Worker binding name matches the implementation.

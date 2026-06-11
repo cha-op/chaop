@@ -2,6 +2,7 @@ use crate::config::{AgentConfig, ExecutionMode};
 use crate::executor::{codex_exec_result_events, codex_exec_started_event};
 use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
+use crate::session_inventory::build_host_sessions_report;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
@@ -64,6 +65,7 @@ pub fn run_connector(
     socket.send(Message::Text(
         json!({ "kind": "agent.ready" }).to_string().into(),
     ))?;
+    send_host_sessions(&mut socket, config)?;
 
     loop {
         let message = socket.read()?;
@@ -81,6 +83,24 @@ pub fn run_connector(
             _ => {}
         }
     }
+}
+
+fn send_host_sessions(
+    socket: &mut AgentSocket,
+    config: &AgentConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Ok(report) = build_host_sessions_report(config) else {
+        return Ok(());
+    };
+    socket.send(Message::Text(
+        json!({
+            "kind": "agent.host_sessions",
+            "payload": report
+        })
+        .to_string()
+        .into(),
+    ))?;
+    Ok(())
 }
 
 fn handle_text_message(

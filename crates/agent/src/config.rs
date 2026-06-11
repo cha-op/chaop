@@ -13,6 +13,8 @@ pub struct AgentConfig {
     pub bootstrap: BootstrapConfig,
     #[serde(default)]
     pub execution: ExecutionConfig,
+    #[serde(default)]
+    pub session_inventory: SessionInventoryConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +42,20 @@ pub struct ExecutionConfig {
     pub extra_args: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInventoryConfig {
+    #[serde(default = "default_session_inventory_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub codex_home: Option<PathBuf>,
+    #[serde(default = "default_session_inventory_max_sessions")]
+    pub max_sessions: usize,
+    #[serde(default)]
+    pub app_server_url: Option<String>,
+    #[serde(default = "default_app_server_timeout_seconds")]
+    pub app_server_timeout_seconds: u64,
+}
+
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
@@ -51,6 +67,18 @@ impl Default for ExecutionConfig {
             codex_timeout_seconds: default_codex_timeout_seconds(),
             codex_output_max_bytes: default_codex_output_max_bytes(),
             extra_args: Vec::new(),
+        }
+    }
+}
+
+impl Default for SessionInventoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_session_inventory_enabled(),
+            codex_home: None,
+            max_sessions: default_session_inventory_max_sessions(),
+            app_server_url: None,
+            app_server_timeout_seconds: default_app_server_timeout_seconds(),
         }
     }
 }
@@ -87,6 +115,7 @@ impl AgentConfig {
             "placeholder_commands".to_owned(),
             "event_stream_summary".to_owned(),
             "local_spool_skeleton".to_owned(),
+            "host_session_inventory".to_owned(),
         ];
         if self.execution.mode == ExecutionMode::CodexExec {
             capabilities.push("codex_exec".to_owned());
@@ -120,6 +149,18 @@ fn default_codex_timeout_seconds() -> u64 {
 
 fn default_codex_output_max_bytes() -> usize {
     256 * 1024
+}
+
+fn default_session_inventory_enabled() -> bool {
+    true
+}
+
+fn default_session_inventory_max_sessions() -> usize {
+    100
+}
+
+fn default_app_server_timeout_seconds() -> u64 {
+    2
 }
 
 #[derive(Debug)]
@@ -187,6 +228,7 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
                 secret_file: "/Users/you/.chaop/bootstrap.secret".into(),
             },
             execution: super::ExecutionConfig::default(),
+            session_inventory: super::SessionInventoryConfig::default(),
         };
 
         let request = config.bootstrap_request("mac-studio.local");
@@ -197,6 +239,11 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
             request
                 .capabilities
                 .contains(&"placeholder_commands".to_owned())
+        );
+        assert!(
+            request
+                .capabilities
+                .contains(&"host_session_inventory".to_owned())
         );
         assert!(!request.capabilities.contains(&"codex_exec".to_owned()));
     }
@@ -217,6 +264,7 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
                 mode: super::ExecutionMode::CodexExec,
                 ..super::ExecutionConfig::default()
             },
+            session_inventory: super::SessionInventoryConfig::default(),
         };
 
         let request = config.bootstrap_request("mac-studio.local");

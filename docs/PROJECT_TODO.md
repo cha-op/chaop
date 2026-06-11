@@ -8,4 +8,5 @@
 - [done] Harden the Cloudflare-first placeholder connector control loop from local skeleton to deploy-ready command dispatch, D1 persistence, Durable Object relay, and connector lifecycle reporting.
 - [done] Run a deployed placeholder E2E smoke using private Cloudflare config, Access service-token auth, and the first local connector.
 - [done] Add opt-in local Codex CLI command execution behind private connector configuration.
+- [done] Add task archive, Host Sessions attach, and real Thread Centre thread selection.
 - [pending] Replace the Codex CLI adapter with real Codex app-server protocol execution.

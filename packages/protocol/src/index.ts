@@ -116,7 +116,7 @@ export type ThreadSummary = {
 export type TaskSummary = {
   id: string;
   workspace_id: string;
-  thread_id?: string | undefined;
+  thread_id: string;
   title: string;
   category_id: string;
   state: TaskState;
@@ -124,7 +124,28 @@ export type TaskSummary = {
   assigned_agent?: string | undefined;
   realtime_mode: RealtimeMode;
   budget_state: BudgetState;
+  archived_at?: string | undefined;
   updated_at: string;
+};
+
+export type HostSessionTitleSource =
+  | "metadata"
+  | "app_server"
+  | "history"
+  | "fallback";
+
+export type HostSessionSummary = {
+  id: string;
+  connector_id: string;
+  hostname: string;
+  workspace_id: string;
+  session_id: string;
+  title: string;
+  title_source: HostSessionTitleSource;
+  cwd?: string | undefined;
+  updated_at: string;
+  attached_task_id?: string | undefined;
+  attached_thread_id?: string | undefined;
 };
 
 export type CommandSummary = {
@@ -185,6 +206,7 @@ export type BootstrapPayload = {
   workspaces: WorkspaceSummary[];
   threads: ThreadSummary[];
   tasks: TaskSummary[];
+  host_sessions: HostSessionSummary[];
   task_categories: TaskCategory[];
   running_commands: CommandSummary[];
   events: ThreadEvent[];
@@ -220,6 +242,16 @@ export type CreateCommandResponse = {
   accepted: boolean;
 };
 
+export type AttachHostSessionRequest = {
+  connector_id?: string | undefined;
+};
+
+export type AttachHostSessionResponse = {
+  host_session: HostSessionSummary;
+  task: TaskSummary;
+  thread: ThreadSummary;
+};
+
 export type CommandDispatch = {
   command: CommandSummary;
 };
@@ -233,6 +265,18 @@ export type AgentCommandEvent = {
     | "command.failed";
   priority: ThreadEvent["priority"];
   summary: string;
+};
+
+export type AgentHostSession = {
+  session_id: string;
+  title: string;
+  title_source: HostSessionTitleSource;
+  cwd?: string | undefined;
+  updated_at: string;
+};
+
+export type AgentHostSessionsReport = {
+  sessions: AgentHostSession[];
 };
 
 export type ThrottleNotice = {

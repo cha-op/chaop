@@ -85,6 +85,59 @@ export function fallbackBootstrap(): BootstrapPayload {
         last_seq: 3,
         updated_at: "2026-06-09T21:42:00.000Z",
         realtime_mode: "cost_saving"
+      },
+      {
+        id: "thread-inventory",
+        workspace_id: "workspace-api",
+        title: "Sync workspace inventory",
+        state: "idle",
+        last_seq: 0,
+        updated_at: "2026-06-09T21:40:00.000Z",
+        realtime_mode: "summary"
+      },
+      {
+        id: "thread-shell-approval",
+        workspace_id: "workspace-api",
+        title: "Await shell approval",
+        state: "active",
+        last_seq: 0,
+        updated_at: "2026-06-09T21:36:00.000Z",
+        realtime_mode: "realtime"
+      },
+      {
+        id: "thread-budget-telemetry",
+        workspace_id: "workspace-api",
+        title: "Budget compacted telemetry",
+        state: "active",
+        last_seq: 0,
+        updated_at: "2026-06-09T21:30:00.000Z",
+        realtime_mode: "throttled"
+      }
+    ],
+    host_sessions: [
+      {
+        id: "host-session-sample-attached",
+        connector_id: "connector-mac-studio",
+        hostname: "mac-studio.local",
+        workspace_id: "workspace-api",
+        session_id: "019d3109-210d-7492-be2b-902b10993a3d",
+        title: "Investigate 500 errors on /api/orders",
+        title_source: "metadata",
+        cwd: "/Users/you/Program/api-control-plane",
+        updated_at: "2026-06-09T21:58:00.000Z",
+        attached_task_id: "task-orders-500",
+        attached_thread_id: "thread-orders-500"
+      },
+      {
+        id: "host-session-sample-unattached",
+        connector_id: "connector-mac-studio",
+        hostname: "mac-studio.local",
+        workspace_id: "workspace-api",
+        session_id: "019e3152-ab17-7ce1-90e8-664c715fe952",
+        title: "Evaluate Telegram bot options",
+        title_source: "history",
+        cwd: "/Users/you/Program/bot-lab",
+        updated_at: "2026-06-09T20:18:00.000Z"
       }
     ],
     task_categories: [
@@ -124,6 +177,7 @@ export function fallbackBootstrap(): BootstrapPayload {
       {
         id: "task-inventory",
         workspace_id: "workspace-api",
+        thread_id: "thread-inventory",
         title: "Sync workspace inventory",
         category_id: "maintenance",
         state: "idle",
@@ -147,6 +201,7 @@ export function fallbackBootstrap(): BootstrapPayload {
       {
         id: "task-shell-approval",
         workspace_id: "workspace-api",
+        thread_id: "thread-shell-approval",
         title: "Await shell approval",
         category_id: "maintenance",
         state: "waiting_for_approval",
@@ -159,6 +214,7 @@ export function fallbackBootstrap(): BootstrapPayload {
       {
         id: "task-budget-telemetry",
         workspace_id: "workspace-api",
+        thread_id: "thread-budget-telemetry",
         title: "Budget compacted telemetry",
         category_id: "personal",
         state: "throttled",

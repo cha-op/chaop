@@ -1,4 +1,11 @@
-import type { BootstrapPayload, CreateCommandRequest, CreateCommandResponse } from "@chaop/protocol";
+import type {
+  AttachHostSessionRequest,
+  AttachHostSessionResponse,
+  BootstrapPayload,
+  CreateCommandRequest,
+  CreateCommandResponse,
+  TaskSummary
+} from "@chaop/protocol";
 import { fallbackBootstrap } from "./sample-data.js";
 
 export async function loadBootstrap(): Promise<BootstrapPayload> {
@@ -37,6 +44,21 @@ export async function createCommand(request: CreateCommandRequest): Promise<Crea
   return (await response.json()) as CreateCommandResponse;
 }
 
+export async function archiveTask(taskId: string): Promise<{ task: TaskSummary }> {
+  return postJson(`/api/tasks/${encodeURIComponent(taskId)}/archive`, {});
+}
+
+export async function unarchiveTask(taskId: string): Promise<{ task: TaskSummary }> {
+  return postJson(`/api/tasks/${encodeURIComponent(taskId)}/unarchive`, {});
+}
+
+export async function attachHostSession(
+  sessionId: string,
+  request: AttachHostSessionRequest
+): Promise<AttachHostSessionResponse> {
+  return postJson(`/api/host-sessions/${encodeURIComponent(sessionId)}/attach`, request);
+}
+
 export function browserSocketUrl(): string {
   const baseUrl = import.meta.env.VITE_CHAOP_API_BASE_URL?.replace(/\/+$/, "");
   if (baseUrl) {
@@ -52,6 +74,24 @@ export function browserSocketUrl(): string {
 function apiUrl(path: string): string {
   const baseUrl = import.meta.env.VITE_CHAOP_API_BASE_URL?.replace(/\/+$/, "") ?? "";
   return `${baseUrl}${path}`;
+}
+
+async function postJson<T>(path: string, request: unknown): Promise<T> {
+  const response = await fetch(apiUrl(path), {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      ...devHeaders()
+    },
+    body: JSON.stringify(request)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Request failed with ${response.status}`);
+  }
+
+  return (await response.json()) as T;
 }
 
 function devHeaders(): HeadersInit {
