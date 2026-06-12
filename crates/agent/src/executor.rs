@@ -1,7 +1,7 @@
 use crate::config::ExecutionConfig;
 use crate::placeholder::ConnectorEvent;
 use serde::Deserialize;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -40,6 +40,14 @@ pub fn codex_exec_result_events(
             &output.stderr,
             output.truncated,
         ),
+        Err(error) if error.kind() == ErrorKind::NotFound => vec![ConnectorEvent {
+            kind: "command.failed".to_owned(),
+            priority: "P1".to_owned(),
+            summary: format!(
+                "Codex executable not found: {}. Set execution.codex_command to an absolute path visible to the connector process.",
+                config.codex_command
+            ),
+        }],
         Err(error) => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
@@ -338,6 +346,8 @@ impl CodexUsage {
 #[cfg(test)]
 mod tests {
     use super::{codex_result_events, parse_codex_jsonl};
+    use crate::config::ExecutionConfig;
+    use std::path::Path;
 
     #[test]
     fn parses_codex_jsonl_agent_message_and_usage() {
@@ -389,6 +399,22 @@ mod tests {
         assert_eq!(
             events[0].summary,
             "Codex exec failed with exit code 2: network unavailable"
+        );
+    }
+
+    #[test]
+    fn reports_missing_codex_executable_with_config_hint() {
+        let config = ExecutionConfig {
+            codex_command: "/definitely/not/codex".to_owned(),
+            ..ExecutionConfig::default()
+        };
+        let events = super::codex_exec_result_events(&config, Path::new("."), "status");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "command.failed");
+        assert_eq!(
+            events[0].summary,
+            "Codex executable not found: /definitely/not/codex. Set execution.codex_command to an absolute path visible to the connector process."
         );
     }
 }

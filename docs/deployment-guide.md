@@ -334,7 +334,7 @@ app_server_timeout_seconds = 2
 ```toml
 [execution]
 mode = "codex_exec"
-codex_command = "codex"
+codex_command = "/opt/homebrew/bin/codex"
 codex_sandbox = "read-only"
 codex_timeout_seconds = 300
 codex_output_max_bytes = 262144
@@ -350,6 +350,7 @@ extra_args = ["--skip-git-repo-check"]
 
 Only add optional settings when the local Codex CLI needs them. `codex_exec` can consume Codex/OpenAI allowance or API budget; set the alerts in [Cost Model](cost-aware.md) before leaving it running unattended.
 Prompts are passed to Codex over stdin, not command-line arguments. Keep the timeout and output cap in place unless there is a specific operator reason to widen them.
+Use an absolute `codex_command` path for long-lived connectors launched by `launchctl` or another service manager. Those processes may not inherit the interactive shell `PATH`; if the executable cannot be found, Codex exec commands fail before any workspace `cwd` is used.
 
 Session inventory is enabled by default. The connector reads local Codex metadata from `CODEX_HOME` or `~/.codex`, reports session id, title, cwd, update time, and title source, and does not upload rollout transcripts. Title resolution prefers metadata or rollout titles, then optional app-server `Thread.name`, then the first local history prompt, and finally a cwd/session-id fallback. Set `app_server_url` only if you already run `codex app-server` with a local WebSocket listener and want Chaop to use app-server titles. Keep `app_server_timeout_seconds` short so a stopped app-server cannot block connector startup.
 
@@ -405,6 +406,7 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - If service-token smoke tests get `401` from the Worker with an identity error, check that the Access policy allows the service token and that the service-token headers reach the API route.
 - If Browser command submission fails before reaching the Worker, check whether the request has become a CORS preflight and either keep the simple request shape or allow `OPTIONS /api/*` through Cloudflare Access.
 - If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether `/connector/bootstrap` and `/ws/agent` are excluded from Browser Access.
+- If Codex exec returns `Codex executable not found`, set `execution.codex_command` to an absolute path that the connector process can execute, for example `/opt/homebrew/bin/codex` on this macOS deployment. This is separate from the attached session `cwd`.
 - If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
 - If Host Sessions is empty, check that the connector was restarted after this slice, `session_inventory.enabled` is true, and the connector user can read `CODEX_HOME` or `~/.codex`.
 - If an attached historical Host Session shows only a few events, that is expected in the current slice: attachment imports session metadata and title only. Historical rollout/transcript backfill and full artefact capture are deferred.

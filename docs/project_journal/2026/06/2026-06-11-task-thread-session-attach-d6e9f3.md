@@ -40,6 +40,8 @@ superseded_by:
 - Agent bootstrap moved to `/connector/bootstrap` so broad Browser Access coverage for `/api/*` does not wrap connector bootstrap. The old `/api/agent/bootstrap` alias was removed after Access was reconfigured.
 - Host Sessions now hides archived task/thread attachments from the active attached list; they remain restorable from the Task Board archive view.
 - Historical Host Session attachment still imports metadata/title only. Full transcript or rollout event backfill is deferred to a later slice.
+- Codex exec diagnostics now distinguish a missing Codex executable from workspace `cwd` failures, and deployment docs recommend an absolute `execution.codex_command` for service-managed connectors.
+- Thread Centre now merges bootstrap/polling payloads with local realtime state so older bootstrap snapshots do not drop already-received events. Empty attached threads show an empty timeline instead of placeholder lifecycle rows.
 
 ## Next Steps
 - Re-test attach after the Cloudflare Access destination covers `/api/*`, `/ws/browser`, and the GUI hostname.

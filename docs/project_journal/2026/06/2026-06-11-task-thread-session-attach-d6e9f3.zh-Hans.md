@@ -40,6 +40,8 @@ superseded_by:
 - Agent bootstrap 已迁到 `/connector/bootstrap`，这样 `/api/*` 的 Browser Access 覆盖不会包住 connector bootstrap。Access 配好后，旧 `/api/agent/bootstrap` alias 已删除。
 - Host Sessions 现在会把已归档 task/thread 的 attachment 从 active attached list 中隐藏；它们仍可从 Task Board archive 视图恢复。
 - 历史 Host Session attachment 目前仍只导入 metadata/title。完整 transcript 或 rollout event backfill 留到后续切片。
+- Codex exec 诊断现在会把缺少 Codex executable 和 workspace `cwd` 失败区分开；部署文档也建议 service-managed connector 使用绝对 `execution.codex_command`。
+- Thread Centre 现在会把 bootstrap/polling payload 与本地 realtime state 合并，避免较旧 bootstrap snapshot 覆盖已经收到的 events。空 attached thread 会显示空 timeline，不再显示 placeholder lifecycle rows。
 
 ## 下一步
 - Cloudflare Access destination 覆盖 `/api/*`、`/ws/browser` 和 GUI hostname 后，重新测试 attach。

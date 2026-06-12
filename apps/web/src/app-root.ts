@@ -138,7 +138,8 @@ export class ChaopApp extends LitElement {
 
   private async load(): Promise<void> {
     try {
-      this.data = await loadBootstrap();
+      const incoming = await loadBootstrap();
+      this.data = mergeBootstrapPayload(this.data, incoming);
       this.ensureSelectedThread();
     } catch (error) {
       this.loadError = error instanceof Error ? error.message : "Bootstrap request failed";
@@ -364,15 +365,7 @@ export class ChaopApp extends LitElement {
                     </div>
                   `
                 )
-              : ["command.accepted", "command.started", "command.output", "command.finished"].map(
-                  (eventName, index) => html`
-                    <div class="event-row">
-                      <span>${String(index + 1).padStart(2, "0")}</span>
-                      <strong>${eventName}</strong>
-                      <p>${eventCopy(eventName)}</p>
-                    </div>
-                  `
-                )}
+              : html`<p class="muted">No events recorded for this thread yet.</p>`}
           </div>
         </section>
         <aside class="panel">
@@ -930,13 +923,46 @@ function isRealtimeHostSessionsPayload(value: unknown): value is RealtimeHostSes
   return Array.isArray(hostSessions);
 }
 
-function eventCopy(eventName: string): string {
+function mergeBootstrapPayload(current: BootstrapPayload | undefined, incoming: BootstrapPayload): BootstrapPayload {
+  if (!current) return incoming;
   return {
-    "command.accepted": "Control plane accepted the placeholder command.",
-    "command.started": "connector-mac-studio acquired the lease.",
-    "command.output": "Summary stream is current; full log detail is deferred.",
-    "command.finished": "Placeholder command completed successfully."
-  }[eventName] ?? "Event received.";
+    ...incoming,
+    threads: mergeById(incoming.threads, current.threads, newerThread),
+    tasks: mergeById(incoming.tasks, current.tasks, newerByUpdatedAt),
+    running_commands: mergeById(incoming.running_commands, current.running_commands, newerByUpdatedAt),
+    events: mergeById(incoming.events, current.events, newerByCreatedAt),
+    host_sessions: mergeById(incoming.host_sessions, current.host_sessions, newerByUpdatedAt)
+  };
+}
+
+function mergeById<T extends { id: string }>(
+  incoming: T[],
+  current: T[],
+  pick: (incoming: T, current: T) => T
+): T[] {
+  const merged = new Map<string, T>();
+  for (const item of incoming) {
+    merged.set(item.id, item);
+  }
+  for (const item of current) {
+    const existing = merged.get(item.id);
+    merged.set(item.id, existing ? pick(existing, item) : item);
+  }
+  return Array.from(merged.values());
+}
+
+function newerThread(incoming: ThreadSummary, current: ThreadSummary): ThreadSummary {
+  if (current.last_seq > incoming.last_seq) return current;
+  if (incoming.last_seq > current.last_seq) return incoming;
+  return newerByUpdatedAt(incoming, current);
+}
+
+function newerByUpdatedAt<T extends { updated_at: string }>(incoming: T, current: T): T {
+  return current.updated_at > incoming.updated_at ? current : incoming;
+}
+
+function newerByCreatedAt<T extends { created_at: string }>(incoming: T, current: T): T {
+  return current.created_at > incoming.created_at ? current : incoming;
 }
 
 function budgetBar(label: string, value: number) {
