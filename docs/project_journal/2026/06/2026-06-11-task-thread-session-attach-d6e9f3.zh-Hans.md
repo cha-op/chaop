@@ -45,6 +45,7 @@ superseded_by:
 - Thread Centre 现在也提供和 Task Board 一致的 archive/unarchive 操作，用于当前选中的 task/thread。
 - Host Sessions 现在有手动 refresh 按钮、`Last synced` timestamp 和 age 显示。Refresh 请求会让在线 connectors 立即重扫，然后重新读取 control-plane snapshot。
 - Connector 现在会按 `session_inventory.report_interval_seconds` 周期性重扫本机 Codex sessions，并且周期路径只有在序列化后的 inventory 发生变化时才会上报。Worker 和 Web 现在会把每次 connector inventory 当成该 connector 范围内的 snapshot，避免已移除的本机 sessions 继续作为可 attach rows 残留。
+- Connector session inventory 现在也会从 `history.jsonl` 创建轻量 entries，即使 session 还没有 `session_index` 或 rollout metadata；它会用 history `ts` 作为 session 更新时间，并用第一条 prompt 作为 title。
 
 ## 下一步
 - 增加明确的新建 Codex thread 流程，让 Chaop 可以创建本机 Codex/app-server thread，而不只是 attach 已存在的 sessions。

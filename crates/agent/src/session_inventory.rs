@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tungstenite::{Message, connect};
+use tungstenite::{connect, Message};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentHostSessionsReport {
@@ -52,6 +52,13 @@ struct SessionIndexLine {
 struct HistoryLine {
     session_id: String,
     text: Option<String>,
+    ts: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistorySession {
+    title: String,
+    updated_at: Option<String>,
 }
 
 pub fn build_host_sessions_report(
@@ -72,7 +79,7 @@ pub fn build_host_sessions_report(
 
     read_session_index(&codex_home, &mut drafts)?;
     read_rollouts(&codex_home, &mut drafts)?;
-    let history_titles = read_history_titles(&codex_home)?;
+    let history_sessions = read_history_sessions(&codex_home)?;
     let app_server_titles = config
         .session_inventory
         .app_server_url
@@ -96,11 +103,21 @@ pub fn build_host_sessions_report(
             });
     }
 
+    for (session_id, history) in &history_sessions {
+        let draft = drafts
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionDraft {
+                session_id: session_id.clone(),
+                ..SessionDraft::default()
+            });
+        draft.updated_at = max_string(history.updated_at.clone(), draft.updated_at.take());
+    }
+
     let mut sessions = drafts
         .into_values()
         .map(|draft| {
             let app_title = app_server_titles.get(&draft.session_id).cloned();
-            resolve_session(draft, app_title, &history_titles)
+            resolve_session(draft, app_title, &history_sessions)
         })
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
@@ -133,24 +150,32 @@ fn read_session_index(
     Ok(())
 }
 
-fn read_history_titles(codex_home: &Path) -> std::io::Result<HashMap<String, String>> {
+fn read_history_sessions(codex_home: &Path) -> std::io::Result<HashMap<String, HistorySession>> {
     let path = codex_home.join("history.jsonl");
-    let mut titles = HashMap::new();
+    let mut sessions = HashMap::new();
     if !path.exists() {
-        return Ok(titles);
+        return Ok(sessions);
     }
     for line in fs::read_to_string(path)?.lines() {
         let Ok(entry) = serde_json::from_str::<HistoryLine>(line) else {
             continue;
         };
-        if titles.contains_key(&entry.session_id) {
+        let updated_at = entry.ts.and_then(unix_seconds_to_iso);
+        if let Some(existing) = sessions.get_mut(&entry.session_id) {
+            existing.updated_at = max_string(updated_at, existing.updated_at.take());
             continue;
         }
         if let Some(text) = compact_title(entry.text.as_deref()) {
-            titles.insert(entry.session_id, text);
+            sessions.insert(
+                entry.session_id,
+                HistorySession {
+                    title: text,
+                    updated_at,
+                },
+            );
         }
     }
-    Ok(titles)
+    Ok(sessions)
 }
 
 fn read_rollouts(
@@ -259,15 +284,18 @@ fn collect_rollout_paths(path: &Path, paths: &mut Vec<PathBuf>) -> std::io::Resu
 fn resolve_session(
     draft: SessionDraft,
     app_server_title: Option<String>,
-    history_titles: &HashMap<String, String>,
+    history_sessions: &HashMap<String, HistorySession>,
 ) -> AgentHostSession {
-    let (title, title_source) = if let Some(title) = compact_title(draft.metadata_title.as_deref()) {
+    let (title, title_source) = if let Some(title) = compact_title(draft.metadata_title.as_deref())
+    {
         (title, TitleSource::Metadata)
     } else if let Some(title) = compact_title(app_server_title.as_deref()) {
         (title, TitleSource::AppServer)
-    } else if let Some(title) =
-        compact_title(history_titles.get(&draft.session_id).map(String::as_str))
-    {
+    } else if let Some(title) = compact_title(
+        history_sessions
+            .get(&draft.session_id)
+            .map(|history| history.title.as_str()),
+    ) {
         (title, TitleSource::History)
     } else {
         (fallback_title(&draft), TitleSource::Fallback)
@@ -282,6 +310,42 @@ fn resolve_session(
             .updated_at
             .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_owned()),
     }
+}
+
+fn unix_seconds_to_iso(seconds: i64) -> Option<String> {
+    if seconds < 0 {
+        return None;
+    }
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z"
+    ))
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
+    let shifted_days = days_since_unix_epoch + 719_468;
+    let era = if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    } / 146_097;
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_piece = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_piece + 2) / 5 + 1;
+    let month = month_piece + if month_piece < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
 }
 
 fn load_app_server_titles(
@@ -425,12 +489,10 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionDraft, TitleSource, app_server_titles_from_response, build_host_sessions_report,
-        resolve_session,
+        app_server_titles_from_response, build_host_sessions_report, resolve_session,
+        unix_seconds_to_iso, HistorySession, SessionDraft, TitleSource,
     };
-    use crate::config::{
-        AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig,
-    };
+    use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
@@ -444,7 +506,13 @@ mod tests {
             updated_at: Some("2026-06-11T10:00:00.000Z".to_owned()),
         };
         let mut history = HashMap::new();
-        history.insert("session-1".to_owned(), "History title".to_owned());
+        history.insert(
+            "session-1".to_owned(),
+            HistorySession {
+                title: "History title".to_owned(),
+                updated_at: Some("2026-06-11T09:00:00.000Z".to_owned()),
+            },
+        );
 
         let session = resolve_session(draft, Some("App title".to_owned()), &history);
 
@@ -461,7 +529,13 @@ mod tests {
             updated_at: None,
         };
         let mut history = HashMap::new();
-        history.insert("session-1".to_owned(), "History title".to_owned());
+        history.insert(
+            "session-1".to_owned(),
+            HistorySession {
+                title: "History title".to_owned(),
+                updated_at: Some("2026-06-11T09:00:00.000Z".to_owned()),
+            },
+        );
 
         let session = resolve_session(draft, Some("App title".to_owned()), &history);
 
@@ -484,8 +558,24 @@ mod tests {
 
         let titles = app_server_titles_from_response(&response);
 
-        assert_eq!(titles.get("session-1").map(String::as_str), Some("App server title"));
+        assert_eq!(
+            titles.get("session-1").map(String::as_str),
+            Some("App server title")
+        );
         assert!(!titles.contains_key("session-2"));
+    }
+
+    #[test]
+    fn converts_history_unix_seconds_to_iso() {
+        assert_eq!(
+            unix_seconds_to_iso(0).as_deref(),
+            Some("1970-01-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            unix_seconds_to_iso(1_781_263_443).as_deref(),
+            Some("2026-06-12T11:24:03.000Z")
+        );
+        assert_eq!(unix_seconds_to_iso(-1), None);
     }
 
     #[test]
@@ -500,7 +590,8 @@ mod tests {
         .expect("session index");
         fs::write(
             codex_home.join("history.jsonl"),
-            r#"{"session_id":"session-2","text":"History title from first prompt"}"#,
+            r#"{"session_id":"session-2","text":"History title from first prompt","ts":1781263443}
+{"session_id":"session-3","text":"History-only prompt","ts":1781267043}"#,
         )
         .expect("history");
         fs::write(
@@ -529,8 +620,11 @@ mod tests {
 
         let report = build_host_sessions_report(&config).expect("report");
 
-        assert_eq!(report.sessions.len(), 2);
-        assert_eq!(report.sessions[0].title, "Metadata index title");
+        assert_eq!(report.sessions.len(), 3);
+        assert_eq!(report.sessions[0].session_id, "session-3");
+        assert_eq!(report.sessions[0].title, "History-only prompt");
+        assert_eq!(report.sessions[0].title_source, TitleSource::History);
         assert_eq!(report.sessions[1].title, "History title from first prompt");
+        assert_eq!(report.sessions[2].title, "Metadata index title");
     }
 }

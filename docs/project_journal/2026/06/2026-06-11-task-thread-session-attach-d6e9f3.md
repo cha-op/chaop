@@ -45,6 +45,7 @@ superseded_by:
 - Thread Centre now exposes the same archive/unarchive action as Task Board for the selected task/thread.
 - Host Sessions now has a manual refresh button, `Last synced` timestamp, and age display. The refresh request asks online connectors to rescan immediately, then reloads the control-plane snapshot.
 - The connector now periodically rescans local Codex sessions using `session_inventory.report_interval_seconds` and only sends the periodic inventory report when the serialized inventory changes. Worker and Web now treat each connector inventory as a connector-scoped snapshot so removed local sessions do not linger as attachable rows.
+- Connector session inventory now creates lightweight entries from `history.jsonl` even when a session has no `session_index` or rollout metadata yet, using history `ts` as the session update time and the first prompt as the title.
 
 ## Next Steps
 - Add an explicit new Codex thread flow so Chaop can create a local Codex/app-server thread instead of only attaching existing sessions.
