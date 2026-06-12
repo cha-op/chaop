@@ -143,20 +143,25 @@ export async function recordHostSessions(
     }
   }
 
-  if (reportedSessionIds.length > 0) {
-    await env.DB.prepare(
-      `DELETE FROM host_sessions
-       WHERE connector_id = ?
-       AND session_id NOT IN (${reportedSessionIds.map(() => "?").join(", ")})`
-    )
-      .bind(connectorId, ...reportedSessionIds)
-      .run();
-  } else {
-    await env.DB.prepare(
-      `DELETE FROM host_sessions
+  const existingRows = await allRows<{ session_id: string }>(
+    env.DB.prepare(
+      `SELECT session_id
+       FROM host_sessions
        WHERE connector_id = ?`
     )
       .bind(connectorId)
+  );
+  const reportedSessionIdSet = new Set(reportedSessionIds);
+  const staleSessionIds = existingRows
+    .map((row) => row.session_id)
+    .filter((sessionId) => !reportedSessionIdSet.has(sessionId));
+  for (const staleChunk of chunks(staleSessionIds, 50)) {
+    await env.DB.prepare(
+      `DELETE FROM host_sessions
+       WHERE connector_id = ?
+       AND session_id IN (${staleChunk.map(() => "?").join(", ")})`
+    )
+      .bind(connectorId, ...staleChunk)
       .run();
   }
 
@@ -1008,6 +1013,14 @@ function finalTaskStateForEvent(kind: AgentCommandEvent["kind"]): TaskSummary["s
 async function allRows<T>(statement: D1PreparedStatement): Promise<T[]> {
   const result = await statement.all<T>();
   return result.results ?? [];
+}
+
+function chunks<T>(items: T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    result.push(items.slice(index, index + size));
+  }
+  return result;
 }
 
 function cryptoRandomId(): string {
