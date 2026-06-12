@@ -1,6 +1,7 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "allowImportingTsExtensions": true,
     "experimentalDecorators": true,
     "useDefineForClassFields": false,
     "types": ["vite/client"]

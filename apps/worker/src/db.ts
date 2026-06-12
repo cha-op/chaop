@@ -594,7 +594,7 @@ export async function recordAgentEvent(
   if (!env.DB) return undefined;
 
   const command = await env.DB.prepare(
-    `SELECT id, workspace_id, thread_id, task_id, target_connector_id
+    `SELECT id, workspace_id, thread_id, task_id, target_connector_id, lease_owner_connector_id, state
      FROM commands
      WHERE id = ?
      LIMIT 1`
@@ -606,22 +606,31 @@ export async function recordAgentEvent(
       thread_id: string | null;
       task_id: string | null;
       target_connector_id: string | null;
+      lease_owner_connector_id: string | null;
+      state: CommandSummary["state"];
     }>();
 
   if (!command) return undefined;
   if (command.target_connector_id && command.target_connector_id !== connectorId) return undefined;
+  if (command.lease_owner_connector_id !== connectorId) return undefined;
+  if (!isActiveCommandState(command.state)) return undefined;
 
   const now = new Date().toISOString();
   const nextState = commandStateForEvent(event.kind);
 
   if (nextState) {
-    await env.DB.prepare(
+    const result = await env.DB.prepare(
       `UPDATE commands
        SET state = ?, lease_owner_connector_id = ?, updated_at = ?
-       WHERE id = ?`
+       WHERE id = ?
+         AND lease_owner_connector_id = ?
+         AND state IN ('leased', 'running')`
     )
-      .bind(nextState, connectorId, now, command.id)
+      .bind(nextState, connectorId, now, command.id, connectorId)
       .run();
+    if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+      return undefined;
+    }
   }
 
   if (command.task_id) {
@@ -757,10 +766,12 @@ async function listThreads(env: Env): Promise<ThreadSummary[]> {
 async function listHostSessions(env: Env): Promise<HostSessionSummary[]> {
   const rows = await allRows<HostSessionRow>(
     env.DB!.prepare(
-      `SELECT id, connector_id, hostname, workspace_id, session_id, title, title_source,
-        cwd, updated_at, attached_task_id, attached_thread_id
-       FROM host_sessions
-       ORDER BY updated_at DESC
+      `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
+        hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
+       FROM host_sessions hs
+       INNER JOIN connectors c ON c.id = hs.connector_id
+       WHERE c.status <> 'offline'
+       ORDER BY hs.updated_at DESC
        LIMIT 200`
     )
   );
@@ -844,19 +855,21 @@ async function findHostSession(
 ): Promise<HostSessionSummary | undefined> {
   const statement = connectorId
     ? env.DB!.prepare(
-      `SELECT id, connector_id, hostname, workspace_id, session_id, title, title_source,
-        cwd, updated_at, attached_task_id, attached_thread_id
-       FROM host_sessions
-       WHERE session_id = ? AND connector_id = ?
-       ORDER BY updated_at DESC
+      `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
+        hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
+       FROM host_sessions hs
+       INNER JOIN connectors c ON c.id = hs.connector_id
+       WHERE hs.session_id = ? AND hs.connector_id = ? AND c.status <> 'offline'
+       ORDER BY hs.updated_at DESC
        LIMIT 1`
     ).bind(sessionId, connectorId)
     : env.DB!.prepare(
-      `SELECT id, connector_id, hostname, workspace_id, session_id, title, title_source,
-        cwd, updated_at, attached_task_id, attached_thread_id
-       FROM host_sessions
-       WHERE session_id = ?
-       ORDER BY updated_at DESC
+      `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
+        hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
+       FROM host_sessions hs
+       INNER JOIN connectors c ON c.id = hs.connector_id
+       WHERE hs.session_id = ? AND c.status <> 'offline'
+       ORDER BY hs.updated_at DESC
        LIMIT 1`
     ).bind(sessionId);
   const row = await statement.first<HostSessionRow>();
@@ -1041,6 +1054,10 @@ function commandStateForEvent(kind: AgentCommandEvent["kind"]): CommandSummary["
   if (kind === "command.finished") return "succeeded";
   if (kind === "command.failed") return "failed";
   return undefined;
+}
+
+function isActiveCommandState(state: CommandSummary["state"]): boolean {
+  return state === "leased" || state === "running";
 }
 
 function finalTaskStateForEvent(kind: AgentCommandEvent["kind"]): TaskSummary["state"] | undefined {

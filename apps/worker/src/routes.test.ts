@@ -622,6 +622,10 @@ function readOnlyBootstrapDb(): D1Database {
   return {
     prepare(sql: string) {
       assert.doesNotMatch(sql, /INSERT INTO users/);
+      if (/FROM host_sessions hs/.test(sql)) {
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
+        assert.match(sql, /c\.status <> 'offline'/);
+      }
       return {
         bind() {
           return this;
@@ -738,7 +742,9 @@ function hostSessionDetachDb(): D1Database {
 
   return {
     prepare(sql: string) {
-      if (/FROM host_sessions/.test(sql) && /WHERE session_id = \? AND connector_id = \?/.test(sql)) {
+      if (/FROM host_sessions hs/.test(sql) && /WHERE hs\.session_id = \? AND hs\.connector_id = \?/.test(sql)) {
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
+        assert.match(sql, /c\.status <> 'offline'/);
         return {
           bind(sessionId: string, connectorId: string) {
             assert.equal(sessionId, "session-1");

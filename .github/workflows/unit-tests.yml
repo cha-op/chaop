@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   unit-tests:
-    name: pnpm and Rust unit tests
+    name: pnpm, Rust unit tests, and build
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -44,3 +44,6 @@ jobs:
 
       - name: Run unit tests
         run: pnpm test
+
+      - name: Build all packages
+        run: pnpm build
