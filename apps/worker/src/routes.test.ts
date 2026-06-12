@@ -97,6 +97,38 @@ test("state-changing browser API reports missing Access coverage", async () => {
   assert.match(body.error, /covered by the Browser Access application/);
 });
 
+test("host session refresh dispatches to the workspace durable object", async () => {
+  let internalPath = "";
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/refresh", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL) => {
+            internalPath = new URL(String(input)).pathname;
+            return new Response(JSON.stringify({ dispatched_to: 2 }), {
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as { requested: boolean; dispatched_to: number };
+
+  assert.equal(response.status, 202);
+  assert.equal(body.requested, true);
+  assert.equal(body.dispatched_to, 2);
+  assert.equal(internalPath, "/internal/refresh-host-sessions");
+});
+
 test("CORS preflight returns configured browser headers", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/commands", {

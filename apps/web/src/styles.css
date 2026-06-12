@@ -187,6 +187,28 @@ main {
   margin-bottom: 16px;
 }
 
+.section-actions {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.host-sync-actions {
+  max-width: 100%;
+}
+
+.sync-meta,
+.sync-note {
+  color: #64748b;
+  font-size: 0.86rem;
+}
+
+.sync-note {
+  margin: -10px 0 18px;
+}
+
 h2 {
   margin: 0;
   font-size: 1.05rem;
@@ -377,6 +399,7 @@ h2 {
 }
 
 .task-actions button,
+.section-actions button,
 .session-row button {
   border: 1px solid #cbd5e1;
   border-radius: 7px;

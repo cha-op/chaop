@@ -6,13 +6,24 @@ import {
   type BootstrapPayload,
   type CommandSummary,
   type ConnectorSummary,
+  type HostSessionSyncSummary,
+  type HostSessionsUpdatePayload,
   type HostSessionSummary,
   type TaskState,
   type TaskSummary,
   type ThreadEvent,
   type ThreadSummary
 } from "@chaop/protocol";
-import { ApiError, archiveTask, attachHostSession, browserSocketUrl, createCommand, loadBootstrap, unarchiveTask } from "./api.js";
+import {
+  ApiError,
+  archiveTask,
+  attachHostSession,
+  browserSocketUrl,
+  createCommand,
+  loadBootstrap,
+  refreshHostSessions,
+  unarchiveTask
+} from "./api.js";
 
 type View = "operations-map" | "task-board" | "host-sessions" | "thread-centre" | "budget-board";
 type TaskBoardMode = "active" | "archive";
@@ -20,9 +31,7 @@ type RealtimeState = "connecting" | "live" | "polling";
 type RealtimeThreadEventPayload = {
   event: ThreadEvent;
 };
-type RealtimeHostSessionsPayload = {
-  host_sessions: HostSessionSummary[];
-};
+type RealtimeHostSessionsPayload = HostSessionsUpdatePayload;
 
 const FALLBACK_POLL_MS = 10_000;
 const SOCKET_RECONNECT_MS = 3_000;
@@ -64,11 +73,25 @@ export class ChaopApp extends LitElement {
   @state()
   private realtimeState: RealtimeState = "connecting";
 
+  @state()
+  private hostSessionsRefreshState: "idle" | "refreshing" | "failed" = "idle";
+
+  @state()
+  private hostSessionsRefreshSummary: string | undefined;
+
+  @state()
+  private hostSessionsRealtimeSyncedAt: string | undefined;
+
+  @state()
+  private clockNow = Date.now();
+
   private socket: WebSocket | undefined;
 
   private pollTimer: number | undefined;
 
   private reconnectTimer: number | undefined;
+
+  private clockTimer: number | undefined;
 
   override createRenderRoot(): HTMLElement {
     return this;
@@ -85,10 +108,14 @@ export class ChaopApp extends LitElement {
         this.connectRealtime();
       }
     });
+    this.clockTimer = window.setInterval(() => {
+      this.clockNow = Date.now();
+    }, 10_000);
   }
 
   override disconnectedCallback(): void {
     window.removeEventListener("hashchange", this.onHashChange);
+    window.clearInterval(this.clockTimer);
     this.disconnectRealtime();
     super.disconnectedCallback();
   }
@@ -323,7 +350,16 @@ export class ChaopApp extends LitElement {
         <section class="panel primary">
           <div class="section-heading">
             <h2>${thread.title}</h2>
-            <span class="chip ${thread.realtime_mode}">${formatMode(thread.realtime_mode)}</span>
+            <div class="section-actions">
+              ${task
+                ? html`
+                    <button type="button" @click=${() => void this.toggleTaskArchive(task)}>
+                      ${task.archived_at ? "Unarchive" : "Archive"}
+                    </button>
+                  `
+                : nothing}
+              <span class="chip ${thread.realtime_mode}">${formatMode(thread.realtime_mode)}</span>
+            </div>
           </div>
           <label class="command-box">
             <span>Command</span>
@@ -424,19 +460,33 @@ export class ChaopApp extends LitElement {
   private renderHostSessions() {
     const attached = this.data!.host_sessions.filter((session) => this.isActiveAttachedHostSession(session));
     const unattached = this.data!.host_sessions.filter((session) => !session.attached_thread_id);
+    const lastSyncedAt = this.hostSessionsLastSyncedAt();
 
     return html`
       <section class="page-grid sessions-grid">
         <section class="panel primary">
           <div class="section-heading">
             <h2>Unattached sessions</h2>
-            <span>${unattached.length} available</span>
+            <div class="section-actions host-sync-actions">
+              <button
+                type="button"
+                ?disabled=${this.hostSessionsRefreshState === "refreshing"}
+                @click=${this.refreshHostSessionInventory}
+              >
+                ${this.hostSessionsRefreshState === "refreshing" ? "Refreshing..." : "Refresh"}
+              </button>
+              <span class="sync-meta">${formatSyncStatus(lastSyncedAt, this.clockNow)}</span>
+              <span>${unattached.length} available</span>
+            </div>
           </div>
           <div class="session-list">
             ${unattached.length > 0
               ? unattached.map((session) => this.hostSessionRow(session))
               : html`<p class="muted">No unattached local Codex sessions reported by connectors.</p>`}
           </div>
+          ${this.hostSessionsRefreshSummary
+            ? html`<p class="sync-note">${this.hostSessionsRefreshSummary}</p>`
+            : nothing}
         </section>
         <aside class="panel">
           <div class="section-heading">
@@ -545,11 +595,10 @@ export class ChaopApp extends LitElement {
   private async toggleTaskArchive(task: TaskSummary): Promise<void> {
     this.actionError = undefined;
     try {
-      if (task.archived_at) {
-        await unarchiveTask(task.id);
-      } else {
-        await archiveTask(task.id);
-      }
+      const response = task.archived_at
+        ? await unarchiveTask(task.id)
+        : await archiveTask(task.id);
+      this.mergeArchivedTask(response.task);
       await this.load();
     } catch (error) {
       this.actionError = actionErrorMessage(task.archived_at ? "Unarchive failed" : "Archive failed", error);
@@ -567,6 +616,24 @@ export class ChaopApp extends LitElement {
     }
   }
 
+  private readonly refreshHostSessionInventory = async (): Promise<void> => {
+    this.actionError = undefined;
+    this.hostSessionsRefreshState = "refreshing";
+    this.hostSessionsRefreshSummary = undefined;
+    try {
+      const response = await refreshHostSessions();
+      this.hostSessionsRefreshSummary = refreshSummary(response.dispatched_to);
+      await this.load();
+      window.setTimeout(() => void this.load(), 1_200);
+      window.setTimeout(() => void this.load(), 2_500);
+      this.hostSessionsRefreshState = "idle";
+    } catch (error) {
+      this.hostSessionsRefreshState = "failed";
+      this.actionError = actionErrorMessage("Host session refresh failed", error);
+      await this.load().catch(() => undefined);
+    }
+  };
+
   private mergeAttachedSession(response: Awaited<ReturnType<typeof attachHostSession>>): void {
     if (!this.data) return;
     this.data = {
@@ -583,6 +650,26 @@ export class ChaopApp extends LitElement {
         response.thread,
         ...this.data.threads.filter((item) => item.id !== response.thread.id)
       ]
+    };
+  }
+
+  private mergeArchivedTask(task: TaskSummary): void {
+    if (!this.data) return;
+    this.data = {
+      ...this.data,
+      tasks: [
+        task,
+        ...this.data.tasks.filter((item) => item.id !== task.id)
+      ],
+      threads: this.data.threads.map((thread) =>
+        thread.id === task.thread_id
+          ? {
+              ...thread,
+              state: task.archived_at ? "archived" : task.state === "running" ? "active" : "idle",
+              updated_at: task.updated_at
+            }
+          : thread
+      )
     };
   }
 
@@ -619,6 +706,14 @@ export class ChaopApp extends LitElement {
       ? this.data?.tasks.find((item) => item.id === session.attached_task_id)
       : undefined;
     return !task?.archived_at;
+  }
+
+  private hostSessionsLastSyncedAt(): string | undefined {
+    const candidates = [
+      this.hostSessionsRealtimeSyncedAt,
+      ...(this.data?.host_session_syncs.map((sync) => sync.synced_at).filter(Boolean) ?? [])
+    ].filter((value): value is string => typeof value === "string" && value.length > 0);
+    return candidates.sort().at(-1);
   }
 
   private threadListItem(thread: ThreadSummary) {
@@ -706,7 +801,7 @@ export class ChaopApp extends LitElement {
       this.applyThreadEvent(envelope.payload.event);
     }
     if (envelope.kind === "host_sessions.updated" && isRealtimeHostSessionsPayload(envelope.payload)) {
-      this.applyHostSessions(envelope.payload.host_sessions);
+      this.applyHostSessions(envelope.payload);
     }
   }
 
@@ -741,14 +836,24 @@ export class ChaopApp extends LitElement {
     };
   }
 
-  private applyHostSessions(hostSessions: HostSessionSummary[]): void {
+  private applyHostSessions(payload: HostSessionsUpdatePayload): void {
     if (!this.data) return;
+    if (payload.synced_at) {
+      this.hostSessionsRealtimeSyncedAt = newerIso(this.hostSessionsRealtimeSyncedAt, payload.synced_at);
+      this.hostSessionsRefreshState = "idle";
+    }
+    const hostSessions = payload.host_sessions;
     const incomingIds = new Set(hostSessions.map((session) => session.id));
     this.data = {
       ...this.data,
       host_sessions: [
         ...hostSessions,
-        ...this.data.host_sessions.filter((session) => !incomingIds.has(session.id))
+        ...this.data.host_sessions.filter((session) => {
+          if (payload.snapshot && payload.connector_id && session.connector_id === payload.connector_id) {
+            return false;
+          }
+          return !incomingIds.has(session.id);
+        })
       ]
     };
   }
@@ -864,6 +969,38 @@ function titleSourceLabel(source: HostSessionSummary["title_source"]): string {
   }[source];
 }
 
+function refreshSummary(dispatchedTo: number): string {
+  if (dispatchedTo === 0) return "No online connector accepted the refresh request.";
+  if (dispatchedTo === 1) return "Refresh requested from 1 online connector.";
+  return `Refresh requested from ${dispatchedTo} online connectors.`;
+}
+
+function formatSyncStatus(iso: string | undefined, nowMs: number): string {
+  if (!iso) return "Last synced: never";
+  const syncedAt = new Date(iso);
+  if (Number.isNaN(syncedAt.getTime())) return "Last synced: unknown";
+  const timestamp = syncedAt.toLocaleString("en-GB", {
+    dateStyle: "medium",
+    timeStyle: "medium"
+  });
+  return `Last synced: ${timestamp} (${formatAge(nowMs - syncedAt.getTime())} ago)`;
+}
+
+function formatAge(ageMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ageMs / 1000));
+  if (totalSeconds < 5) return "just now";
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours < 24) return `${totalHours}h`;
+  return `${Math.floor(totalHours / 24)}d`;
+}
+
+function newerIso(current: string | undefined, incoming: string): string {
+  return current && current > incoming ? current : incoming;
+}
+
 function actionErrorMessage(prefix: string, error: unknown): string {
   if (error instanceof ApiError) {
     return `${prefix}: ${cleanApiErrorMessage(error.message)}`;
@@ -920,7 +1057,15 @@ function isRealtimeThreadEventPayload(value: unknown): value is RealtimeThreadEv
 function isRealtimeHostSessionsPayload(value: unknown): value is RealtimeHostSessionsPayload {
   if (typeof value !== "object" || value === null) return false;
   const hostSessions = (value as { host_sessions?: unknown }).host_sessions;
-  return Array.isArray(hostSessions);
+  const syncedAt = (value as { synced_at?: unknown }).synced_at;
+  const connectorId = (value as { connector_id?: unknown }).connector_id;
+  const snapshot = (value as { snapshot?: unknown }).snapshot;
+  return (
+    Array.isArray(hostSessions) &&
+    (syncedAt === undefined || typeof syncedAt === "string") &&
+    (connectorId === undefined || typeof connectorId === "string") &&
+    (snapshot === undefined || typeof snapshot === "boolean")
+  );
 }
 
 function mergeBootstrapPayload(current: BootstrapPayload | undefined, incoming: BootstrapPayload): BootstrapPayload {
@@ -931,7 +1076,8 @@ function mergeBootstrapPayload(current: BootstrapPayload | undefined, incoming: 
     tasks: mergeById(incoming.tasks, current.tasks, newerByUpdatedAt),
     running_commands: mergeById(incoming.running_commands, current.running_commands, newerByUpdatedAt),
     events: mergeById(incoming.events, current.events, newerByCreatedAt),
-    host_sessions: mergeById(incoming.host_sessions, current.host_sessions, newerByUpdatedAt)
+    host_sessions: mergeById(incoming.host_sessions, current.host_sessions, newerByUpdatedAt),
+    host_session_syncs: mergeHostSessionSyncs(incoming.host_session_syncs, current.host_session_syncs)
   };
 }
 
@@ -963,6 +1109,21 @@ function newerByUpdatedAt<T extends { updated_at: string }>(incoming: T, current
 
 function newerByCreatedAt<T extends { created_at: string }>(incoming: T, current: T): T {
   return current.created_at > incoming.created_at ? current : incoming;
+}
+
+function mergeHostSessionSyncs(
+  incoming: HostSessionSyncSummary[],
+  current: HostSessionSyncSummary[]
+): HostSessionSyncSummary[] {
+  const merged = new Map<string, HostSessionSyncSummary>();
+  for (const item of incoming) {
+    merged.set(item.connector_id, item);
+  }
+  for (const item of current) {
+    const existing = merged.get(item.connector_id);
+    merged.set(item.connector_id, existing && existing.synced_at > item.synced_at ? existing : item);
+  }
+  return Array.from(merged.values());
 }
 
 function budgetBar(label: string, value: number) {

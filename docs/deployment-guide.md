@@ -324,6 +324,7 @@ codex_output_max_bytes = 262144
 [session_inventory]
 enabled = true
 max_sessions = 100
+report_interval_seconds = 15
 app_server_timeout_seconds = 2
 # codex_home = "/Users/you/.codex"
 # app_server_url = "ws://127.0.0.1:9876"
@@ -352,7 +353,7 @@ Only add optional settings when the local Codex CLI needs them. `codex_exec` can
 Prompts are passed to Codex over stdin, not command-line arguments. Keep the timeout and output cap in place unless there is a specific operator reason to widen them.
 Use an absolute `codex_command` path for long-lived connectors launched by `launchctl` or another service manager. Those processes may not inherit the interactive shell `PATH`; if the executable cannot be found, Codex exec commands fail before any workspace `cwd` is used.
 
-Session inventory is enabled by default. The connector reads local Codex metadata from `CODEX_HOME` or `~/.codex`, reports session id, title, cwd, update time, and title source, and does not upload rollout transcripts. Title resolution prefers metadata or rollout titles, then optional app-server `Thread.name`, then the first local history prompt, and finally a cwd/session-id fallback. Set `app_server_url` only if you already run `codex app-server` with a local WebSocket listener and want Chaop to use app-server titles. Keep `app_server_timeout_seconds` short so a stopped app-server cannot block connector startup.
+Session inventory is enabled by default. The connector reads local Codex metadata from `CODEX_HOME` or `~/.codex`, reports session id, title, cwd, update time, and title source, and does not upload rollout transcripts. Title resolution prefers metadata or rollout titles, then optional app-server `Thread.name`, then the first local history prompt, and finally a cwd/session-id fallback. Set `app_server_url` only if you already run `codex app-server` with a local WebSocket listener and want Chaop to use app-server titles. Keep `app_server_timeout_seconds` short so a stopped app-server cannot block connector startup. `report_interval_seconds` controls the periodic local rescan interval; the connector only sends the periodic report when the inventory changes. The Host Sessions refresh button asks online connectors to rescan and report immediately.
 
 Create local files outside the repository:
 
@@ -408,7 +409,7 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether `/connector/bootstrap` and `/ws/agent` are excluded from Browser Access.
 - If Codex exec returns `Codex executable not found`, set `execution.codex_command` to an absolute path that the connector process can execute, for example `/opt/homebrew/bin/codex` on this macOS deployment. This is separate from the attached session `cwd`.
 - If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
-- If Host Sessions is empty, check that the connector was restarted after this slice, `session_inventory.enabled` is true, and the connector user can read `CODEX_HOME` or `~/.codex`.
+- If Host Sessions is empty or stale, use the Host Sessions refresh button, wait up to `session_inventory.report_interval_seconds`, check that the connector was restarted after this slice, `session_inventory.enabled` is true, and the connector user can read `CODEX_HOME` or `~/.codex`.
 - If an attached historical Host Session shows only a few events, that is expected in the current slice: attachment imports session metadata and title only. Historical rollout/transcript backfill and full artefact capture are deferred.
 - If D1 migration fails, confirm the D1 database UUID is present in the Worker config.
 - If R2 writes fail, confirm the bucket exists and the Worker binding name matches the implementation.

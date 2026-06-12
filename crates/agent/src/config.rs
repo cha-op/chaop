@@ -50,6 +50,8 @@ pub struct SessionInventoryConfig {
     pub codex_home: Option<PathBuf>,
     #[serde(default = "default_session_inventory_max_sessions")]
     pub max_sessions: usize,
+    #[serde(default = "default_session_inventory_report_interval_seconds")]
+    pub report_interval_seconds: u64,
     #[serde(default)]
     pub app_server_url: Option<String>,
     #[serde(default = "default_app_server_timeout_seconds")]
@@ -77,6 +79,7 @@ impl Default for SessionInventoryConfig {
             enabled: default_session_inventory_enabled(),
             codex_home: None,
             max_sessions: default_session_inventory_max_sessions(),
+            report_interval_seconds: default_session_inventory_report_interval_seconds(),
             app_server_url: None,
             app_server_timeout_seconds: default_app_server_timeout_seconds(),
         }
@@ -157,6 +160,10 @@ fn default_session_inventory_enabled() -> bool {
 
 fn default_session_inventory_max_sessions() -> usize {
     100
+}
+
+fn default_session_inventory_report_interval_seconds() -> u64 {
+    15
 }
 
 fn default_app_server_timeout_seconds() -> u64 {

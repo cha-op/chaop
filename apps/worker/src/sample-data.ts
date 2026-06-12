@@ -3,6 +3,7 @@ import type {
   BudgetSummary,
   ConnectorSummary,
   HostSessionSummary,
+  HostSessionSyncSummary,
   TaskCategory,
   TaskSummary,
   ThreadEvent,
@@ -164,6 +165,15 @@ export const hostSessions: HostSessionSummary[] = [
   }
 ];
 
+export const hostSessionSyncs: HostSessionSyncSummary[] = [
+  {
+    connector_id: "connector-mac-studio",
+    synced_at: "2026-06-09T21:58:05.000Z",
+    reported_session_count: 2,
+    stored_session_count: 2
+  }
+];
+
 export const budget: BudgetSummary = {
   state: "conservative",
   daily_used_pct: 75,
@@ -209,6 +219,7 @@ export function sampleBootstrap(email = "operator@example.com"): BootstrapPayloa
     threads,
     tasks,
     host_sessions: hostSessions,
+    host_session_syncs: hostSessionSyncs,
     task_categories: taskCategories,
     running_commands: [],
     events,

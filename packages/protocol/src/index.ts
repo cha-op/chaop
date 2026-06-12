@@ -148,6 +148,26 @@ export type HostSessionSummary = {
   attached_thread_id?: string | undefined;
 };
 
+export type HostSessionsUpdatePayload = {
+  host_sessions: HostSessionSummary[];
+  connector_id?: string | undefined;
+  synced_at?: string | undefined;
+  snapshot?: boolean | undefined;
+};
+
+export type HostSessionSyncSummary = {
+  connector_id: string;
+  synced_at: string;
+  reported_session_count: number;
+  stored_session_count: number;
+};
+
+export type RefreshHostSessionsResponse = {
+  requested: true;
+  dispatched_to: number;
+  server_time: string;
+};
+
 export type CommandSummary = {
   id: string;
   workspace_id: string;
@@ -207,6 +227,7 @@ export type BootstrapPayload = {
   threads: ThreadSummary[];
   tasks: TaskSummary[];
   host_sessions: HostSessionSummary[];
+  host_session_syncs: HostSessionSyncSummary[];
   task_categories: TaskCategory[];
   running_commands: CommandSummary[];
   events: ThreadEvent[];

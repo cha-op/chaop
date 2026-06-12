@@ -42,6 +42,9 @@ superseded_by:
 - Historical Host Session attachment still imports metadata/title only. Full transcript or rollout event backfill is deferred to a later slice.
 - Codex exec diagnostics now distinguish a missing Codex executable from workspace `cwd` failures, and deployment docs recommend an absolute `execution.codex_command` for service-managed connectors.
 - Thread Centre now merges bootstrap/polling payloads with local realtime state so older bootstrap snapshots do not drop already-received events. Empty attached threads show an empty timeline instead of placeholder lifecycle rows.
+- Thread Centre now exposes the same archive/unarchive action as Task Board for the selected task/thread.
+- Host Sessions now has a manual refresh button, `Last synced` timestamp, and age display. The refresh request asks online connectors to rescan immediately, then reloads the control-plane snapshot.
+- The connector now periodically rescans local Codex sessions using `session_inventory.report_interval_seconds` and only sends the periodic inventory report when the serialized inventory changes. Worker and Web now treat each connector inventory as a connector-scoped snapshot so removed local sessions do not linger as attachable rows.
 
 ## Next Steps
-- Re-test attach after the Cloudflare Access destination covers `/api/*`, `/ws/browser`, and the GUI hostname.
+- Add an explicit new Codex thread flow so Chaop can create a local Codex/app-server thread instead of only attaching existing sessions.

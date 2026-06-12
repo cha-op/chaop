@@ -1,17 +1,19 @@
 use crate::config::{AgentConfig, ExecutionMode};
 use crate::executor::{codex_exec_result_events, codex_exec_started_event};
-use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
+use crate::placeholder::ConnectorEvent;
 use crate::session_inventory::build_host_sessions_report;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
+use std::io::ErrorKind;
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
-use tungstenite::{Message, connect};
+use tungstenite::{connect, Error as WebSocketError, Message};
 
 type AgentSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
+const CONNECTOR_READ_TICK_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -62,21 +64,44 @@ pub fn run_connector(
 
     let (mut socket, _) = connect(request)?;
     configure_socket(&mut socket)?;
+    set_socket_read_timeout(&mut socket, Some(connector_read_tick()))?;
     socket.send(Message::Text(
         json!({ "kind": "agent.ready" }).to_string().into(),
     ))?;
-    send_host_sessions(&mut socket, config)?;
+    let mut last_host_sessions_message = None;
+    send_host_sessions(&mut socket, config, &mut last_host_sessions_message, true)?;
+    let mut next_host_sessions_at = Instant::now() + host_sessions_interval(config);
 
     loop {
-        let message = socket.read()?;
+        let message = match socket.read() {
+            Ok(message) => message,
+            Err(error) if is_read_timeout(&error) => {
+                if Instant::now() >= next_host_sessions_at {
+                    send_host_sessions(
+                        &mut socket,
+                        config,
+                        &mut last_host_sessions_message,
+                        false,
+                    )?;
+                    next_host_sessions_at = Instant::now() + host_sessions_interval(config);
+                }
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         match message {
             Message::Text(text) => {
-                if handle_text_message(&mut socket, text.as_ref(), config)?
-                    && run_mode == RunMode::Once
+                if handle_text_message(
+                    &mut socket,
+                    text.as_ref(),
+                    config,
+                    &mut last_host_sessions_message,
+                )? && run_mode == RunMode::Once
                 {
                     socket.close(None)?;
                     return Ok(());
                 }
+                set_socket_read_timeout(&mut socket, Some(connector_read_tick()))?;
             }
             Message::Ping(payload) => socket.send(Message::Pong(payload))?,
             Message::Close(_) => return Ok(()),
@@ -88,27 +113,45 @@ pub fn run_connector(
 fn send_host_sessions(
     socket: &mut AgentSocket,
     config: &AgentConfig,
+    last_sent: &mut Option<String>,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Ok(report) = build_host_sessions_report(config) else {
+    let Some(message) = host_sessions_message(config) else {
         return Ok(());
     };
-    socket.send(Message::Text(
+    if !force && last_sent.as_deref() == Some(message.as_str()) {
+        return Ok(());
+    }
+    socket.send(Message::Text(message.clone().into()))?;
+    *last_sent = Some(message);
+    Ok(())
+}
+
+fn host_sessions_message(config: &AgentConfig) -> Option<String> {
+    let Ok(report) = build_host_sessions_report(config) else {
+        return None;
+    };
+    Some(
         json!({
             "kind": "agent.host_sessions",
             "payload": report
         })
-        .to_string()
-        .into(),
-    ))?;
-    Ok(())
+        .to_string(),
+    )
 }
 
 fn handle_text_message(
     socket: &mut AgentSocket,
     text: &str,
     config: &AgentConfig,
+    last_host_sessions_message: &mut Option<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
+    if envelope.kind == "host_sessions.refresh" {
+        send_host_sessions(socket, config, last_host_sessions_message, true)?;
+        return Ok(false);
+    }
+
     if envelope.kind != "command.dispatch" {
         return Ok(false);
     }
@@ -121,17 +164,31 @@ fn handle_text_message(
             socket,
             &dispatch.command,
             vec![codex_exec_started_event(&config.workspace_root)],
+            config,
+            last_host_sessions_message,
         )?;
         let events = codex_exec_result_events(
             &config.execution,
             &config.workspace_root,
             &dispatch.command.prompt,
         );
-        dispatch_events(socket, &dispatch.command, events)?;
+        dispatch_events(
+            socket,
+            &dispatch.command,
+            events,
+            config,
+            last_host_sessions_message,
+        )?;
         return Ok(true);
     }
 
-    dispatch_events(socket, &dispatch.command, command_events(&dispatch.command))?;
+    dispatch_events(
+        socket,
+        &dispatch.command,
+        command_events(&dispatch.command),
+        config,
+        last_host_sessions_message,
+    )?;
     Ok(true)
 }
 
@@ -158,6 +215,8 @@ fn dispatch_events(
     socket: &mut AgentSocket,
     command: &CommandPayload,
     events: Vec<ConnectorEvent>,
+    config: &AgentConfig,
+    last_host_sessions_message: &mut Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for event in events {
         if event.kind == "command.accepted" {
@@ -176,7 +235,13 @@ fn dispatch_events(
             .to_string()
             .into(),
         ))?;
-        wait_for_ack(socket, &command.id, &event.kind)?;
+        wait_for_ack(
+            socket,
+            &command.id,
+            &event.kind,
+            config,
+            last_host_sessions_message,
+        )?;
     }
     Ok(())
 }
@@ -193,16 +258,38 @@ fn configure_socket(socket: &mut AgentSocket) -> std::io::Result<()> {
     }
 }
 
+fn connector_read_tick() -> Duration {
+    Duration::from_secs(CONNECTOR_READ_TICK_SECONDS)
+}
+
+fn host_sessions_interval(config: &AgentConfig) -> Duration {
+    Duration::from_secs(config.session_inventory.report_interval_seconds.max(1))
+}
+
+fn is_read_timeout(error: &WebSocketError) -> bool {
+    matches!(
+        error,
+        WebSocketError::Io(io_error)
+            if io_error.kind() == ErrorKind::WouldBlock || io_error.kind() == ErrorKind::TimedOut
+    )
+}
+
 fn wait_for_ack(
     socket: &mut AgentSocket,
     command_id: &str,
     event_kind: &str,
+    config: &AgentConfig,
+    last_host_sessions_message: &mut Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     set_socket_read_timeout(socket, Some(Duration::from_secs(10)))?;
     loop {
         match socket.read()? {
             Message::Text(text) => {
                 let envelope: Envelope = serde_json::from_str(text.as_ref())?;
+                if envelope.kind == "host_sessions.refresh" {
+                    send_host_sessions(socket, config, last_host_sessions_message, true)?;
+                    continue;
+                }
                 if envelope.kind == "server.ack"
                     && envelope
                         .payload
@@ -244,7 +331,13 @@ fn set_socket_read_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandPayload, CommandType, command_events};
+    use super::{
+        command_events, host_sessions_interval, is_read_timeout, CommandPayload, CommandType,
+    };
+    use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
+    use std::io::{self, ErrorKind};
+    use std::time::Duration;
+    use tungstenite::Error as WebSocketError;
 
     #[test]
     fn placeholder_commands_use_placeholder_stream() {
@@ -287,5 +380,44 @@ mod tests {
             events.last().map(|event| event.summary.as_str()),
             Some("Codex exec is disabled in this connector config.")
         );
+    }
+
+    #[test]
+    fn host_sessions_interval_uses_configured_seconds_with_floor() {
+        let mut config = test_config();
+        config.session_inventory.report_interval_seconds = 0;
+        assert_eq!(host_sessions_interval(&config), Duration::from_secs(1));
+
+        config.session_inventory.report_interval_seconds = 7;
+        assert_eq!(host_sessions_interval(&config), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn recognises_socket_read_timeouts() {
+        assert!(is_read_timeout(&WebSocketError::Io(io::Error::from(
+            ErrorKind::TimedOut
+        ))));
+        assert!(is_read_timeout(&WebSocketError::Io(io::Error::from(
+            ErrorKind::WouldBlock
+        ))));
+        assert!(!is_read_timeout(&WebSocketError::Io(io::Error::from(
+            ErrorKind::NotFound
+        ))));
+    }
+
+    fn test_config() -> AgentConfig {
+        AgentConfig {
+            connector_name: "mac-studio".to_owned(),
+            control_url: "wss://api.example.com/ws/agent".to_owned(),
+            bootstrap_url: "https://api.example.com/connector/bootstrap".to_owned(),
+            workspace_root: "/Users/you/Program".into(),
+            token_file: "/Users/you/.chaop/connector.token".into(),
+            spool_db: "/Users/you/.chaop/connector-spool.sqlite".into(),
+            bootstrap: BootstrapConfig {
+                secret_file: "/Users/you/.chaop/bootstrap.secret".into(),
+            },
+            execution: ExecutionConfig::default(),
+            session_inventory: SessionInventoryConfig::default(),
+        }
     }
 }

@@ -42,6 +42,9 @@ superseded_by:
 - 历史 Host Session attachment 目前仍只导入 metadata/title。完整 transcript 或 rollout event backfill 留到后续切片。
 - Codex exec 诊断现在会把缺少 Codex executable 和 workspace `cwd` 失败区分开；部署文档也建议 service-managed connector 使用绝对 `execution.codex_command`。
 - Thread Centre 现在会把 bootstrap/polling payload 与本地 realtime state 合并，避免较旧 bootstrap snapshot 覆盖已经收到的 events。空 attached thread 会显示空 timeline，不再显示 placeholder lifecycle rows。
+- Thread Centre 现在也提供和 Task Board 一致的 archive/unarchive 操作，用于当前选中的 task/thread。
+- Host Sessions 现在有手动 refresh 按钮、`Last synced` timestamp 和 age 显示。Refresh 请求会让在线 connectors 立即重扫，然后重新读取 control-plane snapshot。
+- Connector 现在会按 `session_inventory.report_interval_seconds` 周期性重扫本机 Codex sessions，并且周期路径只有在序列化后的 inventory 发生变化时才会上报。Worker 和 Web 现在会把每次 connector inventory 当成该 connector 范围内的 snapshot，避免已移除的本机 sessions 继续作为可 attach rows 残留。
 
 ## 下一步
-- Cloudflare Access destination 覆盖 `/api/*`、`/ws/browser` 和 GUI hostname 后，重新测试 attach。
+- 增加明确的新建 Codex thread 流程，让 Chaop 可以创建本机 Codex/app-server thread，而不只是 attach 已存在的 sessions。

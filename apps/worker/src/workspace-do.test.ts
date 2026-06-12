@@ -29,25 +29,38 @@ test("threadEventMessage wraps agent events for browser realtime consumers", () 
 });
 
 test("hostSessionsMessage wraps connector inventory updates for browser consumers", () => {
-  const message = hostSessionsMessage([
-    {
-      id: "host-session-1",
-      connector_id: "connector-1",
-      hostname: "mac-studio.local",
-      workspace_id: "workspace-api",
-      session_id: "session-1",
-      title: "Metadata title",
-      title_source: "metadata",
-      cwd: "/Users/you/Program/project",
-      updated_at: "2026-06-11T10:00:00.000Z"
-    }
-  ]);
+  const message = hostSessionsMessage({
+    connector_id: "connector-1",
+    synced_at: "2026-06-11T10:00:05.000Z",
+    snapshot: true,
+    host_sessions: [
+      {
+        id: "host-session-1",
+        connector_id: "connector-1",
+        hostname: "mac-studio.local",
+        workspace_id: "workspace-api",
+        session_id: "session-1",
+        title: "Metadata title",
+        title_source: "metadata",
+        cwd: "/Users/you/Program/project",
+        updated_at: "2026-06-11T10:00:00.000Z"
+      }
+    ]
+  });
   const envelope = JSON.parse(message) as {
     kind: string;
-    payload?: { host_sessions?: Array<{ session_id?: string; title_source?: string }> };
+    payload?: {
+      host_sessions?: Array<{ session_id?: string; title_source?: string }>;
+      connector_id?: string;
+      synced_at?: string;
+      snapshot?: boolean;
+    };
   };
 
   assert.equal(envelope.kind, "host_sessions.updated");
+  assert.equal(envelope.payload?.connector_id, "connector-1");
+  assert.equal(envelope.payload?.synced_at, "2026-06-11T10:00:05.000Z");
+  assert.equal(envelope.payload?.snapshot, true);
   assert.equal(envelope.payload?.host_sessions?.[0]?.session_id, "session-1");
   assert.equal(envelope.payload?.host_sessions?.[0]?.title_source, "metadata");
 });

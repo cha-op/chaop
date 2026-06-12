@@ -3,7 +3,7 @@ import {
   type AgentCommandEvent,
   type AgentHostSessionsReport,
   type CommandDispatch,
-  type HostSessionSummary,
+  type HostSessionsUpdatePayload,
   type ThreadEvent
 } from "@chaop/protocol";
 import { pendingCommandsForConnector, recordAgentEvent, recordHostSessions } from "./db.js";
@@ -19,6 +19,10 @@ export class WorkspaceDO implements DurableObject {
     const url = new URL(request.url);
     if (url.pathname === "/internal/dispatch-pending") {
       return this.dispatchPending(request);
+    }
+
+    if (url.pathname === "/internal/refresh-host-sessions") {
+      return this.refreshHostSessions();
     }
 
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -101,18 +105,22 @@ export class WorkspaceDO implements DurableObject {
     }
 
     if (message.kind === "agent.host_sessions" && isAgentHostSessionsReport(message.payload)) {
-      const hostSessions = await recordHostSessions(this.env, connectorId, message.payload);
+      const result = await recordHostSessions(this.env, connectorId, message.payload);
       ws.send(
         JSON.stringify(
           createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
             kind: "agent.host_sessions",
-            count: hostSessions.length
+            count: result.host_sessions.length,
+            synced_at: result.synced_at
           })
         )
       );
-      if (hostSessions.length > 0) {
-        this.broadcastToBrowsers(hostSessionsMessage(hostSessions));
-      }
+      this.broadcastToBrowsers(hostSessionsMessage({
+        host_sessions: result.host_sessions,
+        connector_id: connectorId,
+        synced_at: result.synced_at,
+        snapshot: true
+      }));
       return;
     }
 
@@ -144,6 +152,20 @@ export class WorkspaceDO implements DurableObject {
     }
   }
 
+  private refreshHostSessions(): Response {
+    const sockets = this.ctx.getWebSockets("agent");
+    for (const socket of sockets) {
+      socket.send(
+        JSON.stringify(
+          createEnvelope("host_sessions.refresh", { type: "worker", id: "workspace-do-global" }, {})
+        )
+      );
+    }
+    return new Response(JSON.stringify({ dispatched_to: sockets.length }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }
+
   private async sendPendingCommands(ws: WebSocket, connectorId: string): Promise<void> {
     const commands = await pendingCommandsForConnector(this.env, connectorId);
     for (const command of commands) {
@@ -171,9 +193,9 @@ export function threadEventMessage(event: ThreadEvent): string {
   );
 }
 
-export function hostSessionsMessage(hostSessions: HostSessionSummary[]): string {
+export function hostSessionsMessage(payload: HostSessionsUpdatePayload): string {
   return JSON.stringify(
-    createEnvelope("host_sessions.updated", { type: "worker", id: "workspace-do-global" }, { host_sessions: hostSessions })
+    createEnvelope("host_sessions.updated", { type: "worker", id: "workspace-do-global" }, payload)
   );
 }
 

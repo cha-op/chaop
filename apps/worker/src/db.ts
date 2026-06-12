@@ -9,6 +9,7 @@ import type {
   CreateCommandRequest,
   CreateCommandResponse,
   HostSessionSummary,
+  HostSessionSyncSummary,
   TaskCategory,
   TaskSummary,
   ThreadEvent,
@@ -44,6 +45,7 @@ export async function loadBootstrapFromDb(
     workspaces,
     threads,
     hostSessions,
+    hostSessionSyncs,
     categories,
     tasks,
     runningCommands,
@@ -53,6 +55,7 @@ export async function loadBootstrapFromDb(
     listWorkspaces(env),
     listThreads(env),
     listHostSessions(env),
+    listHostSessionSyncs(env),
     listTaskCategories(env),
     listTasks(env),
     listRecentCommands(env),
@@ -65,6 +68,7 @@ export async function loadBootstrapFromDb(
     workspaces,
     threads,
     host_sessions: hostSessions,
+    host_session_syncs: hostSessionSyncs,
     task_categories: categories,
     tasks,
     running_commands: runningCommands,
@@ -77,9 +81,10 @@ export async function loadBootstrapFromDb(
 export async function recordHostSessions(
   env: Env,
   connectorId: string,
-  report: AgentHostSessionsReport
-): Promise<HostSessionSummary[]> {
-  if (!env.DB) return [];
+  report: AgentHostSessionsReport,
+  syncedAt = new Date().toISOString()
+): Promise<{ host_sessions: HostSessionSummary[]; synced_at: string }> {
+  if (!env.DB) return { host_sessions: [], synced_at: syncedAt };
 
   const connector = await env.DB.prepare(
     `SELECT hostname
@@ -89,7 +94,7 @@ export async function recordHostSessions(
   )
     .bind(connectorId)
     .first<{ hostname: string }>();
-  if (!connector) return [];
+  if (!connector) return { host_sessions: [], synced_at: syncedAt };
 
   const workspace = await env.DB.prepare(
     `SELECT workspace_id
@@ -101,8 +106,8 @@ export async function recordHostSessions(
     .bind(connectorId)
     .first<{ workspace_id: string }>();
   const workspaceId = workspace?.workspace_id ?? DEFAULT_WORKSPACE_ID;
-  const now = new Date().toISOString();
   const upserted: HostSessionSummary[] = [];
+  const reportedSessionIds = report.sessions.slice(0, 200).map((session) => session.session_id);
 
   for (const session of report.sessions.slice(0, 200)) {
     const id = hostSessionId(connectorId, session.session_id);
@@ -128,7 +133,7 @@ export async function recordHostSessions(
         session.title,
         session.title_source,
         session.cwd ?? null,
-        now,
+        syncedAt,
         session.updated_at
       )
       .run();
@@ -138,15 +143,44 @@ export async function recordHostSessions(
     }
   }
 
+  if (reportedSessionIds.length > 0) {
+    await env.DB.prepare(
+      `DELETE FROM host_sessions
+       WHERE connector_id = ?
+       AND session_id NOT IN (${reportedSessionIds.map(() => "?").join(", ")})`
+    )
+      .bind(connectorId, ...reportedSessionIds)
+      .run();
+  } else {
+    await env.DB.prepare(
+      `DELETE FROM host_sessions
+       WHERE connector_id = ?`
+    )
+      .bind(connectorId)
+      .run();
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO host_session_syncs (
+       connector_id, synced_at, reported_session_count, stored_session_count
+     ) VALUES (?, ?, ?, ?)
+     ON CONFLICT(connector_id) DO UPDATE SET
+       synced_at = excluded.synced_at,
+       reported_session_count = excluded.reported_session_count,
+       stored_session_count = excluded.stored_session_count`
+  )
+    .bind(connectorId, syncedAt, report.sessions.length, upserted.length)
+    .run();
+
   await env.DB.prepare(
     `UPDATE connectors
      SET last_seen_at = ?, updated_at = ?
      WHERE id = ?`
   )
-    .bind(now, now, connectorId)
+    .bind(syncedAt, syncedAt, connectorId)
     .run();
 
-  return upserted;
+  return { host_sessions: upserted, synced_at: syncedAt };
 }
 
 export async function archiveTaskInDb(env: Env, taskId: string): Promise<TaskSummary> {
@@ -688,6 +722,16 @@ async function listHostSessions(env: Env): Promise<HostSessionSummary[]> {
     )
   );
   return rows.map(hostSessionFromRow);
+}
+
+async function listHostSessionSyncs(env: Env): Promise<HostSessionSyncSummary[]> {
+  return allRows<HostSessionSyncSummary>(
+    env.DB!.prepare(
+      `SELECT connector_id, synced_at, reported_session_count, stored_session_count
+       FROM host_session_syncs
+       ORDER BY synced_at DESC`
+    )
+  );
 }
 
 async function listTaskCategories(env: Env): Promise<TaskCategory[]> {

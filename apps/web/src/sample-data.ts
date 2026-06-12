@@ -140,6 +140,14 @@ export function fallbackBootstrap(): BootstrapPayload {
         updated_at: "2026-06-09T20:18:00.000Z"
       }
     ],
+    host_session_syncs: [
+      {
+        connector_id: "connector-mac-studio",
+        synced_at: "2026-06-09T21:58:05.000Z",
+        reported_session_count: 2,
+        stored_session_count: 2
+      }
+    ],
     task_categories: [
       { id: "release", name: "Release", colour: "#2563eb" },
       { id: "incident", name: "Incident", colour: "#dc2626" },

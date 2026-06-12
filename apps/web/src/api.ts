@@ -4,6 +4,7 @@ import type {
   BootstrapPayload,
   CreateCommandRequest,
   CreateCommandResponse,
+  RefreshHostSessionsResponse,
   TaskSummary
 } from "@chaop/protocol";
 import { fallbackBootstrap } from "./sample-data.js";
@@ -67,6 +68,10 @@ export async function attachHostSession(
   request: AttachHostSessionRequest
 ): Promise<AttachHostSessionResponse> {
   return postJson(`/api/host-sessions/${encodeURIComponent(sessionId)}/attach`, request);
+}
+
+export async function refreshHostSessions(): Promise<RefreshHostSessionsResponse> {
+  return postJson("/api/host-sessions/refresh", {});
 }
 
 export function browserSocketUrl(): string {

@@ -4,7 +4,8 @@ import {
   type AgentBootstrapRequest,
   type AgentBootstrapResponse,
   type CreateCommandRequest,
-  type CreateCommandResponse
+  type CreateCommandResponse,
+  type RefreshHostSessionsResponse
 } from "@chaop/protocol";
 import {
   authenticateAgentBootstrap,
@@ -155,6 +156,22 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
       throw error;
     }
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/host-sessions/refresh") {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.WORKSPACE_DO) return json(request, env, { error: "Workspace Durable Object binding is unavailable" }, 503);
+
+    const dispatchedTo = await requestHostSessionRefresh(env);
+    const response: RefreshHostSessionsResponse = {
+      requested: true,
+      dispatched_to: dispatchedTo,
+      server_time: new Date().toISOString()
+    };
+    return json(request, env, response, 202);
   }
 
   const attachHostSessionMatch = url.pathname.match(/^\/api\/host-sessions\/([^/]+)\/attach$/);
@@ -334,6 +351,18 @@ async function dispatchPendingCommand(env: Env, connectorId: string): Promise<vo
     method: "POST",
     body: JSON.stringify({ connector_id: connectorId })
   });
+}
+
+async function requestHostSessionRefresh(env: Env): Promise<number> {
+  if (!env.WORKSPACE_DO) return 0;
+
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  const response = await stub.fetch("https://workspace-do/internal/refresh-host-sessions", {
+    method: "POST"
+  });
+  const body = await response.json().catch(() => ({})) as { dispatched_to?: unknown };
+  return typeof body.dispatched_to === "number" ? body.dispatched_to : 0;
 }
 
 async function readJson(

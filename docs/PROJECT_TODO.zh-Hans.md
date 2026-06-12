@@ -9,4 +9,5 @@
 - [done] 使用私有 Cloudflare 配置、Access service-token auth 和第一台本地 connector 跑通 deployed placeholder E2E smoke。
 - [done] 在私有 connector 配置后面加入 opt-in 本机 Codex CLI command execution。
 - [done] 加入 task archive、Host Sessions attach，以及 Thread Centre 的真实 thread selection。
+- [todo] 增加明确的“新建 Codex thread”流程，让 Chaop 可以创建本机 Codex/app-server thread，而不只是 attach 已存在的本机 sessions。
 - [pending] 将 Codex CLI adapter 替换为真实 Codex app-server protocol execution。
