@@ -12,7 +12,7 @@ import {
   type ThreadEvent,
   type ThreadSummary
 } from "@chaop/protocol";
-import { archiveTask, attachHostSession, browserSocketUrl, createCommand, loadBootstrap, unarchiveTask } from "./api.js";
+import { ApiError, archiveTask, attachHostSession, browserSocketUrl, createCommand, loadBootstrap, unarchiveTask } from "./api.js";
 
 type View = "operations-map" | "task-board" | "host-sessions" | "thread-centre" | "budget-board";
 type TaskBoardMode = "active" | "archive";
@@ -125,6 +125,7 @@ export class ChaopApp extends LitElement {
         </aside>
         <main>
           ${this.renderTopBar()}
+          ${this.actionError ? html`<div class="action-alert" role="alert">${this.actionError}</div>` : nothing}
           ${this.view === "operations-map" ? this.renderOperationsMap() : nothing}
           ${this.view === "task-board" ? this.renderTaskBoard() : nothing}
           ${this.view === "host-sessions" ? this.renderHostSessions() : nothing}
@@ -165,7 +166,6 @@ export class ChaopApp extends LitElement {
           <span>${viewQuestion(this.view)}</span>
         </div>
         <div class="topbar-status">
-          ${this.actionError ? html`<span class="chip hard_limited">${this.actionError}</span>` : nothing}
           <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
           <span class="chip ${budget.state}">4h ${budget.four_hour_used_pct}%</span>
           <span class="chip ${budget.state}">Day ${budget.daily_used_pct}%</span>
@@ -469,6 +469,7 @@ export class ChaopApp extends LitElement {
       >
         <div>
           <strong>${session.title}</strong>
+          <code class="session-id" title=${session.session_id}>${session.session_id}</code>
           <span>${session.hostname} · ${session.cwd ?? "Unknown cwd"}</span>
         </div>
         <span class="chip ${session.title_source}">${titleSourceLabel(session.title_source)}</span>
@@ -542,9 +543,9 @@ export class ChaopApp extends LitElement {
       this.upsertCommand(response.command);
       this.commandState = "accepted";
       await this.load();
-    } catch {
+    } catch (error) {
       this.commandState = "failed";
-      this.actionError = "Command failed";
+      this.actionError = actionErrorMessage("Command failed", error);
     }
   };
 
@@ -557,8 +558,8 @@ export class ChaopApp extends LitElement {
         await archiveTask(task.id);
       }
       await this.load();
-    } catch {
-      this.actionError = task.archived_at ? "Unarchive failed" : "Archive failed";
+    } catch (error) {
+      this.actionError = actionErrorMessage(task.archived_at ? "Unarchive failed" : "Archive failed", error);
     }
   }
 
@@ -568,8 +569,8 @@ export class ChaopApp extends LitElement {
       const response = await attachHostSession(session.session_id, { connector_id: session.connector_id });
       this.mergeAttachedSession(response);
       this.openThread(response.thread.id);
-    } catch {
-      this.actionError = "Attach failed";
+    } catch (error) {
+      this.actionError = actionErrorMessage("Attach failed", error);
     }
   }
 
@@ -858,6 +859,20 @@ function titleSourceLabel(source: HostSessionSummary["title_source"]): string {
     history: "History",
     fallback: "Fallback"
   }[source];
+}
+
+function actionErrorMessage(prefix: string, error: unknown): string {
+  if (error instanceof ApiError) {
+    return `${prefix}: ${cleanApiErrorMessage(error.message)}`;
+  }
+  if (error instanceof Error && error.message) {
+    return `${prefix}: ${error.message}`;
+  }
+  return prefix;
+}
+
+function cleanApiErrorMessage(message: string): string {
+  return message.replace(/^(Request failed|Command creation failed|Bootstrap failed):\s*/, "");
 }
 
 function commandStateForEvent(kind: ThreadEvent["kind"]): CommandSummary["state"] | undefined {

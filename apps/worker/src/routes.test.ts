@@ -21,8 +21,10 @@ test("health route returns service metadata", async () => {
 
 test("browser bootstrap requires Access outside dev mode", async () => {
   const response = await handleRequest(new Request("https://api.example.com/api/bootstrap"), {});
+  const body = (await response.json()) as { error: string };
 
   assert.equal(response.status, 401);
+  assert.match(body.error, /covered by the Browser Access application/);
 });
 
 test("browser API responses allow the configured GUI origin", async () => {
@@ -71,6 +73,28 @@ test("state-changing browser API requests reject unconfigured origins", async ()
 
   assert.equal(response.status, 403);
   assert.deepEqual(await response.json(), { error: "Disallowed browser origin" });
+});
+
+test("state-changing browser API reports missing Access coverage", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-mac-studio"
+      })
+    }),
+    {
+      CHAOP_API_DOMAIN: "api.example.com",
+      CHAOP_GUI_DOMAIN: "app.example.com"
+    }
+  );
+  const body = (await response.json()) as { error: string };
+
+  assert.equal(response.status, 401);
+  assert.match(body.error, /covered by the Browser Access application/);
 });
 
 test("CORS preflight returns configured browser headers", async () => {

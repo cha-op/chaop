@@ -25,7 +25,11 @@ export async function authenticateBrowser(request: Request, env: Env): Promise<A
 
   const accessJwt = request.headers.get("cf-access-jwt-assertion");
   if (!accessJwt) {
-    return { ok: false, status: 401, message: "Missing Cloudflare Access JWT" };
+    return {
+      ok: false,
+      status: 401,
+      message: "Missing Cloudflare Access JWT. Confirm this API route is covered by the Browser Access application, or refresh the Access login session."
+    };
   }
 
   if (!env.ACCESS_AUD || !env.ACCESS_TEAM_DOMAIN) {

@@ -272,11 +272,13 @@ Allowed email addresses or groups
 Use the Cloudflare Zero Trust dashboard:
 
 1. Create a self-hosted application and add the GUI public hostname.
-2. Add path-scoped public hostnames for browser API traffic on the API hostname, covering `/api/bootstrap`, `/api/usage-summary`, `/api/commands`, and `/ws/browser`.
+2. Add the API public hostname for Browser traffic with `/api/*` and `/ws/browser` coverage. If you choose separate path-scoped destinations instead of `/api/*`, include every Browser HTTP endpoint: `/api/bootstrap`, `/api/usage-summary`, `/api/commands`, `/api/tasks/*`, and `/api/host-sessions/*`.
 3. Add an Allow policy with the `Emails` include selector for the operator email addresses, or use a deliberate Access group selector once identity-provider groups are configured.
 4. Copy the application AUD into `ACCESS_AUD`.
 
 The Worker must validate `Cf-Access-Jwt-Assertion` for Browser HTTP and WebSocket requests. Cloudflare documents that Access passes this token in the request header, and browser requests may also include a `CF_Authorization` cookie. The Worker should prefer the header.
+
+If a Browser write action returns `401 Missing Cloudflare Access JWT`, the most likely cause is that the new API path is not covered by the Access application destination. Add `/api/*` for the API hostname, or add the missing path-scoped destination, then refresh the GUI session.
 
 For the current implementation, Cloudflare Access policy is the source of truth for allowed Browser users. `CHAOP_ACCESS_ALLOWED_EMAILS` and `CHAOP_ACCESS_ALLOWED_GROUPS` document the deployment intent and are available for a later Worker-level allowlist, but the Worker does not enforce them yet.
 

@@ -272,11 +272,13 @@ Allowed email addresses or groups
 在 Cloudflare Zero Trust dashboard 里：
 
 1. 创建 self-hosted application，并添加 GUI public hostname。
-2. 为 API hostname 上的 Browser API traffic 添加 path-scoped public hostname，覆盖 `/api/bootstrap`、`/api/usage-summary`、`/api/commands` 和 `/ws/browser`。
+2. 为 API hostname 上的 Browser traffic 添加 `/api/*` 和 `/ws/browser` 覆盖。如果你选择多个 path-scoped destination，而不是 `/api/*`，请覆盖每一个 Browser HTTP endpoint：`/api/bootstrap`、`/api/usage-summary`、`/api/commands`、`/api/tasks/*` 和 `/api/host-sessions/*`。
 3. 添加 Allow policy，使用 `Emails` include selector 填入 operator email addresses；如果已经配置 identity-provider groups，也可以有意识地改用 Access group selector。
 4. 把 application AUD 复制到 `ACCESS_AUD`。
 
 Worker 必须为 Browser HTTP 和 WebSocket 请求校验 `Cf-Access-Jwt-Assertion`。Cloudflare 文档说明 Access 会在请求 header 中传递这个 token，浏览器请求也可能带有 `CF_Authorization` cookie。Worker 应优先使用 header。
+
+如果 Browser 写操作返回 `401 Missing Cloudflare Access JWT`，最可能的原因是新的 API path 没有被 Access application destination 覆盖。请为 API hostname 添加 `/api/*`，或者补上缺失的 path-scoped destination，然后刷新 GUI session。
 
 在当前实现里，Cloudflare Access policy 是 Browser 用户允许列表的事实来源。`CHAOP_ACCESS_ALLOWED_EMAILS` 和 `CHAOP_ACCESS_ALLOWED_GROUPS` 现在用于记录部署意图，也为后续 Worker 级 allowlist 预留，但 Worker 暂时还不会执行它们。
 

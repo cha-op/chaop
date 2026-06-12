@@ -3,7 +3,7 @@ id: 20260611-d6e9f3-zh-Hans
 title: Task Thread Session Attach 切片
 status: active
 created: 2026-06-11
-updated: 2026-06-11
+updated: 2026-06-12
 branch:
 pr:
 supersedes: []
@@ -32,6 +32,11 @@ superseded_by:
 - Web typecheck 覆盖 Host Sessions、archive actions 和 selected-thread command submission。
 - Commit 前跑现有 full build/test gate。
 
+## 2026-06-12 Attach 后续
+- 已部署的 Host Sessions 渲染正常，但当 API Access destination 没覆盖新的 `/api/host-sessions/*` 写路径时，attach 会返回 401。
+- Worker 的 401 文案现在会说明可能缺少 Browser Access 覆盖，或 Access session 已过期。
+- Web UI 现在会在可换行 alert 里显示服务端返回的 action error，并在每个 Host Sessions row 里显示完整 host `session_id`。
+- 部署指南现在推荐为 API hostname 覆盖 `/api/*`；如果使用多个 path-scoped destination，则必须显式覆盖每个 Browser HTTP endpoint。
+
 ## 下一步
-- 实现 review 干净后跑 full build gate 和 browser smoke。
-- 远端部署前先对 remote D1 应用 migration 0003。
+- Cloudflare Access destination 覆盖 `/api/host-sessions/*` 或 `/api/*` 后，重新测试 attach。

@@ -8,6 +8,16 @@ import type {
 } from "@chaop/protocol";
 import { fallbackBootstrap } from "./sample-data.js";
 
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export async function loadBootstrap(): Promise<BootstrapPayload> {
   try {
     const response = await fetch(apiUrl("/api/bootstrap"), {
@@ -15,7 +25,7 @@ export async function loadBootstrap(): Promise<BootstrapPayload> {
       headers: devHeaders()
     });
     if (!response.ok) {
-      throw new Error(`Bootstrap failed with ${response.status}`);
+      throw await responseError(response, "Bootstrap failed");
     }
     return (await response.json()) as BootstrapPayload;
   } catch (error) {
@@ -38,7 +48,7 @@ export async function createCommand(request: CreateCommandRequest): Promise<Crea
   });
 
   if (!response.ok) {
-    throw new Error(`Command creation failed with ${response.status}`);
+    throw await responseError(response, "Command creation failed");
   }
 
   return (await response.json()) as CreateCommandResponse;
@@ -88,10 +98,32 @@ async function postJson<T>(path: string, request: unknown): Promise<T> {
   });
 
   if (!response.ok) {
-    throw new Error(`Request failed with ${response.status}`);
+    throw await responseError(response, "Request failed");
   }
 
   return (await response.json()) as T;
+}
+
+async function responseError(response: Response, fallback: string): Promise<ApiError> {
+  const message = await responseErrorMessage(response);
+  return new ApiError(response.status, `${fallback}: ${message ?? `HTTP ${response.status}`}`);
+}
+
+async function responseErrorMessage(response: Response): Promise<string | undefined> {
+  const contentType = response.headers.get("content-type") ?? "";
+  try {
+    if (contentType.includes("application/json")) {
+      const body = (await response.json()) as unknown;
+      if (typeof body === "object" && body !== null && typeof (body as { error?: unknown }).error === "string") {
+        return (body as { error: string }).error;
+      }
+    }
+
+    const text = await response.text();
+    return text.trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function devHeaders(): HeadersInit {

@@ -135,6 +135,16 @@ main {
   color: #475569;
 }
 
+.action-alert {
+  margin: 16px 24px 0;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: #991b1b;
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+}
+
 .page-grid {
   display: grid;
   gap: 18px;
@@ -472,6 +482,15 @@ h2 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-id {
+  color: #475569;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .session-row.clickable {

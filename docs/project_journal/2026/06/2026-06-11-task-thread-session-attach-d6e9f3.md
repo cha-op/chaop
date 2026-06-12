@@ -3,7 +3,7 @@ id: 20260611-d6e9f3
 title: Task Thread Session Attach Slice
 status: active
 created: 2026-06-11
-updated: 2026-06-11
+updated: 2026-06-12
 branch:
 pr:
 supersedes: []
@@ -32,6 +32,11 @@ superseded_by:
 - Web typecheck for Host Sessions, archive actions, and selected-thread command submission.
 - Existing full build/test gate before commit.
 
+## 2026-06-12 Attach Follow-Up
+- Deployed Host Sessions rendered correctly, but attach returned 401 when the API Access destination did not cover the new `/api/host-sessions/*` write path.
+- Worker 401 copy now explains missing Browser Access coverage or an expired Access session.
+- The Web UI now surfaces server-provided action errors in a wrapping alert and shows the full host `session_id` in each Host Sessions row.
+- Deployment guidance now recommends covering the API hostname with `/api/*`, or explicitly covering every Browser HTTP endpoint when using path-scoped destinations.
+
 ## Next Steps
-- Run the full build gate and browser smoke once implementation review is clean.
-- Deploy after D1 migration 0003 is applied to the remote database.
+- Re-test attach after the Cloudflare Access destination covers `/api/host-sessions/*` or `/api/*`.
