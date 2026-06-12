@@ -603,6 +603,49 @@ test("command creation rejects unavailable target connectors when D1 is bound", 
   assert.deepEqual(await response.json(), { error: "Target connector not available" });
 });
 
+test("command creation rejects threads outside the requested workspace", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors",
+        target_connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, { threadWorkspaceId: "workspace-docs" })
+    }
+  );
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), { error: "Command thread not available" });
+});
+
+test("command creation rejects tasks outside the selected thread", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        task_id: "task-other-thread",
+        prompt: "Summarise current errors",
+        target_connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, { taskThreadId: "thread-other" })
+    }
+  );
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), { error: "Command task does not belong to the selected thread" });
+});
+
 test("command creation rejects missing prompt", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/commands", {
@@ -640,9 +683,17 @@ function readOnlyBootstrapDb(): D1Database {
 
 function commandTargetDb(
   row: { id: string } | null,
-  options: { supportsCodex?: boolean } = {}
+  options: {
+    supportsCodex?: boolean;
+    threadWorkspaceId?: string;
+    taskWorkspaceId?: string;
+    taskThreadId?: string;
+  } = {}
 ): D1Database {
   const supportsCodex = options.supportsCodex ?? true;
+  const threadWorkspaceId = options.threadWorkspaceId ?? "workspace-api";
+  const taskWorkspaceId = options.taskWorkspaceId ?? "workspace-api";
+  const taskThreadId = options.taskThreadId ?? "thread-orders-500";
   return {
     prepare(sql: string) {
       if (/INSERT INTO users/.test(sql)) {
@@ -651,6 +702,47 @@ function commandTargetDb(
             return {
               async run() {
                 return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id FROM workspaces/.test(sql)) {
+        return {
+          bind(workspaceId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            return {
+              async first() {
+                return { id: workspaceId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, workspace_id FROM threads/.test(sql)) {
+        return {
+          bind(threadId: string) {
+            return {
+              async first() {
+                return { id: threadId, workspace_id: threadWorkspaceId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, workspace_id, thread_id FROM tasks/.test(sql)) {
+        return {
+          bind(taskId: string) {
+            return {
+              async first() {
+                return {
+                  id: taskId,
+                  workspace_id: taskWorkspaceId,
+                  thread_id: taskThreadId
+                };
               }
             };
           }
@@ -701,6 +793,23 @@ function commandTargetDb(
       if (/INSERT INTO commands/.test(sql) || /INSERT INTO events/.test(sql)) {
         return {
           bind() {
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql) && /WHERE id = \? AND workspace_id = \? AND thread_id = \?/.test(sql)) {
+        return {
+          bind(connectorId: string, updatedAt: string, taskId: string, workspaceId: string, threadId: string) {
+            assert.equal(connectorId, "connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId.startsWith("task-"), true);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-orders-500");
             return {
               async run() {
                 return { success: true };

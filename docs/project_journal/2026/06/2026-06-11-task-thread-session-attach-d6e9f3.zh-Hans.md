@@ -50,10 +50,13 @@ superseded_by:
 
 ## 2026-06-12 Review 加固
 - D1 `0003` migration 现在会在重建 `tasks` 时保留已有 `commands.task_id` 关联；直接 SQLite migration check 已确认 migration 后 command 仍指向原 task。
+- D1 schema 和 `0005` 兼容 migration 现在允许独立的 `failed` task state，并且会为已经迁移过的部署保留 command/task 与 host-session/task 关联。
 - Thread event sequence 现在通过原子 `UPDATE threads ... RETURNING last_seq` 分配，降低同一 thread 并发 event 撞号的风险。
-- Durable Object 现在会在 agent socket close/error 时把 connector 标记为 offline、失败 leased/running commands、更新对应 task state，并向 Browser sockets 广播失败事件。
+- Durable Object 现在只会在同一 connector 的最后一个 socket 断开后才把 connector 标记为 offline，然后失败 leased/running commands、更新对应 task state，并向 Browser sockets 广播失败事件。
 - Rust connector 在等待 event ACK 时会 defer 非 ACK WebSocket messages，因此排队的 `command.dispatch` 会在当前 command 完成后继续处理，不会被吞掉。
 - Session inventory 的 rollout 扫描现在会先限制到最近日期目录和有上限的 rollout 文件集合，再读取 rollout metadata。
+- Browser command creation 在非本地 insecure dev 环境必须有 D1 binding；写入前会校验 workspace/thread/task ids 的归属一致性，并且等到 `command.started` 后才把 task 移到 `running`。
+- `command.failed` 现在会映射成 Task Board 可见的 `failed` task state，不再在 Worker、protocol grouping 或 UI 中折叠成 `done`。
 
 ## 下一步
 - 下一步优先做明确的新建 Codex thread 流程。Chaop 应该能从 Task Board 或 Thread Command Centre 创建本机 Codex/app-server thread，把创建出来的 session 绑定回 task/thread 组合，并且在本机 app-server 不可用时返回清晰的 connector/app-server 错误。

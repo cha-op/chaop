@@ -166,6 +166,9 @@ export class WorkspaceDO implements DurableObject {
     if (attachment?.socketType !== "agent" || !attachment.connectorId) {
       return;
     }
+    if (hasPeerAgentSocket(this.ctx, attachment.connectorId, ws)) {
+      return;
+    }
 
     const events = await markConnectorDisconnected(this.env, attachment.connectorId);
     for (const event of events) {
@@ -203,6 +206,14 @@ export class WorkspaceDO implements DurableObject {
       );
     }
   }
+}
+
+export function hasPeerAgentSocket(
+  ctx: Pick<DurableObjectState, "getWebSockets">,
+  connectorId: string,
+  socket: WebSocket
+): boolean {
+  return ctx.getWebSockets(`agent:${connectorId}`).some((candidate) => candidate !== socket);
 }
 
 export function threadEventMessage(event: ThreadEvent): string {

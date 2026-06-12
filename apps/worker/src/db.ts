@@ -458,23 +458,24 @@ export async function createCommandInDb(
   await ensureUser(env, user);
 
   const commandType = request.type ?? "placeholder";
+  const scope = await resolveCommandScope(env, request);
   const targetConnectorId =
-    request.target_connector_id ?? (await chooseConnectorForWorkspace(env, request.workspace_id, commandType));
+    request.target_connector_id ?? (await chooseConnectorForWorkspace(env, scope.workspaceId, commandType));
 
   if (request.target_connector_id && !targetConnectorId) {
     throw new CommandTargetError("Target connector not available");
   }
 
   if (targetConnectorId) {
-    await assertConnectorCanExecute(env, targetConnectorId, request.workspace_id, commandType);
+    await assertConnectorCanExecute(env, targetConnectorId, scope.workspaceId, commandType);
   }
 
   const now = new Date().toISOString();
   const command: CommandSummary = {
     id: `command-${cryptoRandomId().slice(0, 12)}`,
-    workspace_id: request.workspace_id,
-    thread_id: request.thread_id,
-    task_id: request.task_id,
+    workspace_id: scope.workspaceId,
+    thread_id: scope.threadId,
+    task_id: scope.taskId,
     type: commandType,
     prompt: request.prompt,
     state: "pending",
@@ -513,16 +514,6 @@ export async function createCommandInDb(
       priority: "P1",
       summary: `Control plane accepted the ${command.type} command.`
     });
-  }
-
-  if (command.task_id && targetConnectorId) {
-    await env.DB.prepare(
-      `UPDATE tasks
-       SET state = 'running', connector_id = ?, assigned_agent = 'chaop-agent', updated_at = ?
-       WHERE id = ?`
-    )
-      .bind(targetConnectorId, now, command.task_id)
-      .run();
   }
 
   return { response: { accepted: true, command }, targetConnectorId };
@@ -698,7 +689,7 @@ export async function markConnectorDisconnected(env: Env, connectorId: string): 
     if (command.task_id) {
       await env.DB.prepare(
         `UPDATE tasks
-         SET state = 'done', updated_at = ?
+         SET state = 'failed', updated_at = ?
          WHERE id = ?`
       )
         .bind(now, command.task_id)
@@ -986,6 +977,66 @@ async function chooseConnectorForWorkspace(
   return row?.id;
 }
 
+async function resolveCommandScope(
+  env: Env,
+  request: CreateCommandRequest
+): Promise<{ workspaceId: string; threadId?: string | undefined; taskId?: string | undefined }> {
+  const workspace = await env.DB!.prepare(
+    "SELECT id FROM workspaces WHERE id = ? LIMIT 1"
+  )
+    .bind(request.workspace_id)
+    .first<{ id: string }>();
+  if (!workspace) {
+    throw new CommandTargetError("Workspace not available");
+  }
+
+  let threadId = request.thread_id;
+  if (threadId) {
+    const thread = await loadCommandThread(env, threadId);
+    if (!thread || thread.workspace_id !== request.workspace_id) {
+      throw new CommandTargetError("Command thread not available");
+    }
+  }
+
+  if (request.task_id) {
+    const task = await env.DB!.prepare(
+      "SELECT id, workspace_id, thread_id FROM tasks WHERE id = ? LIMIT 1"
+    )
+      .bind(request.task_id)
+      .first<{ id: string; workspace_id: string; thread_id: string }>();
+    if (!task || task.workspace_id !== request.workspace_id) {
+      throw new CommandTargetError("Command task not available");
+    }
+    if (threadId && task.thread_id !== threadId) {
+      throw new CommandTargetError("Command task does not belong to the selected thread");
+    }
+    if (!threadId) {
+      const thread = await loadCommandThread(env, task.thread_id);
+      if (!thread || thread.workspace_id !== request.workspace_id) {
+        throw new CommandTargetError("Command thread not available");
+      }
+      threadId = task.thread_id;
+    }
+  }
+
+  return {
+    workspaceId: request.workspace_id,
+    threadId,
+    taskId: request.task_id
+  };
+}
+
+async function loadCommandThread(
+  env: Env,
+  threadId: string
+): Promise<{ id: string; workspace_id: string } | null> {
+  return await env.DB!.prepare(
+    "SELECT id, workspace_id FROM threads WHERE id = ? LIMIT 1"
+  )
+    .bind(threadId)
+    .first<{ id: string; workspace_id: string }>();
+}
+
 async function assertConnectorCanExecute(
   env: Env,
   connectorId: string,
@@ -1117,7 +1168,8 @@ function isActiveCommandState(state: CommandSummary["state"]): boolean {
 }
 
 function finalTaskStateForEvent(kind: AgentCommandEvent["kind"]): TaskSummary["state"] | undefined {
-  if (kind === "command.finished" || kind === "command.failed") return "done";
+  if (kind === "command.finished") return "done";
+  if (kind === "command.failed") return "failed";
   return undefined;
 }
 

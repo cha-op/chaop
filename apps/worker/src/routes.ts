@@ -44,6 +44,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
     const auth = await authenticateBrowser(request, env);
     if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB && !allowsSampleData(env)) {
+      return json(request, env, { error: "DB binding is required" }, 503);
+    }
     const bootstrap = await loadBootstrapFromDb(env, auth.user);
     return json(request, env, bootstrap ?? sampleBootstrap(auth.user.email));
   }
@@ -104,38 +107,42 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
     const commandRequest = payload.value;
 
-    if (env.DB) {
-      try {
-        const { response, targetConnectorId } = await createCommandInDb(env, auth.user, commandRequest);
-        if (targetConnectorId) {
-          await dispatchPendingCommand(env, targetConnectorId);
-        }
-        return json(request, env, response, 202);
-      } catch (error) {
-        if (error instanceof CommandTargetError) {
-          return json(request, env, { error: error.message }, error.status);
-        }
-        throw error;
+    if (!env.DB) {
+      if (!allowsSampleData(env)) {
+        return json(request, env, { error: "DB binding is required" }, 503);
       }
+
+      const now = new Date().toISOString();
+      const response: CreateCommandResponse = {
+        accepted: true,
+        command: {
+          id: `command-${cryptoRandomId().slice(0, 12)}`,
+          workspace_id: commandRequest.workspace_id,
+          thread_id: commandRequest.thread_id,
+          task_id: commandRequest.task_id,
+          type: commandRequest.type ?? "placeholder",
+          prompt: commandRequest.prompt,
+          state: "pending",
+          target_connector_id: commandRequest.target_connector_id,
+          created_at: now,
+          updated_at: now
+        }
+      };
+      return json(request, env, response, 202);
     }
 
-    const now = new Date().toISOString();
-    const response: CreateCommandResponse = {
-      accepted: true,
-      command: {
-        id: `command-${cryptoRandomId().slice(0, 12)}`,
-        workspace_id: commandRequest.workspace_id,
-        thread_id: commandRequest.thread_id,
-        task_id: commandRequest.task_id,
-        type: commandRequest.type ?? "placeholder",
-        prompt: commandRequest.prompt,
-        state: "pending",
-        target_connector_id: commandRequest.target_connector_id,
-        created_at: now,
-        updated_at: now
+    try {
+      const { response, targetConnectorId } = await createCommandInDb(env, auth.user, commandRequest);
+      if (targetConnectorId) {
+        await dispatchPendingCommand(env, targetConnectorId);
       }
-    };
-    return json(request, env, response, 202);
+      return json(request, env, response, 202);
+    } catch (error) {
+      if (error instanceof CommandTargetError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      throw error;
+    }
   }
 
   const taskArchiveMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/(archive|unarchive)$/);
@@ -478,4 +485,8 @@ function cryptoRandomId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function allowsSampleData(env: Env): boolean {
+  return env.CHAOP_DEV_ALLOW_INSECURE === "true";
 }

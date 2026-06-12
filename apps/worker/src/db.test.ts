@@ -41,6 +41,31 @@ test("recordAgentEvent accepts events from the active lease owner", async () => 
   assert.equal(db.eventInserts, 1);
 });
 
+test("recordAgentEvent marks failed command tasks as failed", async () => {
+  const db = agentEventGuardDb(
+    {
+      leaseOwnerConnectorId: "connector-online",
+      state: "running"
+    },
+    {
+      expectedCommandState: "failed",
+      expectedTaskState: "failed"
+    }
+  );
+
+  const event = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    kind: "command.failed",
+    priority: "P1",
+    summary: "Failed"
+  });
+
+  assert.equal(event?.kind, "command.failed");
+  assert.equal(db.commandUpdates, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+});
+
 test("markConnectorDisconnected fails active commands and marks connector offline", async () => {
   const db = connectorDisconnectedDb();
 
@@ -58,7 +83,12 @@ test("markConnectorDisconnected fails active commands and marks connector offlin
 function agentEventGuardDb(command: {
   leaseOwnerConnectorId: string;
   state: "leased" | "running" | "succeeded";
-}) {
+}, options: {
+  expectedCommandState?: string;
+  expectedTaskState?: string;
+} = {}) {
+  const expectedCommandState = options.expectedCommandState ?? "succeeded";
+  const expectedTaskState = options.expectedTaskState ?? "done";
   const counters = {
     commandUpdates: 0,
     taskUpdates: 0,
@@ -96,7 +126,7 @@ function agentEventGuardDb(command: {
             commandId: string,
             ownerConnectorId: string
           ) {
-            assert.equal(nextState, "succeeded");
+            assert.equal(nextState, expectedCommandState);
             assert.equal(connectorId, "connector-online");
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
@@ -114,7 +144,7 @@ function agentEventGuardDb(command: {
       if (/UPDATE tasks/.test(sql)) {
         return {
           bind(taskState: string, connectorId: string, updatedAt: string, taskId: string) {
-            assert.equal(taskState, "done");
+            assert.equal(taskState, expectedTaskState);
             assert.equal(connectorId, "connector-online");
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(taskId, "task-1");

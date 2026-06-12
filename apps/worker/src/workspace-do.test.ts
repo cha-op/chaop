@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { hostSessionsMessage, threadEventMessage } from "./workspace-do.js";
+import { hasPeerAgentSocket, hostSessionsMessage, threadEventMessage } from "./workspace-do.js";
 
 test("threadEventMessage wraps agent events for browser realtime consumers", () => {
   const message = threadEventMessage({
@@ -63,4 +63,30 @@ test("hostSessionsMessage wraps connector inventory updates for browser consumer
   assert.equal(envelope.payload?.snapshot, true);
   assert.equal(envelope.payload?.host_sessions?.[0]?.session_id, "session-1");
   assert.equal(envelope.payload?.host_sessions?.[0]?.title_source, "metadata");
+});
+
+test("hasPeerAgentSocket ignores the socket that is closing", () => {
+  const closingSocket = {} as WebSocket;
+  const peerSocket = {} as WebSocket;
+  const ctx = {
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "agent:connector-1");
+      return [closingSocket, peerSocket];
+    }
+  };
+
+  assert.equal(hasPeerAgentSocket(ctx, "connector-1", closingSocket), true);
+  assert.equal(hasPeerAgentSocket(ctx, "connector-1", peerSocket), true);
+});
+
+test("hasPeerAgentSocket returns false when the closing socket is the only agent socket", () => {
+  const closingSocket = {} as WebSocket;
+  const ctx = {
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "agent:connector-1");
+      return [closingSocket];
+    }
+  };
+
+  assert.equal(hasPeerAgentSocket(ctx, "connector-1", closingSocket), false);
 });

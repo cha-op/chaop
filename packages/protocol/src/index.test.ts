@@ -11,6 +11,7 @@ test("groupTasksByState preserves empty swimlanes", () => {
     "waiting_for_approval",
     "waiting_for_input",
     "throttled",
+    "failed",
     "done"
   ]);
 });
@@ -26,6 +27,7 @@ test("groupTasksByState groups task cards by operational state", () => {
 
   assert.equal(grouped.running.length, 2);
   assert.equal(grouped.waiting_for_input[0]?.id, "task-2");
+  assert.equal(grouped.failed.length, 0);
   assert.equal(grouped.done.length, 0);
 });
 

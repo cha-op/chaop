@@ -50,10 +50,13 @@ superseded_by:
 
 ## 2026-06-12 Review Hardening
 - The D1 `0003` migration now preserves existing `commands.task_id` links while rebuilding `tasks`, and a direct SQLite migration check confirmed the command still points at its task after migration.
+- The D1 schema and `0005` compatibility migration now allow a distinct `failed` task state while preserving existing command/task and host-session/task links for already-migrated deployments.
 - Thread event sequencing now uses an atomic `UPDATE threads ... RETURNING last_seq` allocation path, reducing same-thread concurrent event collisions.
-- Durable Object agent socket close/error handling now marks the connector offline, fails leased/running commands, updates the attached task state, and broadcasts failure events to Browser sockets.
+- Durable Object agent socket close/error handling now only marks a connector offline after the last socket for that connector is gone, then fails leased/running commands, updates the attached task state, and broadcasts failure events to Browser sockets.
 - The Rust connector now defers non-ACK WebSocket messages seen while waiting for an event ACK, so a queued `command.dispatch` is handled after the current command instead of being consumed.
 - Session inventory rollout scanning is bounded to recent date directories and a capped rollout file set before reading rollout metadata.
+- Browser command creation now requires a D1 binding outside local insecure dev, validates that workspace/thread/task ids belong together before insert, and waits for `command.started` before moving a task to `running`.
+- `command.failed` now maps to a visible `failed` task state in Worker, protocol grouping, and Task Board rather than being folded into `done`.
 
 ## Next Steps
 - Prioritise the explicit new Codex thread flow next. Chaop should be able to create a local Codex/app-server thread from Task Board or Thread Command Centre, bind the created session back to a task/thread pair, and report a clear connector/app-server error when local app-server is unavailable.

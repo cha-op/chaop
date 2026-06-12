@@ -43,6 +43,7 @@ export type TaskState =
   | "waiting_for_approval"
   | "waiting_for_input"
   | "throttled"
+  | "failed"
   | "done";
 
 export type TaskCategory = {
@@ -321,6 +322,7 @@ export const TASK_STATE_LABELS: Record<TaskState, string> = {
   waiting_for_approval: "Waiting for approval",
   waiting_for_input: "Waiting for input",
   throttled: "Throttled",
+  failed: "Failed",
   done: "Done"
 };
 
@@ -333,6 +335,7 @@ export function groupTasksByState(
     waiting_for_approval: [],
     waiting_for_input: [],
     throttled: [],
+    failed: [],
     done: []
   };
 

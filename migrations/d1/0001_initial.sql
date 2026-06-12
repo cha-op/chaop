@@ -70,7 +70,7 @@ CREATE TABLE tasks (
   thread_id TEXT,
   title TEXT NOT NULL,
   category_id TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('running', 'idle', 'waiting_for_approval', 'waiting_for_input', 'throttled', 'done')),
+  state TEXT NOT NULL CHECK (state IN ('running', 'idle', 'waiting_for_approval', 'waiting_for_input', 'throttled', 'failed', 'done')),
   connector_id TEXT,
   assigned_agent TEXT,
   realtime_mode TEXT NOT NULL CHECK (realtime_mode IN ('realtime', 'summary', 'cost_saving', 'throttled', 'waiting_for_upload')),

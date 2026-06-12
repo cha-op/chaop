@@ -263,6 +263,7 @@ export class ChaopApp extends LitElement {
       "waiting_for_approval",
       "waiting_for_input",
       "throttled",
+      "failed",
       "done"
     ];
 
@@ -1058,7 +1059,8 @@ function commandStateForEvent(kind: ThreadEvent["kind"]): CommandSummary["state"
 
 function taskStateForEvent(kind: ThreadEvent["kind"]): TaskSummary["state"] | undefined {
   if (kind === "command.started") return "running";
-  if (kind === "command.finished" || kind === "command.failed") return "done";
+  if (kind === "command.finished") return "done";
+  if (kind === "command.failed") return "failed";
   return undefined;
 }
 
