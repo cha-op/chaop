@@ -364,7 +364,27 @@ chmod 700 ~/.chaop
 
 Then place the bootstrap secret in `~/.chaop/bootstrap.secret` with file permissions readable only by your user.
 
-After the Worker is deployed, run connector bootstrap to exchange the bootstrap secret for a connector token. Store the returned connector token at the `token_file` path in the connector config. The Worker stores only the token hash in D1.
+After the Worker is deployed, run connector bootstrap to exchange the bootstrap secret for a connector token. The current agent CLI prints the bootstrap request body; it does not post the request or write the token file by itself yet. Run the supported manual exchange from the repository checkout:
+
+```bash
+export CHAOP_API_DOMAIN="api.example.com"
+export CHAOP_AGENT_CONFIG="/path/to/agent.toml"
+export CHAOP_HOSTNAME="$(hostname)"
+export CHAOP_BOOTSTRAP_SECRET="$(cat ~/.chaop/bootstrap.secret)"
+
+cargo run -p chaop-agent -- --config "$CHAOP_AGENT_CONFIG" --hostname "$CHAOP_HOSTNAME" \
+  | curl -fsS "https://$CHAOP_API_DOMAIN/connector/bootstrap" \
+      -H "content-type: application/json" \
+      -H "x-chaop-bootstrap-secret: $CHAOP_BOOTSTRAP_SECRET" \
+      --data-binary @- \
+  | node -e 'let s = ""; process.stdin.on("data", c => s += c); process.stdin.on("end", () => { const body = JSON.parse(s); if (!body.token) { console.error(s); process.exit(1); } process.stdout.write(body.token + "\n"); });' \
+  > ~/.chaop/connector.token
+
+chmod 600 ~/.chaop/connector.token
+unset CHAOP_BOOTSTRAP_SECRET
+```
+
+Store the returned connector token at the `token_file` path in the connector config. The Worker stores only the token hash in D1. If you need to inspect the bootstrap response for `connector_id` or `control_url`, run the same command without the final `node` extraction and redirect the response to a local private file outside the repository.
 
 Run the connector loop with:
 

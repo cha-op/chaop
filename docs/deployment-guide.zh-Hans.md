@@ -364,7 +364,27 @@ chmod 700 ~/.chaop
 
 然后把 bootstrap secret 放入 `~/.chaop/bootstrap.secret`，并确保只有当前用户可以读取。
 
-Worker 部署后，执行 connector bootstrap，用 bootstrap secret 换取 connector token。把返回的 connector token 存到 connector config 中 `token_file` 指向的位置。Worker 只会在 D1 中保存 token hash。
+Worker 部署后，执行 connector bootstrap，用 bootstrap secret 换取 connector token。当前 agent CLI 只会打印 bootstrap request body；它还不会自己发送 request，也不会自己写入 token file。请在仓库 checkout 中运行这个受支持的手动 exchange 流程：
+
+```bash
+export CHAOP_API_DOMAIN="api.example.com"
+export CHAOP_AGENT_CONFIG="/path/to/agent.toml"
+export CHAOP_HOSTNAME="$(hostname)"
+export CHAOP_BOOTSTRAP_SECRET="$(cat ~/.chaop/bootstrap.secret)"
+
+cargo run -p chaop-agent -- --config "$CHAOP_AGENT_CONFIG" --hostname "$CHAOP_HOSTNAME" \
+  | curl -fsS "https://$CHAOP_API_DOMAIN/connector/bootstrap" \
+      -H "content-type: application/json" \
+      -H "x-chaop-bootstrap-secret: $CHAOP_BOOTSTRAP_SECRET" \
+      --data-binary @- \
+  | node -e 'let s = ""; process.stdin.on("data", c => s += c); process.stdin.on("end", () => { const body = JSON.parse(s); if (!body.token) { console.error(s); process.exit(1); } process.stdout.write(body.token + "\n"); });' \
+  > ~/.chaop/connector.token
+
+chmod 600 ~/.chaop/connector.token
+unset CHAOP_BOOTSTRAP_SECRET
+```
+
+把返回的 connector token 存到 connector config 中 `token_file` 指向的位置。Worker 只会在 D1 中保存 token hash。如果你需要检查 bootstrap response 里的 `connector_id` 或 `control_url`，可以用同一条命令，但去掉最后的 `node` 提取步骤，并把 response 重定向到仓库外的本地私有文件。
 
 运行 connector loop：
 
