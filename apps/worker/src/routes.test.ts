@@ -228,7 +228,7 @@ test("agent bootstrap returns connector token", async () => {
   assert.equal(body.control_url, "wss://api.example.com/ws/agent");
 });
 
-test("agent bootstrap keeps the legacy /api/agent/bootstrap alias during migration", async () => {
+test("agent bootstrap does not expose the old /api/agent/bootstrap path", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/agent/bootstrap", {
       method: "POST",
@@ -242,10 +242,9 @@ test("agent bootstrap keeps the legacy /api/agent/bootstrap alias during migrati
     }),
     devEnv
   );
-  const body = (await response.json()) as { token: string };
 
-  assert.equal(response.status, 201);
-  assert.equal(body.token.startsWith("chaop_agent_"), true);
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), { error: "Not found" });
 });
 
 test("agent bootstrap returns local websocket URL in insecure local dev", async () => {

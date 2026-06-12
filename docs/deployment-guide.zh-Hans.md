@@ -283,7 +283,7 @@ Worker 必须为 Browser HTTP 和 WebSocket 请求校验 `Cf-Access-Jwt-Assertio
 
 在当前实现里，Cloudflare Access policy 是 Browser 用户允许列表的事实来源。`CHAOP_ACCESS_ALLOWED_EMAILS` 和 `CHAOP_ACCESS_ALLOWED_GROUPS` 现在用于记录部署意图，也为后续 Worker 级 allowlist 预留，但 Worker 暂时还不会执行它们。
 
-除非后续决定为 connector 使用 Access service token，不要把 `/connector/bootstrap` 或 `/ws/agent` 放到这个 Browser Access application 后面。`/api/agent/bootstrap` 只作为迁移期 legacy alias 保留；请优先使用 `/connector/bootstrap`，因为宽泛的 `/api/*` Browser Access protection 也会覆盖 legacy path。
+除非后续决定为 connector 使用 Access service token，不要把 `/connector/bootstrap` 或 `/ws/agent` 放到这个 Browser Access application 后面。Connector bootstrap path 有意放在 `/api/*` 之外，这样宽泛的 Browser Access protection 不会包住 connector registration。
 
 Connector bootstrap 只用 `AGENT_BOOTSTRAP_SECRET` 注册 connector identity。Worker 随后签发随机 connector token，并且只在 D1 中保存它的 SHA-256 hash。重新执行 bootstrap 会创建新的 connector identity 和 token；请替换本地 connector token 文件，并在后续管理流程中停用旧 connector 记录。
 
@@ -407,5 +407,6 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - 如果 connector 返回 `401`，检查 `AGENT_BOOTSTRAP_SECRET`，并确认 `/connector/bootstrap` 和 `/ws/agent` 没有被 Browser Access 拦截。
 - 如果 connector 已连接但一直收不到 command，检查 connector bootstrap 是否已经写入 workspace membership，command 是否 target 到可执行 connector，以及已部署 Worker 是否绑定 `WorkspaceDO`。
 - 如果 Host Sessions 页面为空，检查 connector 是否已经在本切片后重启，`session_inventory.enabled` 是否为 true，以及运行 connector 的用户是否可以读取 `CODEX_HOME` 或 `~/.codex`。
+- 如果 attach 之后的历史 Host Session 只显示少量 events，这是当前切片的预期边界：attachment 只导入 session metadata 和 title。历史 rollout/transcript backfill 和完整 artefact capture 留到后续切片。
 - 如果 D1 migration 失败，确认 D1 database UUID 已写入 Worker 配置。
 - 如果 R2 写入失败，确认 bucket 已创建，并且 Worker binding 名称与实现一致。

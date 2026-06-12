@@ -283,7 +283,7 @@ If a Browser write action returns `401 Missing Cloudflare Access JWT`, the most 
 
 For the current implementation, Cloudflare Access policy is the source of truth for allowed Browser users. `CHAOP_ACCESS_ALLOWED_EMAILS` and `CHAOP_ACCESS_ALLOWED_GROUPS` document the deployment intent and are available for a later Worker-level allowlist, but the Worker does not enforce them yet.
 
-Do not put `/connector/bootstrap` or `/ws/agent` behind this Browser Access application unless we later decide to use Access service tokens for connectors. `/api/agent/bootstrap` is kept only as a legacy migration alias; prefer `/connector/bootstrap` because broad `/api/*` Browser Access protection will also cover the legacy path.
+Do not put `/connector/bootstrap` or `/ws/agent` behind this Browser Access application unless we later decide to use Access service tokens for connectors. The connector bootstrap path intentionally lives outside `/api/*` so broad Browser Access protection does not wrap connector registration.
 
 Connector bootstrap uses `AGENT_BOOTSTRAP_SECRET` only to register a connector identity. The Worker then issues a random connector token and stores only its SHA-256 hash in D1. Re-running bootstrap creates a fresh connector identity and token; replace the local connector token file and retire the old connector record in a later management flow.
 
@@ -407,5 +407,6 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether `/connector/bootstrap` and `/ws/agent` are excluded from Browser Access.
 - If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
 - If Host Sessions is empty, check that the connector was restarted after this slice, `session_inventory.enabled` is true, and the connector user can read `CODEX_HOME` or `~/.codex`.
+- If an attached historical Host Session shows only a few events, that is expected in the current slice: attachment imports session metadata and title only. Historical rollout/transcript backfill and full artefact capture are deferred.
 - If D1 migration fails, confirm the D1 database UUID is present in the Worker config.
 - If R2 writes fail, confirm the bucket exists and the Worker binding name matches the implementation.

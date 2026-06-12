@@ -37,7 +37,9 @@ superseded_by:
 - Worker 401 copy now explains missing Browser Access coverage or an expired Access session.
 - The Web UI now surfaces server-provided action errors in a wrapping alert and shows the full host `session_id` in each Host Sessions row.
 - Deployment guidance now recommends covering the Browser API with `/api/*` plus `/ws/browser`, while keeping connector bootstrap outside `/api/*`.
-- Agent bootstrap is moving to `/connector/bootstrap` so broad Browser Access coverage for `/api/*` does not wrap connector bootstrap. `/api/agent/bootstrap` remains a legacy migration alias only.
+- Agent bootstrap moved to `/connector/bootstrap` so broad Browser Access coverage for `/api/*` does not wrap connector bootstrap. The old `/api/agent/bootstrap` alias was removed after Access was reconfigured.
+- Host Sessions now hides archived task/thread attachments from the active attached list; they remain restorable from the Task Board archive view.
+- Historical Host Session attachment still imports metadata/title only. Full transcript or rollout event backfill is deferred to a later slice.
 
 ## Next Steps
 - Re-test attach after the Cloudflare Access destination covers `/api/*`, `/ws/browser`, and the GUI hostname.

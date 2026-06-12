@@ -53,7 +53,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return json(request, env, budget);
   }
 
-  if (request.method === "POST" && isAgentBootstrapPath(url.pathname)) {
+  if (request.method === "POST" && url.pathname === "/connector/bootstrap") {
     if (!authenticateAgentBootstrap(request, env)) {
       return json(request, env, { error: "Invalid connector bootstrap secret" }, 401);
     }
@@ -401,10 +401,6 @@ function optionalString(value: unknown): value is string | undefined {
 
 function optionalCommandType(value: unknown): value is CreateCommandRequest["type"] {
   return value === undefined || value === "placeholder" || value === "codex";
-}
-
-function isAgentBootstrapPath(pathname: string): boolean {
-  return pathname === "/connector/bootstrap" || pathname === "/api/agent/bootstrap";
 }
 
 function stableConnectorId(name: string, hostname: string): string {

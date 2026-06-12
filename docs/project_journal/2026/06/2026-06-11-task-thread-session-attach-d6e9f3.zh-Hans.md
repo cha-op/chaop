@@ -37,7 +37,9 @@ superseded_by:
 - Worker 的 401 文案现在会说明可能缺少 Browser Access 覆盖，或 Access session 已过期。
 - Web UI 现在会在可换行 alert 里显示服务端返回的 action error，并在每个 Host Sessions row 里显示完整 host `session_id`。
 - 部署指南现在推荐用 `/api/*` 加 `/ws/browser` 覆盖 Browser API，同时把 connector bootstrap 放到 `/api/*` 之外。
-- Agent bootstrap 会迁到 `/connector/bootstrap`，这样 `/api/*` 的 Browser Access 覆盖不会包住 connector bootstrap。`/api/agent/bootstrap` 只保留为迁移期 legacy alias。
+- Agent bootstrap 已迁到 `/connector/bootstrap`，这样 `/api/*` 的 Browser Access 覆盖不会包住 connector bootstrap。Access 配好后，旧 `/api/agent/bootstrap` alias 已删除。
+- Host Sessions 现在会把已归档 task/thread 的 attachment 从 active attached list 中隐藏；它们仍可从 Task Board archive 视图恢复。
+- 历史 Host Session attachment 目前仍只导入 metadata/title。完整 transcript 或 rollout event backfill 留到后续切片。
 
 ## 下一步
 - Cloudflare Access destination 覆盖 `/api/*`、`/ws/browser` 和 GUI hostname 后，重新测试 attach。

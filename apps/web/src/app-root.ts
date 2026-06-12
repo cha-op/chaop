@@ -429,7 +429,7 @@ export class ChaopApp extends LitElement {
   }
 
   private renderHostSessions() {
-    const attached = this.data!.host_sessions.filter((session) => session.attached_thread_id);
+    const attached = this.data!.host_sessions.filter((session) => this.isActiveAttachedHostSession(session));
     const unattached = this.data!.host_sessions.filter((session) => !session.attached_thread_id);
 
     return html`
@@ -616,6 +616,16 @@ export class ChaopApp extends LitElement {
 
   private taskForThread(threadId: string): TaskSummary | undefined {
     return this.data?.tasks.find((task) => task.thread_id === threadId);
+  }
+
+  private isActiveAttachedHostSession(session: HostSessionSummary): boolean {
+    if (!session.attached_thread_id) return false;
+    const thread = this.data?.threads.find((item) => item.id === session.attached_thread_id);
+    if (thread?.state === "archived") return false;
+    const task = session.attached_task_id
+      ? this.data?.tasks.find((item) => item.id === session.attached_task_id)
+      : undefined;
+    return !task?.archived_at;
   }
 
   private threadListItem(thread: ThreadSummary) {
