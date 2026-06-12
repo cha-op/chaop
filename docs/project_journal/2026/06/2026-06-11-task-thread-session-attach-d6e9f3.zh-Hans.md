@@ -49,4 +49,8 @@ superseded_by:
 - Host Sessions 现在有明确的 detach API 和 UI action。Detach 只会清空 host session 的 attachment pointers，并保留 task/thread 历史，所以可以完整测试 archive 和 restore，而不会删除已经创建的 task。
 
 ## 下一步
-- 增加明确的新建 Codex thread 流程，让 Chaop 可以创建本机 Codex/app-server thread，而不只是 attach 已存在的 sessions。
+- 下一步优先做明确的新建 Codex thread 流程。Chaop 应该能从 Task Board 或 Thread Command Centre 创建本机 Codex/app-server thread，把创建出来的 session 绑定回 task/thread 组合，并且在本机 app-server 不可用时返回清晰的 connector/app-server 错误。
+- 新建 thread 跑通后，再做旧 session history backfill，让 attach 的旧 sessions 可以显示有用的历史 output，同时默认不上传宽泛的本机 transcripts。
+- History backfill 之后，再通过 connector 把 Chaop archive/unarchive 同步到本机 Codex app-server archive 状态。本机 history 文件保持只读。
+- 在 app-server protocol path 可以干净覆盖 create、resume、archive 和 event/history reads 之前，Codex CLI adapter 继续作为当前可用的 execution fallback。
+- R2 artefact capture 和 budget aggregation 排在这些核心控制闭环工作之后。

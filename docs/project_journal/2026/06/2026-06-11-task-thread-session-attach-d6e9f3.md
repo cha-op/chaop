@@ -49,4 +49,8 @@ superseded_by:
 - Host Sessions now has an explicit detach API and UI action. Detach clears the host session attachment pointers but preserves the task/thread history so archive and restore can be tested without deleting the created task.
 
 ## Next Steps
-- Add an explicit new Codex thread flow so Chaop can create a local Codex/app-server thread instead of only attaching existing sessions.
+- Prioritise the explicit new Codex thread flow next. Chaop should be able to create a local Codex/app-server thread from Task Board or Thread Command Centre, bind the created session back to a task/thread pair, and report a clear connector/app-server error when local app-server is unavailable.
+- After new-thread creation works, add old-session history backfill so attached sessions can show useful previous output without uploading broad local transcripts by default.
+- After history backfill, sync Chaop archive/unarchive to the local Codex app-server archive state through the connector. Keep local history files read-only.
+- Keep the Codex CLI adapter as the current working execution fallback until the app-server protocol path can cover create, resume, archive, and event/history reads cleanly.
+- Keep R2 artefact capture and budget aggregation behind this core control-loop closure work.

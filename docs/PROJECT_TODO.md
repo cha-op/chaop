@@ -9,6 +9,7 @@
 - [done] Run a deployed placeholder E2E smoke using private Cloudflare config, Access service-token auth, and the first local connector.
 - [done] Add opt-in local Codex CLI command execution behind private connector configuration.
 - [done] Add task archive, Host Sessions attach, and real Thread Centre thread selection.
+- [done] Add GitHub Actions unit-test CI for the shared pnpm and Rust test gate.
 - [todo] Add an explicit "new Codex thread" flow that can create a local Codex/app-server thread from Chaop instead of only attaching existing local sessions.
 - [todo] Sync Chaop archive/unarchive actions to local Codex app-server archive state through the connector, while keeping local history files read-only.
 - [pending] Replace the Codex CLI adapter with real Codex app-server protocol execution.
