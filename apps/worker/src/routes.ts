@@ -478,7 +478,7 @@ function optionalCommandType(value: unknown): value is CreateCommandRequest["typ
 
 function stableConnectorId(name: string, hostname: string): string {
   const slug = `${name}-${hostname}`.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  return `connector-${slug || "local"}-${cryptoRandomId().slice(0, 12)}`;
+  return `connector-${slug || "local"}`;
 }
 
 function cryptoRandomId(): string {

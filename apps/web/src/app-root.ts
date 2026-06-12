@@ -168,6 +168,7 @@ export class ChaopApp extends LitElement {
     try {
       const incoming = await loadBootstrap();
       this.data = mergeBootstrapPayload(this.data, incoming);
+      this.loadError = undefined;
       this.ensureSelectedThread();
     } catch (error) {
       this.loadError = error instanceof Error ? error.message : "Bootstrap request failed";

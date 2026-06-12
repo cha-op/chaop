@@ -285,7 +285,7 @@ Worker 必须为 Browser HTTP 和 WebSocket 请求校验 `Cf-Access-Jwt-Assertio
 
 除非后续决定为 connector 使用 Access service token，不要把 `/connector/bootstrap` 或 `/ws/agent` 放到这个 Browser Access application 后面。Connector bootstrap path 有意放在 `/api/*` 之外，这样宽泛的 Browser Access protection 不会包住 connector registration。
 
-Connector bootstrap 只用 `AGENT_BOOTSTRAP_SECRET` 注册 connector identity。Worker 随后签发随机 connector token，并且只在 D1 中保存它的 SHA-256 hash。重新执行 bootstrap 会创建新的 connector identity 和 token；请替换本地 connector token 文件，并在后续管理流程中停用旧 connector 记录。
+Connector bootstrap 只用 `AGENT_BOOTSTRAP_SECRET` 注册 connector identity。Worker 随后签发随机 connector token，并且只在 D1 中保存它的 SHA-256 hash。用同一个 connector name 和 hostname 重新执行 bootstrap 会保留同一个 connector identity，并轮换 connector token；请用最新值替换本地 connector token 文件。稳定 identity 之前生成的旧重复 connector rows 会自动 retire。
 
 ### 写入 Worker secret
 

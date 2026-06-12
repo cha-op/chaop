@@ -57,6 +57,8 @@ superseded_by:
 - Session inventory rollout scanning is bounded to recent date directories and a capped rollout file set before reading rollout metadata.
 - Browser command creation now requires a D1 binding outside local insecure dev, validates that workspace/thread/task ids belong together before insert, and waits for `command.started` before moving a task to `running`.
 - `command.failed` now maps to a visible `failed` task state in Worker, protocol grouping, and Task Board rather than being folded into `done`.
+- Connector bootstrap now uses a stable connector identity for the same name/hostname, lets a valid offline connector token reconnect and mark itself online, and retires older duplicate connector rows through the disconnect cleanup path while migrating host-session attachments.
+- Successful bootstrap reloads now clear stale full-screen Web load errors.
 
 ## Next Steps
 - Prioritise the explicit new Codex thread flow next. Chaop should be able to create a local Codex/app-server thread from Task Board or Thread Command Centre, bind the created session back to a task/thread pair, and report a clear connector/app-server error when local app-server is unavailable.

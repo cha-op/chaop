@@ -285,7 +285,7 @@ test("agent bootstrap returns connector token", async () => {
   const body = (await response.json()) as { connector_id: string; token: string; control_url: string };
 
   assert.equal(response.status, 201);
-  assert.match(body.connector_id, /^connector-mac-studio-mac-studio-local-[0-9a-f]{12}$/);
+  assert.equal(body.connector_id, "connector-mac-studio-mac-studio-local");
   assert.equal(body.token.startsWith("chaop_agent_"), true);
   assert.equal(body.control_url, "wss://api.example.com/ws/agent");
 });
@@ -329,7 +329,7 @@ test("agent bootstrap returns local websocket URL in insecure local dev", async 
   assert.equal(body.control_url, "ws://127.0.0.1:8787/ws/agent");
 });
 
-test("agent bootstrap creates unique connector ids for repeated names", async () => {
+test("agent bootstrap returns stable connector ids for repeated names", async () => {
   const body = JSON.stringify({
     connector_name: "mac-studio",
     hostname: "mac-studio.local",
@@ -353,7 +353,7 @@ test("agent bootstrap creates unique connector ids for repeated names", async ()
     devEnv
   );
 
-  assert.notEqual(
+  assert.equal(
     ((await first.json()) as { connector_id: string }).connector_id,
     ((await second.json()) as { connector_id: string }).connector_id
   );

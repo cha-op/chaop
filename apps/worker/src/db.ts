@@ -742,12 +742,90 @@ async function retireDuplicateConnectors(
   registration: AgentBootstrapRequest,
   now: string
 ): Promise<void> {
+  const duplicates = await allRows<{ id: string }>(
+    env.DB!.prepare(
+      `SELECT id
+       FROM connectors
+       WHERE id <> ? AND name = ? AND hostname = ?`
+    )
+      .bind(connectorId, registration.connector_name, registration.hostname)
+  );
+
+  for (const duplicate of duplicates) {
+    await markConnectorDisconnected(env, duplicate.id);
+    await migrateHostSessionsToConnector(env, duplicate.id, connectorId, registration.hostname, now);
+  }
+
   await env.DB!.prepare(
     `UPDATE connectors
-     SET status = 'offline', active_command_count = 0, updated_at = ?
+     SET status = 'offline',
+         active_command_count = 0,
+         token_hash = CASE
+           WHEN token_hash LIKE 'retired:%' THEN token_hash
+           ELSE 'retired:' || id || ':' || token_hash
+         END,
+         updated_at = ?
      WHERE id <> ? AND name = ? AND hostname = ?`
   )
     .bind(now, connectorId, registration.connector_name, registration.hostname)
+    .run();
+}
+
+async function migrateHostSessionsToConnector(
+  env: Env,
+  fromConnectorId: string,
+  toConnectorId: string,
+  hostname: string,
+  now: string
+): Promise<void> {
+  const rows = await allRows<HostSessionRow>(
+    env.DB!.prepare(
+      `SELECT id, connector_id, hostname, workspace_id, session_id, title, title_source, cwd,
+        attached_task_id, attached_thread_id, updated_at
+       FROM host_sessions
+       WHERE connector_id = ?`
+    )
+      .bind(fromConnectorId)
+  );
+
+  for (const row of rows) {
+    await env.DB!.prepare(
+      `INSERT INTO host_sessions (
+         id, connector_id, hostname, workspace_id, session_id, title, title_source,
+         cwd, attached_task_id, attached_thread_id, discovered_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(connector_id, session_id) DO UPDATE SET
+         hostname = excluded.hostname,
+         workspace_id = excluded.workspace_id,
+         title = excluded.title,
+         title_source = excluded.title_source,
+         cwd = excluded.cwd,
+         attached_task_id = COALESCE(host_sessions.attached_task_id, excluded.attached_task_id),
+         attached_thread_id = COALESCE(host_sessions.attached_thread_id, excluded.attached_thread_id),
+         updated_at = excluded.updated_at`
+    )
+      .bind(
+        hostSessionId(toConnectorId, row.session_id),
+        toConnectorId,
+        hostname,
+        row.workspace_id,
+        row.session_id,
+        row.title,
+        row.title_source,
+        row.cwd,
+        row.attached_task_id,
+        row.attached_thread_id,
+        row.updated_at,
+        now
+      )
+      .run();
+  }
+
+  await env.DB!.prepare(
+    `DELETE FROM host_sessions
+     WHERE connector_id = ?`
+  )
+    .bind(fromConnectorId)
     .run();
 }
 

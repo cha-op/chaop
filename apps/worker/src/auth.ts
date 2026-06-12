@@ -139,9 +139,18 @@ export async function authenticateAgentToken(request: Request, env: Env): Promis
     .bind(tokenHash)
     .first<{ id: string; status: string }>();
 
-  if (!row || row.status === "offline") {
+  if (!row) {
     return { ok: false, status: 401, message: "Invalid connector token" };
   }
+
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `UPDATE connectors
+     SET status = 'online', last_seen_at = ?, updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(now, now, row.id)
+    .run();
 
   return { ok: true, connectorId: row.id };
 }

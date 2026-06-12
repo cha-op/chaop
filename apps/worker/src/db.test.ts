@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { markConnectorDisconnected, recordAgentEvent } from "./db.js";
+import { ensureConnectorInventory, markConnectorDisconnected, recordAgentEvent } from "./db.js";
 import type { Env } from "./types.js";
 
 test("recordAgentEvent ignores stale events from a connector that lost the lease", async () => {
@@ -78,6 +78,22 @@ test("markConnectorDisconnected fails active commands and marks connector offlin
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
   assert.equal(db.connectorOfflineUpdates, 1);
+});
+
+test("ensureConnectorInventory retires duplicate connectors through disconnect cleanup", async () => {
+  const db = duplicateConnectorRetirementDb();
+
+  await ensureConnectorInventory({ DB: db } as Env, "connector-new", {
+    connector_name: "mac-studio",
+    hostname: "mac-studio.local",
+    workspace_root: "/Users/joey/Program/Codex-workspace",
+    capabilities: ["placeholder_commands"]
+  });
+
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.migratedHostSessions, 1);
+  assert.equal(db.deletedOldHostSessions, 1);
+  assert.equal(db.retiredConnectorTokens, 1);
 });
 
 function agentEventGuardDb(command: {
@@ -370,6 +386,243 @@ function connectorDisconnectedDb() {
     },
     get connectorOfflineUpdates() {
       return counters.connectorOfflineUpdates;
+    }
+  };
+
+  return db as D1Database & typeof counters;
+}
+
+function duplicateConnectorRetirementDb() {
+  const counters = {
+    commandFailures: 0,
+    eventInserts: 0,
+    migratedHostSessions: 0,
+    deletedOldHostSessions: 0,
+    retiredConnectorTokens: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/SELECT id\s+FROM connectors\s+WHERE id <> \? AND name = \? AND hostname = \?/.test(sql)) {
+        return {
+          bind(connectorId: string, name: string, hostname: string) {
+            assert.equal(connectorId, "connector-new");
+            assert.equal(name, "mac-studio");
+            assert.equal(hostname, "mac-studio.local");
+            return {
+              async all() {
+                return { results: [{ id: "connector-old" }] };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM commands/.test(sql) && /lease_owner_connector_id = \?/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-old");
+            return {
+              async all() {
+                return {
+                  results: [
+                    {
+                      id: "command-old",
+                      workspace_id: "workspace-api",
+                      thread_id: "thread-old",
+                      task_id: "task-old",
+                      type: "placeholder",
+                      prompt: "continue",
+                      state: "running",
+                      target_connector_id: "connector-old",
+                      created_at: "2026-06-12T10:00:00.000Z",
+                      updated_at: "2026-06-12T10:00:01.000Z"
+                    }
+                  ]
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /state = 'failed'/.test(sql)) {
+        return {
+          bind(updatedAt: string, commandId: string, connectorId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-old");
+            assert.equal(connectorId, "connector-old");
+            return {
+              async run() {
+                counters.commandFailures += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql) && /state = 'failed'/.test(sql)) {
+        return {
+          bind(updatedAt: string, taskId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId, "task-old");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-old");
+            return {
+              async first() {
+                return { last_seq: 9 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /token_hash = CASE/.test(sql)) {
+        return {
+          bind(updatedAt: string, connectorId: string, name: string, hostname: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-new");
+            assert.equal(name, "mac-studio");
+            assert.equal(hostname, "mac-studio.local");
+            return {
+              async run() {
+                counters.retiredConnectorTokens += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /status = 'offline'/.test(sql)) {
+        return {
+          bind(updatedAt: string, connectorId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-old");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, connector_id, hostname, workspace_id, session_id/.test(sql) && /FROM host_sessions/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-old");
+            return {
+              async all() {
+                return {
+                  results: [
+                    {
+                      id: "host-session-old",
+                      connector_id: "connector-old",
+                      hostname: "mac-studio.local",
+                      workspace_id: "workspace-api",
+                      session_id: "session-1",
+                      title: "Attached session",
+                      title_source: "history",
+                      cwd: "/Users/joey/Program/project",
+                      attached_task_id: "task-old",
+                      attached_thread_id: "thread-old",
+                      updated_at: "2026-06-12T10:00:00.000Z"
+                    }
+                  ]
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO host_sessions/.test(sql)) {
+        return {
+          bind(hostSessionId: string, connectorId: string, hostname: string) {
+            assert.equal(hostSessionId, "host-session-session-1-connector-new");
+            assert.equal(connectorId, "connector-new");
+            assert.equal(hostname, "mac-studio.local");
+            return {
+              async run() {
+                counters.migratedHostSessions += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/DELETE FROM host_sessions/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-old");
+            return {
+              async run() {
+                counters.deletedOldHostSessions += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (
+        /INSERT INTO task_categories/.test(sql) ||
+        /INSERT INTO workspaces/.test(sql) ||
+        /INSERT INTO workspace_connectors/.test(sql) ||
+        /INSERT INTO threads/.test(sql) ||
+        /INSERT INTO tasks/.test(sql)
+      ) {
+        return {
+          bind() {
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandFailures() {
+      return counters.commandFailures;
+    },
+    get migratedHostSessions() {
+      return counters.migratedHostSessions;
+    },
+    get deletedOldHostSessions() {
+      return counters.deletedOldHostSessions;
+    },
+    get retiredConnectorTokens() {
+      return counters.retiredConnectorTokens;
     }
   };
 

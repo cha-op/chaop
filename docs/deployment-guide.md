@@ -285,7 +285,7 @@ For the current implementation, Cloudflare Access policy is the source of truth 
 
 Do not put `/connector/bootstrap` or `/ws/agent` behind this Browser Access application unless we later decide to use Access service tokens for connectors. The connector bootstrap path intentionally lives outside `/api/*` so broad Browser Access protection does not wrap connector registration.
 
-Connector bootstrap uses `AGENT_BOOTSTRAP_SECRET` only to register a connector identity. The Worker then issues a random connector token and stores only its SHA-256 hash in D1. Re-running bootstrap creates a fresh connector identity and token; replace the local connector token file and retire the old connector record in a later management flow.
+Connector bootstrap uses `AGENT_BOOTSTRAP_SECRET` only to register a connector identity. The Worker then issues a random connector token and stores only its SHA-256 hash in D1. Re-running bootstrap with the same connector name and hostname keeps the same connector identity and rotates the connector token; replace the local connector token file with the newest value. Older duplicate connector rows from pre-stable identity builds are retired automatically.
 
 ### Write Worker secrets
 

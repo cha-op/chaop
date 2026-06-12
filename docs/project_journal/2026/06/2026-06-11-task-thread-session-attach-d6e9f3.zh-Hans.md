@@ -57,6 +57,8 @@ superseded_by:
 - Session inventory 的 rollout 扫描现在会先限制到最近日期目录和有上限的 rollout 文件集合，再读取 rollout metadata。
 - Browser command creation 在非本地 insecure dev 环境必须有 D1 binding；写入前会校验 workspace/thread/task ids 的归属一致性，并且等到 `command.started` 后才把 task 移到 `running`。
 - `command.failed` 现在会映射成 Task Board 可见的 `failed` task state，不再在 Worker、protocol grouping 或 UI 中折叠成 `done`。
+- Connector bootstrap 现在会对同一 name/hostname 使用稳定 connector identity；有效的 offline connector token 可以重连并把自身标回 online；旧重复 connector rows 会通过 disconnect cleanup 路径 retire，并迁移 host-session attachments。
+- Web bootstrap 成功重新加载后，现在会清理旧的全屏 `loadError`。
 
 ## 下一步
 - 下一步优先做明确的新建 Codex thread 流程。Chaop 应该能从 Task Board 或 Thread Command Centre 创建本机 Codex/app-server thread，把创建出来的 session 绑定回 task/thread 组合，并且在本机 app-server 不可用时返回清晰的 connector/app-server 错误。
