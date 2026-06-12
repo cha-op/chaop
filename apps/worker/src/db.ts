@@ -8,6 +8,7 @@ import type {
   ConnectorSummary,
   CreateCommandRequest,
   CreateCommandResponse,
+  DetachHostSessionResponse,
   HostSessionSummary,
   HostSessionSyncSummary,
   TaskCategory,
@@ -328,6 +329,43 @@ export async function attachHostSessionInDb(
     },
     task,
     thread
+  };
+}
+
+export async function detachHostSessionInDb(
+  env: Env,
+  sessionId: string,
+  connectorId?: string
+): Promise<DetachHostSessionResponse> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for host session detachment");
+  }
+
+  const hostSession = await findHostSession(env, sessionId, connectorId);
+  if (!hostSession) {
+    throw new NotFoundError("Host session not found");
+  }
+
+  if (!hostSession.attached_task_id && !hostSession.attached_thread_id) {
+    return { host_session: hostSession };
+  }
+
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `UPDATE host_sessions
+     SET attached_task_id = NULL, attached_thread_id = NULL, updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(now, hostSession.id)
+    .run();
+
+  return {
+    host_session: {
+      ...hostSession,
+      attached_task_id: undefined,
+      attached_thread_id: undefined,
+      updated_at: now
+    }
   };
 }
 

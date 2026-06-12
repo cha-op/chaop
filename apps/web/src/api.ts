@@ -4,6 +4,8 @@ import type {
   BootstrapPayload,
   CreateCommandRequest,
   CreateCommandResponse,
+  DetachHostSessionRequest,
+  DetachHostSessionResponse,
   RefreshHostSessionsResponse,
   TaskSummary
 } from "@chaop/protocol";
@@ -68,6 +70,13 @@ export async function attachHostSession(
   request: AttachHostSessionRequest
 ): Promise<AttachHostSessionResponse> {
   return postJson(`/api/host-sessions/${encodeURIComponent(sessionId)}/attach`, request);
+}
+
+export async function detachHostSession(
+  sessionId: string,
+  request: DetachHostSessionRequest
+): Promise<DetachHostSessionResponse> {
+  return postJson(`/api/host-sessions/${encodeURIComponent(sessionId)}/detach`, request);
 }
 
 export async function refreshHostSessions(): Promise<RefreshHostSessionsResponse> {

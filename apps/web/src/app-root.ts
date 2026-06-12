@@ -20,6 +20,7 @@ import {
   attachHostSession,
   browserSocketUrl,
   createCommand,
+  detachHostSession,
   loadBootstrap,
   refreshHostSessions,
   unarchiveTask
@@ -517,7 +518,18 @@ export class ChaopApp extends LitElement {
         </div>
         <span class="chip ${session.title_source}">${titleSourceLabel(session.title_source)}</span>
         ${attachedThreadId
-          ? html`<span class="chip realtime">Attached</span>`
+          ? html`
+              <span class="chip realtime">Attached</span>
+              <button
+                type="button"
+                @click=${(event: Event) => {
+                  event.stopPropagation();
+                  void this.detachSession(session);
+                }}
+              >
+                Detach
+              </button>
+            `
           : html`
               <button
                 type="button"
@@ -616,6 +628,17 @@ export class ChaopApp extends LitElement {
     }
   }
 
+  private async detachSession(session: HostSessionSummary): Promise<void> {
+    this.actionError = undefined;
+    try {
+      const response = await detachHostSession(session.session_id, { connector_id: session.connector_id });
+      this.mergeDetachedSession(response);
+      await this.load();
+    } catch (error) {
+      this.actionError = actionErrorMessage("Detach failed", error);
+    }
+  }
+
   private readonly refreshHostSessionInventory = async (): Promise<void> => {
     this.actionError = undefined;
     this.hostSessionsRefreshState = "refreshing";
@@ -649,6 +672,17 @@ export class ChaopApp extends LitElement {
       threads: [
         response.thread,
         ...this.data.threads.filter((item) => item.id !== response.thread.id)
+      ]
+    };
+  }
+
+  private mergeDetachedSession(response: Awaited<ReturnType<typeof detachHostSession>>): void {
+    if (!this.data) return;
+    this.data = {
+      ...this.data,
+      host_sessions: [
+        response.host_session,
+        ...this.data.host_sessions.filter((item) => item.id !== response.host_session.id)
       ]
     };
   }

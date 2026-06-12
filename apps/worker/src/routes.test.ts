@@ -129,6 +129,36 @@ test("host session refresh dispatches to the workspace durable object", async ()
   assert.equal(internalPath, "/internal/refresh-host-sessions");
 });
 
+test("host session detach clears the attached task and thread when D1 is bound", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: hostSessionDetachDb()
+    }
+  );
+  const body = (await response.json()) as {
+    host_session: {
+      session_id: string;
+      attached_task_id?: string;
+      attached_thread_id?: string;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.host_session.session_id, "session-1");
+  assert.equal(body.host_session.attached_task_id, undefined);
+  assert.equal(body.host_session.attached_thread_id, undefined);
+});
+
 test("CORS preflight returns configured browser headers", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/commands", {
@@ -678,6 +708,59 @@ function commandTargetDb(
               async first() {
                 return { active_count: 0 };
               },
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    }
+  } as unknown as D1Database;
+}
+
+function hostSessionDetachDb(): D1Database {
+  const row = {
+    id: "host-session-1",
+    connector_id: "connector-online",
+    hostname: "mac-studio.local",
+    workspace_id: "workspace-api",
+    session_id: "session-1",
+    title: "Attached session",
+    title_source: "history",
+    cwd: "/Users/joey/Program/project",
+    updated_at: "2026-06-12T10:00:00.000Z",
+    attached_task_id: "task-host-1",
+    attached_thread_id: "thread-host-1"
+  };
+
+  return {
+    prepare(sql: string) {
+      if (/FROM host_sessions/.test(sql) && /WHERE session_id = \? AND connector_id = \?/.test(sql)) {
+        return {
+          bind(sessionId: string, connectorId: string) {
+            assert.equal(sessionId, "session-1");
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return row;
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE host_sessions/.test(sql) && /attached_task_id = NULL/.test(sql)) {
+        return {
+          bind(updatedAt: string, hostSessionId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(hostSessionId, "host-session-1");
+            row.updated_at = updatedAt;
+            row.attached_task_id = null as unknown as string;
+            row.attached_thread_id = null as unknown as string;
+            return {
               async run() {
                 return { success: true };
               }

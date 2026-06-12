@@ -5,6 +5,7 @@ import {
   type AgentBootstrapResponse,
   type CreateCommandRequest,
   type CreateCommandResponse,
+  type DetachHostSessionRequest,
   type RefreshHostSessionsResponse
 } from "@chaop/protocol";
 import {
@@ -19,6 +20,7 @@ import {
   archiveTaskInDb,
   attachHostSessionInDb,
   createCommandInDb,
+  detachHostSessionInDb,
   ensureConnectorInventory,
   loadBootstrapFromDb,
   unarchiveTaskInDb
@@ -197,6 +199,37 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         payload.value.connector_id
       );
       return json(request, env, response, 201);
+    } catch (error) {
+      if (error instanceof NotFoundError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      throw error;
+    }
+  }
+
+  const detachHostSessionMatch = url.pathname.match(/^\/api\/host-sessions\/([^/]+)\/detach$/);
+  if (request.method === "POST" && detachHostSessionMatch) {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+
+    const payload = await readOptionalJson(request);
+    if (!payload.ok) {
+      return json(request, env, { error: payload.message }, 400);
+    }
+    if (!isDetachHostSessionRequest(payload.value)) {
+      return json(request, env, { error: "Invalid host session detach payload" }, 400);
+    }
+
+    try {
+      const response = await detachHostSessionInDb(
+        env,
+        decodeURIComponent(detachHostSessionMatch[1] ?? ""),
+        payload.value.connector_id
+      );
+      return json(request, env, response, 200);
     } catch (error) {
       if (error instanceof NotFoundError) {
         return json(request, env, { error: error.message }, error.status);
@@ -413,6 +446,10 @@ function isCreateCommandRequest(value: unknown): value is CreateCommandRequest {
 }
 
 function isAttachHostSessionRequest(value: unknown): value is AttachHostSessionRequest {
+  return isRecord(value) && optionalString(value.connector_id);
+}
+
+function isDetachHostSessionRequest(value: unknown): value is DetachHostSessionRequest {
   return isRecord(value) && optionalString(value.connector_id);
 }
 

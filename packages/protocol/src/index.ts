@@ -273,6 +273,14 @@ export type AttachHostSessionResponse = {
   thread: ThreadSummary;
 };
 
+export type DetachHostSessionRequest = {
+  connector_id?: string | undefined;
+};
+
+export type DetachHostSessionResponse = {
+  host_session: HostSessionSummary;
+};
+
 export type CommandDispatch = {
   command: CommandSummary;
 };
