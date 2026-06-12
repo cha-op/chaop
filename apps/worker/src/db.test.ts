@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { recordAgentEvent } from "./db.js";
+import { markConnectorDisconnected, recordAgentEvent } from "./db.js";
 import type { Env } from "./types.js";
 
 test("recordAgentEvent ignores stale events from a connector that lost the lease", async () => {
@@ -39,6 +39,20 @@ test("recordAgentEvent accepts events from the active lease owner", async () => 
   assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
+});
+
+test("markConnectorDisconnected fails active commands and marks connector offline", async () => {
+  const db = connectorDisconnectedDb();
+
+  const events = await markConnectorDisconnected({ DB: db } as Env, "connector-online");
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.kind, "command.failed");
+  assert.equal(events[0]?.seq, 8);
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.connectorOfflineUpdates, 1);
 });
 
 function agentEventGuardDb(command: {
@@ -115,12 +129,17 @@ function agentEventGuardDb(command: {
       }
 
       if (/SELECT last_seq/.test(sql)) {
+        throw new Error("appendEvent must allocate event sequence with UPDATE ... RETURNING");
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
         return {
-          bind(threadId: string) {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(threadId, "thread-1");
             return {
               async first() {
-                return { last_seq: 0 };
+                return { last_seq: 1 };
               }
             };
           }
@@ -175,6 +194,152 @@ function agentEventGuardDb(command: {
     },
     get eventInserts() {
       return counters.eventInserts;
+    }
+  };
+
+  return db as D1Database & typeof counters;
+}
+
+function connectorDisconnectedDb() {
+  const counters = {
+    commandFailures: 0,
+    taskUpdates: 0,
+    eventInserts: 0,
+    connectorOfflineUpdates: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/FROM commands/.test(sql) && /lease_owner_connector_id = \?/.test(sql) && /state IN \('leased', 'running'\)/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [
+                    {
+                      id: "command-1",
+                      workspace_id: "workspace-api",
+                      thread_id: "thread-1",
+                      task_id: "task-1",
+                      type: "codex",
+                      prompt: "continue",
+                      state: "running",
+                      target_connector_id: "connector-online",
+                      created_at: "2026-06-12T10:00:00.000Z",
+                      updated_at: "2026-06-12T10:00:01.000Z"
+                    }
+                  ]
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /state = 'failed'/.test(sql)) {
+        return {
+          bind(updatedAt: string, commandId: string, connectorId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                counters.commandFailures += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql)) {
+        return {
+          bind(updatedAt: string, taskId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId, "task-1");
+            return {
+              async run() {
+                counters.taskUpdates += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 8 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind(
+            eventId: string,
+            workspaceId: string,
+            threadId: string,
+            commandId: string,
+            seq: number,
+            kind: string,
+            priority: string,
+            summary: string
+          ) {
+            assert.match(eventId, /^event-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-1");
+            assert.equal(commandId, "command-1");
+            assert.equal(seq, 8);
+            assert.equal(kind, "command.failed");
+            assert.equal(priority, "P1");
+            assert.equal(summary, "Connector disconnected before the command completed.");
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /status = 'offline'/.test(sql)) {
+        return {
+          bind(updatedAt: string, connectorId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                counters.connectorOfflineUpdates += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandFailures() {
+      return counters.commandFailures;
+    },
+    get taskUpdates() {
+      return counters.taskUpdates;
+    },
+    get eventInserts() {
+      return counters.eventInserts;
+    },
+    get connectorOfflineUpdates() {
+      return counters.connectorOfflineUpdates;
     }
   };
 

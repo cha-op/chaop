@@ -48,6 +48,13 @@ superseded_by:
 - Connector session inventory now creates lightweight entries from `history.jsonl` even when a session has no `session_index` or rollout metadata yet, using history `ts` as the session update time and the first prompt as the title.
 - Host Sessions now has an explicit detach API and UI action. Detach clears the host session attachment pointers but preserves the task/thread history so archive and restore can be tested without deleting the created task.
 
+## 2026-06-12 Review Hardening
+- The D1 `0003` migration now preserves existing `commands.task_id` links while rebuilding `tasks`, and a direct SQLite migration check confirmed the command still points at its task after migration.
+- Thread event sequencing now uses an atomic `UPDATE threads ... RETURNING last_seq` allocation path, reducing same-thread concurrent event collisions.
+- Durable Object agent socket close/error handling now marks the connector offline, fails leased/running commands, updates the attached task state, and broadcasts failure events to Browser sockets.
+- The Rust connector now defers non-ACK WebSocket messages seen while waiting for an event ACK, so a queued `command.dispatch` is handled after the current command instead of being consumed.
+- Session inventory rollout scanning is bounded to recent date directories and a capped rollout file set before reading rollout metadata.
+
 ## Next Steps
 - Prioritise the explicit new Codex thread flow next. Chaop should be able to create a local Codex/app-server thread from Task Board or Thread Command Centre, bind the created session back to a task/thread pair, and report a clear connector/app-server error when local app-server is unavailable.
 - After new-thread creation works, add old-session history backfill so attached sessions can show useful previous output without uploading broad local transcripts by default.

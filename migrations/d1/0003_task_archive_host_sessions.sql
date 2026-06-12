@@ -2,6 +2,17 @@ ALTER TABLE tasks ADD COLUMN archived_at TEXT;
 
 PRAGMA defer_foreign_keys = ON;
 
+DROP TABLE IF EXISTS _migration_0003_command_task_links;
+CREATE TABLE _migration_0003_command_task_links (
+  command_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL
+);
+
+INSERT INTO _migration_0003_command_task_links (command_id, task_id)
+SELECT id, task_id
+FROM commands
+WHERE task_id IS NOT NULL;
+
 INSERT OR IGNORE INTO threads (id, workspace_id, title, state, realtime_mode, last_seq, created_at, updated_at)
 SELECT
   'thread-' || id,
@@ -50,6 +61,19 @@ FROM tasks;
 
 DROP TABLE tasks;
 ALTER TABLE tasks_new RENAME TO tasks;
+
+UPDATE commands
+SET task_id = (
+  SELECT task_id
+  FROM _migration_0003_command_task_links
+  WHERE command_id = commands.id
+)
+WHERE id IN (
+  SELECT command_id
+  FROM _migration_0003_command_task_links
+);
+
+DROP TABLE _migration_0003_command_task_links;
 
 CREATE INDEX idx_tasks_state ON tasks(state, updated_at);
 CREATE INDEX idx_tasks_category ON tasks(category_id, updated_at);

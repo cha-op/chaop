@@ -680,25 +680,30 @@ function commandTargetDb(
         };
       }
 
-      if (/INSERT INTO commands/.test(sql) || /INSERT INTO events/.test(sql) || /UPDATE threads/.test(sql)) {
+      if (/SELECT last_seq/.test(sql)) {
+        throw new Error("appendEvent must allocate event sequence with UPDATE ... RETURNING");
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
         return {
-          bind() {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-orders-500");
             return {
-              async run() {
-                return { success: true };
+              async first() {
+                return { last_seq: 1 };
               }
             };
           }
         };
       }
 
-      if (/SELECT last_seq/.test(sql)) {
+      if (/INSERT INTO commands/.test(sql) || /INSERT INTO events/.test(sql)) {
         return {
-          bind(threadId: string) {
-            assert.equal(threadId, "thread-orders-500");
+          bind() {
             return {
-              async first() {
-                return { last_seq: 0 };
+              async run() {
+                return { success: true };
               }
             };
           }

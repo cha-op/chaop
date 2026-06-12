@@ -78,7 +78,11 @@ pub fn build_host_sessions_report(
     let mut drafts = HashMap::<String, SessionDraft>::new();
 
     read_session_index(&codex_home, &mut drafts)?;
-    read_rollouts(&codex_home, &mut drafts)?;
+    read_rollouts(
+        &codex_home,
+        &mut drafts,
+        config.session_inventory.max_sessions,
+    )?;
     let history_sessions = read_history_sessions(&codex_home)?;
     let app_server_titles = config
         .session_inventory
@@ -181,12 +185,13 @@ fn read_history_sessions(codex_home: &Path) -> std::io::Result<HashMap<String, H
 fn read_rollouts(
     codex_home: &Path,
     drafts: &mut HashMap<String, SessionDraft>,
+    max_sessions: usize,
 ) -> std::io::Result<()> {
     let sessions_dir = codex_home.join("sessions");
     if !sessions_dir.exists() {
         return Ok(());
     }
-    for path in rollout_paths(&sessions_dir)? {
+    for path in rollout_paths(&sessions_dir, rollout_scan_limit(max_sessions))? {
         read_rollout_metadata(&path, drafts)?;
     }
     Ok(())
@@ -258,27 +263,121 @@ fn read_rollout_metadata(
     Ok(())
 }
 
-fn rollout_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+fn rollout_scan_limit(max_sessions: usize) -> usize {
+    max_sessions.saturating_mul(3).clamp(50, 500)
+}
+
+fn rollout_paths(root: &Path, limit: usize) -> std::io::Result<Vec<PathBuf>> {
+    let limit = limit.max(1);
+    let day_dirs = dated_session_dirs(root)?;
+    if !day_dirs.is_empty() {
+        let mut paths = Vec::new();
+        for day_dir in day_dirs {
+            paths.extend(rollout_files_in_dir(&day_dir)?);
+            if paths.len() >= limit {
+                break;
+            }
+        }
+        sort_paths_by_mtime_desc(&mut paths);
+        paths.truncate(limit);
+        return Ok(paths);
+    }
+
     let mut paths = Vec::new();
-    collect_rollout_paths(root, &mut paths)?;
+    collect_rollout_paths(root, &mut paths, limit)?;
+    sort_paths_by_mtime_desc(&mut paths);
+    paths.truncate(limit);
     Ok(paths)
 }
 
-fn collect_rollout_paths(path: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect_rollout_paths(
+    path: &Path,
+    paths: &mut Vec<PathBuf>,
+    limit: usize,
+) -> std::io::Result<()> {
+    if paths.len() >= limit {
+        return Ok(());
+    }
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_rollout_paths(&path, paths)?;
+            collect_rollout_paths(&path, paths, limit)?;
         } else if path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
         {
             paths.push(path);
+            if paths.len() >= limit {
+                break;
+            }
         }
     }
     Ok(())
+}
+
+fn dated_session_dirs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut day_dirs = Vec::new();
+    for year in sorted_numeric_dirs(root, false)? {
+        for month in sorted_numeric_dirs(&year, false)? {
+            for day in sorted_numeric_dirs(&month, false)? {
+                day_dirs.push(day);
+            }
+        }
+    }
+    day_dirs.sort_by(|left, right| right.cmp(left));
+    Ok(day_dirs)
+}
+
+fn sorted_numeric_dirs(root: &Path, ascending: bool) -> std::io::Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.chars().all(|char| char.is_ascii_digit()))
+        {
+            dirs.push(path);
+        }
+    }
+    if ascending {
+        dirs.sort();
+    } else {
+        dirs.sort_by(|left, right| right.cmp(left));
+    }
+    Ok(dirs)
+}
+
+fn rollout_files_in_dir(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            paths.push(path);
+        }
+    }
+    sort_paths_by_mtime_desc(&mut paths);
+    Ok(paths)
+}
+
+fn sort_paths_by_mtime_desc(paths: &mut [PathBuf]) {
+    paths.sort_by(|left, right| {
+        let right_time = right.metadata().and_then(|metadata| metadata.modified()).ok();
+        let left_time = left.metadata().and_then(|metadata| metadata.modified()).ok();
+        right_time
+            .cmp(&left_time)
+            .then_with(|| right.cmp(left))
+    });
 }
 
 fn resolve_session(
@@ -489,7 +588,7 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_server_titles_from_response, build_host_sessions_report, resolve_session,
+        app_server_titles_from_response, build_host_sessions_report, resolve_session, rollout_paths,
         unix_seconds_to_iso, HistorySession, SessionDraft, TitleSource,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
@@ -576,6 +675,32 @@ mod tests {
             Some("2026-06-12T11:24:03.000Z")
         );
         assert_eq!(unix_seconds_to_iso(-1), None);
+    }
+
+    #[test]
+    fn rollout_paths_are_limited_to_recent_date_directories() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = tempdir.path();
+        fs::create_dir_all(sessions_dir.join("2026/06/10")).expect("old dir");
+        fs::create_dir_all(sessions_dir.join("2026/06/12")).expect("new dir");
+        fs::write(
+            sessions_dir.join("2026/06/10/rollout-old.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"old"}}"#,
+        )
+        .expect("old rollout");
+        fs::write(
+            sessions_dir.join("2026/06/12/rollout-new.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"new"}}"#,
+        )
+        .expect("new rollout");
+
+        let paths = rollout_paths(sessions_dir, 1).expect("paths");
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].file_name().and_then(|name| name.to_str()),
+            Some("rollout-new.jsonl")
+        );
     }
 
     #[test]

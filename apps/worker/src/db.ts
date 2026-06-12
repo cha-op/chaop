@@ -668,6 +668,69 @@ export async function recordAgentEvent(
   return threadEvent;
 }
 
+export async function markConnectorDisconnected(env: Env, connectorId: string): Promise<ThreadEvent[]> {
+  if (!env.DB) return [];
+
+  const now = new Date().toISOString();
+  const activeCommands = await allRows<CommandRow>(
+    env.DB.prepare(
+      `SELECT id, workspace_id, thread_id, task_id, type, prompt, state, target_connector_id, created_at, updated_at
+       FROM commands
+       WHERE lease_owner_connector_id = ? AND state IN ('leased', 'running')
+       ORDER BY updated_at ASC`
+    )
+      .bind(connectorId)
+  );
+
+  const events: ThreadEvent[] = [];
+  for (const command of activeCommands) {
+    const result = await env.DB.prepare(
+      `UPDATE commands
+       SET state = 'failed', lease_owner_connector_id = NULL, lease_until = NULL, updated_at = ?
+       WHERE id = ? AND lease_owner_connector_id = ? AND state IN ('leased', 'running')`
+    )
+      .bind(now, command.id, connectorId)
+      .run();
+    if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+      continue;
+    }
+
+    if (command.task_id) {
+      await env.DB.prepare(
+        `UPDATE tasks
+         SET state = 'done', updated_at = ?
+         WHERE id = ?`
+      )
+        .bind(now, command.task_id)
+        .run();
+    }
+
+    if (command.thread_id) {
+      const event = await appendEvent(env, {
+        workspace_id: command.workspace_id,
+        thread_id: command.thread_id,
+        command_id: command.id,
+        kind: "command.failed",
+        priority: "P1",
+        summary: "Connector disconnected before the command completed."
+      });
+      if (event) {
+        events.push(event);
+      }
+    }
+  }
+
+  await env.DB.prepare(
+    `UPDATE connectors
+     SET status = 'offline', active_command_count = 0, updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(now, connectorId)
+    .run();
+
+  return events;
+}
+
 async function ensureUser(env: Env, user: BrowserIdentity): Promise<void> {
   if (!env.DB) return;
   const now = new Date().toISOString();
@@ -948,19 +1011,19 @@ async function appendEvent(
   env: Env,
   input: EventInput
 ): Promise<ThreadEvent | undefined> {
-  const current = await env.DB!.prepare(
-    `SELECT last_seq
-     FROM threads
+  const now = new Date().toISOString();
+  const sequence = await env.DB!.prepare(
+    `UPDATE threads
+     SET last_seq = last_seq + 1, updated_at = ?
      WHERE id = ?
-     LIMIT 1`
+     RETURNING last_seq`
   )
-    .bind(input.thread_id)
+    .bind(now, input.thread_id)
     .first<{ last_seq: number }>();
 
-  if (!current) return undefined;
+  if (!sequence) return undefined;
 
-  const seq = current.last_seq + 1;
-  const now = new Date().toISOString();
+  const seq = sequence.last_seq;
   const event: ThreadEvent = {
     id: `event-${cryptoRandomId().slice(0, 16)}`,
     thread_id: input.thread_id,
@@ -986,13 +1049,6 @@ async function appendEvent(
       event.summary,
       event.created_at
     )
-    .run();
-  await env.DB!.prepare(
-    `UPDATE threads
-     SET last_seq = ?, updated_at = ?
-     WHERE id = ?`
-  )
-    .bind(seq, now, input.thread_id)
     .run();
   return event;
 }

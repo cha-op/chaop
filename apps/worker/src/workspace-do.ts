@@ -6,7 +6,12 @@ import {
   type HostSessionsUpdatePayload,
   type ThreadEvent
 } from "@chaop/protocol";
-import { pendingCommandsForConnector, recordAgentEvent, recordHostSessions } from "./db.js";
+import {
+  markConnectorDisconnected,
+  pendingCommandsForConnector,
+  recordAgentEvent,
+  recordHostSessions
+} from "./db.js";
 import type { Env } from "./types.js";
 
 export class WorkspaceDO implements DurableObject {
@@ -68,9 +73,13 @@ export class WorkspaceDO implements DurableObject {
     );
   }
 
-  async webSocketClose(): Promise<void> {}
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    await this.handleSocketGone(ws);
+  }
 
-  async webSocketError(): Promise<void> {}
+  async webSocketError(ws: WebSocket): Promise<void> {
+    await this.handleSocketGone(ws);
+  }
 
   private async dispatchPending(request: Request): Promise<Response> {
     const payload = await request.json().catch(() => ({})) as { connector_id?: string };
@@ -149,6 +158,18 @@ export class WorkspaceDO implements DurableObject {
   private broadcastToBrowsers(message: string): void {
     for (const socket of this.ctx.getWebSockets("browser")) {
       socket.send(message);
+    }
+  }
+
+  private async handleSocketGone(ws: WebSocket): Promise<void> {
+    const attachment = ws.deserializeAttachment() as { socketType?: string; connectorId?: string } | undefined;
+    if (attachment?.socketType !== "agent" || !attachment.connectorId) {
+      return;
+    }
+
+    const events = await markConnectorDisconnected(this.env, attachment.connectorId);
+    for (const event of events) {
+      this.broadcastToBrowsers(threadEventMessage(event));
     }
   }
 

@@ -5,6 +5,7 @@ use crate::placeholder::ConnectorEvent;
 use crate::session_inventory::build_host_sessions_report;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::TcpStream;
@@ -69,25 +70,29 @@ pub fn run_connector(
         json!({ "kind": "agent.ready" }).to_string().into(),
     ))?;
     let mut last_host_sessions_message = None;
+    let mut deferred_messages = VecDeque::<String>::new();
     send_host_sessions(&mut socket, config, &mut last_host_sessions_message, true)?;
     let mut next_host_sessions_at = Instant::now() + host_sessions_interval(config);
 
     loop {
-        let message = match socket.read() {
-            Ok(message) => message,
-            Err(error) if is_read_timeout(&error) => {
-                if Instant::now() >= next_host_sessions_at {
-                    send_host_sessions(
-                        &mut socket,
-                        config,
-                        &mut last_host_sessions_message,
-                        false,
-                    )?;
-                    next_host_sessions_at = Instant::now() + host_sessions_interval(config);
+        let message = match deferred_messages.pop_front() {
+            Some(text) => Message::Text(text.into()),
+            None => match socket.read() {
+                Ok(message) => message,
+                Err(error) if is_read_timeout(&error) => {
+                    if Instant::now() >= next_host_sessions_at {
+                        send_host_sessions(
+                            &mut socket,
+                            config,
+                            &mut last_host_sessions_message,
+                            false,
+                        )?;
+                        next_host_sessions_at = Instant::now() + host_sessions_interval(config);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(error) => return Err(error.into()),
+                Err(error) => return Err(error.into()),
+            },
         };
         match message {
             Message::Text(text) => {
@@ -96,6 +101,7 @@ pub fn run_connector(
                     text.as_ref(),
                     config,
                     &mut last_host_sessions_message,
+                    &mut deferred_messages,
                 )? && run_mode == RunMode::Once
                 {
                     socket.close(None)?;
@@ -145,6 +151,7 @@ fn handle_text_message(
     text: &str,
     config: &AgentConfig,
     last_host_sessions_message: &mut Option<String>,
+    deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
     if envelope.kind == "host_sessions.refresh" {
@@ -166,6 +173,7 @@ fn handle_text_message(
             vec![codex_exec_started_event(&config.workspace_root)],
             config,
             last_host_sessions_message,
+            deferred_messages,
         )?;
         let events = codex_exec_result_events(
             &config.execution,
@@ -178,6 +186,7 @@ fn handle_text_message(
             events,
             config,
             last_host_sessions_message,
+            deferred_messages,
         )?;
         return Ok(true);
     }
@@ -188,6 +197,7 @@ fn handle_text_message(
         command_events(&dispatch.command),
         config,
         last_host_sessions_message,
+        deferred_messages,
     )?;
     Ok(true)
 }
@@ -217,6 +227,7 @@ fn dispatch_events(
     events: Vec<ConnectorEvent>,
     config: &AgentConfig,
     last_host_sessions_message: &mut Option<String>,
+    deferred_messages: &mut VecDeque<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for event in events {
         if event.kind == "command.accepted" {
@@ -241,6 +252,7 @@ fn dispatch_events(
             &event.kind,
             config,
             last_host_sessions_message,
+            deferred_messages,
         )?;
     }
     Ok(())
@@ -280,30 +292,21 @@ fn wait_for_ack(
     event_kind: &str,
     config: &AgentConfig,
     last_host_sessions_message: &mut Option<String>,
+    deferred_messages: &mut VecDeque<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     set_socket_read_timeout(socket, Some(Duration::from_secs(10)))?;
     loop {
         match socket.read()? {
             Message::Text(text) => {
-                let envelope: Envelope = serde_json::from_str(text.as_ref())?;
-                if envelope.kind == "host_sessions.refresh" {
-                    send_host_sessions(socket, config, last_host_sessions_message, true)?;
-                    continue;
-                }
-                if envelope.kind == "server.ack"
-                    && envelope
-                        .payload
-                        .get("command_id")
-                        .and_then(|value| value.as_str())
-                        == Some(command_id)
-                    && envelope
-                        .payload
-                        .get("kind")
-                        .and_then(|value| value.as_str())
-                        == Some(event_kind)
-                {
-                    set_socket_read_timeout(socket, None)?;
-                    return Ok(());
+                match classify_ack_wait_text(text.as_ref(), command_id, event_kind)? {
+                    AckWaitAction::Matched => {
+                        set_socket_read_timeout(socket, None)?;
+                        return Ok(());
+                    }
+                    AckWaitAction::HostSessionsRefresh => {
+                        send_host_sessions(socket, config, last_host_sessions_message, true)?;
+                    }
+                    AckWaitAction::Defer => deferred_messages.push_back(text.to_string()),
                 }
             }
             Message::Ping(payload) => socket.send(Message::Pong(payload))?,
@@ -314,6 +317,39 @@ fn wait_for_ack(
             _ => {}
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckWaitAction {
+    Matched,
+    HostSessionsRefresh,
+    Defer,
+}
+
+fn classify_ack_wait_text(
+    text: &str,
+    command_id: &str,
+    event_kind: &str,
+) -> Result<AckWaitAction, serde_json::Error> {
+    let envelope: Envelope = serde_json::from_str(text)?;
+    if envelope.kind == "host_sessions.refresh" {
+        return Ok(AckWaitAction::HostSessionsRefresh);
+    }
+    if envelope.kind == "server.ack"
+        && envelope
+            .payload
+            .get("command_id")
+            .and_then(|value| value.as_str())
+            == Some(command_id)
+        && envelope
+            .payload
+            .get("kind")
+            .and_then(|value| value.as_str())
+            == Some(event_kind)
+    {
+        return Ok(AckWaitAction::Matched);
+    }
+    Ok(AckWaitAction::Defer)
 }
 
 fn set_socket_read_timeout(
@@ -332,7 +368,8 @@ fn set_socket_read_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        command_events, host_sessions_interval, is_read_timeout, CommandPayload, CommandType,
+        classify_ack_wait_text, command_events, host_sessions_interval, is_read_timeout,
+        AckWaitAction, CommandPayload, CommandType,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use std::io::{self, ErrorKind};
@@ -403,6 +440,30 @@ mod tests {
         assert!(!is_read_timeout(&WebSocketError::Io(io::Error::from(
             ErrorKind::NotFound
         ))));
+    }
+
+    #[test]
+    fn ack_wait_defers_command_dispatch_messages() {
+        let action = classify_ack_wait_text(
+            r#"{"kind":"command.dispatch","payload":{"command":{"id":"command-2","prompt":"next"}}}"#,
+            "command-1",
+            "command.output",
+        )
+        .expect("classified");
+
+        assert_eq!(action, AckWaitAction::Defer);
+    }
+
+    #[test]
+    fn ack_wait_matches_expected_ack() {
+        let action = classify_ack_wait_text(
+            r#"{"kind":"server.ack","payload":{"command_id":"command-1","kind":"command.output"}}"#,
+            "command-1",
+            "command.output",
+        )
+        .expect("classified");
+
+        assert_eq!(action, AckWaitAction::Matched);
     }
 
     fn test_config() -> AgentConfig {
