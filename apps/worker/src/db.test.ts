@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ensureConnectorInventory, markConnectorDisconnected, recordAgentEvent } from "./db.js";
+import { ensureConnectorInventory, markConnectorDisconnected, recordAgentEvent, recordHostSessions } from "./db.js";
 import type { Env } from "./types.js";
 
 test("recordAgentEvent ignores stale events from a connector that lost the lease", async () => {
@@ -94,6 +94,37 @@ test("ensureConnectorInventory retires duplicate connectors through disconnect c
   assert.equal(db.migratedHostSessions, 1);
   assert.equal(db.deletedOldHostSessions, 1);
   assert.equal(db.retiredConnectorTokens, 1);
+});
+
+test("recordHostSessions preserves stored sessions outside the latest top-N report", async () => {
+  const db = hostSessionsInventoryDb();
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-new",
+          title: "New session",
+          title_source: "metadata",
+          cwd: "/Users/joey/Program/new",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 1);
+  assert.equal(result.host_sessions[0]?.session_id, "session-new");
+  assert.equal(db.hasSession("session-attached"), true);
+  assert.equal(db.hasSession("session-new"), true);
+  assert.deepEqual(db.sync, {
+    connectorId: "connector-online",
+    reported: 1,
+    stored: 1
+  });
 });
 
 function agentEventGuardDb(command: {
@@ -623,6 +654,173 @@ function duplicateConnectorRetirementDb() {
     },
     get retiredConnectorTokens() {
       return counters.retiredConnectorTokens;
+    }
+  };
+
+  return db as D1Database & typeof counters;
+}
+
+function hostSessionsInventoryDb() {
+  type StoredHostSession = {
+    id: string;
+    connector_id: string;
+    hostname: string;
+    workspace_id: string;
+    session_id: string;
+    title: string;
+    title_source: string;
+    cwd: string | null;
+    attached_task_id: string | null;
+    attached_thread_id: string | null;
+    updated_at: string;
+  };
+
+  const sessions = new Map<string, StoredHostSession>([
+    [
+      "session-attached",
+      {
+        id: "host-session-attached",
+        connector_id: "connector-online",
+        hostname: "mac-studio.local",
+        workspace_id: "workspace-api",
+        session_id: "session-attached",
+        title: "Attached session",
+        title_source: "history",
+        cwd: "/Users/joey/Program/attached",
+        attached_task_id: "task-attached",
+        attached_thread_id: "thread-attached",
+        updated_at: "2026-06-12T10:00:00.000Z"
+      }
+    ]
+  ]);
+  const counters = {
+    sync: undefined as { connectorId: string; reported: number; stored: number } | undefined,
+    hasSession(sessionId: string) {
+      return sessions.has(sessionId);
+    }
+  };
+
+  const db = {
+    prepare(sql: string) {
+      if (/SELECT hostname/.test(sql) && /FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { hostname: "mac-studio.local" };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT workspace_id/.test(sql) && /FROM workspace_connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { workspace_id: "workspace-api" };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO host_sessions/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            connectorId: string,
+            hostname: string,
+            workspaceId: string,
+            sessionId: string,
+            title: string,
+            titleSource: string,
+            cwd: string | null,
+            discoveredAt: string,
+            updatedAt: string
+          ) {
+            assert.equal(connectorId, "connector-online");
+            assert.equal(hostname, "mac-studio.local");
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(discoveredAt, "2026-06-12T11:00:05.000Z");
+            return {
+              async run() {
+                sessions.set(sessionId, {
+                  id,
+                  connector_id: connectorId,
+                  hostname,
+                  workspace_id: workspaceId,
+                  session_id: sessionId,
+                  title,
+                  title_source: titleSource,
+                  cwd,
+                  attached_task_id: null,
+                  attached_thread_id: null,
+                  updated_at: updatedAt
+                });
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT hs\.id, hs\.connector_id/.test(sql) && /FROM host_sessions hs/.test(sql)) {
+        return {
+          bind(sessionId: string, connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return sessions.get(sessionId);
+              }
+            };
+          }
+        };
+      }
+
+      if (/DELETE FROM host_sessions/.test(sql)) {
+        throw new Error("recordHostSessions must not delete sessions from partial inventory reports");
+      }
+
+      if (/INSERT INTO host_session_syncs/.test(sql)) {
+        return {
+          bind(connectorId: string, syncedAt: string, reported: number, stored: number) {
+            assert.equal(syncedAt, "2026-06-12T11:00:05.000Z");
+            return {
+              async run() {
+                counters.sync = { connectorId, reported, stored };
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /last_seen_at/.test(sql)) {
+        return {
+          bind(lastSeenAt: string, updatedAt: string, connectorId: string) {
+            assert.equal(lastSeenAt, "2026-06-12T11:00:05.000Z");
+            assert.equal(updatedAt, "2026-06-12T11:00:05.000Z");
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get sync() {
+      return counters.sync;
+    },
+    hasSession(sessionId: string) {
+      return counters.hasSession(sessionId);
     }
   };
 

@@ -1,7 +1,7 @@
 use crate::config::{AgentConfig, ExecutionMode};
 use crate::executor::{codex_exec_result_events, codex_exec_started_event};
-use crate::placeholder::placeholder_event_stream;
 use crate::placeholder::ConnectorEvent;
+use crate::placeholder::placeholder_event_stream;
 use crate::session_inventory::build_host_sessions_report;
 use serde::Deserialize;
 use serde_json::json;
@@ -9,12 +9,15 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::TcpStream;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
-use tungstenite::{connect, Error as WebSocketError, Message};
+use tungstenite::{Error as WebSocketError, Message, connect};
 
 type AgentSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
 const CONNECTOR_READ_TICK_SECONDS: u64 = 5;
+const CONNECTOR_RECONNECT_BACKOFF_SECONDS: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -50,6 +53,23 @@ enum CommandType {
 }
 
 pub fn run_connector(
+    config: &AgentConfig,
+    run_mode: RunMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        match run_connected_session(config, run_mode) {
+            Ok(()) if run_mode == RunMode::Once => return Ok(()),
+            Ok(()) => {}
+            Err(error) if run_mode == RunMode::Once => return Err(error),
+            Err(error) => {
+                eprintln!("connector connection ended: {error}; reconnecting");
+            }
+        }
+        thread::sleep(reconnect_backoff());
+    }
+}
+
+fn run_connected_session(
     config: &AgentConfig,
     run_mode: RunMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -175,15 +195,17 @@ fn handle_text_message(
             last_host_sessions_message,
             deferred_messages,
         )?;
-        let events = codex_exec_result_events(
-            &config.execution,
-            &config.workspace_root,
+        let events = wait_for_codex_exec_events(
+            socket,
+            config,
             &dispatch.command.prompt,
+            last_host_sessions_message,
+            deferred_messages,
         );
         dispatch_events(
             socket,
             &dispatch.command,
-            events,
+            events?,
             config,
             last_host_sessions_message,
             deferred_messages,
@@ -200,6 +222,72 @@ fn handle_text_message(
         deferred_messages,
     )?;
     Ok(true)
+}
+
+fn wait_for_codex_exec_events(
+    socket: &mut AgentSocket,
+    config: &AgentConfig,
+    prompt: &str,
+    last_host_sessions_message: &mut Option<String>,
+    deferred_messages: &mut VecDeque<String>,
+) -> Result<Vec<ConnectorEvent>, Box<dyn std::error::Error>> {
+    let execution = config.execution.clone();
+    let workspace_root = config.workspace_root.clone();
+    let prompt = prompt.to_owned();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let events = codex_exec_result_events(&execution, &workspace_root, &prompt);
+        let _ = sender.send(events);
+    });
+
+    set_socket_read_timeout(socket, Some(connector_read_tick()))?;
+    loop {
+        match receiver.try_recv() {
+            Ok(events) => {
+                set_socket_read_timeout(socket, Some(connector_read_tick()))?;
+                return Ok(events);
+            }
+            Err(TryRecvError::Disconnected) => {
+                return Err("codex exec worker stopped before returning events".into());
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                handle_background_text_message(
+                    socket,
+                    text.as_ref(),
+                    config,
+                    last_host_sessions_message,
+                    deferred_messages,
+                )?;
+            }
+            Ok(Message::Ping(payload)) => socket.send(Message::Pong(payload))?,
+            Ok(Message::Close(_)) => {
+                return Err("connection closed while codex exec was running".into());
+            }
+            Ok(_) => {}
+            Err(error) if is_read_timeout(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn handle_background_text_message(
+    socket: &mut AgentSocket,
+    text: &str,
+    config: &AgentConfig,
+    last_host_sessions_message: &mut Option<String>,
+    deferred_messages: &mut VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let envelope: Envelope = serde_json::from_str(text)?;
+    if envelope.kind == "host_sessions.refresh" {
+        send_host_sessions(socket, config, last_host_sessions_message, true)?;
+    } else {
+        deferred_messages.push_back(text.to_owned());
+    }
+    Ok(())
 }
 
 fn command_events(command: &CommandPayload) -> Vec<ConnectorEvent> {
@@ -276,6 +364,10 @@ fn connector_read_tick() -> Duration {
 
 fn host_sessions_interval(config: &AgentConfig) -> Duration {
     Duration::from_secs(config.session_inventory.report_interval_seconds.max(1))
+}
+
+fn reconnect_backoff() -> Duration {
+    Duration::from_secs(CONNECTOR_RECONNECT_BACKOFF_SECONDS)
 }
 
 fn is_read_timeout(error: &WebSocketError) -> bool {
@@ -368,8 +460,8 @@ fn set_socket_read_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_ack_wait_text, command_events, host_sessions_interval, is_read_timeout,
-        AckWaitAction, CommandPayload, CommandType,
+        AckWaitAction, CommandPayload, CommandType, classify_ack_wait_text, command_events,
+        host_sessions_interval, is_read_timeout,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use std::io::{self, ErrorKind};

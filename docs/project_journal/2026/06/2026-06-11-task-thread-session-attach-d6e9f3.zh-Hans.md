@@ -59,6 +59,10 @@ superseded_by:
 - `command.failed` 现在会映射成 Task Board 可见的 `failed` task state，不再在 Worker、protocol grouping 或 UI 中折叠成 `done`。
 - Connector bootstrap 现在会对同一 name/hostname 使用稳定 connector identity；有效的 offline connector token 可以重连并把自身标回 online；旧重复 connector rows 会通过 disconnect cleanup 路径 retire，并迁移 host-session attachments。
 - Web bootstrap 成功重新加载后，现在会清理旧的全屏 `loadError`。
+- Host session inventory reports 现在被当作有上限的 top-N updates，而不是完整 snapshots：Worker 不再因为 partial report 缺少某个 session 就删除旧 row；realtime Browser update 也不会清空同 connector 的本地 session list。这样可以保留最新 report 窗口之外已有的 attachments。
+- Connector `codex_exec` 现在会把等待 Codex CLI 的部分放到后台 worker，同时 WebSocket loop 继续响应 pings、close frames 和 Host Sessions refresh；其它消息仍会 defer 到当前 command 完成后处理。
+- Continuous connector mode 现在会在 socket close 或非 timeout read error 后用短 backoff 重连；`--run-once` 仍保持处理一个 command 后返回的行为。
+- Browser command request validation 现在会在写入 DB 前拒绝 thread、task 和 target connector 字段里的空字符串 optional ids。
 
 ## 下一步
 - 下一步优先做明确的新建 Codex thread 流程。Chaop 应该能从 Task Board 或 Thread Command Centre 创建本机 Codex/app-server thread，把创建出来的 session 绑定回 task/thread 组合，并且在本机 app-server 不可用时返回清晰的 connector/app-server 错误。

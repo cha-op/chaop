@@ -469,7 +469,7 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function optionalString(value: unknown): value is string | undefined {
-  return value === undefined || typeof value === "string";
+  return value === undefined || isNonEmptyString(value);
 }
 
 function optionalCommandType(value: unknown): value is CreateCommandRequest["type"] {

@@ -661,6 +661,25 @@ test("command creation rejects missing prompt", async () => {
   assert.deepEqual(await response.json(), { error: "Invalid command payload" });
 });
 
+test("command creation rejects empty optional ids", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "",
+        task_id: "",
+        target_connector_id: "",
+        prompt: "Summarise current errors"
+      })
+    }),
+    devEnv
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid command payload" });
+});
+
 function readOnlyBootstrapDb(): D1Database {
   return {
     prepare(sql: string) {

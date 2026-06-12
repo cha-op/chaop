@@ -127,8 +127,7 @@ export class WorkspaceDO implements DurableObject {
       this.broadcastToBrowsers(hostSessionsMessage({
         host_sessions: result.host_sessions,
         connector_id: connectorId,
-        synced_at: result.synced_at,
-        snapshot: true
+        synced_at: result.synced_at
       }));
       return;
     }

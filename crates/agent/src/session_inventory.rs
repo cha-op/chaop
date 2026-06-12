@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tungstenite::{connect, Message};
+use tungstenite::{Message, connect};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentHostSessionsReport {
@@ -372,11 +372,15 @@ fn rollout_files_in_dir(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 fn sort_paths_by_mtime_desc(paths: &mut [PathBuf]) {
     paths.sort_by(|left, right| {
-        let right_time = right.metadata().and_then(|metadata| metadata.modified()).ok();
-        let left_time = left.metadata().and_then(|metadata| metadata.modified()).ok();
-        right_time
-            .cmp(&left_time)
-            .then_with(|| right.cmp(left))
+        let right_time = right
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let left_time = left
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        right_time.cmp(&left_time).then_with(|| right.cmp(left))
     });
 }
 
@@ -588,8 +592,8 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_server_titles_from_response, build_host_sessions_report, resolve_session, rollout_paths,
-        unix_seconds_to_iso, HistorySession, SessionDraft, TitleSource,
+        HistorySession, SessionDraft, TitleSource, app_server_titles_from_response,
+        build_host_sessions_report, resolve_session, rollout_paths, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
