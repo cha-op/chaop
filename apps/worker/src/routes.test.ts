@@ -687,6 +687,7 @@ function readOnlyBootstrapDb(): D1Database {
       if (/FROM host_sessions hs/.test(sql)) {
         assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
         assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /hs\.attached_task_id IS NOT NULL OR hs\.attached_thread_id IS NOT NULL/);
       }
       return {
         bind() {

@@ -3,9 +3,10 @@ import test from "node:test";
 import type { BootstrapPayload, HostSessionSummary } from "@chaop/protocol";
 import { mergeBootstrapPayload } from "./state.ts";
 
-test("mergeBootstrapPayload drops stale host sessions after newer server sync", () => {
+test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
+  const currentSession = hostSession("session-old");
   const current = payload({
-    host_sessions: [hostSession("session-old")],
+    host_sessions: [currentSession],
     host_session_syncs: [sync("connector-1", "2026-06-12T10:00:00.000Z", 1, 1)]
   });
   const incoming = payload({
@@ -15,7 +16,7 @@ test("mergeBootstrapPayload drops stale host sessions after newer server sync", 
 
   const merged = mergeBootstrapPayload(current, incoming);
 
-  assert.deepEqual(merged.host_sessions, []);
+  assert.deepEqual(merged.host_sessions, [currentSession]);
 });
 
 test("mergeBootstrapPayload keeps realtime host sessions newer than bootstrap sync", () => {

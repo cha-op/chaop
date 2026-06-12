@@ -881,7 +881,9 @@ async function listHostSessions(env: Env): Promise<HostSessionSummary[]> {
        FROM host_sessions hs
        INNER JOIN connectors c ON c.id = hs.connector_id
        WHERE c.status <> 'offline'
-       ORDER BY hs.updated_at DESC
+       ORDER BY
+         CASE WHEN hs.attached_task_id IS NOT NULL OR hs.attached_thread_id IS NOT NULL THEN 0 ELSE 1 END,
+         hs.updated_at DESC
        LIMIT 200`
     )
   );

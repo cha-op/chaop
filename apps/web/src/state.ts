@@ -18,12 +18,7 @@ export function mergeBootstrapPayload(
     tasks: mergeById(incoming.tasks, current.tasks, newerByUpdatedAt),
     running_commands: mergeById(incoming.running_commands, current.running_commands, newerByUpdatedAt),
     events: mergeById(incoming.events, current.events, newerByCreatedAt),
-    host_sessions: mergeHostSessions(
-      incoming.host_sessions,
-      current.host_sessions,
-      incoming.host_session_syncs,
-      current.host_session_syncs
-    ),
+    host_sessions: mergeHostSessions(incoming.host_sessions, current.host_sessions),
     host_session_syncs: hostSessionSyncs
   };
 }
@@ -46,13 +41,9 @@ function mergeById<T extends { id: string }>(
 
 function mergeHostSessions(
   incoming: HostSessionSummary[],
-  current: HostSessionSummary[],
-  incomingSyncs: HostSessionSyncSummary[],
-  currentSyncs: HostSessionSyncSummary[]
+  current: HostSessionSummary[]
 ): HostSessionSummary[] {
   const merged = new Map<string, HostSessionSummary>();
-  const incomingSyncByConnector = syncByConnector(incomingSyncs);
-  const currentSyncByConnector = syncByConnector(currentSyncs);
 
   for (const item of incoming) {
     merged.set(item.id, item);
@@ -65,11 +56,6 @@ function mergeHostSessions(
       continue;
     }
 
-    const incomingSync = incomingSyncByConnector.get(item.connector_id);
-    const currentSync = currentSyncByConnector.get(item.connector_id);
-    if (incomingSync && (!currentSync || incomingSync.synced_at >= currentSync.synced_at)) {
-      continue;
-    }
     merged.set(item.id, item);
   }
 
@@ -103,8 +89,4 @@ function mergeHostSessionSyncs(
     merged.set(item.connector_id, existing && existing.synced_at > item.synced_at ? existing : item);
   }
   return Array.from(merged.values());
-}
-
-function syncByConnector(items: HostSessionSyncSummary[]): Map<string, HostSessionSyncSummary> {
-  return new Map(items.map((item) => [item.connector_id, item]));
 }
