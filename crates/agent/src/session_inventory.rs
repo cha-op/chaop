@@ -512,7 +512,7 @@ mod tests {
         let config = AgentConfig {
             connector_name: "mac-studio".to_owned(),
             control_url: "wss://api.example.com/ws/agent".to_owned(),
-            bootstrap_url: "https://api.example.com/api/agent/bootstrap".to_owned(),
+            bootstrap_url: "https://api.example.com/connector/bootstrap".to_owned(),
             workspace_root: "/tmp/project".into(),
             token_file: "/tmp/token".into(),
             spool_db: "/tmp/spool.sqlite".into(),

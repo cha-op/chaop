@@ -249,11 +249,12 @@ The API hostname serves:
 
 ```text
 /api/*
+/connector/bootstrap
 /ws/browser
 /ws/agent
 ```
 
-Browser routes are protected by Cloudflare Access. Agent bootstrap and agent WebSocket routes are authenticated by Worker-level bootstrap/agent tokens, not by Access, in the first slice.
+Browser routes under `/api/*` and `/ws/browser` are protected by Cloudflare Access. Agent bootstrap and agent WebSocket routes are authenticated by Worker-level bootstrap/agent tokens, not by Access, in the first slice.
 
 The current Browser command submission sends JSON as `text/plain; charset=utf-8` so that the cross-origin credentialed `POST /api/commands` remains a simple request and does not need an Access preflight path. If a later slice adds custom browser headers or switches command submission back to `application/json`, configure Cloudflare Access and the Worker route so `OPTIONS /api/*` can reach the Worker and return the configured CORS response.
 
@@ -272,17 +273,17 @@ Allowed email addresses or groups
 Use the Cloudflare Zero Trust dashboard:
 
 1. Create a self-hosted application and add the GUI public hostname.
-2. Add the API public hostname for Browser traffic with `/api/*` and `/ws/browser` coverage. If you choose separate path-scoped destinations instead of `/api/*`, include every Browser HTTP endpoint: `/api/bootstrap`, `/api/usage-summary`, `/api/commands`, `/api/tasks/*`, and `/api/host-sessions/*`.
+2. Add the API public hostname for Browser traffic with `/api/*` and `/ws/browser` coverage.
 3. Add an Allow policy with the `Emails` include selector for the operator email addresses, or use a deliberate Access group selector once identity-provider groups are configured.
 4. Copy the application AUD into `ACCESS_AUD`.
 
 The Worker must validate `Cf-Access-Jwt-Assertion` for Browser HTTP and WebSocket requests. Cloudflare documents that Access passes this token in the request header, and browser requests may also include a `CF_Authorization` cookie. The Worker should prefer the header.
 
-If a Browser write action returns `401 Missing Cloudflare Access JWT`, the most likely cause is that the new API path is not covered by the Access application destination. Add `/api/*` for the API hostname, or add the missing path-scoped destination, then refresh the GUI session.
+If a Browser write action returns `401 Missing Cloudflare Access JWT`, the most likely cause is that the new API path is not covered by the Access application destination. Add `/api/*` for the API hostname, then refresh the GUI session.
 
 For the current implementation, Cloudflare Access policy is the source of truth for allowed Browser users. `CHAOP_ACCESS_ALLOWED_EMAILS` and `CHAOP_ACCESS_ALLOWED_GROUPS` document the deployment intent and are available for a later Worker-level allowlist, but the Worker does not enforce them yet.
 
-Do not put `/api/agent/bootstrap` or `/ws/agent` behind this Browser Access application unless we later decide to use Access service tokens for connectors.
+Do not put `/connector/bootstrap` or `/ws/agent` behind this Browser Access application unless we later decide to use Access service tokens for connectors. `/api/agent/bootstrap` is kept only as a legacy migration alias; prefer `/connector/bootstrap` because broad `/api/*` Browser Access protection will also cover the legacy path.
 
 Connector bootstrap uses `AGENT_BOOTSTRAP_SECRET` only to register a connector identity. The Worker then issues a random connector token and stores only its SHA-256 hash in D1. Re-running bootstrap creates a fresh connector identity and token; replace the local connector token file and retire the old connector record in a later management flow.
 
@@ -305,7 +306,7 @@ The connector needs a local config file with:
 ```toml
 connector_name = "mac-studio"
 control_url = "wss://api.example.com/ws/agent"
-bootstrap_url = "https://api.example.com/api/agent/bootstrap"
+bootstrap_url = "https://api.example.com/connector/bootstrap"
 workspace_root = "/Users/you/Program"
 token_file = "/Users/you/.chaop/connector.token"
 spool_db = "/Users/you/.chaop/connector-spool.sqlite"
@@ -403,7 +404,7 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - If the Browser gets `403`, check the Access application AUD, team domain, and allowed user policy.
 - If service-token smoke tests get `401` from the Worker with an identity error, check that the Access policy allows the service token and that the service-token headers reach the API route.
 - If Browser command submission fails before reaching the Worker, check whether the request has become a CORS preflight and either keep the simple request shape or allow `OPTIONS /api/*` through Cloudflare Access.
-- If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether the Worker route excludes Browser Access.
+- If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether `/connector/bootstrap` and `/ws/agent` are excluded from Browser Access.
 - If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
 - If Host Sessions is empty, check that the connector was restarted after this slice, `session_inventory.enabled` is true, and the connector user can read `CODEX_HOME` or `~/.codex`.
 - If D1 migration fails, confirm the D1 database UUID is present in the Worker config.

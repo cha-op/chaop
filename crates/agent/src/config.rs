@@ -194,7 +194,7 @@ mod tests {
             r#"
 connector_name = "mac-studio"
 control_url = "wss://api.example.com/ws/agent"
-bootstrap_url = "https://api.example.com/api/agent/bootstrap"
+bootstrap_url = "https://api.example.com/connector/bootstrap"
 workspace_root = "/Users/you/Program"
 token_file = "/Users/you/.chaop/connector.token"
 spool_db = "/Users/you/.chaop/connector-spool.sqlite"
@@ -220,7 +220,7 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
         let config = AgentConfig {
             connector_name: "mac-studio".to_owned(),
             control_url: "wss://api.example.com/ws/agent".to_owned(),
-            bootstrap_url: "https://api.example.com/api/agent/bootstrap".to_owned(),
+            bootstrap_url: "https://api.example.com/connector/bootstrap".to_owned(),
             workspace_root: "/Users/you/Program".into(),
             token_file: "/Users/you/.chaop/connector.token".into(),
             spool_db: "/Users/you/.chaop/connector-spool.sqlite".into(),
@@ -253,7 +253,7 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
         let config = AgentConfig {
             connector_name: "mac-studio".to_owned(),
             control_url: "wss://api.example.com/ws/agent".to_owned(),
-            bootstrap_url: "https://api.example.com/api/agent/bootstrap".to_owned(),
+            bootstrap_url: "https://api.example.com/connector/bootstrap".to_owned(),
             workspace_root: "/Users/you/Program".into(),
             token_file: "/Users/you/.chaop/connector.token".into(),
             spool_db: "/Users/you/.chaop/connector-spool.sqlite".into(),

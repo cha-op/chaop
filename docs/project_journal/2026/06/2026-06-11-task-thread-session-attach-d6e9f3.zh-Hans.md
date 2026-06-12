@@ -36,7 +36,8 @@ superseded_by:
 - 已部署的 Host Sessions 渲染正常，但当 API Access destination 没覆盖新的 `/api/host-sessions/*` 写路径时，attach 会返回 401。
 - Worker 的 401 文案现在会说明可能缺少 Browser Access 覆盖，或 Access session 已过期。
 - Web UI 现在会在可换行 alert 里显示服务端返回的 action error，并在每个 Host Sessions row 里显示完整 host `session_id`。
-- 部署指南现在推荐为 API hostname 覆盖 `/api/*`；如果使用多个 path-scoped destination，则必须显式覆盖每个 Browser HTTP endpoint。
+- 部署指南现在推荐用 `/api/*` 加 `/ws/browser` 覆盖 Browser API，同时把 connector bootstrap 放到 `/api/*` 之外。
+- Agent bootstrap 会迁到 `/connector/bootstrap`，这样 `/api/*` 的 Browser Access 覆盖不会包住 connector bootstrap。`/api/agent/bootstrap` 只保留为迁移期 legacy alias。
 
 ## 下一步
-- Cloudflare Access destination 覆盖 `/api/host-sessions/*` 或 `/api/*` 后，重新测试 attach。
+- Cloudflare Access destination 覆盖 `/api/*`、`/ws/browser` 和 GUI hostname 后，重新测试 attach。

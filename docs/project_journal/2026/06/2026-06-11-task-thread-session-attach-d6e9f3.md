@@ -36,7 +36,8 @@ superseded_by:
 - Deployed Host Sessions rendered correctly, but attach returned 401 when the API Access destination did not cover the new `/api/host-sessions/*` write path.
 - Worker 401 copy now explains missing Browser Access coverage or an expired Access session.
 - The Web UI now surfaces server-provided action errors in a wrapping alert and shows the full host `session_id` in each Host Sessions row.
-- Deployment guidance now recommends covering the API hostname with `/api/*`, or explicitly covering every Browser HTTP endpoint when using path-scoped destinations.
+- Deployment guidance now recommends covering the Browser API with `/api/*` plus `/ws/browser`, while keeping connector bootstrap outside `/api/*`.
+- Agent bootstrap is moving to `/connector/bootstrap` so broad Browser Access coverage for `/api/*` does not wrap connector bootstrap. `/api/agent/bootstrap` remains a legacy migration alias only.
 
 ## Next Steps
-- Re-test attach after the Cloudflare Access destination covers `/api/host-sessions/*` or `/api/*`.
+- Re-test attach after the Cloudflare Access destination covers `/api/*`, `/ws/browser`, and the GUI hostname.

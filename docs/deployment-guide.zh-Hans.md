@@ -249,11 +249,12 @@ API 主机名承载：
 
 ```text
 /api/*
+/connector/bootstrap
 /ws/browser
 /ws/agent
 ```
 
-Browser 路径由 Cloudflare Access 保护。第一轮切片里，agent bootstrap 和 agent WebSocket 路径由 Worker 级 bootstrap/agent token 认证，不由 Access 认证。
+`/api/*` 和 `/ws/browser` 下的 Browser 路径由 Cloudflare Access 保护。第一轮切片里，agent bootstrap 和 agent WebSocket 路径由 Worker 级 bootstrap/agent token 认证，不由 Access 认证。
 
 当前 Browser command submission 会把 JSON 作为 `text/plain; charset=utf-8` 发送，使跨域、带凭据的 `POST /api/commands` 仍然是 simple request，不需要 Access preflight 路径。如果后续切片加入自定义浏览器 header，或把 command submission 改回 `application/json`，请配置 Cloudflare Access 和 Worker route，让 `OPTIONS /api/*` 能到达 Worker 并返回已配置的 CORS response。
 
@@ -272,17 +273,17 @@ Allowed email addresses or groups
 在 Cloudflare Zero Trust dashboard 里：
 
 1. 创建 self-hosted application，并添加 GUI public hostname。
-2. 为 API hostname 上的 Browser traffic 添加 `/api/*` 和 `/ws/browser` 覆盖。如果你选择多个 path-scoped destination，而不是 `/api/*`，请覆盖每一个 Browser HTTP endpoint：`/api/bootstrap`、`/api/usage-summary`、`/api/commands`、`/api/tasks/*` 和 `/api/host-sessions/*`。
+2. 为 API hostname 上的 Browser traffic 添加 `/api/*` 和 `/ws/browser` 覆盖。
 3. 添加 Allow policy，使用 `Emails` include selector 填入 operator email addresses；如果已经配置 identity-provider groups，也可以有意识地改用 Access group selector。
 4. 把 application AUD 复制到 `ACCESS_AUD`。
 
 Worker 必须为 Browser HTTP 和 WebSocket 请求校验 `Cf-Access-Jwt-Assertion`。Cloudflare 文档说明 Access 会在请求 header 中传递这个 token，浏览器请求也可能带有 `CF_Authorization` cookie。Worker 应优先使用 header。
 
-如果 Browser 写操作返回 `401 Missing Cloudflare Access JWT`，最可能的原因是新的 API path 没有被 Access application destination 覆盖。请为 API hostname 添加 `/api/*`，或者补上缺失的 path-scoped destination，然后刷新 GUI session。
+如果 Browser 写操作返回 `401 Missing Cloudflare Access JWT`，最可能的原因是新的 API path 没有被 Access application destination 覆盖。请为 API hostname 添加 `/api/*`，然后刷新 GUI session。
 
 在当前实现里，Cloudflare Access policy 是 Browser 用户允许列表的事实来源。`CHAOP_ACCESS_ALLOWED_EMAILS` 和 `CHAOP_ACCESS_ALLOWED_GROUPS` 现在用于记录部署意图，也为后续 Worker 级 allowlist 预留，但 Worker 暂时还不会执行它们。
 
-除非后续决定为 connector 使用 Access service token，不要把 `/api/agent/bootstrap` 或 `/ws/agent` 放到这个 Browser Access application 后面。
+除非后续决定为 connector 使用 Access service token，不要把 `/connector/bootstrap` 或 `/ws/agent` 放到这个 Browser Access application 后面。`/api/agent/bootstrap` 只作为迁移期 legacy alias 保留；请优先使用 `/connector/bootstrap`，因为宽泛的 `/api/*` Browser Access protection 也会覆盖 legacy path。
 
 Connector bootstrap 只用 `AGENT_BOOTSTRAP_SECRET` 注册 connector identity。Worker 随后签发随机 connector token，并且只在 D1 中保存它的 SHA-256 hash。重新执行 bootstrap 会创建新的 connector identity 和 token；请替换本地 connector token 文件，并在后续管理流程中停用旧 connector 记录。
 
@@ -305,7 +306,7 @@ connector 需要一个本地配置文件：
 ```toml
 connector_name = "mac-studio"
 control_url = "wss://api.example.com/ws/agent"
-bootstrap_url = "https://api.example.com/api/agent/bootstrap"
+bootstrap_url = "https://api.example.com/connector/bootstrap"
 workspace_root = "/Users/you/Program"
 token_file = "/Users/you/.chaop/connector.token"
 spool_db = "/Users/you/.chaop/connector-spool.sqlite"
@@ -403,7 +404,7 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - 如果 Browser 返回 `403`，检查 Access application AUD、team domain 和允许访问的用户策略。
 - 如果 service-token smoke tests 收到 Worker 返回的身份类 `401`，检查 Access policy 是否允许该 service token，以及 service-token headers 是否能到达 API route。
 - 如果 Browser command submission 在到达 Worker 前失败，检查请求是否已经变成 CORS preflight；要么保持 simple request 形态，要么允许 `OPTIONS /api/*` 通过 Cloudflare Access。
-- 如果 connector 返回 `401`，检查 `AGENT_BOOTSTRAP_SECRET`，并确认 Worker route 没有被 Browser Access 拦截。
+- 如果 connector 返回 `401`，检查 `AGENT_BOOTSTRAP_SECRET`，并确认 `/connector/bootstrap` 和 `/ws/agent` 没有被 Browser Access 拦截。
 - 如果 connector 已连接但一直收不到 command，检查 connector bootstrap 是否已经写入 workspace membership，command 是否 target 到可执行 connector，以及已部署 Worker 是否绑定 `WorkspaceDO`。
 - 如果 Host Sessions 页面为空，检查 connector 是否已经在本切片后重启，`session_inventory.enabled` 是否为 true，以及运行 connector 的用户是否可以读取 `CODEX_HOME` 或 `~/.codex`。
 - 如果 D1 migration 失败，确认 D1 database UUID 已写入 Worker 配置。

@@ -171,7 +171,7 @@ test("browser bootstrap does not write the user row when D1 is bound", async () 
 
 test("agent bootstrap rejects invalid secret", async () => {
   const response = await handleRequest(
-    new Request("https://api.example.com/api/agent/bootstrap", { method: "POST", body: "{}" }),
+    new Request("https://api.example.com/connector/bootstrap", { method: "POST", body: "{}" }),
     devEnv
   );
 
@@ -180,7 +180,7 @@ test("agent bootstrap rejects invalid secret", async () => {
 
 test("agent bootstrap rejects malformed JSON", async () => {
   const response = await handleRequest(
-    new Request("https://api.example.com/api/agent/bootstrap", {
+    new Request("https://api.example.com/connector/bootstrap", {
       method: "POST",
       headers: { "x-chaop-bootstrap-secret": "test-bootstrap" },
       body: "{"
@@ -194,7 +194,7 @@ test("agent bootstrap rejects malformed JSON", async () => {
 
 test("agent bootstrap rejects missing connector fields", async () => {
   const response = await handleRequest(
-    new Request("https://api.example.com/api/agent/bootstrap", {
+    new Request("https://api.example.com/connector/bootstrap", {
       method: "POST",
       headers: { "x-chaop-bootstrap-secret": "test-bootstrap" },
       body: JSON.stringify({})
@@ -208,7 +208,7 @@ test("agent bootstrap rejects missing connector fields", async () => {
 
 test("agent bootstrap returns connector token", async () => {
   const response = await handleRequest(
-    new Request("https://api.example.com/api/agent/bootstrap", {
+    new Request("https://api.example.com/connector/bootstrap", {
       method: "POST",
       headers: { "x-chaop-bootstrap-secret": "test-bootstrap" },
       body: JSON.stringify({
@@ -228,9 +228,29 @@ test("agent bootstrap returns connector token", async () => {
   assert.equal(body.control_url, "wss://api.example.com/ws/agent");
 });
 
+test("agent bootstrap keeps the legacy /api/agent/bootstrap alias during migration", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/agent/bootstrap", {
+      method: "POST",
+      headers: { "x-chaop-bootstrap-secret": "test-bootstrap" },
+      body: JSON.stringify({
+        connector_name: "mac-studio",
+        hostname: "mac-studio.local",
+        workspace_root: "/Users/joey/Program",
+        capabilities: ["placeholder"]
+      })
+    }),
+    devEnv
+  );
+  const body = (await response.json()) as { token: string };
+
+  assert.equal(response.status, 201);
+  assert.equal(body.token.startsWith("chaop_agent_"), true);
+});
+
 test("agent bootstrap returns local websocket URL in insecure local dev", async () => {
   const response = await handleRequest(
-    new Request("http://127.0.0.1:8787/api/agent/bootstrap", {
+    new Request("http://127.0.0.1:8787/connector/bootstrap", {
       method: "POST",
       headers: { "x-chaop-bootstrap-secret": "test-bootstrap" },
       body: JSON.stringify({
@@ -256,7 +276,7 @@ test("agent bootstrap creates unique connector ids for repeated names", async ()
     capabilities: ["placeholder"]
   });
   const first = await handleRequest(
-    new Request("https://api.example.com/api/agent/bootstrap", {
+    new Request("https://api.example.com/connector/bootstrap", {
       method: "POST",
       headers: { "x-chaop-bootstrap-secret": "test-bootstrap" },
       body
@@ -264,7 +284,7 @@ test("agent bootstrap creates unique connector ids for repeated names", async ()
     devEnv
   );
   const second = await handleRequest(
-    new Request("https://api.example.com/api/agent/bootstrap", {
+    new Request("https://api.example.com/connector/bootstrap", {
       method: "POST",
       headers: { "x-chaop-bootstrap-secret": "test-bootstrap" },
       body
@@ -280,7 +300,7 @@ test("agent bootstrap creates unique connector ids for repeated names", async ()
 
 test("agent websocket accepts bootstrap-issued connector token before Durable Object routing", async () => {
   const bootstrapResponse = await handleRequest(
-    new Request("https://api.example.com/api/agent/bootstrap", {
+    new Request("https://api.example.com/connector/bootstrap", {
       method: "POST",
       headers: { "x-chaop-bootstrap-secret": "test-bootstrap" },
       body: JSON.stringify({
