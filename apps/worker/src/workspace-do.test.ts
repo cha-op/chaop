@@ -284,6 +284,49 @@ test("rejected stale final command events still poll pending work for the connec
   assert.equal(db.pendingDispatchQueries, 1);
 });
 
+test("rejected starts with generated final events still poll pending work for the connector", async () => {
+  const sent: string[] = [];
+  const agentSocket = {
+    send(message: string) {
+      sent.push(message);
+    },
+    deserializeAttachment() {
+      return { socketType: "agent", connectorId: "connector-online", connectedAt: 300 };
+    }
+  } as unknown as WebSocket;
+  const db = rejectedStartedEventWithFailedResultDb();
+  const workspace = new WorkspaceDO({
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "browser");
+      return [];
+    }
+  } as unknown as DurableObjectState, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "command.started",
+      priority: "P1",
+      summary: "Starting stale explicit target"
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, {
+    command_id: "command-1",
+    kind: "command.started",
+    accepted: false
+  });
+  assert.equal(db.explicitFailures, 1);
+  assert.equal(db.pendingDispatchQueries, 1);
+});
+
 test("rejected targeted app-server starts trigger pending dispatch to available agents", async () => {
   const staleSent: string[] = [];
   const replacementSent: string[] = [];
@@ -437,6 +480,172 @@ function staleFinalCommandEventDb(): D1Database & { readonly pendingDispatchQuer
       return counters.pendingDispatchQueries;
     }
   } as D1Database & { readonly pendingDispatchQueries: number };
+}
+
+function rejectedStartedEventWithFailedResultDb(): D1Database & {
+  readonly explicitFailures: number;
+  readonly pendingDispatchQueries: number;
+} {
+  const counters = {
+    explicitFailures: 0,
+    pendingDispatchQueries: 0
+  };
+  return {
+    prepare(sql: string) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
+        return {
+          bind(commandId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                return {
+                  id: "command-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  task_id: "task-1",
+                  type: "codex",
+                  target_connector_id: "connector-online",
+                  target_connector_id_source: "explicit",
+                  lease_owner_connector_id: "connector-online",
+                  state: "leased",
+                  lease_target_host_session_id: "session-old"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                return { meta: { changes: 0 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'failed'/.test(sql)) {
+        return {
+          bind(now: string, commandId: string, connectorId: string, sessionId: string) {
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(connectorId, "connector-online");
+            assert.equal(sessionId, "session-old");
+            return {
+              async run() {
+                counters.explicitFailures += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql)) {
+        return {
+          bind(now: string, taskId: string) {
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId, "task-1");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(now: string, threadId: string) {
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 8 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { active_count: 0 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql)) {
+        return {
+          bind(activeCount: number, now: string, connectorId: string) {
+            assert.equal(activeCount, 0);
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
+        return {
+          bind(
+            now: string,
+            targetConnectorId: string,
+            autoAttachmentConnectorId: string,
+            hostSessionConnectorId: string,
+            executableConnectorId: string
+          ) {
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(targetConnectorId, "connector-online");
+            assert.equal(autoAttachmentConnectorId, "connector-online");
+            assert.equal(hostSessionConnectorId, "connector-online");
+            assert.equal(executableConnectorId, "connector-online");
+            return {
+              async all() {
+                counters.pendingDispatchQueries += 1;
+                return { results: [] };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get explicitFailures() {
+      return counters.explicitFailures;
+    },
+    get pendingDispatchQueries() {
+      return counters.pendingDispatchQueries;
+    }
+  } as D1Database & { readonly explicitFailures: number; readonly pendingDispatchQueries: number };
 }
 
 function rejectedTargetedStartDispatchDb(): D1Database & {

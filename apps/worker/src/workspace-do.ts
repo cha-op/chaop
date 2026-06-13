@@ -192,11 +192,13 @@ export class WorkspaceDO implements DurableObject {
       }
       const finalCommandEvent =
         message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
-      if (result.accepted && finalCommandEvent) {
+      const resultFinalCommandEvent =
+        result.event?.kind === "command.finished" || result.event?.kind === "command.failed";
+      if (result.accepted && (finalCommandEvent || resultFinalCommandEvent)) {
         await this.sendPendingCommands(ws, connectorId);
       } else if (!result.accepted && result.dispatch_pending) {
         await this.sendPendingCommandsToAgents();
-      } else if (!result.accepted && finalCommandEvent) {
+      } else if (!result.accepted && (finalCommandEvent || resultFinalCommandEvent)) {
         await this.sendPendingCommands(ws, connectorId);
       }
       return;

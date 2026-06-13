@@ -77,6 +77,8 @@ superseded_by:
 - Codex review-gate also found that non-app-server attached-inferred commands could be inserted after the selected attachment changed. Command creation now revalidates all attached-inferred Host Session targets before insert, while only app-server Codex commands persist a lease-time app-server target.
 - Codex review-gate found stale rejected final acknowledgements could stop without polling the connector's next pending command. The Durable Object now polls pending work for the same connector after rejected final command events.
 - Offline frozen-diff review found that a command already bound to a stored app-server session target could still be leased against a newer current attachment before any release/retarget flow cleared that stored target. Pending dispatch now requires stored app-server lease targets to be empty or match the selected Host Session session id before dispatch or lease update.
+- A follow-up frozen-diff review found that explicitly targeted commands could still depend on an attached Host Session without using the guarded insert path. Command creation now guards every command that read an attachment before insert while preserving `explicit` target-source semantics.
+- The same review found stale rejected `command.started` acknowledgements could generate a final failure event without polling the connector's next pending command. The Durable Object now treats final events returned by the DB result as a same-connector dispatch trigger too.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -123,6 +125,8 @@ superseded_by:
 - Worker route tests assert attached non-app-server command creation is rejected when the attachment changes before insert.
 - Worker Durable Object tests assert rejected stale final command events still poll pending work for that connector.
 - Worker DB tests assert pending dispatch skips commands whose stored app-server target differs from the current attachment.
+- Worker route tests assert explicit attached command targets are rejected if the attachment changes before insert.
+- Worker Durable Object tests assert rejected `command.started` events that generate `command.failed` results still poll pending work for that connector.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.

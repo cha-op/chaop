@@ -1129,7 +1129,7 @@ export async function createCommandInDb(
 
   const inserted = await insertCommandInDb(env, user.id, command, {
     appServerTargetHostSessionId,
-    attachedTarget: targetConnectorIdSource === "attached" ? attachedTargetForInsert : undefined,
+    attachedTarget: attachedTargetForInsert,
     targetConnectorIdSource
   });
   if (!inserted) {

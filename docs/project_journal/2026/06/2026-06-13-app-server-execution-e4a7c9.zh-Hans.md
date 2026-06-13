@@ -77,6 +77,8 @@ superseded_by:
 - Codex review-gate 也发现非 app-server attached-inferred commands 可能在所选 attachment 变化后仍被 insert。现在 command creation 会在 insert 前重新验证所有 attached-inferred Host Session targets；只有 app-server Codex commands 会额外持久化 lease-time app-server target。
 - Codex review-gate 发现 stale rejected final acknowledgement 可能停止后不再查询该 connector 的下一个 pending command。现在 Durable Object 会在 rejected final command event 后继续为同一个 connector 查询 pending work。
 - Offline frozen-diff review 发现已经绑定到 stored app-server session target 的 command，在任何 release/retarget flow 清空该 stored target 前，仍可能被 lease 到新的当前 attachment。现在 pending dispatch 要求 stored app-server lease target 为空，或等于选中的 Host Session session id，才允许 dispatch 或 lease update。
+- 后续 frozen-diff review 发现 explicit target commands 仍可能依赖已读取的 attached Host Session，但没有走 guarded insert path。现在只要 command creation 读取了 attachment，insert 前都会重新验证该 attachment，同时保留 `explicit` target-source 语义。
+- 同一轮 review 还发现 stale rejected `command.started` acknowledgement 可能生成最终 failure event，但不会查询该 connector 的下一个 pending command。现在 Durable Object 也会把 DB result 里返回的 final event 当作同 connector dispatch trigger。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -123,6 +125,8 @@ superseded_by:
 - Worker route tests 断言 attached non-app-server command creation 在 insert 前 attachment 变化时会被拒绝。
 - Worker Durable Object tests 断言 rejected stale final command events 仍会为该 connector 查询 pending work。
 - Worker DB tests 断言当 stored app-server target 与当前 attachment 不同时，pending dispatch 会跳过该 command。
+- Worker route tests 断言 explicit attached command target 在 insert 前 attachment 变化时会被拒绝。
+- Worker Durable Object tests 断言 rejected `command.started` event 生成 `command.failed` result 时，仍会为该 connector 查询 pending work。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。

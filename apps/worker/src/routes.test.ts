@@ -1458,6 +1458,41 @@ test("command creation rejects attached non-app-server commands when the attachm
   });
 });
 
+test("command creation rejects explicit attached targets when the attachment changes before insert", async () => {
+  const envWithDetachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        supportsCodex: false,
+        supportsAppServerExec: true,
+        guardedCommandInsertChanges: 0,
+        expectedTargetConnectorIdSource: "explicit"
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        target_connector_id: "connector-attached",
+        type: "codex",
+        prompt: "Continue the explicit attached app-server session"
+      })
+    }),
+    envWithDetachedSession
+  );
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: "Attached host session changed before command creation"
+  });
+});
+
 test("command creation rejects explicit targets that do not own an attached host session", async () => {
   const envWithAttachedSession: Env = {
     ...devEnv,
@@ -1670,6 +1705,7 @@ function commandTargetDb(
     attachedThreadAppServerPresent?: boolean;
     supportsAppServerExec?: boolean;
     guardedCommandInsertChanges?: number;
+    expectedTargetConnectorIdSource?: "explicit" | "attached" | "auto";
   } = {}
 ): D1Database {
   const supportsCodex = options.supportsCodex ?? true;
@@ -1873,7 +1909,7 @@ function commandTargetDb(
               const leaseTargetHostSessionId = args[9];
               const appServerPresentGuard = args[24];
               assert.equal(targetConnectorId, "connector-attached");
-              assert.equal(targetConnectorIdSource, "attached");
+              assert.equal(targetConnectorIdSource, options.expectedTargetConnectorIdSource ?? "attached");
               assert.equal(
                 leaseTargetHostSessionId,
                 attachedThreadAppServerPresent ? "session-attached-thread" : null
