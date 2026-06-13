@@ -361,6 +361,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             commandId: string,
             connectorId: string,
             targetHostSessionId: string,
+            replacementExcludedConnectorId: string,
             replacementExcludedSessionId: string,
             replacementCanIgnoreOldTarget: number
           ) {
@@ -371,6 +372,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             assert.equal(commandId, "command-1");
             assert.equal(connectorId, "connector-stale");
             assert.equal(targetHostSessionId, "session-old");
+            assert.equal(replacementExcludedConnectorId, "connector-stale");
             assert.equal(replacementExcludedSessionId, "session-old");
             return {
               async run() {

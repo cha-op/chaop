@@ -368,6 +368,7 @@ export async function detachHostSessionInDb(
   )
     .bind(now, hostSession.id)
     .run();
+  await releaseCommandsForDetachedAppServerHostSession(env, hostSession, now);
   await failCommandsForDetachedAppServerHostSession(env, hostSession, now);
 
   return {
@@ -378,6 +379,128 @@ export async function detachHostSessionInDb(
       updated_at: now
     }
   };
+}
+
+async function releaseCommandsForDetachedAppServerHostSession(
+  env: Env,
+  hostSession: HostSessionSummary,
+  now: string
+): Promise<void> {
+  if (hostSession.app_server_present !== true) {
+    return;
+  }
+
+  const taskId = hostSession.attached_task_id ?? null;
+  const threadId = hostSession.attached_thread_id ?? null;
+  if (!taskId && !threadId) {
+    return;
+  }
+
+  const result = await env.DB!.prepare(
+    `UPDATE commands
+     SET state = 'pending',
+         target_connector_id = CASE WHEN target_connector_id_source = 'attached' THEN NULL ELSE target_connector_id END,
+         target_connector_id_source = CASE WHEN target_connector_id_source = 'attached' THEN 'auto' ELSE target_connector_id_source END,
+         lease_owner_connector_id = NULL,
+         lease_until = NULL,
+         lease_target_host_session_id = NULL,
+         updated_at = ?
+     WHERE workspace_id = ?
+       AND type = 'codex'
+       AND (target_connector_id = ? OR target_connector_id IS NULL)
+       AND (
+         (
+           state = 'pending'
+           AND lease_target_host_session_id = ?
+         )
+         OR (
+           state = 'leased'
+           AND (
+             lease_target_host_session_id = ?
+             OR (
+               lease_target_host_session_id IS NULL
+               AND lease_owner_connector_id = ?
+             )
+           )
+         )
+       )
+       AND (
+         (? IS NOT NULL AND task_id = ?)
+         OR (? IS NOT NULL AND thread_id = ?)
+       )
+       AND EXISTS (
+         SELECT 1
+         FROM host_sessions hs
+         INNER JOIN connectors c ON c.id = hs.connector_id
+         INNER JOIN workspace_connectors wc
+           ON wc.workspace_id = commands.workspace_id
+          AND wc.connector_id = hs.connector_id
+         WHERE hs.id = COALESCE(
+           (
+             SELECT hs_task.id
+             FROM host_sessions hs_task
+             WHERE hs_task.workspace_id = commands.workspace_id
+               AND commands.task_id IS NOT NULL
+               AND hs_task.attached_task_id = commands.task_id
+               AND (hs_task.connector_id <> ? OR hs_task.session_id <> ?)
+             ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+             LIMIT 1
+           ),
+           (
+             SELECT hs_thread.id
+             FROM host_sessions hs_thread
+             WHERE hs_thread.workspace_id = commands.workspace_id
+               AND commands.thread_id IS NOT NULL
+               AND hs_thread.attached_thread_id = commands.thread_id
+               AND (hs_thread.connector_id <> ? OR hs_thread.session_id <> ?)
+               AND (
+                 commands.task_id IS NULL
+                 OR NOT EXISTS (
+                   SELECT 1
+                   FROM host_sessions hst
+                   WHERE hst.workspace_id = commands.workspace_id
+                     AND hst.attached_task_id = commands.task_id
+                     AND (hst.connector_id <> ? OR hst.session_id <> ?)
+                 )
+               )
+             ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+             LIMIT 1
+           )
+         )
+           AND hs.app_server_present = 1
+           AND wc.can_execute = 1
+           AND c.status <> 'offline'
+           AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
+           AND (
+             commands.target_connector_id_source = 'attached'
+             OR commands.target_connector_id IS NULL
+             OR hs.connector_id = commands.target_connector_id
+           )
+       )`
+  )
+    .bind(
+      now,
+      hostSession.workspace_id,
+      hostSession.connector_id,
+      hostSession.session_id,
+      hostSession.session_id,
+      hostSession.connector_id,
+      taskId,
+      taskId,
+      threadId,
+      threadId,
+      hostSession.connector_id,
+      hostSession.session_id,
+      hostSession.connector_id,
+      hostSession.session_id,
+      hostSession.connector_id,
+      hostSession.session_id
+    )
+    .run();
+
+  if ((result.meta as { changes?: number } | undefined)?.changes) {
+    await updateConnectorActivity(env, hostSession.connector_id);
+  }
 }
 
 async function failCommandsForDetachedAppServerHostSession(
@@ -1340,7 +1463,7 @@ async function releaseRejectedAppServerStartLease(
              LIMIT 1
            )
          )
-           AND hs.session_id <> ?
+           AND (hs.connector_id <> ? OR hs.session_id <> ?)
            AND hs.app_server_present = 1
            AND wc.can_execute = 1
            AND c.status <> 'offline'
@@ -1355,6 +1478,7 @@ async function releaseRejectedAppServerStartLease(
       command.id,
       connectorId,
       command.lease_target_host_session_id,
+      connectorId,
       command.lease_target_host_session_id,
       clearImplicitTarget
     )

@@ -792,6 +792,35 @@ test("host session detach refreshes connector activity after failing a leased co
   assert.equal(db.connectorActivityUpdates, 1);
 });
 
+test("host session detach releases attached-inferred commands when a replacement app-server session exists", async () => {
+  const db = hostSessionDetachDb({
+    releaseDetachedCommands: true,
+    returnDetachedCommands: false
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(db.commandReleases, 1);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.connectorActivityUpdates, 1);
+});
+
 test("host session detach keeps nullable-target leases owned by another connector", async () => {
   const db = hostSessionDetachDb({ returnDetachedCommands: false });
   const response = await handleRequest(
@@ -2588,13 +2617,16 @@ function hostSessionDetachDb(options: {
   returnDetachedCommands?: boolean;
   detachedCommandState?: "pending" | "leased";
   detachedCommandFailureChanges?: number;
+  releaseDetachedCommands?: boolean;
 } = {}): D1Database & {
+  readonly commandReleases: number;
   readonly commandFailures: number;
   readonly connectorActivityUpdates: number;
   readonly taskUpdates: number;
   readonly eventInserts: number;
 } {
   const counters = {
+    commandReleases: 0,
     commandFailures: 0,
     connectorActivityUpdates: 0,
     taskUpdates: 0,
@@ -2690,8 +2722,9 @@ function hostSessionDetachDb(options: {
             assert.equal(excludedTaskHostSessionId, "host-session-1");
             return {
               async all() {
+                const commandWasReleased = counters.commandReleases > 0;
                 return {
-                  results: options.returnDetachedCommands === false ? [] : [
+                  results: options.returnDetachedCommands === false || commandWasReleased ? [] : [
                     {
                       id: "command-detached",
                       workspace_id: "workspace-api",
@@ -2712,6 +2745,68 @@ function hostSessionDetachDb(options: {
             }
           };
         }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
+        assert.match(sql, /target_connector_id = CASE WHEN target_connector_id_source = 'attached' THEN NULL ELSE target_connector_id END/);
+        assert.match(sql, /target_connector_id_source = CASE WHEN target_connector_id_source = 'attached' THEN 'auto' ELSE target_connector_id_source END/);
+        assert.match(sql, /lease_owner_connector_id = NULL/);
+        assert.match(sql, /lease_until = NULL/);
+        assert.match(sql, /lease_target_host_session_id = NULL/);
+        assert.match(sql, /state = 'pending'\s+AND lease_target_host_session_id = \?/);
+        assert.match(sql, /state = 'leased'/);
+        assert.match(sql, /lease_owner_connector_id = \?/);
+        assert.match(sql, /AND EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /hs_task\.connector_id <> \? OR hs_task\.session_id <> \?/);
+        assert.match(sql, /hs_thread\.connector_id <> \? OR hs_thread\.session_id <> \?/);
+        assert.match(sql, /hst\.connector_id <> \? OR hst\.session_id <> \?/);
+        assert.match(sql, /commands\.target_connector_id_source = 'attached'/);
+        assert.match(sql, /commands\.target_connector_id IS NULL/);
+        assert.match(sql, /hs\.connector_id = commands\.target_connector_id/);
+        return {
+          bind(
+            updatedAt: string,
+            workspaceId: string,
+            connectorId: string,
+            pendingLeaseTargetHostSessionId: string,
+            leasedLeaseTargetHostSessionId: string,
+            legacyLeaseOwnerConnectorId: string,
+            taskIdPresent: string | null,
+            taskId: string | null,
+            threadIdPresent: string | null,
+            threadId: string | null,
+            excludedTaskConnectorId: string,
+            excludedTaskSessionId: string,
+            excludedThreadConnectorId: string,
+            excludedThreadSessionId: string,
+            excludedFallbackConnectorId: string,
+            excludedFallbackSessionId: string
+          ) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(connectorId, "connector-online");
+            assert.equal(pendingLeaseTargetHostSessionId, "session-1");
+            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
+            assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
+            assert.equal(taskIdPresent, "task-host-1");
+            assert.equal(taskId, "task-host-1");
+            assert.equal(threadIdPresent, "thread-host-1");
+            assert.equal(threadId, "thread-host-1");
+            assert.equal(excludedTaskConnectorId, "connector-online");
+            assert.equal(excludedTaskSessionId, "session-1");
+            assert.equal(excludedThreadConnectorId, "connector-online");
+            assert.equal(excludedThreadSessionId, "session-1");
+            assert.equal(excludedFallbackConnectorId, "connector-online");
+            assert.equal(excludedFallbackSessionId, "session-1");
+            return {
+              async run() {
+                const changes = options.releaseDetachedCommands ? 1 : 0;
+                counters.commandReleases += changes;
+                return { meta: { changes } };
+              }
+            };
+          }
+        };
+      }
 
       if (/UPDATE commands/.test(sql) && /state = 'failed'/.test(sql)) {
         assert.match(sql, /workspace_id = \?/);
@@ -2880,6 +2975,9 @@ function hostSessionDetachDb(options: {
       }
 
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandReleases() {
+      return counters.commandReleases;
     },
     get commandFailures() {
       return counters.commandFailures;

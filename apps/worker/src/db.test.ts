@@ -100,6 +100,29 @@ test("recordAgentEvent releases attached inferred targets to replacement connect
   assert.equal(db.eventInserts, 0);
 });
 
+test("recordAgentEvent releases attached inferred targets to replacement connectors with the same app-server session id", async () => {
+  const db = appServerStartAfterDetachDb({
+    connector_id: "connector-replacement",
+    session_id: "session-old",
+    app_server_present: 1
+  });
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    target_host_session_id: "session-old",
+    kind: "command.started",
+    priority: "P1",
+    summary: "Starting"
+  });
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.dispatch_pending, true);
+  assert.equal(result.event, undefined);
+  assert.equal(db.commandUpdates, 1);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
 test("recordAgentEvent fails explicit targets that moved to a different connector", async () => {
   const db = appServerStartAfterDetachDb(
     {
@@ -817,7 +840,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
         assert.match(sql, /lease_target_host_session_id IS NOT NULL/);
         assert.match(sql, /lease_target_host_session_id = \?/);
         assert.match(sql, /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
-        assert.match(sql, /hs\.session_id <> \?/);
+        assert.match(sql, /hs\.connector_id <> \? OR hs\.session_id <> \?/);
         assert.match(sql, /\? OR commands\.target_connector_id IS NULL OR hs\.connector_id = commands\.target_connector_id/);
         return {
           bind(
@@ -827,6 +850,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
             commandId: string,
             ownerConnectorId: string,
             targetHostSessionId: string | null,
+            replacementExcludedConnectorId: string,
             replacementExcludedSessionId: string | null,
             replacementCanIgnoreOldTarget: number
           ) {
@@ -838,15 +862,21 @@ function appServerStartAfterDetachDb(currentTarget?: {
             assert.equal(commandId, "command-1");
             assert.equal(ownerConnectorId, "connector-online");
             assert.equal(targetHostSessionId, leaseTargetHostSessionId);
+            assert.equal(replacementExcludedConnectorId, "connector-online");
             assert.equal(replacementExcludedSessionId, leaseTargetHostSessionId);
             const replacementMatchesTarget = Boolean(
               currentTarget && (targetConnectorIdSource === "attached" || currentTarget.connector_id === "connector-online")
+            );
+            const replacementIsOldLeaseTarget = Boolean(
+              currentTarget
+              && currentTarget.connector_id === replacementExcludedConnectorId
+              && currentTarget.session_id === leaseTargetHostSessionId
             );
             const changes =
               leaseTargetHostSessionId !== null &&
               replacementMatchesTarget &&
               currentTarget &&
-              currentTarget.session_id !== leaseTargetHostSessionId &&
+              !replacementIsOldLeaseTarget &&
               currentTarget.app_server_present === 1
                 ? 1
                 : 0;
