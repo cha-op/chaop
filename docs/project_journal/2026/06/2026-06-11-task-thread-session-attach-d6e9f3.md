@@ -79,7 +79,7 @@ superseded_by:
 - Task Board and Thread Command Centre now expose a focused `New local thread` form; successful creation opens the real thread.
 - Review follow-up aligns the app-server client with the documented protocol by sending `initialize` and `initialized` before `thread/list` or `thread/start`, and by accepting official `Thread.id` responses without a legacy `sessionId`.
 - Review follow-up makes app-server inventory scans request `cli`, `vscode`, and `appServer` source kinds so Chaop-created threads remain discoverable after connector restarts.
-- Review follow-up makes the Thread Centre create form use the selected thread's workspace instead of always falling back to the first workspace.
+- Review follow-up makes the Thread Centre create form use the selected thread's workspace and filters connector choices to that workspace, falling back to Auto when a stale connector selection no longer belongs there.
 - Deployment guidance now documents the local `codex app-server --listen ws://127.0.0.1:9876` prerequisite and the private connector `app_server_url` setting.
 
 ## Next Steps

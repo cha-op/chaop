@@ -1,5 +1,6 @@
 import type {
   BootstrapPayload,
+  ConnectorSummary,
   HostSessionSummary,
   HostSessionSyncSummary,
   ThreadSummary
@@ -32,6 +33,28 @@ export function localThreadWorkspaceId(
     ? data.threads.find((thread) => thread.id === selectedThreadId)
     : undefined;
   return selectedThread?.workspace_id ?? data.workspaces[0]?.id;
+}
+
+export function localThreadConnectors(
+  data: BootstrapPayload | undefined,
+  workspaceId: string | undefined
+): ConnectorSummary[] {
+  if (!data || !workspaceId) return [];
+  const workspace = data.workspaces.find((item) => item.id === workspaceId);
+  if (!workspace) return [];
+  const connectorIds = new Set(workspace.connector_ids);
+  return data.connectors.filter((connector) => connectorIds.has(connector.id));
+}
+
+export function localThreadConnectorId(
+  data: BootstrapPayload | undefined,
+  workspaceId: string | undefined,
+  selectedConnectorId: string
+): string | undefined {
+  if (!selectedConnectorId) return undefined;
+  return localThreadConnectors(data, workspaceId).some((connector) => connector.id === selectedConnectorId)
+    ? selectedConnectorId
+    : undefined;
 }
 
 function mergeById<T extends { id: string }>(

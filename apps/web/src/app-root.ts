@@ -26,7 +26,12 @@ import {
   refreshHostSessions,
   unarchiveTask
 } from "./api.js";
-import { localThreadWorkspaceId, mergeBootstrapPayload } from "./state.js";
+import {
+  localThreadConnectorId,
+  localThreadConnectors,
+  localThreadWorkspaceId,
+  mergeBootstrapPayload
+} from "./state.js";
 
 type View = "operations-map" | "task-board" | "host-sessions" | "thread-centre" | "budget-board";
 type TaskBoardMode = "active" | "archive";
@@ -621,7 +626,8 @@ export class ChaopApp extends LitElement {
 
   private renderCreateThreadForm(layout: "compact" | "stacked", selectedThreadId?: string) {
     const workspaceId = localThreadWorkspaceId(this.data, selectedThreadId);
-    const connectors = this.data?.connectors ?? [];
+    const connectors = localThreadConnectors(this.data, workspaceId);
+    const selectedConnectorId = localThreadConnectorId(this.data, workspaceId, this.newThreadConnectorId) ?? "";
     return html`
       <form class=${`create-thread-form ${layout}`} @submit=${this.submitLocalThreadCreate}>
         <input type="hidden" name="workspace_id" .value=${workspaceId ?? ""} />
@@ -635,7 +641,7 @@ export class ChaopApp extends LitElement {
         />
         <select
           aria-label="Connector"
-          .value=${this.newThreadConnectorId}
+          .value=${selectedConnectorId}
           ?disabled=${this.newThreadState === "creating" || connectors.length === 0}
           @change=${(event: Event) => {
             this.newThreadConnectorId = (event.target as HTMLSelectElement).value;
@@ -668,6 +674,7 @@ export class ChaopApp extends LitElement {
     }
 
     const title = this.newThreadTitle.trim() || "New Codex thread";
+    const connectorId = localThreadConnectorId(this.data, workspaceId, this.newThreadConnectorId);
     this.newThreadState = "creating";
     this.actionError = undefined;
     let response: CreateLocalThreadResponse;
@@ -675,7 +682,7 @@ export class ChaopApp extends LitElement {
       response = await createLocalThread({
         workspace_id: workspaceId,
         title,
-        connector_id: this.newThreadConnectorId || undefined
+        connector_id: connectorId
       });
     } catch (error) {
       this.newThreadState = "failed";

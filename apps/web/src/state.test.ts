@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { BootstrapPayload, HostSessionSummary } from "@chaop/protocol";
-import { localThreadWorkspaceId, mergeBootstrapPayload } from "./state.ts";
+import {
+  localThreadConnectorId,
+  localThreadConnectors,
+  localThreadWorkspaceId,
+  mergeBootstrapPayload
+} from "./state.ts";
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
   const currentSession = hostSession("session-old");
@@ -62,6 +67,40 @@ test("localThreadWorkspaceId falls back to the first workspace", () => {
   assert.equal(localThreadWorkspaceId(data, "missing-thread"), "workspace-api");
 });
 
+test("localThreadConnectors filters connectors by workspace", () => {
+  const data = payload({
+    connectors: [
+      connector("connector-a"),
+      connector("connector-b")
+    ],
+    workspaces: [
+      workspace("workspace-api", ["connector-a"]),
+      workspace("workspace-docs", ["connector-b"])
+    ]
+  });
+
+  assert.deepEqual(
+    localThreadConnectors(data, "workspace-docs").map((item) => item.id),
+    ["connector-b"]
+  );
+});
+
+test("localThreadConnectorId drops stale connector selections", () => {
+  const data = payload({
+    connectors: [
+      connector("connector-a"),
+      connector("connector-b")
+    ],
+    workspaces: [
+      workspace("workspace-api", ["connector-a"]),
+      workspace("workspace-docs", ["connector-b"])
+    ]
+  });
+
+  assert.equal(localThreadConnectorId(data, "workspace-docs", "connector-a"), undefined);
+  assert.equal(localThreadConnectorId(data, "workspace-docs", "connector-b"), "connector-b");
+});
+
 function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   return {
     user: {
@@ -92,11 +131,24 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   };
 }
 
-function workspace(id: string) {
+function connector(id: string) {
   return {
     id,
     name: id,
-    connector_ids: [],
+    hostname: `${id}.local`,
+    status: "online" as const,
+    logical_agent_count: 1,
+    active_command_count: 0,
+    realtime_mode: "realtime" as const,
+    budget_state: "normal" as const
+  };
+}
+
+function workspace(id: string, connectorIds: string[] = []) {
+  return {
+    id,
+    name: id,
+    connector_ids: connectorIds,
     active_thread_count: 0
   };
 }

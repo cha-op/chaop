@@ -79,7 +79,7 @@ superseded_by:
 - Task Board 和 Thread Command Centre 现在提供聚焦的 `New local thread` 表单；创建成功后会直接打开真实 thread。
 - Review follow-up 让 app-server client 对齐已记录的协议：会在 `thread/list` 或 `thread/start` 前先发送 `initialize` 和 `initialized`，并接受没有 legacy `sessionId` 的官方 `Thread.id` 响应。
 - Review follow-up 让 app-server inventory scan 显式请求 `cli`、`vscode` 和 `appServer` source kinds，确保 Chaop 创建的 threads 在 connector 重启后仍能被发现。
-- Review follow-up 让 Thread Centre 的创建表单使用当前选中 thread 的 workspace，不再总是 fallback 到第一个 workspace。
+- Review follow-up 让 Thread Centre 的创建表单使用当前选中 thread 的 workspace，并把 connector 选项过滤到该 workspace；当旧 connector selection 不再属于当前 workspace 时，会回退到 Auto。
 - 部署指南现在记录了本地 `codex app-server --listen ws://127.0.0.1:9876` 前提，以及私有 connector `app_server_url` 配置。
 
 ## 下一步
