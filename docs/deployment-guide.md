@@ -324,7 +324,7 @@ codex_output_max_bytes = 262144
 [session_inventory]
 enabled = true
 max_sessions = 100
-report_interval_seconds = 15
+report_interval_seconds = 60
 app_server_timeout_seconds = 2
 # codex_home = "/Users/you/.codex"
 # app_server_url = "ws://127.0.0.1:9876"
@@ -353,7 +353,7 @@ Only add optional settings when the local Codex CLI needs them. `codex_exec` can
 Prompts are passed to Codex over stdin, not command-line arguments. Keep the timeout and output cap in place unless there is a specific operator reason to widen them.
 Use an absolute `codex_command` path for long-lived connectors launched by `launchctl` or another service manager. Those processes may not inherit the interactive shell `PATH`; if the executable cannot be found, Codex exec commands fail before any workspace `cwd` is used.
 
-Session inventory is enabled by default. The connector reads local Codex metadata from `CODEX_HOME` or `~/.codex`, reports session id, title, cwd, update time, and title source, and does not upload rollout transcripts. Title resolution prefers metadata or rollout titles, then optional app-server `Thread.name`, then the first local history prompt, and finally a cwd/session-id fallback. Set `app_server_url` only if you already run `codex app-server` with a local WebSocket listener and want Chaop to use app-server titles. Keep `app_server_timeout_seconds` short so a stopped app-server cannot block connector startup. `report_interval_seconds` controls the periodic local rescan interval; the connector only sends the periodic report when the inventory changes. The Host Sessions refresh button asks online connectors to rescan and report immediately.
+Session inventory is enabled by default. The connector reads local Codex metadata from `CODEX_HOME` or `~/.codex`, reports session id, title, cwd, update time, and title source, and does not upload rollout transcripts. Title resolution prefers metadata or rollout titles, then optional app-server `Thread.name`, then a recent local history prompt, and finally a cwd/session-id fallback. Set `app_server_url` only if you already run `codex app-server` with a local WebSocket listener and want Chaop to use app-server titles. Keep `app_server_timeout_seconds` short so a stopped app-server cannot block connector startup. `report_interval_seconds` controls the periodic local rescan interval; the connector only sends the periodic report when the inventory changes. The Host Sessions refresh button asks online connectors to rescan and report immediately.
 
 Create local files outside the repository:
 

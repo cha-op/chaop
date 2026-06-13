@@ -324,7 +324,7 @@ codex_output_max_bytes = 262144
 [session_inventory]
 enabled = true
 max_sessions = 100
-report_interval_seconds = 15
+report_interval_seconds = 60
 app_server_timeout_seconds = 2
 # codex_home = "/Users/you/.codex"
 # app_server_url = "ws://127.0.0.1:9876"
@@ -353,7 +353,7 @@ extra_args = ["--skip-git-repo-check"]
 Prompt 会通过 stdin 传给 Codex，不放在命令行参数里。除非有明确运维理由，不要放宽 timeout 和 output cap。
 由 `launchctl` 或其他 service manager 启动的常驻 connector，请使用绝对 `codex_command` 路径。这类进程不一定继承交互式 shell 的 `PATH`；如果找不到 executable，Codex exec 会在使用 workspace `cwd` 之前就失败。
 
-Session inventory 默认开启。Connector 会从 `CODEX_HOME` 或 `~/.codex` 读取本机 Codex metadata，上报 session id、title、cwd、更新时间和 title 来源，不上传 rollout transcripts。Title 解析优先使用 metadata 或 rollout 里的标题，其次使用可选 app-server `Thread.name`，再其次使用本地 history 的第一条 prompt，最后 fallback 到 cwd 和 session id。只有当你已经用本地 WebSocket listener 运行 `codex app-server`，并希望 Chaop 使用 app-server 标题时，才设置 `app_server_url`。`app_server_timeout_seconds` 应保持较短，避免 app-server 未运行时阻塞 connector 启动。`report_interval_seconds` 控制周期性本机重扫间隔；周期路径只有 inventory 变化时才会上报。Host Sessions 的 refresh 按钮会请求在线 connectors 立即重扫并上报。
+Session inventory 默认开启。Connector 会从 `CODEX_HOME` 或 `~/.codex` 读取本机 Codex metadata，上报 session id、title、cwd、更新时间和 title 来源，不上传 rollout transcripts。Title 解析优先使用 metadata 或 rollout 里的标题，其次使用可选 app-server `Thread.name`，再其次使用本地 history 里的近期 prompt，最后 fallback 到 cwd 和 session id。只有当你已经用本地 WebSocket listener 运行 `codex app-server`，并希望 Chaop 使用 app-server 标题时，才设置 `app_server_url`。`app_server_timeout_seconds` 应保持较短，避免 app-server 未运行时阻塞 connector 启动。`report_interval_seconds` 控制周期性本机重扫间隔；周期路径只有 inventory 变化时才会上报。Host Sessions 的 refresh 按钮会请求在线 connectors 立即重扫并上报。
 
 在仓库外创建本地文件目录：
 

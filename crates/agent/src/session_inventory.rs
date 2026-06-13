@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -77,13 +77,18 @@ pub fn build_host_sessions_report(
         .unwrap_or_else(default_codex_home);
     let mut drafts = HashMap::<String, SessionDraft>::new();
 
-    read_session_index(&codex_home, &mut drafts)?;
+    read_session_index(
+        &codex_home,
+        &mut drafts,
+        config.session_inventory.max_sessions,
+    )?;
     read_rollouts(
         &codex_home,
         &mut drafts,
         config.session_inventory.max_sessions,
     )?;
-    let history_sessions = read_history_sessions(&codex_home)?;
+    let history_sessions =
+        read_history_sessions(&codex_home, config.session_inventory.max_sessions)?;
     let app_server_titles = config
         .session_inventory
         .app_server_url
@@ -133,13 +138,14 @@ pub fn build_host_sessions_report(
 fn read_session_index(
     codex_home: &Path,
     drafts: &mut HashMap<String, SessionDraft>,
+    max_sessions: usize,
 ) -> std::io::Result<()> {
     let path = codex_home.join("session_index.jsonl");
     if !path.exists() {
         return Ok(());
     }
-    for line in fs::read_to_string(path)?.lines() {
-        let Ok(entry) = serde_json::from_str::<SessionIndexLine>(line) else {
+    for line in read_recent_lines(&path, metadata_scan_limit(max_sessions))? {
+        let Ok(entry) = serde_json::from_str::<SessionIndexLine>(&line) else {
             continue;
         };
         let draft = drafts
@@ -154,14 +160,17 @@ fn read_session_index(
     Ok(())
 }
 
-fn read_history_sessions(codex_home: &Path) -> std::io::Result<HashMap<String, HistorySession>> {
+fn read_history_sessions(
+    codex_home: &Path,
+    max_sessions: usize,
+) -> std::io::Result<HashMap<String, HistorySession>> {
     let path = codex_home.join("history.jsonl");
     let mut sessions = HashMap::new();
     if !path.exists() {
         return Ok(sessions);
     }
-    for line in fs::read_to_string(path)?.lines() {
-        let Ok(entry) = serde_json::from_str::<HistoryLine>(line) else {
+    for line in read_recent_lines(&path, metadata_scan_limit(max_sessions))? {
+        let Ok(entry) = serde_json::from_str::<HistoryLine>(&line) else {
             continue;
         };
         let updated_at = entry.ts.and_then(unix_seconds_to_iso);
@@ -265,6 +274,45 @@ fn read_rollout_metadata(
 
 fn rollout_scan_limit(max_sessions: usize) -> usize {
     max_sessions.saturating_mul(3).clamp(50, 500)
+}
+
+fn metadata_scan_limit(max_sessions: usize) -> usize {
+    max_sessions.saturating_mul(5).clamp(50, 1000)
+}
+
+fn read_recent_lines(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut file = fs::File::open(path)?;
+    let mut position = file.seek(SeekFrom::End(0))?;
+    let mut bytes = Vec::<u8>::new();
+    let mut newline_count = 0_usize;
+    let mut chunk = [0_u8; 8192];
+
+    while position > 0 && newline_count <= limit {
+        let read_len = (position as usize).min(chunk.len());
+        position -= read_len as u64;
+        file.seek(SeekFrom::Start(position))?;
+        file.read_exact(&mut chunk[..read_len])?;
+        newline_count += chunk[..read_len]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+
+        let mut next = Vec::with_capacity(read_len + bytes.len());
+        next.extend_from_slice(&chunk[..read_len]);
+        next.extend_from_slice(&bytes);
+        bytes = next;
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+    if lines.len() > limit {
+        lines = lines.split_off(lines.len() - limit);
+    }
+    Ok(lines)
 }
 
 fn rollout_paths(root: &Path, limit: usize) -> std::io::Result<Vec<PathBuf>> {
@@ -593,7 +641,8 @@ fn default_codex_home() -> PathBuf {
 mod tests {
     use super::{
         HistorySession, SessionDraft, TitleSource, app_server_titles_from_response,
-        build_host_sessions_report, resolve_session, rollout_paths, unix_seconds_to_iso,
+        build_host_sessions_report, read_recent_lines, resolve_session, rollout_paths,
+        unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
@@ -704,6 +753,28 @@ mod tests {
         assert_eq!(
             paths[0].file_name().and_then(|name| name.to_str()),
             Some("rollout-new.jsonl")
+        );
+    }
+
+    #[test]
+    fn recent_line_reader_returns_only_tail_lines() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("history.jsonl");
+        let lines = (0..200)
+            .map(|index| format!(r#"{{"session_id":"session-{index}","text":"Prompt {index}"}}"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, lines).expect("history");
+
+        let recent = read_recent_lines(&path, 3).expect("recent lines");
+
+        assert_eq!(
+            recent,
+            vec![
+                r#"{"session_id":"session-197","text":"Prompt 197"}"#,
+                r#"{"session_id":"session-198","text":"Prompt 198"}"#,
+                r#"{"session_id":"session-199","text":"Prompt 199"}"#
+            ]
         );
     }
 

@@ -62,8 +62,10 @@ superseded_by:
 - Host session inventory reports 现在被当作有上限的 top-N updates，而不是完整 snapshots：Worker 不再因为 partial report 缺少某个 session 就删除旧 row；realtime Browser update 也不会清空同 connector 的本地 session list。这样可以保留最新 report 窗口之外已有的 attachments。
 - Browser bootstrap merge 现在也遵循同样的 partial-inventory 契约，会保留 newer top-N payload 中缺失的当前 host sessions。Worker bootstrap list 会优先返回 attached host sessions，再返回未 attached 的近期 sessions，避免已绑定 task/thread 的 rows 被 200 条 payload 上限挤掉。
 - Connector `codex_exec` 现在会把等待 Codex CLI 的部分放到后台 worker，同时 WebSocket loop 继续响应 pings、close frames 和 Host Sessions refresh；其它消息仍会 defer 到当前 command 完成后处理。
+- Connector `codex_exec` 现在会把取消信号传给 Codex CLI worker，并在 socket close 或 read error 时 join 这个 worker，因此 stale child process 会被 kill，而不是在服务端已经把 command 标记失败后继续跑到 timeout。
 - Continuous connector mode 现在会在 socket close 或非 timeout read error 后用短 backoff 重连；`--run-once` 仍保持处理一个 command 后返回的行为。
 - Browser command request validation 现在会在写入 DB 前拒绝 thread、task 和 target connector 字段里的空字符串 optional ids。
+- Session inventory 现在会从 `session_index.jsonl` 和 `history.jsonl` 读取有上限的近期 tail，不再每次扫描都把完整文件读入内存。默认周期扫描间隔现在是 60 秒；Host Sessions 的手动 refresh 仍会请求在线 connectors 立即重扫。
 
 ## 下一步
 - 下一步优先做明确的新建 Codex thread 流程。Chaop 应该能从 Task Board 或 Thread Command Centre 创建本机 Codex/app-server thread，把创建出来的 session 绑定回 task/thread 组合，并且在本机 app-server 不可用时返回清晰的 connector/app-server 错误。

@@ -1,5 +1,5 @@
 use crate::config::{AgentConfig, ExecutionMode};
-use crate::executor::{codex_exec_result_events, codex_exec_started_event};
+use crate::executor::{codex_exec_result_events_with_cancel, codex_exec_started_event};
 use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
 use crate::session_inventory::build_host_sessions_report;
@@ -9,7 +9,11 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::TcpStream;
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, TryRecvError},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
@@ -235,19 +239,28 @@ fn wait_for_codex_exec_events(
     let workspace_root = config.workspace_root.clone();
     let prompt = prompt.to_owned();
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let events = codex_exec_result_events(&execution, &workspace_root, &prompt);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let mut worker = Some(thread::spawn(move || {
+        let events = codex_exec_result_events_with_cancel(
+            &execution,
+            &workspace_root,
+            &prompt,
+            worker_cancel,
+        );
         let _ = sender.send(events);
-    });
+    }));
 
     set_socket_read_timeout(socket, Some(connector_read_tick()))?;
     loop {
         match receiver.try_recv() {
             Ok(events) => {
+                join_codex_worker(worker.take())?;
                 set_socket_read_timeout(socket, Some(connector_read_tick()))?;
                 return Ok(events);
             }
             Err(TryRecvError::Disconnected) => {
+                join_codex_worker(worker.take())?;
                 return Err("codex exec worker stopped before returning events".into());
             }
             Err(TryRecvError::Empty) => {}
@@ -265,13 +278,36 @@ fn wait_for_codex_exec_events(
             }
             Ok(Message::Ping(payload)) => socket.send(Message::Pong(payload))?,
             Ok(Message::Close(_)) => {
+                cancel_codex_worker(&cancel, worker.take())?;
                 return Err("connection closed while codex exec was running".into());
             }
             Ok(_) => {}
             Err(error) if is_read_timeout(&error) => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                cancel_codex_worker(&cancel, worker.take())?;
+                return Err(error.into());
+            }
         }
     }
+}
+
+fn cancel_codex_worker(
+    cancel: &AtomicBool,
+    worker: Option<thread::JoinHandle<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    cancel.store(true, Ordering::Relaxed);
+    join_codex_worker(worker)
+}
+
+fn join_codex_worker(
+    worker: Option<thread::JoinHandle<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(worker) = worker {
+        if worker.join().is_err() {
+            return Err("codex exec worker panicked".into());
+        }
+    }
+    Ok(())
 }
 
 fn handle_background_text_message(

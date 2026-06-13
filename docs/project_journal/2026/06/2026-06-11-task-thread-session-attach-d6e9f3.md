@@ -62,8 +62,10 @@ superseded_by:
 - Host session inventory reports are now treated as bounded top-N updates rather than complete snapshots: Worker no longer deletes missing session rows from a partial report, and realtime Browser updates no longer clear the connector-local session list. This preserves existing attachments outside the latest report window.
 - Browser bootstrap merging now follows the same partial-inventory contract and preserves current host sessions that are absent from a newer top-N payload. Worker bootstrap lists prioritise attached host sessions before unattached recent sessions, so attached task/thread rows are not displaced by the 200-row payload cap.
 - Connector `codex_exec` now runs the Codex CLI wait in a background worker while the WebSocket loop keeps responding to pings, close frames, and Host Sessions refresh requests; other messages remain deferred until the command finishes.
+- Connector `codex_exec` now passes a cancellation signal into the Codex CLI worker and joins the worker on socket close or read error, so a stale child process is killed instead of running until timeout after the server has already failed the command.
 - Continuous connector mode now reconnects after socket close or non-timeout read errors with a small backoff, while `--run-once` still returns after one handled command.
 - Browser command request validation now rejects empty optional ids for thread, task, and target connector fields before DB insert.
+- Session inventory now reads bounded recent tails from `session_index.jsonl` and `history.jsonl` instead of loading the full files every scan. The default periodic scan interval is now 60 seconds, while manual Host Sessions refresh still asks online connectors to rescan immediately.
 
 ## Next Steps
 - Prioritise the explicit new Codex thread flow next. Chaop should be able to create a local Codex/app-server thread from Task Board or Thread Command Centre, bind the created session back to a task/thread pair, and report a clear connector/app-server error when local app-server is unavailable.

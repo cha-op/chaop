@@ -4,6 +4,10 @@ use serde::Deserialize;
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,8 +27,27 @@ pub fn codex_exec_result_events(
     workspace_root: &Path,
     prompt: &str,
 ) -> Vec<ConnectorEvent> {
-    let output = run_codex_command(config, workspace_root, prompt);
+    codex_exec_result_events_with_cancel(
+        config,
+        workspace_root,
+        prompt,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+pub(crate) fn codex_exec_result_events_with_cancel(
+    config: &ExecutionConfig,
+    workspace_root: &Path,
+    prompt: &str,
+    cancel: Arc<AtomicBool>,
+) -> Vec<ConnectorEvent> {
+    let output = run_codex_command(config, workspace_root, prompt, &cancel);
     match output {
+        Ok(output) if output.cancelled => vec![ConnectorEvent {
+            kind: "command.failed".to_owned(),
+            priority: "P1".to_owned(),
+            summary: "Codex exec was cancelled because the connector connection closed.".to_owned(),
+        }],
         Ok(output) if output.timed_out => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
@@ -78,6 +101,7 @@ fn run_codex_command(
     config: &ExecutionConfig,
     workspace_root: &Path,
     prompt: &str,
+    cancel: &AtomicBool,
 ) -> std::io::Result<CodexCommandOutput> {
     let max_bytes = config.codex_output_max_bytes;
     let mut command = codex_command(config, workspace_root);
@@ -104,13 +128,17 @@ fn run_codex_command(
 
     let timeout = Duration::from_secs(config.codex_timeout_seconds.max(1));
     let started_at = Instant::now();
-    let (status, timed_out) = loop {
+    let (status, timed_out, cancelled) = loop {
         if let Some(status) = child.try_wait()? {
-            break (status, false);
+            break (status, false, false);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            break (child.wait()?, false, true);
         }
         if started_at.elapsed() >= timeout {
             let _ = child.kill();
-            break (child.wait()?, true);
+            break (child.wait()?, true, false);
         }
         thread::sleep(Duration::from_millis(100));
     };
@@ -123,6 +151,7 @@ fn run_codex_command(
         stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
         timed_out,
+        cancelled,
         truncated: stdout.truncated || stderr.truncated,
     })
 }
@@ -285,6 +314,7 @@ struct CodexCommandOutput {
     stdout: String,
     stderr: String,
     timed_out: bool,
+    cancelled: bool,
     truncated: bool,
 }
 
@@ -347,7 +377,14 @@ impl CodexUsage {
 mod tests {
     use super::{codex_result_events, parse_codex_jsonl};
     use crate::config::ExecutionConfig;
+    use std::fs;
     use std::path::Path;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn parses_codex_jsonl_agent_message_and_usage() {
@@ -415,6 +452,49 @@ mod tests {
         assert_eq!(
             events[0].summary,
             "Codex executable not found: /definitely/not/codex. Set execution.codex_command to an absolute path visible to the connector process."
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_codex_exec_returns_without_waiting_for_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let command_path = tempdir.path().join("fake-codex");
+        fs::write(&command_path, "#!/bin/sh\nexec sleep 30\n").expect("fake codex");
+        let mut permissions = fs::metadata(&command_path)
+            .expect("fake codex metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&command_path, permissions).expect("fake codex permissions");
+
+        let config = ExecutionConfig {
+            codex_command: command_path.to_string_lossy().into_owned(),
+            codex_timeout_seconds: 30,
+            ..ExecutionConfig::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let workspace_root = tempdir.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            super::codex_exec_result_events_with_cancel(
+                &config,
+                &workspace_root,
+                "status",
+                worker_cancel,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(150));
+        cancel.store(true, Ordering::Relaxed);
+        let events = worker.join().expect("worker");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "command.failed");
+        assert_eq!(
+            events[0].summary,
+            "Codex exec was cancelled because the connector connection closed."
         );
     }
 }

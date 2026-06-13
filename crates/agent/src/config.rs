@@ -163,7 +163,7 @@ fn default_session_inventory_max_sessions() -> usize {
 }
 
 fn default_session_inventory_report_interval_seconds() -> u64 {
-    15
+    60
 }
 
 fn default_app_server_timeout_seconds() -> u64 {
