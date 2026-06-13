@@ -450,6 +450,27 @@ function staleFinalCommandEventDb(): D1Database & { readonly pendingDispatchQuer
         };
       }
 
+      if (/FROM commands cmd/.test(sql) && /target_connector_id_source = 'explicit'/.test(sql)) {
+        return {
+          bind(
+            targetConnectorId: string,
+            leaseOwnerConnectorId: string,
+            now: string,
+            currentTargetConnectorId: string
+          ) {
+            assert.equal(targetConnectorId, "connector-online");
+            assert.equal(leaseOwnerConnectorId, "connector-online");
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(currentTargetConnectorId, "connector-online");
+            return {
+              async all() {
+                return { results: [] };
+              }
+            };
+          }
+        };
+      }
+
       if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
         return {
           bind(
@@ -613,6 +634,27 @@ function rejectedStartedEventWithFailedResultDb(): D1Database & {
         };
       }
 
+      if (/FROM commands cmd/.test(sql) && /target_connector_id_source = 'explicit'/.test(sql)) {
+        return {
+          bind(
+            targetConnectorId: string,
+            leaseOwnerConnectorId: string,
+            now: string,
+            currentTargetConnectorId: string
+          ) {
+            assert.equal(targetConnectorId, "connector-online");
+            assert.equal(leaseOwnerConnectorId, "connector-online");
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(currentTargetConnectorId, "connector-online");
+            return {
+              async all() {
+                return { results: [] };
+              }
+            };
+          }
+        };
+      }
+
       if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
         return {
           bind(
@@ -731,6 +773,26 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
               async run() {
                 counters.leaseReleases += 1;
                 return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM commands cmd/.test(sql) && /target_connector_id_source = 'explicit'/.test(sql)) {
+        return {
+          bind(
+            targetConnectorId: string,
+            leaseOwnerConnectorId: string,
+            now: string,
+            currentTargetConnectorId: string
+          ) {
+            assert.equal(targetConnectorId, leaseOwnerConnectorId);
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(currentTargetConnectorId, targetConnectorId);
+            return {
+              async all() {
+                return { results: [] };
               }
             };
           }

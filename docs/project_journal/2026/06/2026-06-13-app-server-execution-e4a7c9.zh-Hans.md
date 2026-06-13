@@ -84,6 +84,7 @@ superseded_by:
 - 后续 frozen-diff review 发现 duplicate connector retirement 会把 attached Host Sessions 迁移到新 connector，但 pending attached-inferred commands 仍然指向已 retired 的旧 connector。现在 Host Session migration 会把迁移后 task/thread scope 下的 pending `attached` commands 重新指向新 connector，并用已迁移 connector/session 仍是当前 attachment 作为 guard。
 - GitHub review-gate 发现 Chaop 发起的 app-server turn 可能一直等待 interactive approval request。现在 connector 的 `turn/start` 会发送 `approvalPolicy: "never"`，让本切片在 Chaop 拥有一等 approval UI 前保持非交互执行。
 - GitHub review-gate 也发现 sticky `app_server_present` 可能在 connector 不再通过 app-server 上报该 session 后，仍把新的 commands 分类为 app-server work。现在 Host Session inventory 会把 `app_server_present` 当作本次 report 的当前状态，而不是 ever-seen 标记。
+- 后续 PR readiness review 发现两个残留的 stale app-server target 缺口：inventory demotion 可能让已绑定 app-server session 的 command 卡住；显式 app-server command 也可能在 lease 前 attachment 已迁移时一直 pending。现在 inventory demotion 会运行与 detach 相同的 release/failure cleanup，Durable Object 也会在 dispatch 前失败 stale explicit app-server targets，即使目标 connector 当前没有 active socket。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -136,6 +137,8 @@ superseded_by:
 - Worker DB 与 route tests 断言 app-server release paths 会把 replacement app-server `session_id` 写入 `lease_target_host_session_id`，而不是清空 app-server target。
 - Worker DB tests 断言 duplicate connector retirement 会把 pending attached-inferred commands 重新指向迁移后的 connector/session。
 - Worker DB tests 断言后续 inventory report 不再标记 session app-server present 时，会清掉 stale `app_server_present`。
+- Worker DB tests 断言 stale explicit app-server command target 会在 dispatch 前失败，而不是一直 pending。
+- Worker Durable Object tests 断言 stale-target cleanup 与 rejected-event dispatch polling 兼容。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 Chaop app-server `turn/start` request 会把 `approvalPolicy` 设为 `never`。
 - Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。

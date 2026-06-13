@@ -12,6 +12,7 @@ import {
   type ThreadEvent
 } from "@chaop/protocol";
 import {
+  failStaleExplicitAppServerCommandTargets,
   markConnectorDisconnected,
   pendingCommandsForConnector,
   recordAgentEvent,
@@ -173,6 +174,12 @@ export class WorkspaceDO implements DurableObject {
         connector_id: connectorId,
         synced_at: result.synced_at
       }));
+      for (const event of result.failed_events) {
+        this.broadcastToBrowsers(threadEventMessage(event));
+      }
+      for (const releasedConnectorId of result.released_connector_ids) {
+        await this.sendPendingCommandsToAgents(releasedConnectorId);
+      }
       return;
     }
 
@@ -494,7 +501,17 @@ export class WorkspaceDO implements DurableObject {
     pending.resolve(result);
   }
 
-  private async sendPendingCommands(ws: WebSocket, connectorId: string): Promise<void> {
+  private async sendPendingCommands(
+    ws: WebSocket,
+    connectorId: string,
+    options: { skipStaleExplicitCleanup?: boolean } = {}
+  ): Promise<void> {
+    if (!options.skipStaleExplicitCleanup) {
+      const failedEvents = await failStaleExplicitAppServerCommandTargets(this.env, connectorId);
+      for (const event of failedEvents) {
+        this.broadcastToBrowsers(threadEventMessage(event));
+      }
+    }
     const dispatches = await pendingCommandsForConnector(this.env, connectorId);
     for (const payload of dispatches) {
       const command = payload.command;
@@ -513,8 +530,14 @@ export class WorkspaceDO implements DurableObject {
 
   private async sendPendingCommandsToAgents(connectorId?: string): Promise<WebSocket[]> {
     if (connectorId) {
+      const failedEvents = await failStaleExplicitAppServerCommandTargets(this.env, connectorId);
+      for (const event of failedEvents) {
+        this.broadcastToBrowsers(threadEventMessage(event));
+      }
       const sockets = this.ctx.getWebSockets(`agent:${connectorId}`);
-      await Promise.all(sockets.map((socket) => this.sendPendingCommands(socket, connectorId)));
+      await Promise.all(
+        sockets.map((socket) => this.sendPendingCommands(socket, connectorId, { skipStaleExplicitCleanup: true }))
+      );
       return sockets;
     }
 

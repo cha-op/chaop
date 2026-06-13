@@ -4,6 +4,7 @@ import {
   LocalThreadTargetError,
   chooseConnectorForLocalThread,
   ensureConnectorInventory,
+  failStaleExplicitAppServerCommandTargets,
   listThreadEventsInDb,
   markConnectorDisconnected,
   pendingCommandsForConnector,
@@ -435,6 +436,23 @@ test("pendingCommandsForConnector skips dispatch when the stored app-server targ
   assert.equal(dispatches.length, 0);
   assert.equal(db.commandLeaseUpdates, 0);
   assert.equal(db.connectorActivityUpdates, 0);
+});
+
+test("failStaleExplicitAppServerCommandTargets fails pending explicit app-server commands before dispatch", async () => {
+  const db = staleExplicitAppServerTargetDb();
+
+  const events = await failStaleExplicitAppServerCommandTargets(
+    { DB: db } as Env,
+    "connector-online",
+    "2026-06-13T10:00:30.000Z"
+  );
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.kind, "command.failed");
+  assert.equal(events[0]?.summary, "Explicit app-server target changed before the command could start.");
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
 });
 
 test("pendingCommandsForConnector does not downgrade expired app-server leases to codex_exec", async () => {
@@ -1770,6 +1788,167 @@ function pendingCommandDispatchDb(options: {
   return db as D1Database & typeof counters;
 }
 
+function staleExplicitAppServerTargetDb() {
+  const counters = {
+    commandFailures: 0,
+    taskUpdates: 0,
+    eventInserts: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/FROM commands cmd/.test(sql) && /target_connector_id_source = 'explicit'/.test(sql)) {
+        assert.match(sql, /cmd\.lease_target_host_session_id IS NOT NULL/);
+        assert.match(sql, /cmd\.state = 'pending'/);
+        assert.match(sql, /cmd\.state = 'leased'/);
+        assert.match(sql, /AND NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /hs\.session_id = cmd\.lease_target_host_session_id/);
+        assert.match(sql, /COALESCE\(hs\.app_server_present, 0\) = 1/);
+        assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
+        return {
+          bind(
+            targetConnectorId: string,
+            leaseOwnerConnectorId: string,
+            now: string,
+            currentTargetConnectorId: string
+          ) {
+            assert.equal(targetConnectorId, "connector-online");
+            assert.equal(leaseOwnerConnectorId, "connector-online");
+            assert.equal(now, "2026-06-13T10:00:30.000Z");
+            assert.equal(currentTargetConnectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [
+                    {
+                      id: "command-1",
+                      workspace_id: "workspace-api",
+                      thread_id: "thread-1",
+                      task_id: "task-1",
+                      type: "codex",
+                      prompt: "continue",
+                      state: "pending",
+                      target_connector_id: "connector-online",
+                      lease_owner_connector_id: null,
+                      lease_target_host_session_id: "session-old",
+                      created_at: "2026-06-13T10:00:00.000Z",
+                      updated_at: "2026-06-13T10:00:00.000Z"
+                    }
+                  ]
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /target_connector_id_source = 'explicit'/.test(sql)) {
+        assert.match(sql, /SET state = 'failed'/);
+        assert.match(sql, /lease_owner_connector_id = NULL/);
+        assert.match(sql, /lease_until = NULL/);
+        assert.match(sql, /lease_target_host_session_id IS NOT NULL/);
+        assert.match(sql, /AND NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /hs\.session_id = commands\.lease_target_host_session_id/);
+        return {
+          bind(
+            updatedAt: string,
+            commandId: string,
+            targetConnectorId: string,
+            leaseOwnerConnectorId: string,
+            now: string,
+            currentTargetConnectorId: string
+          ) {
+            assert.equal(updatedAt, "2026-06-13T10:00:30.000Z");
+            assert.equal(commandId, "command-1");
+            assert.equal(targetConnectorId, "connector-online");
+            assert.equal(leaseOwnerConnectorId, "connector-online");
+            assert.equal(now, "2026-06-13T10:00:30.000Z");
+            assert.equal(currentTargetConnectorId, "connector-online");
+            return {
+              async run() {
+                counters.commandFailures += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql)) {
+        return {
+          bind(updatedAt: string, taskId: string) {
+            assert.equal(updatedAt, "2026-06-13T10:00:30.000Z");
+            assert.equal(taskId, "task-1");
+            return {
+              async run() {
+                counters.taskUpdates += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 1 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind(
+            eventId: string,
+            workspaceId: string,
+            threadId: string,
+            commandId: string,
+            seq: number,
+            kind: string,
+            priority: string,
+            summary: string,
+            createdAt: string
+          ) {
+            assert.match(eventId, /^event-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-1");
+            assert.equal(commandId, "command-1");
+            assert.equal(seq, 1);
+            assert.equal(kind, "command.failed");
+            assert.equal(priority, "P1");
+            assert.equal(summary, "Explicit app-server target changed before the command could start.");
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandFailures() {
+      return counters.commandFailures;
+    },
+    get taskUpdates() {
+      return counters.taskUpdates;
+    },
+    get eventInserts() {
+      return counters.eventInserts;
+    }
+  };
+  return db as D1Database & typeof counters;
+}
+
 function expiredAppServerLeaseDispatchDb() {
   const counters = {
     commandLeaseUpdates: 0,
@@ -1955,6 +2134,34 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
             return {
               async first() {
                 return sessions.get(sessionId);
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
+        assert.match(sql, /lease_target_host_session_id = \?/);
+        assert.match(sql, /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        return {
+          bind() {
+            return {
+              async run() {
+                return { meta: { changes: 0 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, workspace_id, thread_id, task_id, type, prompt, state/.test(sql) && /FROM commands cmd/.test(sql)) {
+        assert.match(sql, /cmd\.lease_target_host_session_id = \?/);
+        assert.match(sql, /AND NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        return {
+          bind() {
+            return {
+              async all() {
+                return { results: [] };
               }
             };
           }

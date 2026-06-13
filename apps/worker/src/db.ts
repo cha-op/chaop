@@ -106,8 +106,8 @@ export async function recordHostSessions(
   report: AgentHostSessionsReport,
   syncedAt = new Date().toISOString(),
   options: { workspaceId?: string | undefined } = {}
-): Promise<{ host_sessions: HostSessionSummary[]; synced_at: string }> {
-  if (!env.DB) return { host_sessions: [], synced_at: syncedAt };
+): Promise<{ host_sessions: HostSessionSummary[]; synced_at: string; released_connector_ids: string[]; failed_events: ThreadEvent[] }> {
+  if (!env.DB) return { host_sessions: [], synced_at: syncedAt, released_connector_ids: [], failed_events: [] };
 
   const connector = await env.DB.prepare(
     `SELECT hostname
@@ -117,7 +117,7 @@ export async function recordHostSessions(
   )
     .bind(connectorId)
     .first<{ hostname: string }>();
-  if (!connector) return { host_sessions: [], synced_at: syncedAt };
+  if (!connector) return { host_sessions: [], synced_at: syncedAt, released_connector_ids: [], failed_events: [] };
 
   const workspace = await env.DB.prepare(
     `SELECT workspace_id
@@ -130,10 +130,13 @@ export async function recordHostSessions(
     .first<{ workspace_id: string }>();
   const workspaceId = options.workspaceId ?? workspace?.workspace_id ?? DEFAULT_WORKSPACE_ID;
   const upserted: HostSessionSummary[] = [];
+  const releasedConnectorIds = new Set<string>();
+  const failedEvents: ThreadEvent[] = [];
   const reportedSessions = report.sessions.slice(0, 200);
 
   for (const session of reportedSessions) {
     const id = hostSessionId(connectorId, session.session_id);
+    const previous = await findHostSession(env, session.session_id, connectorId);
     await env.DB.prepare(
       `INSERT INTO host_sessions (
          id, connector_id, hostname, workspace_id, session_id, title, title_source, app_server_present,
@@ -169,6 +172,17 @@ export async function recordHostSessions(
     const stored = await findHostSession(env, session.session_id, connectorId);
     if (stored) {
       upserted.push(stored);
+      if (
+        previous?.app_server_present === true &&
+        stored.app_server_present !== true &&
+        (stored.attached_task_id || stored.attached_thread_id)
+      ) {
+        const released = await releaseCommandsForDetachedAppServerHostSession(env, stored, syncedAt);
+        for (const releasedConnectorId of released) {
+          releasedConnectorIds.add(releasedConnectorId);
+        }
+        failedEvents.push(...await failCommandsForDetachedAppServerHostSession(env, stored, syncedAt));
+      }
     }
   }
 
@@ -192,7 +206,12 @@ export async function recordHostSessions(
     .bind(syncedAt, syncedAt, connectorId)
     .run();
 
-  return { host_sessions: upserted, synced_at: syncedAt };
+  return {
+    host_sessions: upserted,
+    synced_at: syncedAt,
+    released_connector_ids: [...releasedConnectorIds],
+    failed_events: failedEvents
+  };
 }
 
 export async function archiveTaskInDb(env: Env, taskId: string): Promise<TaskSummary> {
@@ -385,10 +404,6 @@ async function releaseCommandsForDetachedAppServerHostSession(
   hostSession: HostSessionSummary,
   now: string
 ): Promise<string[]> {
-  if (hostSession.app_server_present !== true) {
-    return [];
-  }
-
   const taskId = hostSession.attached_task_id ?? null;
   const threadId = hostSession.attached_thread_id ?? null;
   if (!taskId && !threadId) {
@@ -623,10 +638,6 @@ async function failCommandsForDetachedAppServerHostSession(
   hostSession: HostSessionSummary,
   now: string
 ): Promise<ThreadEvent[]> {
-  if (hostSession.app_server_present !== true) {
-    return [];
-  }
-
   const taskId = hostSession.attached_task_id ?? null;
   const threadId = hostSession.attached_thread_id ?? null;
   if (!taskId && !threadId) {
@@ -1579,6 +1590,187 @@ export async function pendingCommandsForConnector(
       ? { command, target_host_session: targetHostSession }
       : { command };
   });
+}
+
+export async function failStaleExplicitAppServerCommandTargets(
+  env: Env,
+  connectorId: string,
+  now = new Date().toISOString()
+): Promise<ThreadEvent[]> {
+  if (!env.DB) return [];
+
+  const commands = await allRows<CommandRow & {
+    lease_owner_connector_id: string | null;
+    lease_target_host_session_id: string | null;
+  }>(
+    env.DB.prepare(
+      `SELECT id, workspace_id, thread_id, task_id, type, prompt, state,
+              target_connector_id, lease_owner_connector_id, created_at, updated_at,
+              lease_target_host_session_id
+       FROM commands cmd
+       WHERE cmd.type = 'codex'
+         AND cmd.target_connector_id = ?
+         AND cmd.target_connector_id_source = 'explicit'
+         AND cmd.lease_target_host_session_id IS NOT NULL
+         AND (
+           cmd.state = 'pending'
+           OR (
+             cmd.state = 'leased'
+             AND cmd.lease_owner_connector_id = ?
+             AND cmd.lease_until IS NOT NULL
+             AND cmd.lease_until < ?
+           )
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM host_sessions hs
+           INNER JOIN connectors c ON c.id = hs.connector_id
+           INNER JOIN workspace_connectors wc
+             ON wc.workspace_id = cmd.workspace_id
+            AND wc.connector_id = hs.connector_id
+           WHERE hs.id = COALESCE(
+             (
+               SELECT hs_task.id
+               FROM host_sessions hs_task
+               WHERE hs_task.workspace_id = cmd.workspace_id
+                 AND cmd.task_id IS NOT NULL
+                 AND hs_task.attached_task_id = cmd.task_id
+               ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+               LIMIT 1
+             ),
+             (
+               SELECT hs_thread.id
+               FROM host_sessions hs_thread
+               WHERE hs_thread.workspace_id = cmd.workspace_id
+                 AND cmd.thread_id IS NOT NULL
+                 AND hs_thread.attached_thread_id = cmd.thread_id
+                 AND (
+                   cmd.task_id IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1
+                     FROM host_sessions hst
+                     WHERE hst.workspace_id = cmd.workspace_id
+                       AND hst.attached_task_id = cmd.task_id
+                   )
+                 )
+               ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+               LIMIT 1
+             )
+           )
+             AND hs.connector_id = ?
+             AND hs.session_id = cmd.lease_target_host_session_id
+             AND COALESCE(hs.app_server_present, 0) = 1
+             AND wc.can_execute = 1
+             AND c.status <> 'offline'
+             AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
+         )
+       ORDER BY cmd.created_at ASC
+       LIMIT 20`
+    ).bind(connectorId, connectorId, now, connectorId)
+  );
+
+  const failedEvents: ThreadEvent[] = [];
+  for (const command of commands) {
+    const result = await env.DB.prepare(
+      `UPDATE commands
+       SET state = 'failed',
+           lease_owner_connector_id = NULL,
+           lease_until = NULL,
+           updated_at = ?
+       WHERE id = ?
+         AND type = 'codex'
+         AND target_connector_id = ?
+         AND target_connector_id_source = 'explicit'
+         AND lease_target_host_session_id IS NOT NULL
+         AND (
+           state = 'pending'
+           OR (
+             state = 'leased'
+             AND lease_owner_connector_id = ?
+             AND lease_until IS NOT NULL
+             AND lease_until < ?
+           )
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM host_sessions hs
+           INNER JOIN connectors c ON c.id = hs.connector_id
+           INNER JOIN workspace_connectors wc
+             ON wc.workspace_id = commands.workspace_id
+            AND wc.connector_id = hs.connector_id
+           WHERE hs.id = COALESCE(
+             (
+               SELECT hs_task.id
+               FROM host_sessions hs_task
+               WHERE hs_task.workspace_id = commands.workspace_id
+                 AND commands.task_id IS NOT NULL
+                 AND hs_task.attached_task_id = commands.task_id
+               ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+               LIMIT 1
+             ),
+             (
+               SELECT hs_thread.id
+               FROM host_sessions hs_thread
+               WHERE hs_thread.workspace_id = commands.workspace_id
+                 AND commands.thread_id IS NOT NULL
+                 AND hs_thread.attached_thread_id = commands.thread_id
+                 AND (
+                   commands.task_id IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1
+                     FROM host_sessions hst
+                     WHERE hst.workspace_id = commands.workspace_id
+                       AND hst.attached_task_id = commands.task_id
+                   )
+                 )
+               ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+               LIMIT 1
+             )
+           )
+             AND hs.connector_id = ?
+             AND hs.session_id = commands.lease_target_host_session_id
+             AND COALESCE(hs.app_server_present, 0) = 1
+             AND wc.can_execute = 1
+             AND c.status <> 'offline'
+             AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
+         )`
+    )
+      .bind(now, command.id, connectorId, connectorId, now, connectorId)
+      .run();
+    if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+      continue;
+    }
+
+    if (command.state === "leased" && command.lease_owner_connector_id) {
+      await updateConnectorActivity(env, command.lease_owner_connector_id);
+    }
+
+    if (command.task_id) {
+      await env.DB.prepare(
+        `UPDATE tasks
+         SET state = 'failed', updated_at = ?
+         WHERE id = ?`
+      )
+        .bind(now, command.task_id)
+        .run();
+    }
+
+    if (command.thread_id) {
+      const event = await appendEvent(env, {
+        workspace_id: command.workspace_id,
+        thread_id: command.thread_id,
+        command_id: command.id,
+        kind: "command.failed",
+        priority: "P1",
+        summary: "Explicit app-server target changed before the command could start."
+      });
+      if (event) {
+        failedEvents.push(event);
+      }
+    }
+  }
+
+  return failedEvents;
 }
 
 export async function recordAgentEvent(
