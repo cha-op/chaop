@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ensureConnectorInventory, markConnectorDisconnected, recordAgentEvent, recordHostSessions } from "./db.js";
+import {
+  LocalThreadTargetError,
+  chooseConnectorForLocalThread,
+  ensureConnectorInventory,
+  markConnectorDisconnected,
+  recordAgentEvent,
+  recordHostSessions
+} from "./db.js";
 import type { Env } from "./types.js";
 
 test("recordAgentEvent ignores stale events from a connector that lost the lease", async () => {
@@ -125,6 +132,28 @@ test("recordHostSessions preserves stored sessions outside the latest top-N repo
     reported: 1,
     stored: 1
   });
+});
+
+test("chooseConnectorForLocalThread selects app-server capable connectors", async () => {
+  const connectorId = await chooseConnectorForLocalThread(
+    { DB: localThreadConnectorDb({ id: "connector-online" }) } as Env,
+    { id: "user-1", email: "operator@example.com", name: "Operator" },
+    { workspace_id: "workspace-api" }
+  );
+
+  assert.equal(connectorId, "connector-online");
+});
+
+test("chooseConnectorForLocalThread rejects connectors without app-server support", async () => {
+  await assert.rejects(
+    () =>
+      chooseConnectorForLocalThread(
+        { DB: localThreadConnectorDb(null) } as Env,
+        { id: "user-1", email: "operator@example.com", name: "Operator" },
+        { workspace_id: "workspace-api", connector_id: "connector-placeholder" }
+      ),
+    LocalThreadTargetError
+  );
 });
 
 function agentEventGuardDb(command: {
@@ -825,4 +854,62 @@ function hostSessionsInventoryDb() {
   };
 
   return db as D1Database & typeof counters;
+}
+
+function localThreadConnectorDb(row: { id: string } | null): D1Database {
+  return {
+    prepare(sql: string) {
+      if (/INSERT INTO users/.test(sql)) {
+        return {
+          bind(userId: string, email: string, name: string) {
+            assert.equal(userId, "user-1");
+            assert.equal(email, "operator@example.com");
+            assert.equal(name, "Operator");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id FROM workspaces/.test(sql)) {
+        return {
+          bind(workspaceId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            return {
+              async first() {
+                return { id: workspaceId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT c\.id/.test(sql) && /app_server_threads/.test(sql)) {
+        assert.match(sql, /workspace_connectors/);
+        assert.match(sql, /wc\.can_execute = 1/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /capabilities_json LIKE/);
+        return {
+          bind(first: string, second?: string) {
+            if (second !== undefined) {
+              assert.equal(first, "connector-placeholder");
+              assert.equal(second, "workspace-api");
+            } else {
+              assert.equal(first, "workspace-api");
+            }
+            return {
+              async first() {
+                return row;
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    }
+  } as unknown as D1Database;
 }

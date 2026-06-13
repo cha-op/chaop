@@ -4,6 +4,8 @@ import type {
   BootstrapPayload,
   CreateCommandRequest,
   CreateCommandResponse,
+  CreateLocalThreadRequest,
+  CreateLocalThreadResponse,
   DetachHostSessionRequest,
   DetachHostSessionResponse,
   RefreshHostSessionsResponse,
@@ -55,6 +57,10 @@ export async function createCommand(request: CreateCommandRequest): Promise<Crea
   }
 
   return (await response.json()) as CreateCommandResponse;
+}
+
+export async function createLocalThread(request: CreateLocalThreadRequest): Promise<CreateLocalThreadResponse> {
+  return postJson("/api/local-threads", request);
 }
 
 export async function archiveTask(taskId: string): Promise<{ task: TaskSummary }> {

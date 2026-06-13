@@ -6,8 +6,11 @@ import type {
   BootstrapPayload,
   CommandSummary,
   ConnectorSummary,
+  CreateLocalThreadRequest,
+  CreateLocalThreadResponse,
   CreateCommandRequest,
   CreateCommandResponse,
+  AgentHostSession,
   DetachHostSessionResponse,
   HostSessionSummary,
   HostSessionSyncSummary,
@@ -26,6 +29,10 @@ const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 
 export class CommandTargetError extends Error {
+  readonly status = 404;
+}
+
+export class LocalThreadTargetError extends Error {
   readonly status = 404;
 }
 
@@ -345,6 +352,50 @@ export async function detachHostSessionInDb(
       updated_at: now
     }
   };
+}
+
+export async function chooseConnectorForLocalThread(
+  env: Env,
+  user: BrowserIdentity,
+  request: CreateLocalThreadRequest
+): Promise<string> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for local thread creation");
+  }
+
+  await ensureUser(env, user);
+
+  const workspace = await env.DB.prepare(
+    "SELECT id FROM workspaces WHERE id = ? LIMIT 1"
+  )
+    .bind(request.workspace_id)
+    .first<{ id: string }>();
+  if (!workspace) {
+    throw new LocalThreadTargetError("Workspace not available");
+  }
+
+  const connector = request.connector_id
+    ? await findLocalThreadConnector(env, request.workspace_id, request.connector_id)
+    : await findBestLocalThreadConnector(env, request.workspace_id);
+
+  if (!connector) {
+    throw new LocalThreadTargetError("No online connector with app-server thread support is available");
+  }
+
+  return connector.id;
+}
+
+export async function attachCreatedLocalThreadInDb(
+  env: Env,
+  connectorId: string,
+  session: AgentHostSession
+): Promise<CreateLocalThreadResponse> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for local thread creation");
+  }
+
+  await recordHostSessions(env, connectorId, { sessions: [session] }, new Date().toISOString());
+  return attachHostSessionInDb(env, session.session_id, connectorId);
 }
 
 export async function ensureConnectorInventory(
@@ -1033,6 +1084,42 @@ async function chooseConnectorForWorkspace(
     .bind(workspaceId, commandType)
     .first<{ id: string }>();
   return row?.id;
+}
+
+async function findBestLocalThreadConnector(
+  env: Env,
+  workspaceId: string
+): Promise<{ id: string } | undefined> {
+  const row = await env.DB!.prepare(
+    `SELECT c.id
+     FROM connectors c
+     INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
+     WHERE wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+       AND c.capabilities_json LIKE '%"app_server_threads"%'
+     ORDER BY c.last_seen_at DESC, c.updated_at DESC
+     LIMIT 1`
+  )
+    .bind(workspaceId)
+    .first<{ id: string }>();
+  return row ?? undefined;
+}
+
+async function findLocalThreadConnector(
+  env: Env,
+  workspaceId: string,
+  connectorId: string
+): Promise<{ id: string } | undefined> {
+  const row = await env.DB!.prepare(
+    `SELECT c.id
+     FROM connectors c
+     INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
+     WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+       AND c.capabilities_json LIKE '%"app_server_threads"%'
+     LIMIT 1`
+  )
+    .bind(connectorId, workspaceId)
+    .first<{ id: string }>();
+  return row ?? undefined;
 }
 
 async function resolveCommandScope(

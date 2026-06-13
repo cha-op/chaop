@@ -574,6 +574,181 @@ fn app_server_titles_from_response(value: &Value) -> HashMap<String, String> {
     titles
 }
 
+pub fn create_app_server_thread(
+    config: &AgentConfig,
+    title: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    let url = config
+        .session_inventory
+        .app_server_url
+        .as_deref()
+        .ok_or("session_inventory.app_server_url is required for local thread creation")?;
+    let cwd = cwd
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| config.workspace_root.to_string_lossy().into_owned());
+    create_app_server_thread_at(
+        url,
+        title,
+        &cwd,
+        config.session_inventory.app_server_timeout_seconds,
+    )
+}
+
+fn create_app_server_thread_at(
+    url: &str,
+    title: Option<&str>,
+    cwd: &str,
+    timeout_seconds: u64,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    let (mut socket, _) = connect(url)?;
+    configure_socket_timeout(&mut socket, Duration::from_secs(timeout_seconds.max(1)))?;
+    let start_response = send_app_server_request(
+        &mut socket,
+        1,
+        "thread/start",
+        serde_json::json!({
+            "cwd": cwd,
+            "ephemeral": false,
+            "threadSource": "user"
+        }),
+    )?;
+    let started = app_server_thread_from_response(&start_response)?;
+    let requested_title = compact_title(title);
+
+    if let Some(title) = requested_title.as_deref() {
+        send_app_server_request(
+            &mut socket,
+            2,
+            "thread/name/set",
+            serde_json::json!({
+                "threadId": started.id,
+                "name": title
+            }),
+        )?;
+    }
+
+    Ok(AgentHostSession {
+        session_id: started.session_id.clone(),
+        title: requested_title
+            .or_else(|| compact_title(started.name.as_deref()))
+            .unwrap_or_else(|| {
+                fallback_title(&SessionDraft {
+                    session_id: started.session_id.clone(),
+                    cwd: started.cwd.clone(),
+                    ..SessionDraft::default()
+                })
+            }),
+        title_source: TitleSource::AppServer,
+        cwd: started.cwd,
+        updated_at: started.updated_at,
+    })
+}
+
+fn send_app_server_request(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    socket.send(Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        })
+        .to_string()
+        .into(),
+    ))?;
+
+    loop {
+        match socket.read()? {
+            Message::Text(text) => {
+                let value = serde_json::from_str::<Value>(text.as_ref())?;
+                if value.get("id").and_then(Value::as_i64) != Some(id) {
+                    continue;
+                }
+                if let Some(error) = value.get("error") {
+                    return Err(app_server_error(method, error).into());
+                }
+                return Ok(value);
+            }
+            Message::Close(_) => {
+                return Err(format!("app-server closed before {method} completed").into());
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppServerThread {
+    id: String,
+    session_id: String,
+    name: Option<String>,
+    cwd: Option<String>,
+    updated_at: String,
+}
+
+fn app_server_thread_from_response(
+    value: &Value,
+) -> Result<AppServerThread, Box<dyn std::error::Error>> {
+    let thread = value
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .ok_or("app-server thread/start response did not include result.thread")?;
+    let id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("app-server thread/start response did not include thread.id")?;
+    let session_id = thread
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or("app-server thread/start response did not include thread.sessionId")?;
+    Ok(AppServerThread {
+        id: id.to_owned(),
+        session_id: session_id.to_owned(),
+        name: thread
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        cwd: thread
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        updated_at: app_server_thread_timestamp(thread)
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_owned()),
+    })
+}
+
+fn app_server_thread_timestamp(thread: &Value) -> Option<String> {
+    ["updatedAt", "createdAt"]
+        .into_iter()
+        .find_map(|key| thread.get(key).and_then(value_to_unix_seconds))
+        .and_then(unix_seconds_to_iso)
+}
+
+fn value_to_unix_seconds(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| {
+            value
+                .as_u64()
+                .and_then(|seconds| i64::try_from(seconds).ok())
+        })
+        .or_else(|| value.as_f64().map(|seconds| seconds.floor() as i64))
+}
+
+fn app_server_error(method: &str, error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown app-server error");
+    format!("app-server {method} failed: {message}")
+}
+
 fn metadata_title(payload: &Value) -> Option<String> {
     ["title", "name", "thread_name"]
         .into_iter()
@@ -640,9 +815,9 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        HistorySession, SessionDraft, TitleSource, app_server_titles_from_response,
-        build_host_sessions_report, read_recent_lines, resolve_session, rollout_paths,
-        unix_seconds_to_iso,
+        HistorySession, SessionDraft, TitleSource, app_server_thread_from_response,
+        app_server_titles_from_response, build_host_sessions_report, read_recent_lines,
+        resolve_session, rollout_paths, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
@@ -715,6 +890,31 @@ mod tests {
             Some("App server title")
         );
         assert!(!titles.contains_key("session-2"));
+    }
+
+    #[test]
+    fn parses_app_server_thread_start_response() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "thread": {
+                    "id": "thread-1",
+                    "sessionId": "session-1",
+                    "name": "Created title",
+                    "cwd": "/tmp/project",
+                    "updatedAt": 1781263443
+                }
+            }
+        });
+
+        let thread = app_server_thread_from_response(&response).expect("thread");
+
+        assert_eq!(thread.id, "thread-1");
+        assert_eq!(thread.session_id, "session-1");
+        assert_eq!(thread.name.as_deref(), Some("Created title"));
+        assert_eq!(thread.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(thread.updated_at, "2026-06-12T11:24:03.000Z");
     }
 
     #[test]

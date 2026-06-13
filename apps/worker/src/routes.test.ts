@@ -129,6 +129,58 @@ test("host session refresh dispatches to the workspace durable object", async ()
   assert.equal(internalPath, "/internal/refresh-host-sessions");
 });
 
+test("local thread creation rejects invalid payloads before DB work", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/local-threads", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: ""
+      })
+    }),
+    {
+      ...devEnv,
+      DB: {
+        prepare() {
+          throw new Error("DB should not be read for invalid payloads");
+        }
+      } as unknown as D1Database,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not be called for invalid payloads");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid local thread payload" });
+});
+
+test("local thread creation requires D1 before connector dispatch", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/local-threads", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        title: "Investigate retry loop"
+      })
+    }),
+    devEnv
+  );
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: "DB binding is required" });
+});
+
 test("host session detach clears the attached task and thread when D1 is bound", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/detach", {

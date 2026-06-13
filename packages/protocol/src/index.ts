@@ -169,6 +169,19 @@ export type RefreshHostSessionsResponse = {
   server_time: string;
 };
 
+export type CreateLocalThreadRequest = {
+  workspace_id: string;
+  title?: string | undefined;
+  connector_id?: string | undefined;
+  cwd?: string | undefined;
+};
+
+export type CreateLocalThreadResponse = {
+  host_session: HostSessionSummary;
+  task: TaskSummary;
+  thread: ThreadSummary;
+};
+
 export type CommandSummary = {
   id: string;
   workspace_id: string;
@@ -307,6 +320,20 @@ export type AgentHostSession = {
 
 export type AgentHostSessionsReport = {
   sessions: AgentHostSession[];
+};
+
+export type LocalThreadCreateDispatch = {
+  request_id: string;
+  workspace_id: string;
+  title?: string | undefined;
+  cwd?: string | undefined;
+};
+
+export type LocalThreadCreateResult = {
+  request_id: string;
+  ok: boolean;
+  session?: AgentHostSession | undefined;
+  error?: string | undefined;
 };
 
 export type ThrottleNotice = {

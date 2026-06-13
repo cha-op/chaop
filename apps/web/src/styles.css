@@ -21,6 +21,8 @@ a {
 }
 
 button,
+input,
+select,
 textarea {
   font: inherit;
 }
@@ -301,6 +303,7 @@ h2 {
   gap: 16px;
   align-items: center;
   margin-bottom: 16px;
+  flex-wrap: wrap;
 }
 
 .category-strip {
@@ -325,6 +328,46 @@ h2 {
   color: white;
   padding: 8px 12px;
   cursor: pointer;
+}
+
+.create-thread-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.create-thread-form input,
+.create-thread-form select {
+  min-width: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  background: #fff;
+  color: #172033;
+  padding: 7px 9px;
+}
+
+.create-thread-form.compact {
+  flex: 1 1 520px;
+  justify-content: flex-end;
+}
+
+.create-thread-form.compact input {
+  flex: 1 1 220px;
+  max-width: 320px;
+}
+
+.create-thread-form.compact select {
+  flex: 0 1 240px;
+}
+
+.create-thread-form.stacked {
+  display: grid;
+  margin-bottom: 16px;
+}
+
+.create-thread-form.stacked .primary-action {
+  width: 100%;
 }
 
 .board {
@@ -538,6 +581,11 @@ textarea {
 
 .primary-action {
   margin: 14px 0 18px;
+}
+
+.create-thread-form .primary-action {
+  margin: 0;
+  white-space: nowrap;
 }
 
 .command-status {
