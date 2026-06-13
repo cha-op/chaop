@@ -859,6 +859,7 @@ fn load_app_server_sessions(
     let page_limit = limit.max(1);
     let mut request_id = 1;
     let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
     let mut sessions = HashMap::new();
 
     loop {
@@ -877,9 +878,17 @@ fn load_app_server_sessions(
         for (session_id, session) in app_server_sessions_from_response(&value) {
             sessions.entry(session_id).or_insert(session);
         }
-        cursor = app_server_thread_list_next_cursor(&value);
-        if cursor.is_none() {
-            return Ok(sessions);
+        match app_server_thread_list_next_cursor(&value) {
+            Some(next_cursor) => {
+                if !seen_cursors.insert(next_cursor.clone()) {
+                    return Err(format!(
+                        "app-server thread/list returned repeated nextCursor {next_cursor}"
+                    )
+                    .into());
+                }
+                cursor = Some(next_cursor);
+            }
+            None => return Ok(sessions),
         }
         request_id += 1;
     }
@@ -899,11 +908,7 @@ fn read_app_server_inventory_page(
                 if let Some(error) = value.get("error") {
                     return Err(app_server_error("thread/list", error).into());
                 }
-                if app_server_thread_list_data(&value).is_none() {
-                    return Err(
-                        "app-server thread/list response did not include result.data".into(),
-                    );
-                }
+                validate_app_server_thread_list_response(&value)?;
                 return Ok(value);
             }
             Message::Close(_) => {
@@ -1043,11 +1048,51 @@ fn app_server_sessions_from_response(value: &Value) -> HashMap<String, AppServer
     sessions
 }
 
+fn validate_app_server_thread_list_response(
+    value: &Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data = app_server_thread_list_data(value)
+        .ok_or("app-server thread/list response did not include result.data")?;
+    for (index, thread) in data.iter().enumerate() {
+        if !thread.is_object() {
+            return Err(
+                format!("app-server thread/list response data[{index}] was not an object").into(),
+            );
+        }
+        if app_server_thread_session_id(thread).is_none() {
+            return Err(format!(
+                "app-server thread/list response data[{index}] did not include a thread id"
+            )
+            .into());
+        }
+    }
+
+    if let Some(next_cursor) = value
+        .get("result")
+        .and_then(|result| result.get("nextCursor"))
+    {
+        match next_cursor {
+            Value::Null => {}
+            Value::String(cursor) if !cursor.trim().is_empty() => {}
+            Value::String(_) => {
+                return Err("app-server thread/list response included empty nextCursor".into());
+            }
+            _ => {
+                return Err(
+                    "app-server thread/list response included non-string nextCursor".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn app_server_thread_session_id(thread: &Value) -> Option<&str> {
     thread
         .get("sessionId")
         .and_then(Value::as_str)
         .or_else(|| thread.get("id").and_then(Value::as_str))
+        .filter(|session_id| !session_id.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -2405,6 +2450,7 @@ fn app_server_thread_list_next_cursor(value: &Value) -> Option<String> {
         .get("result")
         .and_then(|result| result.get("nextCursor"))
         .and_then(Value::as_str)
+        .filter(|cursor| !cursor.trim().is_empty())
         .map(ToOwned::to_owned)
 }
 
@@ -2843,6 +2889,92 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "app-server thread/list response did not include result.data"
+        );
+    }
+
+    #[test]
+    fn load_app_server_sessions_fails_on_thread_list_row_without_identity() {
+        let url = run_fake_app_server(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "threadId": "schema-drift-1",
+                        "name": "Schema drift"
+                    }
+                ]
+            }
+        })]);
+
+        let error = load_app_server_sessions(&url, 20, 1).expect_err("malformed row");
+
+        assert_eq!(
+            error.to_string(),
+            "app-server thread/list response data[0] did not include a thread id"
+        );
+    }
+
+    #[test]
+    fn load_app_server_sessions_fails_on_non_string_next_cursor() {
+        let url = run_fake_app_server(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "id": "session-1",
+                        "name": "First page"
+                    }
+                ],
+                "nextCursor": { "cursor": "cursor-page-2" }
+            }
+        })]);
+
+        let error = load_app_server_sessions(&url, 20, 1).expect_err("malformed cursor");
+
+        assert_eq!(
+            error.to_string(),
+            "app-server thread/list response included non-string nextCursor"
+        );
+    }
+
+    #[test]
+    fn load_app_server_sessions_fails_on_repeated_next_cursor() {
+        let url = run_fake_app_server(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "session-1",
+                            "name": "First page"
+                        }
+                    ],
+                    "nextCursor": "cursor-loop"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "session-2",
+                            "name": "Second page"
+                        }
+                    ],
+                    "nextCursor": "cursor-loop"
+                }
+            }),
+        ]);
+
+        let error = load_app_server_sessions(&url, 20, 1).expect_err("repeated cursor");
+
+        assert_eq!(
+            error.to_string(),
+            "app-server thread/list returned repeated nextCursor cursor-loop"
         );
     }
 

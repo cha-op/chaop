@@ -134,7 +134,7 @@ export async function recordHostSessions(
   const failedEvents: ThreadEvent[] = [];
   const reportedSessions = report.sessions.slice(0, 200);
   const reportedSessionIds = new Set(reportedSessions.map((session) => session.session_id));
-  const inventoryScope = report.inventory_scope ?? "full";
+  const inventoryScope = report.inventory_scope ?? "incremental";
   const canClearMissingAppServerSessions =
     inventoryScope === "full" &&
     report.app_server_inventory_ok !== false &&
@@ -202,7 +202,6 @@ export async function recordHostSessions(
          INNER JOIN connectors c ON c.id = hs.connector_id
          WHERE hs.connector_id = ?
            AND hs.app_server_present = 1
-           AND hs.title_source = 'app_server'
            AND c.status <> 'offline'`
       ).bind(connectorId)
     );
@@ -214,8 +213,7 @@ export async function recordHostSessions(
         `UPDATE host_sessions
          SET app_server_present = 0, updated_at = ?
          WHERE id = ?
-           AND app_server_present = 1
-           AND title_source = 'app_server'`
+           AND app_server_present = 1`
       )
         .bind(syncedAt, row.id)
         .run();

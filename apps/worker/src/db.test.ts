@@ -499,6 +499,37 @@ test("recordHostSessions preserves stored sessions outside the latest top-N repo
 test("recordHostSessions clears app-server-only sessions omitted from inventory reports", async () => {
   const db = hostSessionsInventoryDb({
     initialAppServerPresent: 1,
+    initialTitleSource: "metadata"
+  });
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "full",
+      app_server_inventory_ok: true,
+      sessions: [
+        {
+          session_id: "session-new",
+          title: "New session",
+          title_source: "metadata",
+          cwd: "/workspace/new",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 2);
+  assert.equal(db.hasSession("session-attached"), true);
+  assert.equal(db.appServerPresentOf("session-attached"), 0);
+  assert.equal(db.demotedSessions, 1);
+});
+
+test("recordHostSessions preserves app-server-only sessions from legacy reports without inventory scope", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
     initialTitleSource: "app_server"
   });
 
@@ -519,10 +550,10 @@ test("recordHostSessions clears app-server-only sessions omitted from inventory 
     "2026-06-12T11:00:05.000Z"
   );
 
-  assert.equal(result.host_sessions.length, 2);
+  assert.equal(result.host_sessions.length, 1);
   assert.equal(db.hasSession("session-attached"), true);
-  assert.equal(db.appServerPresentOf("session-attached"), 0);
-  assert.equal(db.demotedSessions, 1);
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
 });
 
 test("recordHostSessions preserves app-server-only sessions from incremental reports", async () => {
@@ -2225,7 +2256,13 @@ function hostSessionsInventoryDb(options: {
         };
       }
 
-      if (/hs\.app_server_present = 1/.test(sql) && /hs\.title_source = 'app_server'/.test(sql)) {
+      if (
+        /SELECT hs\.id, hs\.connector_id/.test(sql) &&
+        /FROM host_sessions hs/.test(sql) &&
+        /INNER JOIN connectors c/.test(sql) &&
+        /hs\.app_server_present = 1/.test(sql)
+      ) {
+        assert.doesNotMatch(sql, /hs\.title_source = 'app_server'/);
         return {
           bind(connectorId: string) {
             assert.equal(connectorId, "connector-online");
@@ -2235,8 +2272,7 @@ function hostSessionsInventoryDb(options: {
                   results: [...sessions.values()].filter(
                     (session) =>
                       session.connector_id === connectorId &&
-                      session.app_server_present === 1 &&
-                      session.title_source === "app_server"
+                      session.app_server_present === 1
                   )
                 };
               }
@@ -2265,7 +2301,7 @@ function hostSessionsInventoryDb(options: {
             return {
               async run() {
                 for (const session of sessions.values()) {
-                  if (session.id === hostSessionIdValue && session.app_server_present === 1 && session.title_source === "app_server") {
+                  if (session.id === hostSessionIdValue && session.app_server_present === 1) {
                     session.app_server_present = 0;
                     session.updated_at = updatedAt;
                     counters.demotedSessions += 1;

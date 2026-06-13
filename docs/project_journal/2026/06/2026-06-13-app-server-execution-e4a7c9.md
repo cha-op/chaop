@@ -87,6 +87,7 @@ superseded_by:
 - Follow-up PR readiness reviews found stale app-server target holes: inventory demotion could strand commands already scoped to an app-server session, app-server-only sessions omitted from later inventory reports could keep a stale `app_server_present=true`, and explicit app-server commands could stay pending after their attachment moved before lease. Inventory freshness cleanup now demotes both reported-false and omitted app-server-only sessions, runs the same release/failure cleanup used by detach, and the Durable Object fails stale explicit app-server targets before dispatch, even when the targeted connector has no active socket.
 - Final follow-up reviews found three more inventory/release edge cases before merge: a single newly-created local app-server thread was being treated as a full inventory snapshot, transient app-server list failures were indistinguishable from a successful empty app-server inventory, and multi-command app-server release could miss a replacement connector dispatch. Host Session reports now carry `inventory_scope` and `app_server_inventory_ok`; Worker only clears omitted app-server-only sessions for complete successful snapshots, preserves known app-server presence during app-server inventory failures, and fans out post-release dispatch to every online executable app-server connector in the workspace so command-level filters choose the real recipient.
 - Final review of that fix found the agent still marked incomplete app-server inventories as full when `thread/list` returned an error-like response, closed mid-list, or had more pages. App-server inventory now treats JSON-RPC errors, malformed responses, and early close/reset as failures, follows `nextCursor` until exhausted, and marks disabled or `max_sessions`-truncated Host Session reports as incremental so Worker omitted-session cleanup only runs on complete evidence.
+- Final rerun reviews found two more completeness gaps: schema-drift app-server rows or cursors could still be accepted as a successful full inventory, and Worker treated missing legacy `inventory_scope` as full while only clearing omitted sessions whose title came from app-server. The agent now rejects thread/list rows without `sessionId`/`id`, non-string or empty cursors, and repeated cursors; Worker treats missing scope as incremental and clears omitted sessions by current `app_server_present` state rather than title source.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -142,6 +143,8 @@ superseded_by:
 - Worker DB tests assert app-server-only Host Sessions omitted from later inventory reports are demoted from app-server-present state.
 - Worker DB tests assert incremental Host Session reports do not demote unrelated app-server-only sessions.
 - Worker DB tests assert failed app-server inventory reports preserve known app-server presence instead of triggering cleanup.
+- Worker DB tests assert legacy reports without `inventory_scope` do not trigger omitted-session cleanup.
+- Worker DB tests assert omitted app-server cleanup is keyed by `app_server_present`, not title source.
 - Worker DB tests assert stale explicit app-server command targets fail before dispatch instead of remaining pending.
 - Worker Durable Object tests assert stale-target cleanup remains compatible with rejected-event dispatch polling.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
@@ -151,7 +154,7 @@ superseded_by:
 - Rust tests assert rejected command-event acknowledgements are recognised instead of treated as successful acks.
 - Rust tests assert app-server `command.started` event payloads identify the target Host Session, without leaking that field onto non-started events.
 - Rust tests assert Host Session reports mark app-server inventory failures instead of collapsing them into successful empty app-server snapshots.
-- Rust tests assert app-server inventory follows `nextCursor`, fails on `thread/list` errors or malformed responses, and marks disabled or truncated Host Session reports as incremental.
+- Rust tests assert app-server inventory follows `nextCursor`, rejects malformed rows/cursors/repeated cursors, fails on `thread/list` errors or malformed responses, and marks disabled or truncated Host Session reports as incremental.
 - Rust tests cover the `turn/start` cancellation window before the connector has read the turn id.
 - Full `pnpm test`, Rust workspace tests, build, journal validation, and PR readiness review before merge.
 
