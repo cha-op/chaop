@@ -171,7 +171,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     try {
       const connectorId = await chooseConnectorForLocalThread(env, auth.user, threadRequest);
       const session = await requestLocalThreadCreate(env, connectorId, threadRequest);
-      const response = await attachCreatedLocalThreadInDb(env, connectorId, session);
+      const response = await attachCreatedLocalThreadInDb(env, connectorId, threadRequest.workspace_id, session);
       return json(request, env, response, 201);
     } catch (error) {
       if (error instanceof LocalThreadTargetError) {

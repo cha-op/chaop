@@ -1052,7 +1052,7 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
             assert.equal(connectorId, "connector-online");
             return {
               async first() {
-                return { workspace_id: "workspace-api" };
+                return { workspace_id: "workspace-other" };
               }
             };
           }

@@ -90,7 +90,8 @@ export async function recordHostSessions(
   env: Env,
   connectorId: string,
   report: AgentHostSessionsReport,
-  syncedAt = new Date().toISOString()
+  syncedAt = new Date().toISOString(),
+  options: { workspaceId?: string | undefined } = {}
 ): Promise<{ host_sessions: HostSessionSummary[]; synced_at: string }> {
   if (!env.DB) return { host_sessions: [], synced_at: syncedAt };
 
@@ -113,7 +114,7 @@ export async function recordHostSessions(
   )
     .bind(connectorId)
     .first<{ workspace_id: string }>();
-  const workspaceId = workspace?.workspace_id ?? DEFAULT_WORKSPACE_ID;
+  const workspaceId = options.workspaceId ?? workspace?.workspace_id ?? DEFAULT_WORKSPACE_ID;
   const upserted: HostSessionSummary[] = [];
   const reportedSessions = report.sessions.slice(0, 200);
 
@@ -388,13 +389,14 @@ export async function chooseConnectorForLocalThread(
 export async function attachCreatedLocalThreadInDb(
   env: Env,
   connectorId: string,
+  workspaceId: string,
   session: AgentHostSession
 ): Promise<CreateLocalThreadResponse> {
   if (!env.DB) {
     throw new Error("DB binding is required for local thread creation");
   }
 
-  await recordHostSessions(env, connectorId, { sessions: [session] }, new Date().toISOString());
+  await recordHostSessions(env, connectorId, { sessions: [session] }, new Date().toISOString(), { workspaceId });
   return attachHostSessionInDb(env, session.session_id, connectorId);
 }
 
