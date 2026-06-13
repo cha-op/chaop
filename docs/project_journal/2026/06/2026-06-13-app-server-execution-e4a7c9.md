@@ -70,6 +70,9 @@ superseded_by:
 - Final PR readiness reviews found that cross-connector replacement still failed when the replacement app-server Host Session reused the same app-server session id, and detach cleanup could still fail attached-inferred commands instead of requeueing them for a valid replacement. Stale-start release now excludes only the old connector/session pair, and detach cleanup source-aware releases attachment-inferred commands back to pending before running failure cleanup.
 - Final independent review found detach cleanup could still release or fail a command already leased by a replacement connector that reused the same app-server session id. Detach cleanup now requires leased commands to be owned by the detached connector before release or failure handling.
 - Third PR readiness review found auto-target commands could get stuck if a task/thread gained an app-server attachment after command creation but before lease. Pending dispatch now allows `auto` targets to retarget to the current app-server attachment owner and converts that lease to an `attached` target before dispatch.
+- Follow-up third review found the auto-retarget branch was too broad and the migration over-relaxed existing targeted commands. Auto retargeting now requires the current attachment to be an app-server Host Session, and the migration backfills existing non-null target connectors as `explicit` so upgrade keeps their previous fixed-target behaviour.
+- Follow-up frozen-diff review found command leasing could still dispatch stale work if the selected Host Session changed between the pending-command `SELECT` and lease `UPDATE`. The lease update now revalidates the same task-first Host Session target, connector target rules, online executable connector state, and app-server capability before taking the lease.
+- Follow-up frozen-diff review also found detach release could leave attached-inferred commands pending until an unrelated trigger. Detach now returns replacement app-server connector ids internally, strips that metadata from the public response, and immediately asks the Durable Object to dispatch pending work to those connectors.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -108,6 +111,10 @@ superseded_by:
 - Worker route tests assert Host Session detach source-aware releases attached-inferred commands when a replacement app-server Host Session exists, without writing failed task/event side effects.
 - Worker route tests assert Host Session detach does not release or fail same-session app-server leases owned by a replacement connector.
 - Worker DB tests assert pending auto-target commands retarget to the current app-server attachment owner instead of staying blocked behind the originally selected connector.
+- Worker DB tests assert pending auto-target commands do not retarget to non-app-server attachments.
+- Migration tests assert existing non-null command targets are backfilled to `explicit` target-source semantics.
+- Worker DB tests assert pending-command dispatch skips work when the guarded lease update loses the attachment race.
+- Worker route and Durable Object tests assert detached attached-inferred command releases immediately dispatch to replacement app-server connectors while keeping the public detach response unchanged.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.

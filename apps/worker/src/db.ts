@@ -346,7 +346,7 @@ export async function detachHostSessionInDb(
   env: Env,
   sessionId: string,
   connectorId?: string
-): Promise<DetachHostSessionResponse> {
+): Promise<DetachHostSessionResponse & { released_connector_ids?: string[] }> {
   if (!env.DB) {
     throw new Error("DB binding is required for host session detachment");
   }
@@ -368,7 +368,7 @@ export async function detachHostSessionInDb(
   )
     .bind(now, hostSession.id)
     .run();
-  await releaseCommandsForDetachedAppServerHostSession(env, hostSession, now);
+  const releasedConnectorIds = await releaseCommandsForDetachedAppServerHostSession(env, hostSession, now);
   await failCommandsForDetachedAppServerHostSession(env, hostSession, now);
 
   return {
@@ -377,7 +377,8 @@ export async function detachHostSessionInDb(
       attached_task_id: undefined,
       attached_thread_id: undefined,
       updated_at: now
-    }
+    },
+    released_connector_ids: releasedConnectorIds
   };
 }
 
@@ -385,15 +386,15 @@ async function releaseCommandsForDetachedAppServerHostSession(
   env: Env,
   hostSession: HostSessionSummary,
   now: string
-): Promise<void> {
+): Promise<string[]> {
   if (hostSession.app_server_present !== true) {
-    return;
+    return [];
   }
 
   const taskId = hostSession.attached_task_id ?? null;
   const threadId = hostSession.attached_thread_id ?? null;
   if (!taskId && !threadId) {
-    return;
+    return [];
   }
 
   const result = await env.DB!.prepare(
@@ -496,9 +497,86 @@ async function releaseCommandsForDetachedAppServerHostSession(
     )
     .run();
 
-  if ((result.meta as { changes?: number } | undefined)?.changes) {
-    await updateConnectorActivity(env, hostSession.connector_id);
+  if (!(result.meta as { changes?: number } | undefined)?.changes) {
+    return [];
   }
+
+  await updateConnectorActivity(env, hostSession.connector_id);
+  return replacementAppServerConnectorIdsForDetachedHostSession(env, hostSession);
+}
+
+async function replacementAppServerConnectorIdsForDetachedHostSession(
+  env: Env,
+  hostSession: HostSessionSummary
+): Promise<string[]> {
+  const taskId = hostSession.attached_task_id ?? null;
+  const threadId = hostSession.attached_thread_id ?? null;
+  if (!taskId && !threadId) return [];
+
+  const rows = await allRows<{ connector_id: string }>(
+    env.DB!.prepare(
+      `SELECT DISTINCT hs.connector_id
+       FROM host_sessions hs
+       INNER JOIN connectors c ON c.id = hs.connector_id
+       INNER JOIN workspace_connectors wc
+         ON wc.workspace_id = hs.workspace_id
+        AND wc.connector_id = hs.connector_id
+       WHERE hs.id = COALESCE(
+         (
+           SELECT hs_task.id
+           FROM host_sessions hs_task
+           WHERE hs_task.workspace_id = ?
+             AND ? IS NOT NULL
+             AND hs_task.attached_task_id = ?
+             AND (hs_task.connector_id <> ? OR hs_task.session_id <> ?)
+           ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+           LIMIT 1
+         ),
+         (
+           SELECT hs_thread.id
+           FROM host_sessions hs_thread
+           WHERE hs_thread.workspace_id = ?
+             AND ? IS NOT NULL
+             AND hs_thread.attached_thread_id = ?
+             AND (hs_thread.connector_id <> ? OR hs_thread.session_id <> ?)
+             AND (
+               ? IS NULL
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM host_sessions hst
+                 WHERE hst.workspace_id = ?
+                   AND hst.attached_task_id = ?
+                   AND (hst.connector_id <> ? OR hst.session_id <> ?)
+               )
+             )
+           ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+           LIMIT 1
+         )
+       )
+         AND hs.app_server_present = 1
+         AND wc.can_execute = 1
+         AND c.status <> 'offline'
+         AND c.capabilities_json LIKE '%"codex_app_server_exec"%'`
+    ).bind(
+      hostSession.workspace_id,
+      taskId,
+      taskId,
+      hostSession.connector_id,
+      hostSession.session_id,
+      hostSession.workspace_id,
+      threadId,
+      threadId,
+      hostSession.connector_id,
+      hostSession.session_id,
+      taskId,
+      hostSession.workspace_id,
+      taskId,
+      hostSession.connector_id,
+      hostSession.session_id
+    )
+  );
+
+  return rows.map((row) => row.connector_id);
 }
 
 async function failCommandsForDetachedAppServerHostSession(
@@ -1178,6 +1256,7 @@ export async function pendingCommandsForConnector(
     env.DB.prepare(
       `SELECT cmd.id, cmd.workspace_id, cmd.thread_id, cmd.task_id, cmd.type, cmd.prompt, cmd.state,
               cmd.target_connector_id, cmd.target_connector_id_source, cmd.created_at, cmd.updated_at,
+              hs.id AS target_host_session_row_id,
               hs.session_id AS target_host_session_id,
               hs.app_server_present AS target_host_session_app_server_present,
               hs.cwd AS target_host_session_cwd
@@ -1222,6 +1301,7 @@ export async function pendingCommandsForConnector(
            OR (
              cmd.target_connector_id_source = 'auto'
              AND hs.connector_id = ?
+             AND COALESCE(hs.app_server_present, 0) = 1
            )
          )
          AND (hs.connector_id IS NULL OR hs.connector_id = ?)
@@ -1276,6 +1356,109 @@ export async function pendingCommandsForConnector(
          AND (
            state = 'pending'
            OR (state = 'leased' AND lease_until IS NOT NULL AND lease_until < ?)
+         )
+         AND (
+           (
+             ? IS NULL
+             AND COALESCE(
+               (
+                 SELECT hs_task.id
+                 FROM host_sessions hs_task
+                 WHERE hs_task.workspace_id = commands.workspace_id
+                   AND commands.task_id IS NOT NULL
+                   AND hs_task.attached_task_id = commands.task_id
+                 ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+                 LIMIT 1
+               ),
+               (
+                 SELECT hs_thread.id
+                 FROM host_sessions hs_thread
+                 WHERE hs_thread.workspace_id = commands.workspace_id
+                   AND commands.thread_id IS NOT NULL
+                   AND hs_thread.attached_thread_id = commands.thread_id
+                   AND (
+                     commands.task_id IS NULL
+                     OR NOT EXISTS (
+                       SELECT 1
+                       FROM host_sessions hst
+                       WHERE hst.workspace_id = commands.workspace_id
+                         AND hst.attached_task_id = commands.task_id
+                     )
+                   )
+                 ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+                 LIMIT 1
+               )
+             ) IS NULL
+           )
+           OR (
+             ? IS NOT NULL
+             AND COALESCE(
+               (
+                 SELECT hs_task.id
+                 FROM host_sessions hs_task
+                 WHERE hs_task.workspace_id = commands.workspace_id
+                   AND commands.task_id IS NOT NULL
+                   AND hs_task.attached_task_id = commands.task_id
+                 ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+                 LIMIT 1
+               ),
+               (
+                 SELECT hs_thread.id
+                 FROM host_sessions hs_thread
+                 WHERE hs_thread.workspace_id = commands.workspace_id
+                   AND commands.thread_id IS NOT NULL
+                   AND hs_thread.attached_thread_id = commands.thread_id
+                   AND (
+                     commands.task_id IS NULL
+                     OR NOT EXISTS (
+                       SELECT 1
+                       FROM host_sessions hst
+                       WHERE hst.workspace_id = commands.workspace_id
+                         AND hst.attached_task_id = commands.task_id
+                     )
+                   )
+                 ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+                 LIMIT 1
+               )
+             ) = ?
+           )
+         )
+         AND (
+           target_connector_id = ?
+           OR target_connector_id IS NULL
+           OR (
+             target_connector_id_source = 'auto'
+             AND EXISTS (
+               SELECT 1
+               FROM host_sessions hs_target
+               WHERE hs_target.id = ?
+                 AND hs_target.connector_id = ?
+                 AND COALESCE(hs_target.app_server_present, 0) = 1
+             )
+           )
+         )
+         AND EXISTS (
+           SELECT 1
+           FROM workspace_connectors wc
+           INNER JOIN connectors c ON c.id = wc.connector_id
+           LEFT JOIN host_sessions hs_guard ON hs_guard.id = ?
+           WHERE wc.workspace_id = commands.workspace_id
+             AND wc.connector_id = ?
+             AND wc.can_execute = 1
+             AND c.status <> 'offline'
+             AND (hs_guard.id IS NULL OR hs_guard.connector_id = ?)
+             AND (
+               commands.type <> 'codex'
+               OR (
+                 COALESCE(hs_guard.app_server_present, 0) = 1
+                 AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
+               )
+               OR (
+                 COALESCE(hs_guard.app_server_present, 0) <> 1
+                 AND commands.lease_target_host_session_id IS NULL
+                 AND c.capabilities_json LIKE '%"codex_exec"%'
+               )
+             )
          )`
     )
       .bind(
@@ -1289,7 +1472,16 @@ export async function pendingCommandsForConnector(
         appServerLeaseTargetHostSessionId(row),
         now,
         row.id,
-        now
+        now,
+        row.target_host_session_row_id,
+        row.target_host_session_row_id,
+        row.target_host_session_row_id,
+        connectorId,
+        row.target_host_session_row_id,
+        connectorId,
+        row.target_host_session_row_id,
+        connectorId,
+        connectorId
       )
       .run();
     if ((result.meta as { changes?: number } | undefined)?.changes) {
@@ -2517,6 +2709,7 @@ type CommandTargetConnectorIdSource = "explicit" | "attached" | "auto";
 
 type PendingCommandRow = CommandRow & {
   target_connector_id_source: CommandTargetConnectorIdSource | null;
+  target_host_session_row_id: string | null;
   target_host_session_id: string | null;
   target_host_session_app_server_present: number | boolean | null;
   target_host_session_cwd: string | null;

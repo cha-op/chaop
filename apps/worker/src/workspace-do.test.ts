@@ -333,6 +333,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
       if (
         /UPDATE commands/.test(sql) &&
         /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/.test(sql) &&
+        !/SET state = 'leased'/.test(sql) &&
         !/SET state = 'pending'/.test(sql)
       ) {
         return {
@@ -416,6 +417,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
                       target_connector_id_source: "auto",
                       created_at: "2026-06-13T10:00:00.000Z",
                       updated_at: "2026-06-13T10:00:00.000Z",
+                      target_host_session_row_id: "host-session-new",
                       target_host_session_id: "session-new",
                       target_host_session_app_server_present: 1,
                       target_host_session_cwd: "/workspace/project"
@@ -441,7 +443,16 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             leaseTargetHostSessionId: string,
             updatedAt: string,
             commandId: string,
-            now: string
+            now: string,
+            selectedHostSessionIdForNullGuard: string | null,
+            selectedHostSessionIdForPresentGuard: string | null,
+            selectedHostSessionIdForMatchGuard: string | null,
+            targetConnectorId: string,
+            targetHostSessionIdForAutoTargetGuard: string | null,
+            autoTargetConnectorId: string,
+            targetHostSessionIdForCapabilityGuard: string | null,
+            capabilityConnectorId: string,
+            capabilityHostSessionConnectorId: string
           ) {
             assert.equal(targetHostSessionIdForTarget, "session-new");
             assert.equal(targetHostSessionIsAppServerForTarget, 1);
@@ -454,6 +465,15 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
             assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(selectedHostSessionIdForNullGuard, "host-session-new");
+            assert.equal(selectedHostSessionIdForPresentGuard, "host-session-new");
+            assert.equal(selectedHostSessionIdForMatchGuard, "host-session-new");
+            assert.equal(targetConnectorId, "connector-replacement");
+            assert.equal(targetHostSessionIdForAutoTargetGuard, "host-session-new");
+            assert.equal(autoTargetConnectorId, "connector-replacement");
+            assert.equal(targetHostSessionIdForCapabilityGuard, "host-session-new");
+            assert.equal(capabilityConnectorId, "connector-replacement");
+            assert.equal(capabilityHostSessionConnectorId, "connector-replacement");
             return {
               async run() {
                 counters.commandLeases += 1;

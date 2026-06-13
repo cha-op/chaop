@@ -70,6 +70,9 @@ superseded_by:
 - Final PR readiness reviews 发现 cross-connector replacement 在 replacement app-server Host Session 复用同一个 app-server session id 时仍会失败，且 detach cleanup 仍可能把 attached-inferred commands 标记 failed，而不是交给有效 replacement 继续 dispatch。现在 stale-start release 只排除旧的 connector/session 组合；detach cleanup 会 source-aware 地先把 attachment-inferred commands release 回 pending，再执行 failure cleanup。
 - Final independent review 发现 detach cleanup 仍可能 release 或 fail 一个已被 replacement connector 租走、但复用同一个 app-server session id 的 command。现在 detach cleanup 只有在 leased command owner 是被 detach 的 connector 时，才会执行 release 或 failure handling。
 - 第三轮 PR readiness review 发现，如果 command creation 时还没有 app-server attachment，但 lease 前 task/thread 获得了 app-server attachment，`auto` target command 可能卡在原 connector 与新 attachment owner 之间。现在 pending dispatch 会允许 `auto` target 重新指向当前 app-server attachment owner，并在 dispatch 前把该 lease 转成 `attached` target。
+- 第三轮 follow-up review 发现 auto-retarget 分支过宽，且 migration 会放松存量 targeted commands 的语义。现在 auto retarget 只允许当前 attachment 是 app-server Host Session 的情况；migration 会把已有非空 target connector 的 commands 回填为 `explicit`，从而保持升级前固定 target 的行为。
+- 后续 frozen-diff review 发现，如果 pending-command `SELECT` 与 lease `UPDATE` 之间选中的 Host Session 发生变化，command lease 仍可能 dispatch stale work。现在 lease update 会重新验证同一套 task-first Host Session target、connector target rules、online executable connector 状态和 app-server capability 后才会拿到 lease。
+- 后续 frozen-diff review 也发现 detach release 可能让 attached-inferred commands 停在 pending，直到出现无关触发。现在 detach 会在内部返回 replacement app-server connector ids，从公开 response 中剥离这份 metadata，并立即请求 Durable Object 向这些 connectors dispatch pending work。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -108,6 +111,10 @@ superseded_by:
 - Worker route tests 断言当 replacement app-server Host Session 存在时，Host Session detach 会 source-aware 地 release attached-inferred commands，而不会写 failed task/event side effects。
 - Worker route tests 断言 Host Session detach 不会 release 或 fail 由 replacement connector 拥有的同 app-server session id lease。
 - Worker DB tests 断言 pending `auto` target command 会重新指向当前 app-server attachment owner，而不是被创建时选中的旧 connector 卡住。
+- Worker DB tests 断言 pending `auto` target command 不会重新指向非 app-server attachment。
+- Migration tests 断言已有非空 command target 会回填成 `explicit` target-source 语义。
+- Worker DB tests 断言当 guarded lease update 在 attachment race 中失效时，pending-command dispatch 会跳过该 command。
+- Worker route 和 Durable Object tests 断言 detached attached-inferred command release 会立即 dispatch 到 replacement app-server connectors，同时公开 detach response 不暴露内部 metadata。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。

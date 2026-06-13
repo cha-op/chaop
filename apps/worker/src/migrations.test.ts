@@ -33,6 +33,10 @@ test("command target connector source is added by forward migration", async () =
     migration,
     /ALTER TABLE commands ADD COLUMN target_connector_id_source TEXT NOT NULL DEFAULT 'auto'/
   );
+  assert.match(
+    migration,
+    /UPDATE commands\s+SET target_connector_id_source = 'explicit'\s+WHERE target_connector_id IS NOT NULL/
+  );
 });
 
 async function readMigration(fileName: string): Promise<string> {

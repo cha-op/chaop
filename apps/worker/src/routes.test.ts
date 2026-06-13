@@ -797,6 +797,8 @@ test("host session detach releases attached-inferred commands when a replacement
     releaseDetachedCommands: true,
     returnDetachedCommands: false
   });
+  let internalPath = "";
+  let dispatchedConnectorId = "";
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/detach", {
       method: "POST",
@@ -809,16 +811,31 @@ test("host session detach releases attached-inferred commands when a replacement
     }),
     {
       ...devEnv,
-      DB: db
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            const body = JSON.parse(String(init?.body ?? "{}")) as { connector_id?: string };
+            dispatchedConnectorId = body.connector_id ?? "";
+            return new Response("{}");
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
     }
   );
+  const body = (await response.json()) as Record<string, unknown>;
 
   assert.equal(response.status, 200);
+  assert.equal(body.released_connector_ids, undefined);
   assert.equal(db.commandReleases, 1);
   assert.equal(db.commandFailures, 0);
   assert.equal(db.taskUpdates, 0);
   assert.equal(db.eventInserts, 0);
   assert.equal(db.connectorActivityUpdates, 1);
+  assert.equal(internalPath, "/internal/dispatch-pending");
+  assert.equal(dispatchedConnectorId, "connector-replacement");
 });
 
 test("host session detach does not release same-session leases owned by a replacement connector", async () => {
@@ -2838,6 +2855,60 @@ function hostSessionDetachDb(options: {
                     : 0;
                 counters.commandReleases += changes;
                 return { meta: { changes } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT DISTINCT hs\.connector_id/.test(sql)) {
+        assert.match(sql, /FROM host_sessions hs/);
+        assert.match(sql, /hs_task\.attached_task_id = \?/);
+        assert.match(sql, /hs_thread\.attached_thread_id = \?/);
+        assert.match(sql, /hs\.app_server_present = 1/);
+        assert.match(sql, /wc\.can_execute = 1/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
+        return {
+          bind(
+            taskWorkspaceId: string,
+            taskIdPresent: string | null,
+            taskId: string | null,
+            excludedTaskConnectorId: string,
+            excludedTaskSessionId: string,
+            threadWorkspaceId: string,
+            threadIdPresent: string | null,
+            threadId: string | null,
+            excludedThreadConnectorId: string,
+            excludedThreadSessionId: string,
+            fallbackTaskIdPresent: string | null,
+            fallbackWorkspaceId: string,
+            fallbackTaskId: string | null,
+            excludedFallbackConnectorId: string,
+            excludedFallbackSessionId: string
+          ) {
+            assert.equal(taskWorkspaceId, "workspace-api");
+            assert.equal(taskIdPresent, "task-host-1");
+            assert.equal(taskId, "task-host-1");
+            assert.equal(excludedTaskConnectorId, "connector-online");
+            assert.equal(excludedTaskSessionId, "session-1");
+            assert.equal(threadWorkspaceId, "workspace-api");
+            assert.equal(threadIdPresent, "thread-host-1");
+            assert.equal(threadId, "thread-host-1");
+            assert.equal(excludedThreadConnectorId, "connector-online");
+            assert.equal(excludedThreadSessionId, "session-1");
+            assert.equal(fallbackTaskIdPresent, "task-host-1");
+            assert.equal(fallbackWorkspaceId, "workspace-api");
+            assert.equal(fallbackTaskId, "task-host-1");
+            assert.equal(excludedFallbackConnectorId, "connector-online");
+            assert.equal(excludedFallbackSessionId, "session-1");
+            return {
+              async all() {
+                return {
+                  results: options.releaseDetachedCommands && !options.detachedLeaseOwnedByReplacement
+                    ? [{ connector_id: "connector-replacement" }]
+                    : []
+                };
               }
             };
           }

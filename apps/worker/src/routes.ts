@@ -334,11 +334,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     try {
-      const response = await detachHostSessionInDb(
+      const { released_connector_ids: releasedConnectorIds, ...response } = await detachHostSessionInDb(
         env,
         decodeURIComponent(detachHostSessionMatch[1] ?? ""),
         payload.value.connector_id
       );
+      await Promise.all((releasedConnectorIds ?? []).map((targetConnectorId) => dispatchPendingCommand(env, targetConnectorId)));
       return json(request, env, response, 200);
     } catch (error) {
       if (error instanceof NotFoundError) {
