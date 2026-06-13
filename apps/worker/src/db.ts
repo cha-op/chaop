@@ -1806,6 +1806,7 @@ async function updateCommandStateForAgentEvent(
     workspace_id: string;
     thread_id: string | null;
     task_id: string | null;
+    lease_target_host_session_id: string | null;
     type: CommandSummary["type"];
   },
   event: AgentCommandEvent,
@@ -1820,6 +1821,7 @@ async function updateCommandStateForAgentEvent(
        WHERE id = ?
          AND lease_owner_connector_id = ?
          AND state IN ('leased', 'running')
+         AND (? IS NULL OR lease_target_host_session_id = ?)
          AND EXISTS (
            SELECT 1
            FROM host_sessions hs
@@ -1860,6 +1862,8 @@ async function updateCommandStateForAgentEvent(
         now,
         command.id,
         connectorId,
+        command.lease_target_host_session_id,
+        event.target_host_session_id ?? null,
         command.workspace_id,
         command.task_id ?? null,
         command.task_id ?? null,

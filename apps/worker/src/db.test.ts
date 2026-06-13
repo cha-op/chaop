@@ -72,6 +72,28 @@ test("recordAgentEvent rejects app-server starts after the connector reattaches 
   assert.equal(db.eventInserts, 0);
 });
 
+test("recordAgentEvent rejects app-server starts that differ from the leased target session", async () => {
+  const db = appServerStartAfterDetachDb({
+    connector_id: "connector-online",
+    session_id: "session-new",
+    app_server_present: 1
+  });
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    target_host_session_id: "session-new",
+    kind: "command.started",
+    priority: "P1",
+    summary: "Starting"
+  });
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.event, undefined);
+  assert.equal(db.commandUpdates, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
 test("recordAgentEvent accepts app-server starts for the current target session", async () => {
   const db = appServerStartAfterDetachDb({
     connector_id: "connector-online",
@@ -670,6 +692,8 @@ function appServerStartAfterDetachDb(currentTarget?: {
             updatedAt: string,
             commandId: string,
             ownerConnectorId: string,
+            leaseTargetHostSessionId: string | null,
+            eventTargetHostSessionId: string | null,
             workspaceId: string,
             taskIdPresent: string | null,
             taskId: string | null,
@@ -687,6 +711,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
             assert.equal(ownerConnectorId, "connector-online");
+            assert.equal(leaseTargetHostSessionId, "session-old");
             assert.equal(workspaceId, "workspace-api");
             assert.equal(taskIdPresent, "task-1");
             assert.equal(taskId, "task-1");
@@ -698,6 +723,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
             assert.equal(taskIdForOrderMatch, "task-1");
             assert.equal(targetConnectorId, "connector-online");
             const changes =
+              leaseTargetHostSessionId === eventTargetHostSessionId &&
               currentTarget?.connector_id === targetConnectorId &&
               currentTarget.session_id === targetHostSessionId &&
               currentTarget.app_server_present === 1
