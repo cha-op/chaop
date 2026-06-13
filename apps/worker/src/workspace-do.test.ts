@@ -389,11 +389,13 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
           bind(
             now: string,
             targetConnectorId: string,
+            autoAttachmentConnectorId: string,
             hostSessionConnectorId: string,
             executableConnectorId: string
           ) {
             assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
-            assert.equal(targetConnectorId, hostSessionConnectorId);
+            assert.equal(targetConnectorId, autoAttachmentConnectorId);
+            assert.equal(autoAttachmentConnectorId, hostSessionConnectorId);
             assert.equal(hostSessionConnectorId, executableConnectorId);
             return {
               async all() {
@@ -411,6 +413,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
                       prompt: "Continue on the replacement session",
                       state: "pending",
                       target_connector_id: null,
+                      target_connector_id_source: "auto",
                       created_at: "2026-06-13T10:00:00.000Z",
                       updated_at: "2026-06-13T10:00:00.000Z",
                       target_host_session_id: "session-new",
@@ -428,6 +431,11 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
       if (/UPDATE commands/.test(sql) && /SET state = 'leased'/.test(sql)) {
         return {
           bind(
+            targetHostSessionIdForTarget: string | null,
+            targetHostSessionIsAppServerForTarget: number,
+            retargetConnectorId: string,
+            targetHostSessionIdForSource: string | null,
+            targetHostSessionIsAppServerForSource: number,
             connectorId: string,
             leaseUntil: string,
             leaseTargetHostSessionId: string,
@@ -435,6 +443,11 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             commandId: string,
             now: string
           ) {
+            assert.equal(targetHostSessionIdForTarget, "session-new");
+            assert.equal(targetHostSessionIsAppServerForTarget, 1);
+            assert.equal(retargetConnectorId, "connector-replacement");
+            assert.equal(targetHostSessionIdForSource, "session-new");
+            assert.equal(targetHostSessionIsAppServerForSource, 1);
             assert.equal(connectorId, "connector-replacement");
             assert.match(leaseUntil, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(leaseTargetHostSessionId, "session-new");

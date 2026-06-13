@@ -383,6 +383,24 @@ test("pendingCommandsForConnector includes the task-first attached host session 
   assert.equal(db.connectorActivityUpdates, 1);
 });
 
+test("pendingCommandsForConnector retargets auto commands to the current app-server attachment owner", async () => {
+  const db = pendingCommandDispatchDb({
+    connectorId: "connector-attached",
+    commandTargetConnectorId: "connector-auto",
+    targetConnectorIdSource: "auto"
+  });
+
+  const dispatches = await pendingCommandsForConnector({ DB: db } as Env, "connector-attached");
+
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0]?.command.id, "command-1");
+  assert.equal(dispatches[0]?.command.target_connector_id, "connector-attached");
+  assert.equal(dispatches[0]?.target_host_session?.session_id, "session-tree-1");
+  assert.equal(dispatches[0]?.target_host_session?.app_server_present, true);
+  assert.equal(db.commandLeaseUpdates, 1);
+  assert.equal(db.connectorActivityUpdates, 1);
+});
+
 test("pendingCommandsForConnector does not downgrade expired app-server leases to codex_exec", async () => {
   const db = expiredAppServerLeaseDispatchDb();
 
@@ -1463,7 +1481,14 @@ function duplicateConnectorRetirementDb() {
   return db as D1Database & typeof counters;
 }
 
-function pendingCommandDispatchDb() {
+function pendingCommandDispatchDb(options: {
+  connectorId?: string;
+  commandTargetConnectorId?: string | null;
+  targetConnectorIdSource?: "explicit" | "attached" | "auto";
+} = {}) {
+  const connectorIdUnderTest = options.connectorId ?? "connector-online";
+  const commandTargetConnectorId = options.commandTargetConnectorId ?? connectorIdUnderTest;
+  const targetConnectorIdSource = options.targetConnectorIdSource ?? "attached";
   const counters = {
     commandLeaseUpdates: 0,
     connectorActivityUpdates: 0
@@ -1480,6 +1505,7 @@ function pendingCommandDispatchDb() {
         assert.doesNotMatch(sql, /CASE\s+WHEN cmd\.task_id IS NOT NULL/);
         assert.match(sql, /ORDER BY hs_task\.updated_at DESC,\s+hs_task\.id DESC/);
         assert.match(sql, /ORDER BY hs_thread\.updated_at DESC,\s+hs_thread\.id DESC/);
+        assert.match(sql, /cmd\.target_connector_id_source = 'auto'\s+AND hs\.connector_id = \?/);
         assert.match(sql, /hs\.connector_id IS NULL OR hs\.connector_id = \?/);
         assert.match(sql, /codex_app_server_exec/);
         assert.match(
@@ -1491,13 +1517,15 @@ function pendingCommandDispatchDb() {
           bind(
             now: string,
             targetConnectorId: string,
+            autoAttachmentConnectorId: string,
             hostSessionConnectorId: string,
             executableConnectorId: string
           ) {
             assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
-            assert.equal(targetConnectorId, "connector-online");
-            assert.equal(hostSessionConnectorId, "connector-online");
-            assert.equal(executableConnectorId, "connector-online");
+            assert.equal(targetConnectorId, connectorIdUnderTest);
+            assert.equal(autoAttachmentConnectorId, connectorIdUnderTest);
+            assert.equal(hostSessionConnectorId, connectorIdUnderTest);
+            assert.equal(executableConnectorId, connectorIdUnderTest);
             return {
               async all() {
                 return {
@@ -1510,7 +1538,8 @@ function pendingCommandDispatchDb() {
                       type: "codex",
                       prompt: "Summarise this thread",
                       state: "pending",
-                      target_connector_id: "connector-online",
+                      target_connector_id: commandTargetConnectorId,
+                      target_connector_id_source: targetConnectorIdSource,
                       created_at: "2026-06-13T10:00:00.000Z",
                       updated_at: "2026-06-13T10:00:00.000Z",
                       target_host_session_id: "session-tree-1",
@@ -1528,6 +1557,11 @@ function pendingCommandDispatchDb() {
       if (/UPDATE commands/.test(sql) && /SET state = 'leased'/.test(sql)) {
         return {
           bind(
+            targetHostSessionIdForTarget: string | null,
+            targetHostSessionIsAppServerForTarget: number,
+            retargetConnectorId: string,
+            targetHostSessionIdForSource: string | null,
+            targetHostSessionIsAppServerForSource: number,
             connectorId: string,
             leaseUntil: string,
             leaseTargetHostSessionId: string | null,
@@ -1535,7 +1569,12 @@ function pendingCommandDispatchDb() {
             commandId: string,
             now: string
           ) {
-            assert.equal(connectorId, "connector-online");
+            assert.equal(targetHostSessionIdForTarget, "session-tree-1");
+            assert.equal(targetHostSessionIsAppServerForTarget, 1);
+            assert.equal(retargetConnectorId, connectorIdUnderTest);
+            assert.equal(targetHostSessionIdForSource, "session-tree-1");
+            assert.equal(targetHostSessionIsAppServerForSource, 1);
+            assert.equal(connectorId, connectorIdUnderTest);
             assert.match(leaseUntil, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(leaseTargetHostSessionId, "session-tree-1");
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
@@ -1554,7 +1593,7 @@ function pendingCommandDispatchDb() {
       if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
         return {
           bind(connectorId: string) {
-            assert.equal(connectorId, "connector-online");
+            assert.equal(connectorId, connectorIdUnderTest);
             return {
               async first() {
                 return { active_count: 1 };
@@ -1569,7 +1608,7 @@ function pendingCommandDispatchDb() {
           bind(activeCount: number, updatedAt: string, connectorId: string) {
             assert.equal(activeCount, 1);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
-            assert.equal(connectorId, "connector-online");
+            assert.equal(connectorId, connectorIdUnderTest);
             return {
               async run() {
                 counters.connectorActivityUpdates += 1;
@@ -1609,11 +1648,13 @@ function expiredAppServerLeaseDispatchDb() {
           bind(
             now: string,
             targetConnectorId: string,
+            autoAttachmentConnectorId: string,
             hostSessionConnectorId: string,
             executableConnectorId: string
           ) {
             assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(targetConnectorId, "connector-online");
+            assert.equal(autoAttachmentConnectorId, "connector-online");
             assert.equal(hostSessionConnectorId, "connector-online");
             assert.equal(executableConnectorId, "connector-online");
             return {

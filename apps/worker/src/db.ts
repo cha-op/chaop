@@ -1177,7 +1177,7 @@ export async function pendingCommandsForConnector(
   const rows = await allRows<PendingCommandRow>(
     env.DB.prepare(
       `SELECT cmd.id, cmd.workspace_id, cmd.thread_id, cmd.task_id, cmd.type, cmd.prompt, cmd.state,
-              cmd.target_connector_id, cmd.created_at, cmd.updated_at,
+              cmd.target_connector_id, cmd.target_connector_id_source, cmd.created_at, cmd.updated_at,
               hs.session_id AS target_host_session_id,
               hs.app_server_present AS target_host_session_app_server_present,
               hs.cwd AS target_host_session_cwd
@@ -1216,7 +1216,14 @@ export async function pendingCommandsForConnector(
            cmd.state = 'pending'
            OR (cmd.state = 'leased' AND cmd.lease_until IS NOT NULL AND cmd.lease_until < ?)
          )
-         AND (cmd.target_connector_id = ? OR cmd.target_connector_id IS NULL)
+         AND (
+           cmd.target_connector_id = ?
+           OR cmd.target_connector_id IS NULL
+           OR (
+             cmd.target_connector_id_source = 'auto'
+             AND hs.connector_id = ?
+           )
+         )
          AND (hs.connector_id IS NULL OR hs.connector_id = ?)
          AND EXISTS (
            SELECT 1
@@ -1241,7 +1248,7 @@ export async function pendingCommandsForConnector(
          )
        ORDER BY created_at ASC
        LIMIT 1`
-    ).bind(now, connectorId, connectorId, connectorId)
+    ).bind(now, connectorId, connectorId, connectorId, connectorId)
   );
 
   const leaseUntil = new Date(Date.now() + 60_000).toISOString();
@@ -1251,6 +1258,16 @@ export async function pendingCommandsForConnector(
     const result = await env.DB.prepare(
       `UPDATE commands
        SET state = 'leased',
+           target_connector_id = CASE
+             WHEN target_connector_id_source = 'auto' AND ? IS NOT NULL AND ? = 1
+             THEN ?
+             ELSE target_connector_id
+           END,
+           target_connector_id_source = CASE
+             WHEN target_connector_id_source = 'auto' AND ? IS NOT NULL AND ? = 1
+             THEN 'attached'
+             ELSE target_connector_id_source
+           END,
            lease_owner_connector_id = ?,
            lease_until = ?,
            lease_target_host_session_id = ?,
@@ -1261,7 +1278,19 @@ export async function pendingCommandsForConnector(
            OR (state = 'leased' AND lease_until IS NOT NULL AND lease_until < ?)
          )`
     )
-      .bind(connectorId, leaseUntil, appServerLeaseTargetHostSessionId(row), now, row.id, now)
+      .bind(
+        row.target_host_session_id,
+        targetHostSessionIsAppServer(row) ? 1 : 0,
+        connectorId,
+        row.target_host_session_id,
+        targetHostSessionIsAppServer(row) ? 1 : 0,
+        connectorId,
+        leaseUntil,
+        appServerLeaseTargetHostSessionId(row),
+        now,
+        row.id,
+        now
+      )
       .run();
     if ((result.meta as { changes?: number } | undefined)?.changes) {
       leasedRows.push(row);
@@ -1273,7 +1302,14 @@ export async function pendingCommandsForConnector(
   }
 
   return leasedRows.map((row) => {
-    const command = { ...commandFromRow(row), state: "leased" as const };
+    const command = {
+      ...commandFromRow(row),
+      target_connector_id:
+        row.target_connector_id_source === "auto" && targetHostSessionIsAppServer(row)
+          ? connectorId
+          : row.target_connector_id ?? undefined,
+      state: "leased" as const
+    };
     const targetHostSession = commandTargetHostSessionFromRow(row);
     return targetHostSession
       ? { command, target_host_session: targetHostSession }
@@ -2221,10 +2257,13 @@ function commandTargetHostSessionFromRow(row: PendingCommandRow): CommandTargetH
   if (!row.target_host_session_id) return undefined;
   return {
     session_id: row.target_host_session_id,
-    app_server_present:
-      row.target_host_session_app_server_present === 1 || row.target_host_session_app_server_present === true,
+    app_server_present: targetHostSessionIsAppServer(row),
     cwd: row.target_host_session_cwd ?? undefined
   };
+}
+
+function targetHostSessionIsAppServer(row: PendingCommandRow): boolean {
+  return row.target_host_session_app_server_present === 1 || row.target_host_session_app_server_present === true;
 }
 
 function appServerLeaseTargetHostSessionId(row: PendingCommandRow): string | null {
@@ -2477,6 +2516,7 @@ type CommandRow = Omit<CommandSummary, "thread_id" | "task_id" | "target_connect
 type CommandTargetConnectorIdSource = "explicit" | "attached" | "auto";
 
 type PendingCommandRow = CommandRow & {
+  target_connector_id_source: CommandTargetConnectorIdSource | null;
   target_host_session_id: string | null;
   target_host_session_app_server_present: number | boolean | null;
   target_host_session_cwd: string | null;
