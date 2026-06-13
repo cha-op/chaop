@@ -415,12 +415,10 @@ async function releaseCommandsForDetachedAppServerHostSession(
          )
          OR (
            state = 'leased'
+           AND lease_owner_connector_id = ?
            AND (
              lease_target_host_session_id = ?
-             OR (
-               lease_target_host_session_id IS NULL
-               AND lease_owner_connector_id = ?
-             )
+             OR lease_target_host_session_id IS NULL
            )
          )
        )
@@ -483,8 +481,8 @@ async function releaseCommandsForDetachedAppServerHostSession(
       hostSession.workspace_id,
       hostSession.connector_id,
       hostSession.session_id,
-      hostSession.session_id,
       hostSession.connector_id,
+      hostSession.session_id,
       taskId,
       taskId,
       threadId,
@@ -533,12 +531,10 @@ async function failCommandsForDetachedAppServerHostSession(
            )
            OR (
              cmd.state = 'leased'
+             AND cmd.lease_owner_connector_id = ?
              AND (
                cmd.lease_target_host_session_id = ?
-               OR (
-                 cmd.lease_target_host_session_id IS NULL
-                 AND cmd.lease_owner_connector_id = ?
-               )
+               OR cmd.lease_target_host_session_id IS NULL
              )
            )
          )
@@ -596,8 +592,8 @@ async function failCommandsForDetachedAppServerHostSession(
       hostSession.workspace_id,
       hostSession.connector_id,
       hostSession.session_id,
-      hostSession.session_id,
       hostSession.connector_id,
+      hostSession.session_id,
       taskId,
       taskId,
       threadId,
@@ -623,12 +619,10 @@ async function failCommandsForDetachedAppServerHostSession(
            )
            OR (
              state = 'leased'
+             AND lease_owner_connector_id = ?
              AND (
                lease_target_host_session_id = ?
-               OR (
-                 lease_target_host_session_id IS NULL
-                 AND lease_owner_connector_id = ?
-               )
+               OR lease_target_host_session_id IS NULL
              )
            )
          )
@@ -688,8 +682,8 @@ async function failCommandsForDetachedAppServerHostSession(
         hostSession.workspace_id,
         hostSession.connector_id,
         hostSession.session_id,
-        hostSession.session_id,
         hostSession.connector_id,
+        hostSession.session_id,
         taskId,
         taskId,
         threadId,

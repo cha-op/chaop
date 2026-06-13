@@ -68,6 +68,7 @@ superseded_by:
 - Follow-up frozen-diff review found that stale-start release still constrained replacement Host Sessions to the old connector even when the command target was inferred from an attached session. Rejected starts now allow cross-connector replacement only for `attached` inferred targets; explicit targets remain pinned to the requested connector.
 - Follow-up reviews found two remaining stuck or drift paths: expired app-server leases could fall back to `codex_exec`, and explicit app-server targets could stay leased forever after another connector took over the attachment. Pending dispatch now excludes non-null app-server lease targets from the CLI branch, and rejected explicit-target app-server starts fail the command instead of drifting or staying leased.
 - Final PR readiness reviews found that cross-connector replacement still failed when the replacement app-server Host Session reused the same app-server session id, and detach cleanup could still fail attached-inferred commands instead of requeueing them for a valid replacement. Stale-start release now excludes only the old connector/session pair, and detach cleanup source-aware releases attachment-inferred commands back to pending before running failure cleanup.
+- Final independent review found detach cleanup could still release or fail a command already leased by a replacement connector that reused the same app-server session id. Detach cleanup now requires leased commands to be owned by the detached connector before release or failure handling.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -104,6 +105,7 @@ superseded_by:
 - Worker DB tests assert expired app-server leases with a stored app-server target do not downgrade to the `codex_exec` dispatch branch.
 - Worker DB tests assert attached-inferred stale app-server starts release to a replacement connector even when the replacement reports the same app-server session id.
 - Worker route tests assert Host Session detach source-aware releases attached-inferred commands when a replacement app-server Host Session exists, without writing failed task/event side effects.
+- Worker route tests assert Host Session detach does not release or fail same-session app-server leases owned by a replacement connector.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.

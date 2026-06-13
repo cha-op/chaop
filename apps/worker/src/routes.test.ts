@@ -821,6 +821,36 @@ test("host session detach releases attached-inferred commands when a replacement
   assert.equal(db.connectorActivityUpdates, 1);
 });
 
+test("host session detach does not release same-session leases owned by a replacement connector", async () => {
+  const db = hostSessionDetachDb({
+    detachedCommandState: "leased",
+    detachedLeaseOwnedByReplacement: true,
+    returnDetachedCommands: false
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(db.commandReleases, 0);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.connectorActivityUpdates, 0);
+});
+
 test("host session detach keeps nullable-target leases owned by another connector", async () => {
   const db = hostSessionDetachDb({ returnDetachedCommands: false });
   const response = await handleRequest(
@@ -2618,6 +2648,7 @@ function hostSessionDetachDb(options: {
   detachedCommandState?: "pending" | "leased";
   detachedCommandFailureChanges?: number;
   releaseDetachedCommands?: boolean;
+  detachedLeaseOwnedByReplacement?: boolean;
 } = {}): D1Database & {
   readonly commandReleases: number;
   readonly commandFailures: number;
@@ -2675,6 +2706,7 @@ function hostSessionDetachDb(options: {
         assert.match(sql, /cmd\.state = 'leased'/);
         assert.match(sql, /cmd\.lease_target_host_session_id = \?/);
         assert.match(sql, /cmd\.lease_owner_connector_id = \?/);
+        assert.match(sql, /cmd\.state = 'leased'\s+AND cmd\.lease_owner_connector_id = \?\s+AND \(\s+cmd\.lease_target_host_session_id = \?/);
         assert.match(sql, /cmd\.state = 'pending'\s+AND cmd\.lease_target_host_session_id = \?/);
         assert.doesNotMatch(sql, /cmd\.lease_until IS NOT NULL/);
         assert.match(sql, /NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
@@ -2700,8 +2732,8 @@ function hostSessionDetachDb(options: {
             workspaceId: string,
             connectorId: string,
             pendingLeaseTargetHostSessionId: string,
-            leasedLeaseTargetHostSessionId: string,
             legacyLeaseOwnerConnectorId: string,
+            leasedLeaseTargetHostSessionId: string,
             taskIdPresent: string | null,
             taskId: string | null,
             threadIdPresent: string | null,
@@ -2712,8 +2744,8 @@ function hostSessionDetachDb(options: {
             assert.equal(workspaceId, "workspace-api");
             assert.equal(connectorId, "connector-online");
             assert.equal(pendingLeaseTargetHostSessionId, "session-1");
-            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
             assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
+            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
             assert.equal(taskIdPresent, "task-host-1");
             assert.equal(taskId, "task-host-1");
             assert.equal(threadIdPresent, "thread-host-1");
@@ -2724,7 +2756,7 @@ function hostSessionDetachDb(options: {
               async all() {
                 const commandWasReleased = counters.commandReleases > 0;
                 return {
-                  results: options.returnDetachedCommands === false || commandWasReleased ? [] : [
+                  results: options.returnDetachedCommands === false || commandWasReleased || options.detachedLeaseOwnedByReplacement ? [] : [
                     {
                       id: "command-detached",
                       workspace_id: "workspace-api",
@@ -2755,6 +2787,7 @@ function hostSessionDetachDb(options: {
         assert.match(sql, /state = 'pending'\s+AND lease_target_host_session_id = \?/);
         assert.match(sql, /state = 'leased'/);
         assert.match(sql, /lease_owner_connector_id = \?/);
+        assert.match(sql, /state = 'leased'\s+AND lease_owner_connector_id = \?\s+AND \(\s+lease_target_host_session_id = \?/);
         assert.match(sql, /AND EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /hs_task\.connector_id <> \? OR hs_task\.session_id <> \?/);
         assert.match(sql, /hs_thread\.connector_id <> \? OR hs_thread\.session_id <> \?/);
@@ -2768,8 +2801,8 @@ function hostSessionDetachDb(options: {
             workspaceId: string,
             connectorId: string,
             pendingLeaseTargetHostSessionId: string,
-            leasedLeaseTargetHostSessionId: string,
             legacyLeaseOwnerConnectorId: string,
+            leasedLeaseTargetHostSessionId: string,
             taskIdPresent: string | null,
             taskId: string | null,
             threadIdPresent: string | null,
@@ -2785,8 +2818,8 @@ function hostSessionDetachDb(options: {
             assert.equal(workspaceId, "workspace-api");
             assert.equal(connectorId, "connector-online");
             assert.equal(pendingLeaseTargetHostSessionId, "session-1");
-            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
             assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
+            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
             assert.equal(taskIdPresent, "task-host-1");
             assert.equal(taskId, "task-host-1");
             assert.equal(threadIdPresent, "thread-host-1");
@@ -2799,7 +2832,10 @@ function hostSessionDetachDb(options: {
             assert.equal(excludedFallbackSessionId, "session-1");
             return {
               async run() {
-                const changes = options.releaseDetachedCommands ? 1 : 0;
+                const changes =
+                  options.releaseDetachedCommands && counters.commandReleases === 0 && !options.detachedLeaseOwnedByReplacement
+                    ? 1
+                    : 0;
                 counters.commandReleases += changes;
                 return { meta: { changes } };
               }
@@ -2815,6 +2851,7 @@ function hostSessionDetachDb(options: {
         assert.match(sql, /state = 'pending'\s+AND lease_target_host_session_id = \?/);
         assert.match(sql, /state = 'leased'/);
         assert.match(sql, /lease_owner_connector_id = \?/);
+        assert.match(sql, /state = 'leased'\s+AND lease_owner_connector_id = \?\s+AND \(\s+lease_target_host_session_id = \?/);
         assert.match(sql, /AND NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /WHERE hs\.id = COALESCE\(/);
         assert.match(sql, /wc\.workspace_id = commands\.workspace_id/);
@@ -2833,8 +2870,8 @@ function hostSessionDetachDb(options: {
             workspaceId: string,
             connectorId: string,
             pendingLeaseTargetHostSessionId: string,
-            leasedLeaseTargetHostSessionId: string,
             legacyLeaseOwnerConnectorId: string,
+            leasedLeaseTargetHostSessionId: string,
             taskIdPresent: string | null,
             taskId: string | null,
             threadIdPresent: string | null,
@@ -2848,8 +2885,8 @@ function hostSessionDetachDb(options: {
             assert.equal(workspaceId, "workspace-api");
             assert.equal(connectorId, "connector-online");
             assert.equal(pendingLeaseTargetHostSessionId, "session-1");
-            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
             assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
+            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
             assert.equal(taskIdPresent, "task-host-1");
             assert.equal(taskId, "task-host-1");
             assert.equal(threadIdPresent, "thread-host-1");
