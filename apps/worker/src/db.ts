@@ -730,9 +730,27 @@ export async function pendingCommandsForConnector(
           WHERE hs2.workspace_id = cmd.workspace_id
             AND (
               (cmd.task_id IS NOT NULL AND hs2.attached_task_id = cmd.task_id)
-              OR (cmd.task_id IS NULL AND cmd.thread_id IS NOT NULL AND hs2.attached_thread_id = cmd.thread_id)
+              OR (
+                cmd.thread_id IS NOT NULL
+                AND hs2.attached_thread_id = cmd.thread_id
+                AND (
+                  cmd.task_id IS NULL
+                  OR NOT EXISTS (
+                    SELECT 1
+                    FROM host_sessions hst
+                    WHERE hst.workspace_id = cmd.workspace_id
+                      AND hst.attached_task_id = cmd.task_id
+                  )
+                )
+              )
             )
-          ORDER BY hs2.updated_at DESC, hs2.id DESC
+          ORDER BY
+            CASE
+              WHEN cmd.task_id IS NOT NULL AND hs2.attached_task_id = cmd.task_id THEN 0
+              ELSE 1
+            END,
+            hs2.updated_at DESC,
+            hs2.id DESC
           LIMIT 1
         )
        WHERE (
