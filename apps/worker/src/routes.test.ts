@@ -1743,8 +1743,10 @@ function commandTargetDb(
             assert.equal(typeof prompt, "string");
             assert.equal(state, "pending");
             if (/WHERE EXISTS/.test(sql)) {
-              const leaseTargetHostSessionId = args[8];
+              const targetConnectorIdSource = args[8];
+              const leaseTargetHostSessionId = args[9];
               assert.equal(targetConnectorId, "connector-attached");
+              assert.equal(targetConnectorIdSource, "attached");
               assert.equal(leaseTargetHostSessionId, "session-attached-thread");
               assert.match(sql, /hs\.app_server_present = 1/);
               assert.match(sql, /hs\.id = \(\s+SELECT hs2\.id/);

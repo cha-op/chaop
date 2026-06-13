@@ -62,7 +62,7 @@ superseded_by:
 - 后续 frozen-diff review 发现 detach cleanup 仍从 task/thread scope 推断 pending command 是否依赖该 session，可能误失败在 Host Session attach 前创建的普通 pending `codex_exec` command。现在 app-server command creation 会持久化 intended Host Session id，detach cleanup 只会失败 stored app-server target 匹配被 detach session 的 pending command。
 - Codex review-gate 在合并前发现剩余 hardening gaps：app-server assistant deltas 现在会按 `codex_output_max_bytes` 限制本地累计；detach cleanup 的 guarded failure update 会重新验证 replacement Host Session；leased detach cleanup 会刷新 connector activity count；pending-command Host Session selection 不再在 subquery `ORDER BY` 中使用 SQLite 不接受的 outer reference；cost guide 也改成可直接复制的两个独立 TOML mode snippets。
 - 后续 independent review 发现 detach cleanup 的 `SELECT` 与 failure `UPDATE` 之间仍可能发生 command 被重新 lease 或 retarget 的 race。现在 guarded failure update 会在写入 task/event side effects 前重新验证 command workspace、type、target connector、scope、lease ownership，以及当前 replacement Host Session selection。
-- 后续 frozen-diff review 发现 rejected stale app-server start 释放 lease fields 后，仍会保留 command creation 时写入的 stale implicit `target_connector_id`。现在释放该 stale app-server lease 时也会清空 `target_connector_id`，让立即 re-dispatch 能按当前 attachment 重新选择 connector。
+- 后续 frozen-diff review 发现 rejected stale app-server start 释放 lease fields 后，仍会保留 command creation 时写入的 stale implicit `target_connector_id`。现在释放该 stale app-server lease 时只会清空 attached-session 推导出的 target，所以立即 re-dispatch 可以按当前 attachment 重新选择 connector，同时显式指定 target 的 command 不会漂移到其他 connector。
 - 后续 independent review 发现 guarded detach failure update 把 `lease_target_host_session_id` 与内部 `host_sessions.id` 比较，而 command 中保存的是 app-server session id。现在 guarded update 用 `hostSession.session_id` 做 lease-target matching，只在 replacement selection 排除被 detach row 时使用 `hostSession.id`。
 
 ## 验证目标
@@ -90,7 +90,8 @@ superseded_by:
 - Worker DB tests 断言 pending command dispatch 使用 SQLite-compatible task-first Host Session selection，不再依赖 outer-reference `ORDER BY`。
 - Worker route tests 断言 Host Session detach 在失败 leased command 后会刷新 connector activity。
 - Worker route tests 断言当 guarded command failure update 在 race 中失效时，Host Session detach 不会继续写 task、event 或 connector activity side effects。
-- Worker DB 与 Durable Object tests 断言 rejected stale app-server start 在释放 app-server lease 以便立即 re-dispatch 时，也会清空 stale target connector。
+- Worker DB 与 Durable Object tests 断言 rejected stale app-server start 在释放 app-server lease 以便立即 re-dispatch 时，只会清空 attached-session 推导出的 stale target connector。
+- Worker DB tests 断言 stale app-server start 被拒后仍会保留显式 command target，避免用户指定的 target connector 漂移到其他 host。
 - Worker route tests 断言 guarded detach failure update 会为 `lease_target_host_session_id` 绑定已存的 app-server session id，而不是内部 Host Session row id。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。

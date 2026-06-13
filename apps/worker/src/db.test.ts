@@ -51,6 +51,25 @@ test("recordAgentEvent rejects app-server starts after the attachment is detache
   assert.equal(db.eventInserts, 0);
 });
 
+test("recordAgentEvent keeps explicit targets when stale app-server starts are released", async () => {
+  const db = appServerStartAfterDetachDb(undefined, { targetConnectorIdSource: "explicit" });
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    target_host_session_id: "session-old",
+    kind: "command.started",
+    priority: "P1",
+    summary: "Starting"
+  });
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.dispatch_pending, true);
+  assert.equal(result.event, undefined);
+  assert.equal(db.commandUpdates, 1);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
 test("recordAgentEvent rejects app-server starts after the connector reattaches a different session", async () => {
   const db = appServerStartAfterDetachDb({
     connector_id: "connector-online",
@@ -527,7 +546,7 @@ function agentEventGuardDb(command: {
   };
   const db = {
     prepare(sql: string) {
-      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
             assert.equal(commandId, "command-1");
@@ -540,6 +559,7 @@ function agentEventGuardDb(command: {
                   task_id: "task-1",
                   type: "codex",
                   target_connector_id: null,
+                  target_connector_id_source: "auto",
                   lease_owner_connector_id: command.leaseOwnerConnectorId,
                   state: command.state,
                   lease_target_host_session_id: null
@@ -667,9 +687,13 @@ function appServerStartAfterDetachDb(currentTarget?: {
   connector_id: string;
   session_id: string;
   app_server_present: number;
-}, options: { leaseTargetHostSessionId?: string | null } = {}) {
+}, options: {
+  leaseTargetHostSessionId?: string | null;
+  targetConnectorIdSource?: "explicit" | "attached" | "auto";
+} = {}) {
   const leaseTargetHostSessionId =
     options.leaseTargetHostSessionId === undefined ? "session-old" : options.leaseTargetHostSessionId;
+  const targetConnectorIdSource = options.targetConnectorIdSource ?? "attached";
   const counters = {
     commandUpdates: 0,
     taskUpdates: 0,
@@ -678,7 +702,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
   let releasedLease = false;
   const db = {
     prepare(sql: string) {
-      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
             assert.equal(commandId, "command-1");
@@ -691,6 +715,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
                   task_id: "task-1",
                   type: "codex",
                   target_connector_id: "connector-online",
+                  target_connector_id_source: targetConnectorIdSource,
                   lease_owner_connector_id: "connector-online",
                   state: "leased",
                   lease_target_host_session_id: leaseTargetHostSessionId
@@ -715,7 +740,8 @@ function appServerStartAfterDetachDb(currentTarget?: {
       }
 
       if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
-        assert.match(sql, /target_connector_id = NULL/);
+        assert.match(sql, /target_connector_id = CASE WHEN \? THEN NULL ELSE target_connector_id END/);
+        assert.match(sql, /target_connector_id_source = CASE WHEN \? THEN 'auto' ELSE target_connector_id_source END/);
         assert.match(sql, /lease_owner_connector_id = NULL/);
         assert.match(sql, /lease_until = NULL/);
         assert.match(sql, /lease_target_host_session_id = NULL/);
@@ -724,11 +750,16 @@ function appServerStartAfterDetachDb(currentTarget?: {
         assert.match(sql, /lease_target_host_session_id = \?/);
         return {
           bind(
+            clearTargetConnectorId: number,
+            clearTargetConnectorIdSource: number,
             updatedAt: string,
             commandId: string,
             ownerConnectorId: string,
             targetHostSessionId: string | null
           ) {
+            const shouldClearImplicitTarget = targetConnectorIdSource === "attached" ? 1 : 0;
+            assert.equal(clearTargetConnectorId, shouldClearImplicitTarget);
+            assert.equal(clearTargetConnectorIdSource, shouldClearImplicitTarget);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
             assert.equal(ownerConnectorId, "connector-online");

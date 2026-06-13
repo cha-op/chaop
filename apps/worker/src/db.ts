@@ -885,6 +885,11 @@ export async function createCommandInDb(
     request.target_connector_id
     ?? attachedTarget?.connector_id
     ?? (await chooseConnectorForWorkspace(env, scope.workspaceId, commandType));
+  const targetConnectorIdSource = request.target_connector_id
+    ? "explicit"
+    : attachedTarget?.connector_id
+      ? "attached"
+      : "auto";
 
   if (request.target_connector_id && !targetConnectorId) {
     throw new CommandTargetError("Target connector not available");
@@ -915,7 +920,8 @@ export async function createCommandInDb(
   };
 
   const inserted = await insertCommandInDb(env, user.id, command, {
-    appServerTargetHostSessionId
+    appServerTargetHostSessionId,
+    targetConnectorIdSource
   });
   if (!inserted) {
     throw new CommandTargetError("Attached host session changed before command creation", 409);
@@ -939,7 +945,10 @@ async function insertCommandInDb(
   env: Env,
   userId: string,
   command: CommandSummary,
-  options: { appServerTargetHostSessionId?: string | null }
+  options: {
+    appServerTargetHostSessionId?: string | null;
+    targetConnectorIdSource: CommandTargetConnectorIdSource;
+  }
 ): Promise<boolean> {
   if (options.appServerTargetHostSessionId) {
     if (!command.target_connector_id) {
@@ -948,9 +957,10 @@ async function insertCommandInDb(
     const result = await env.DB!.prepare(
       `INSERT INTO commands (
          id, workspace_id, thread_id, task_id, type, prompt, state,
-         target_connector_id, lease_target_host_session_id, created_by, created_at, updated_at
+         target_connector_id, target_connector_id_source, lease_target_host_session_id,
+         created_by, created_at, updated_at
        )
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE EXISTS (
          SELECT 1
          FROM host_sessions hs
@@ -994,6 +1004,7 @@ async function insertCommandInDb(
         command.prompt,
         command.state,
         command.target_connector_id,
+        options.targetConnectorIdSource,
         options.appServerTargetHostSessionId,
         userId,
         command.created_at,
@@ -1017,8 +1028,9 @@ async function insertCommandInDb(
   await env.DB!.prepare(
     `INSERT INTO commands (
        id, workspace_id, thread_id, task_id, type, prompt, state,
-       target_connector_id, lease_target_host_session_id, created_by, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+       target_connector_id, target_connector_id_source, lease_target_host_session_id,
+       created_by, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
   )
     .bind(
       command.id,
@@ -1029,6 +1041,7 @@ async function insertCommandInDb(
       command.prompt,
       command.state,
       command.target_connector_id ?? null,
+      options.targetConnectorIdSource,
       userId,
       command.created_at,
       command.updated_at
@@ -1158,7 +1171,8 @@ export async function recordAgentEvent(
   if (!env.DB) return { accepted: false };
 
   const command = await env.DB.prepare(
-    `SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state, lease_target_host_session_id
+    `SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,
+            lease_owner_connector_id, state, lease_target_host_session_id
      FROM commands
      WHERE id = ?
      LIMIT 1`
@@ -1171,6 +1185,7 @@ export async function recordAgentEvent(
       task_id: string | null;
       type: CommandSummary["type"];
       target_connector_id: string | null;
+      target_connector_id_source: CommandTargetConnectorIdSource | null;
       lease_owner_connector_id: string | null;
       lease_target_host_session_id: string | null;
       state: CommandSummary["state"];
@@ -1250,6 +1265,7 @@ async function releaseRejectedAppServerStartLease(
   command: {
     id: string;
     lease_target_host_session_id: string | null;
+    target_connector_id_source: CommandTargetConnectorIdSource | null;
   },
   now: string
 ): Promise<boolean> {
@@ -1257,10 +1273,12 @@ async function releaseRejectedAppServerStartLease(
     return false;
   }
 
+  const clearImplicitTarget = command.target_connector_id_source === "attached" ? 1 : 0;
   const result = await env.DB!.prepare(
     `UPDATE commands
      SET state = 'pending',
-         target_connector_id = NULL,
+         target_connector_id = CASE WHEN ? THEN NULL ELSE target_connector_id END,
+         target_connector_id_source = CASE WHEN ? THEN 'auto' ELSE target_connector_id_source END,
          lease_owner_connector_id = NULL,
          lease_until = NULL,
          lease_target_host_session_id = NULL,
@@ -1271,7 +1289,14 @@ async function releaseRejectedAppServerStartLease(
        AND lease_target_host_session_id IS NOT NULL
        AND lease_target_host_session_id = ?`
   )
-    .bind(now, command.id, connectorId, command.lease_target_host_session_id)
+    .bind(
+      clearImplicitTarget,
+      clearImplicitTarget,
+      now,
+      command.id,
+      connectorId,
+      command.lease_target_host_session_id
+    )
     .run();
   const released = Boolean((result.meta as { changes?: number } | undefined)?.changes);
   if (released) {
@@ -2207,6 +2232,8 @@ type CommandRow = Omit<CommandSummary, "thread_id" | "task_id" | "target_connect
   task_id: string | null;
   target_connector_id: string | null;
 };
+
+type CommandTargetConnectorIdSource = "explicit" | "attached" | "auto";
 
 type PendingCommandRow = CommandRow & {
   target_host_session_id: string | null;

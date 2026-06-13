@@ -268,7 +268,7 @@ test("rejected targeted app-server starts trigger pending dispatch to available 
 function staleCommandEventDb(): D1Database {
   return {
     prepare(sql: string) {
-      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
             assert.equal(commandId, "command-1");
@@ -281,6 +281,7 @@ function staleCommandEventDb(): D1Database {
                   task_id: "task-1",
                   type: "codex",
                   target_connector_id: "connector-online",
+                  target_connector_id_source: "auto",
                   lease_owner_connector_id: null,
                   state: "failed"
                 };
@@ -305,7 +306,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
-      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
             assert.equal(commandId, "command-1");
@@ -318,6 +319,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
                   task_id: "task-1",
                   type: "codex",
                   target_connector_id: null,
+                  target_connector_id_source: "attached",
                   lease_owner_connector_id: "connector-stale",
                   state: "leased",
                   lease_target_host_session_id: "session-old"
@@ -341,10 +343,20 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
       }
 
       if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
-        assert.match(sql, /target_connector_id = NULL/);
+        assert.match(sql, /target_connector_id = CASE WHEN \? THEN NULL ELSE target_connector_id END/);
+        assert.match(sql, /target_connector_id_source = CASE WHEN \? THEN 'auto' ELSE target_connector_id_source END/);
         assert.match(sql, /lease_target_host_session_id = \?/);
         return {
-          bind(updatedAt: string, commandId: string, connectorId: string, targetHostSessionId: string) {
+          bind(
+            clearTargetConnectorId: number,
+            clearTargetConnectorIdSource: number,
+            updatedAt: string,
+            commandId: string,
+            connectorId: string,
+            targetHostSessionId: string
+          ) {
+            assert.equal(clearTargetConnectorId, 1);
+            assert.equal(clearTargetConnectorIdSource, 1);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
             assert.equal(connectorId, "connector-stale");
