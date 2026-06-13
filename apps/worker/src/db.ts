@@ -395,7 +395,7 @@ async function failCommandsForDetachedAppServerHostSession(
        FROM commands cmd
        WHERE cmd.workspace_id = ?
          AND cmd.type = 'codex'
-         AND cmd.target_connector_id = ?
+         AND (cmd.target_connector_id = ? OR cmd.target_connector_id IS NULL)
          AND (
            cmd.state = 'pending'
            OR cmd.state = 'leased'
@@ -410,7 +410,7 @@ async function failCommandsForDetachedAppServerHostSession(
            WHERE hs.workspace_id = cmd.workspace_id
              AND hs.id <> ?
              AND hs.app_server_present = 1
-             AND hs.connector_id = cmd.target_connector_id
+             AND (cmd.target_connector_id IS NULL OR hs.connector_id = cmd.target_connector_id)
              AND (
                (cmd.task_id IS NOT NULL AND hs.attached_task_id = cmd.task_id)
                OR (
@@ -936,7 +936,7 @@ export async function recordAgentEvent(
   if (!env.DB) return { accepted: false };
 
   const command = await env.DB.prepare(
-    `SELECT id, workspace_id, thread_id, task_id, target_connector_id, lease_owner_connector_id, state
+    `SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state
      FROM commands
      WHERE id = ?
      LIMIT 1`
@@ -947,6 +947,7 @@ export async function recordAgentEvent(
       workspace_id: string;
       thread_id: string | null;
       task_id: string | null;
+      type: CommandSummary["type"];
       target_connector_id: string | null;
       lease_owner_connector_id: string | null;
       state: CommandSummary["state"];
@@ -958,6 +959,9 @@ export async function recordAgentEvent(
   }
   if (command.lease_owner_connector_id !== connectorId) return { accepted: false };
   if (!isActiveCommandState(command.state)) return { accepted: false };
+  if (await shouldRejectStaleAppServerStart(env, connectorId, command, event)) {
+    return { accepted: false };
+  }
 
   const now = new Date().toISOString();
   const nextState = commandStateForEvent(event.kind);
@@ -1692,6 +1696,106 @@ function commandTargetHostSessionFromRow(row: PendingCommandRow): CommandTargetH
     app_server_present:
       row.target_host_session_app_server_present === 1 || row.target_host_session_app_server_present === true,
     cwd: row.target_host_session_cwd ?? undefined
+  };
+}
+
+async function shouldRejectStaleAppServerStart(
+  env: Env,
+  connectorId: string,
+  command: {
+    workspace_id: string;
+    thread_id: string | null;
+    task_id: string | null;
+    type: CommandSummary["type"];
+  },
+  event: AgentCommandEvent
+): Promise<boolean> {
+  if (event.kind !== "command.started" || command.type !== "codex") {
+    return false;
+  }
+  if (!(await connectorRequiresAppServerStartValidation(env, connectorId))) {
+    return false;
+  }
+
+  const target = await findCurrentCommandHostSessionTarget(env, {
+    workspaceId: command.workspace_id,
+    threadId: command.thread_id ?? undefined,
+    taskId: command.task_id ?? undefined
+  });
+  return target?.connector_id !== connectorId || target.app_server_present !== true;
+}
+
+async function connectorRequiresAppServerStartValidation(env: Env, connectorId: string): Promise<boolean> {
+  const row = await env.DB!.prepare(
+    `SELECT capabilities_json
+     FROM connectors
+     WHERE id = ?
+     LIMIT 1`
+  )
+    .bind(connectorId)
+    .first<{ capabilities_json: string | null }>();
+  if (!row?.capabilities_json) return false;
+
+  try {
+    const capabilities = JSON.parse(row.capabilities_json) as unknown;
+    return (
+      Array.isArray(capabilities) &&
+      capabilities.includes("codex_app_server_exec") &&
+      !capabilities.includes("codex_exec")
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function findCurrentCommandHostSessionTarget(
+  env: Env,
+  scope: { workspaceId: string; threadId?: string | undefined; taskId?: string | undefined }
+): Promise<{ connector_id: string; app_server_present: boolean } | undefined> {
+  if (!scope.threadId && !scope.taskId) return undefined;
+
+  const row = await env.DB!.prepare(
+    `SELECT hs.connector_id, hs.app_server_present
+     FROM host_sessions hs
+     WHERE hs.workspace_id = ?
+       AND (
+         (? IS NOT NULL AND hs.attached_task_id = ?)
+         OR (
+           ? IS NOT NULL
+           AND hs.attached_thread_id = ?
+           AND (
+             ? IS NULL
+             OR NOT EXISTS (
+               SELECT 1
+               FROM host_sessions hst
+               WHERE hst.workspace_id = hs.workspace_id
+                 AND hst.attached_task_id = ?
+             )
+           )
+         )
+       )
+     ORDER BY
+       CASE WHEN ? IS NOT NULL AND hs.attached_task_id = ? THEN 0 ELSE 1 END,
+       hs.updated_at DESC,
+       hs.id DESC
+     LIMIT 1`
+  )
+    .bind(
+      scope.workspaceId,
+      scope.taskId ?? null,
+      scope.taskId ?? null,
+      scope.threadId ?? null,
+      scope.threadId ?? null,
+      scope.taskId ?? null,
+      scope.taskId ?? null,
+      scope.taskId ?? null,
+      scope.taskId ?? null
+    )
+    .first<{ connector_id: string; app_server_present: number | boolean | null }>();
+  if (!row?.connector_id) return undefined;
+  return {
+    connector_id: row.connector_id,
+    app_server_present: row.app_server_present === 1 || row.app_server_present === true
   };
 }
 

@@ -32,6 +32,23 @@ test("recordAgentEvent ignores stale events from a connector that lost the lease
   assert.equal(db.eventInserts, 0);
 });
 
+test("recordAgentEvent rejects app-server starts after the attachment is detached", async () => {
+  const db = appServerStartAfterDetachDb();
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    kind: "command.started",
+    priority: "P1",
+    summary: "Starting"
+  });
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.event, undefined);
+  assert.equal(db.commandUpdates, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
 test("recordAgentEvent accepts events from the active lease owner", async () => {
   const db = agentEventGuardDb({
     leaseOwnerConnectorId: "connector-online",
@@ -366,7 +383,7 @@ function agentEventGuardDb(command: {
   };
   const db = {
     prepare(sql: string) {
-      if (/SELECT id, workspace_id, thread_id, task_id, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
             assert.equal(commandId, "command-1");
@@ -377,6 +394,7 @@ function agentEventGuardDb(command: {
                   workspace_id: "workspace-api",
                   thread_id: "thread-1",
                   task_id: "task-1",
+                  type: "codex",
                   target_connector_id: null,
                   lease_owner_connector_id: command.leaseOwnerConnectorId,
                   state: command.state
@@ -478,6 +496,127 @@ function agentEventGuardDb(command: {
             return {
               async first() {
                 return { active_count: 0 };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandUpdates() {
+      return counters.commandUpdates;
+    },
+    get taskUpdates() {
+      return counters.taskUpdates;
+    },
+    get eventInserts() {
+      return counters.eventInserts;
+    }
+  };
+
+  return db as D1Database & typeof counters;
+}
+
+function appServerStartAfterDetachDb() {
+  const counters = {
+    commandUpdates: 0,
+    taskUpdates: 0,
+    eventInserts: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
+        return {
+          bind(commandId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                return {
+                  id: "command-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  task_id: "task-1",
+                  type: "codex",
+                  target_connector_id: "connector-online",
+                  lease_owner_connector_id: "connector-online",
+                  state: "leased"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT capabilities_json/.test(sql) && /FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { capabilities_json: JSON.stringify(["codex_app_server_exec"]) };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT hs\.connector_id, hs\.app_server_present/.test(sql) && /FROM host_sessions hs/.test(sql)) {
+        return {
+          bind(
+            workspaceId: string,
+            taskIdPresent: string | null,
+            taskId: string | null,
+            threadIdPresent: string | null,
+            threadId: string | null
+          ) {
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(taskIdPresent, "task-1");
+            assert.equal(taskId, "task-1");
+            assert.equal(threadIdPresent, "thread-1");
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                counters.commandUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                counters.taskUpdates += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
               }
             };
           }

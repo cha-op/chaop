@@ -204,7 +204,7 @@ test("agent event ack rejects stale command events", async () => {
 function staleCommandEventDb(): D1Database {
   return {
     prepare(sql: string) {
-      if (/SELECT id, workspace_id, thread_id, task_id, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
             assert.equal(commandId, "command-1");
@@ -215,6 +215,7 @@ function staleCommandEventDb(): D1Database {
                   workspace_id: "workspace-api",
                   thread_id: "thread-1",
                   task_id: "task-1",
+                  type: "codex",
                   target_connector_id: "connector-online",
                   lease_owner_connector_id: null,
                   state: "failed"

@@ -2473,12 +2473,13 @@ function hostSessionDetachDb(): D1Database & {
         assert.equal(attachmentCleared, true);
         assert.match(sql, /cmd\.type = 'codex'/);
         assert.match(sql, /cmd\.target_connector_id = \?/);
+        assert.match(sql, /cmd\.target_connector_id IS NULL/);
         assert.match(sql, /cmd\.state = 'pending'/);
         assert.match(sql, /cmd\.state = 'leased'/);
         assert.doesNotMatch(sql, /cmd\.lease_until IS NOT NULL/);
         assert.match(sql, /NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /hs\.id <> \?/);
-        assert.match(sql, /hs\.connector_id = cmd\.target_connector_id/);
+        assert.match(sql, /cmd\.target_connector_id IS NULL OR hs\.connector_id = cmd\.target_connector_id/);
         assert.match(sql, /hst\.id <> \?/);
         assert.doesNotMatch(sql, /hst\.connector_id = cmd\.target_connector_id/);
         return {
