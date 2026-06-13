@@ -109,7 +109,7 @@ pub fn build_host_sessions_report(
     if !config.session_inventory.enabled {
         return Ok(AgentHostSessionsReport {
             sessions: Vec::new(),
-            inventory_scope: InventoryScope::Full,
+            inventory_scope: InventoryScope::Incremental,
             app_server_inventory_ok: None,
         });
     }
@@ -179,11 +179,16 @@ pub fn build_host_sessions_report(
         })
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    let inventory_scope = if sessions.len() > config.session_inventory.max_sessions {
+        InventoryScope::Incremental
+    } else {
+        InventoryScope::Full
+    };
     sessions.truncate(config.session_inventory.max_sessions);
 
     Ok(AgentHostSessionsReport {
         sessions,
-        inventory_scope: InventoryScope::Full,
+        inventory_scope,
         app_server_inventory_ok,
     })
 }
@@ -851,26 +856,59 @@ fn load_app_server_sessions(
     let timeout = Duration::from_secs(timeout_seconds.max(1));
     let mut socket = connect_app_server(url, timeout)?;
     initialize_app_server_connection(&mut socket)?;
-    socket.send(Message::Text(
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "thread/list",
-            "params": app_server_thread_list_params(limit, None, Some(false))
-        })
-        .to_string()
-        .into(),
-    ))?;
+    let page_limit = limit.max(1);
+    let mut request_id = 1;
+    let mut cursor: Option<String> = None;
+    let mut sessions = HashMap::new();
 
+    loop {
+        socket.send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "thread/list",
+                "params": app_server_thread_list_params(page_limit, cursor.as_deref(), Some(false))
+            })
+            .to_string()
+            .into(),
+        ))?;
+
+        let value = read_app_server_inventory_page(&mut socket, request_id)?;
+        for (session_id, session) in app_server_sessions_from_response(&value) {
+            sessions.entry(session_id).or_insert(session);
+        }
+        cursor = app_server_thread_list_next_cursor(&value);
+        if cursor.is_none() {
+            return Ok(sessions);
+        }
+        request_id += 1;
+    }
+}
+
+fn read_app_server_inventory_page(
+    socket: &mut AppServerSocket,
+    request_id: i64,
+) -> Result<Value, Box<dyn std::error::Error>> {
     loop {
         match socket.read()? {
             Message::Text(text) => {
                 let value = serde_json::from_str::<Value>(text.as_ref())?;
-                if value.get("id").and_then(Value::as_i64) == Some(1) {
-                    return Ok(app_server_sessions_from_response(&value));
+                if value.get("id").and_then(Value::as_i64) != Some(request_id) {
+                    continue;
                 }
+                if let Some(error) = value.get("error") {
+                    return Err(app_server_error("thread/list", error).into());
+                }
+                if app_server_thread_list_data(&value).is_none() {
+                    return Err(
+                        "app-server thread/list response did not include result.data".into(),
+                    );
+                }
+                return Ok(value);
             }
-            Message::Close(_) => return Ok(HashMap::new()),
+            Message::Close(_) => {
+                return Err("app-server closed before thread/list response".into());
+            }
             _ => {}
         }
     }
@@ -2712,6 +2750,112 @@ mod tests {
     }
 
     #[test]
+    fn loads_app_server_sessions_until_next_cursor_is_exhausted() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "session-1",
+                            "name": "First page",
+                            "cwd": "/tmp/page-1",
+                            "updatedAt": 1781263443
+                        }
+                    ],
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "session-2",
+                            "name": "Second page",
+                            "cwd": "/tmp/page-2",
+                            "updatedAt": 1781267043
+                        }
+                    ],
+                    "nextCursor": null
+                }
+            }),
+        ]);
+
+        let sessions = load_app_server_sessions(&url, 1, 1).expect("sessions");
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first request");
+        let second_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second request");
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions
+                .get("session-1")
+                .and_then(|session| session.name.as_deref()),
+            Some("First page")
+        );
+        assert_eq!(
+            sessions
+                .get("session-2")
+                .and_then(|session| session.name.as_deref()),
+            Some("Second page")
+        );
+        assert!(first_request.pointer("/params/cursor").is_none());
+        assert_eq!(
+            second_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+    }
+
+    #[test]
+    fn load_app_server_sessions_fails_on_thread_list_error() {
+        let url = run_fake_app_server(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "message": "state database unavailable" }
+        })]);
+
+        let error = load_app_server_sessions(&url, 20, 1).expect_err("thread/list error");
+
+        assert_eq!(
+            error.to_string(),
+            "app-server thread/list failed: state database unavailable"
+        );
+    }
+
+    #[test]
+    fn load_app_server_sessions_fails_on_malformed_thread_list_response() {
+        let url = run_fake_app_server(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {}
+        })]);
+
+        let error = load_app_server_sessions(&url, 20, 1).expect_err("malformed response");
+
+        assert_eq!(
+            error.to_string(),
+            "app-server thread/list response did not include result.data"
+        );
+    }
+
+    #[test]
+    fn load_app_server_sessions_fails_when_socket_closes_before_response() {
+        let url = run_fake_app_server(Vec::new());
+
+        let error = load_app_server_sessions(&url, 20, 1).expect_err("closed socket");
+
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
     fn parses_app_server_thread_start_response() {
         let response = json!({
             "jsonrpc": "2.0",
@@ -3773,6 +3917,40 @@ mod tests {
         assert_eq!(report.sessions[0].title_source, TitleSource::History);
         assert_eq!(report.sessions[1].title, "History title from first prompt");
         assert_eq!(report.sessions[2].title, "Metadata index title");
+    }
+
+    #[test]
+    fn host_session_report_marks_truncated_inventory_as_incremental() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        fs::write(
+            codex_home.join("session_index.jsonl"),
+            r#"{"id":"session-1","thread_name":"First","updated_at":"2026-06-12T10:00:00.000Z"}
+{"id":"session-2","thread_name":"Second","updated_at":"2026-06-12T11:00:00.000Z"}"#,
+        )
+        .expect("session index");
+
+        let mut config = test_config(codex_home);
+        config.session_inventory.max_sessions = 1;
+
+        let report = build_host_sessions_report(&config).expect("report");
+
+        assert_eq!(report.inventory_scope, InventoryScope::Incremental);
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].session_id, "session-2");
+    }
+
+    #[test]
+    fn disabled_host_session_report_is_not_a_full_inventory() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        config.session_inventory.enabled = false;
+
+        let report = build_host_sessions_report(&config).expect("report");
+
+        assert_eq!(report.inventory_scope, InventoryScope::Incremental);
+        assert_eq!(report.app_server_inventory_ok, None);
+        assert!(report.sessions.is_empty());
     }
 
     #[test]

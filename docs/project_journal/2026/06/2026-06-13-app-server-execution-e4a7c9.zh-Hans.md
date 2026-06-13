@@ -86,6 +86,7 @@ superseded_by:
 - GitHub review-gate 也发现 sticky `app_server_present` 可能在 connector 不再通过 app-server 上报该 session 后，仍把新的 commands 分类为 app-server work。现在 Host Session inventory 会把 `app_server_present` 当作本次 report 的当前状态，而不是 ever-seen 标记。
 - 后续 PR readiness review 发现 stale app-server target 的残留缺口：inventory demotion 可能让已绑定 app-server session 的 command 卡住；只存在于 app-server 的 session 如果在后续 inventory report 中消失，也可能继续保留 stale `app_server_present=true`；显式 app-server command 也可能在 lease 前 attachment 已迁移时一直 pending。现在 inventory freshness cleanup 会同时 demote reported-false 和 omitted app-server-only sessions，运行与 detach 相同的 release/failure cleanup；Durable Object 也会在 dispatch 前失败 stale explicit app-server targets，即使目标 connector 当前没有 active socket。
 - 最后一轮 follow-up reviews 在合并前又发现三个 inventory/release 边界：新建一个本机 app-server thread 时，单条新 session report 被当作完整 inventory snapshot；短暂 app-server list 失败无法和成功但为空的 app-server inventory 区分；多条 app-server command release 后可能漏掉某个 replacement connector dispatch。现在 Host Session report 会携带 `inventory_scope` 和 `app_server_inventory_ok`；Worker 只会在完整且成功的 snapshot 中清理 omitted app-server-only sessions，app-server inventory 失败时会保留已知 app-server presence，并在 release 后向 workspace 内所有 online executable app-server connectors fan out dispatch，让 command-level filters 决定真实接收者。
+- 对该修复的最后 review 发现 agent 在 `thread/list` 返回 error-like response、中途关闭，或还有后续分页时，仍可能把不完整 app-server inventory 标记为 full。现在 app-server inventory 会把 JSON-RPC errors、malformed responses 和 early close/reset 当作失败，会沿 `nextCursor` 一直翻页直到耗尽，并且在 inventory disabled 或 report 被 `max_sessions` 截断时把 Host Session report 标记为 incremental，因此 Worker omitted-session cleanup 只会基于完整证据运行。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -150,6 +151,7 @@ superseded_by:
 - Rust tests 断言 rejected command-event acknowledgements 会被识别，不会被当作 successful ack。
 - Rust tests 断言 app-server `command.started` event payload 会标识目标 Host Session，且不会把该字段带到非 started events 上。
 - Rust tests 断言 Host Session report 会标记 app-server inventory failure，而不是把失败折叠成 successful empty app-server snapshot。
+- Rust tests 断言 app-server inventory 会沿 `nextCursor` 翻页，遇到 `thread/list` error 或 malformed response 会失败，并且 disabled 或 truncated Host Session report 会标记为 incremental。
 - Rust tests 覆盖 connector 还没读取 turn id 时的 `turn/start` 取消窗口。
 - 合并前跑完整 `pnpm test`、Rust workspace tests、build、journal validation 和 PR readiness review。
 
