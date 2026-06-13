@@ -39,7 +39,7 @@ mode = "codex_exec"
 mode = "app_server"
 ```
 
-App-server execution 当前只会把 lifecycle events 和最终 assistant message 摘要发回 Cloudflare。CLI adapter 还会在 Codex JSONL 包含 token usage 时回传 token-usage 摘要。Connector 不会上传完整 Codex stdout/stderr、本机 transcripts、artefacts 或 token 级日志。
+App-server execution 当前只会把 lifecycle events 和最终 assistant message 摘要发回 Cloudflare；app-server `commandExecution` output 默认不会上传。CLI adapter 还会在 Codex JSONL 包含 token usage 时回传 token-usage 摘要。Connector 不会上传完整 Codex stdout/stderr、本机 transcripts、artefacts 或 token 级日志。
 `codex_exec` 会通过 stdin 传入 Codex prompt，`app_server` 会通过 `turn/start` 传入；每个 Codex command 都有 connector 配置里的 runtime timeout。
 
 ## 后续需要保留的成本控制

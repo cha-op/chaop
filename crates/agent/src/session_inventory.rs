@@ -1171,6 +1171,7 @@ fn run_app_server_command(
         timeout_seconds,
         &cancel,
     )?;
+    request_id += 1;
     let Some(turn) = turn_response
         .get("result")
         .and_then(|result| result.get("turn"))
@@ -1199,6 +1200,7 @@ fn run_app_server_command(
         deadline,
         timeout_seconds,
         &cancel,
+        &mut request_id,
     )
 }
 
@@ -1319,20 +1321,7 @@ fn resolve_app_server_thread_id_for_command(
         timeout_seconds,
         cancel,
     )?;
-    match scan {
-        AppServerArchivePageScan::Complete(scan) => Ok(scan.thread_ids.into_iter().next()),
-        AppServerArchivePageScan::Exhausted { session_thread_ids }
-            if !session_thread_ids.is_empty() =>
-        {
-            Err(AppServerCommandError::Other(
-                "app-server execution exceeded page budget while resolving a session tree"
-                    .to_owned(),
-            ))
-        }
-        AppServerArchivePageScan::Exhausted { .. } => Err(AppServerCommandError::Other(
-            "app-server execution exceeded page budget before resolving thread state".to_owned(),
-        )),
-    }
+    Ok(scan.thread_ids.into_iter().next())
 }
 
 fn find_app_server_thread_ids_in_pages_for_command(
@@ -1344,13 +1333,13 @@ fn find_app_server_thread_ids_in_pages_for_command(
     deadline: Instant,
     timeout_seconds: u64,
     cancel: &AtomicBool,
-) -> Result<AppServerArchivePageScan, AppServerCommandError> {
+) -> Result<AppServerArchiveCompletePageScan, AppServerCommandError> {
     let mut seen_threads = HashSet::new();
     let mut seen_match_thread_ids = HashSet::new();
     let mut session_thread_ids = Vec::new();
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
-    for _ in 0..APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE {
+    loop {
         ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
         let response = send_app_server_request_for_command(
             socket,
@@ -1370,12 +1359,10 @@ fn find_app_server_thread_ids_in_pages_for_command(
 
         let matches = app_server_archive_thread_ids_from_response(&response, thread_id);
         if let Some(exact_thread_id) = matches.exact_thread_id {
-            return Ok(AppServerArchivePageScan::Complete(
-                AppServerArchiveCompletePageScan {
-                    thread_ids: vec![exact_thread_id],
-                    matched_exact_thread: true,
-                },
-            ));
+            return Ok(AppServerArchiveCompletePageScan {
+                thread_ids: vec![exact_thread_id],
+                matched_exact_thread: true,
+            });
         }
         for session_thread_id in matches.session_thread_ids {
             if seen_match_thread_ids.insert(session_thread_id.clone()) {
@@ -1393,25 +1380,20 @@ fn find_app_server_thread_ids_in_pages_for_command(
             .count();
         let next_cursor = app_server_thread_list_next_cursor(&response);
         if next_cursor.is_none() || page_len == 0 || new_key_count == 0 {
-            return Ok(AppServerArchivePageScan::Complete(
-                AppServerArchiveCompletePageScan {
-                    thread_ids: session_thread_ids,
-                    matched_exact_thread: false,
-                },
-            ));
+            return Ok(AppServerArchiveCompletePageScan {
+                thread_ids: session_thread_ids,
+                matched_exact_thread: false,
+            });
         }
         let next_cursor = next_cursor.expect("checked above");
         if !seen_cursors.insert(next_cursor.clone()) {
-            return Ok(AppServerArchivePageScan::Complete(
-                AppServerArchiveCompletePageScan {
-                    thread_ids: session_thread_ids,
-                    matched_exact_thread: false,
-                },
-            ));
+            return Ok(AppServerArchiveCompletePageScan {
+                thread_ids: session_thread_ids,
+                matched_exact_thread: false,
+            });
         }
         cursor = Some(next_cursor);
     }
-    Ok(AppServerArchivePageScan::Exhausted { session_thread_ids })
 }
 
 fn wait_for_app_server_turn_completion(
@@ -1422,10 +1404,20 @@ fn wait_for_app_server_turn_completion(
     deadline: Instant,
     timeout_seconds: u64,
     cancel: &AtomicBool,
+    next_request_id: &mut i64,
 ) -> Result<Vec<ConnectorEvent>, AppServerCommandError> {
     let mut output = AppServerTurnOutput::default();
     loop {
-        ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
+        if cancel.load(Ordering::Relaxed) {
+            send_app_server_turn_interrupt(socket, *next_request_id, thread_id, turn_id);
+            *next_request_id += 1;
+            return Err(AppServerCommandError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            send_app_server_turn_interrupt(socket, *next_request_id, thread_id, turn_id);
+            *next_request_id += 1;
+            return Err(AppServerCommandError::TimedOut(timeout_seconds));
+        }
         configure_socket_timeout(
             socket,
             remaining_app_server_command_timeout(timeout, deadline),
@@ -1455,6 +1447,27 @@ fn wait_for_app_server_turn_completion(
     }
 }
 
+fn send_app_server_turn_interrupt(
+    socket: &mut AppServerSocket,
+    id: i64,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    let _ = socket.send(Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "turn/interrupt",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id
+            }
+        })
+        .to_string()
+        .into(),
+    ));
+}
+
 fn handle_app_server_turn_notification(
     value: &Value,
     thread_id: &str,
@@ -1469,11 +1482,6 @@ fn handle_app_server_turn_notification(
         "item/agentMessage/delta" if notification_matches(params, thread_id, turn_id) => {
             if let Some(delta) = params.get("delta").and_then(Value::as_str) {
                 output.agent_message.push_str(delta);
-            }
-        }
-        "item/commandExecution/outputDelta" if notification_matches(params, thread_id, turn_id) => {
-            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                output.command_output.push_str(delta);
             }
         }
         "turn/completed" if turn_completed_notification_matches(params, thread_id, turn_id) => {
@@ -1537,17 +1545,6 @@ fn app_server_command_events_from_turn(
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
             summary: "Codex app-server turn completed without an assistant message.".to_owned(),
-        });
-    }
-
-    let command_output = command_output_from_turn(turn).or_else(|| {
-        fallback.and_then(|output| compact_command_summary(&output.command_output, 500))
-    });
-    if let Some(output) = command_output {
-        events.push(ConnectorEvent {
-            kind: "command.output".to_owned(),
-            priority: "P3".to_owned(),
-            summary: format!("Codex app-server command output: {output}"),
         });
     }
 
@@ -1615,16 +1612,6 @@ fn last_agent_message_from_turn(turn: &Value) -> Option<String> {
         .last()
 }
 
-fn command_output_from_turn(turn: &Value) -> Option<String> {
-    turn.get("items")
-        .and_then(Value::as_array)?
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("commandExecution"))
-        .filter_map(|item| item.get("aggregatedOutput").and_then(Value::as_str))
-        .filter_map(|text| compact_command_summary(text, 500))
-        .last()
-}
-
 fn app_server_turn_error_message(error: Option<&Value>) -> String {
     error
         .and_then(|error| error.get("message"))
@@ -1649,7 +1636,6 @@ fn compact_command_summary(value: &str, max_chars: usize) -> Option<String> {
 #[derive(Default)]
 struct AppServerTurnOutput {
     agent_message: String,
-    command_output: String,
 }
 
 fn ensure_app_server_command_budget(
@@ -3931,6 +3917,135 @@ mod tests {
     }
 
     #[test]
+    fn app_server_command_resolves_session_beyond_archive_sync_page_budget() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-old-1",
+                            "sessionId": "session-tree-old-1",
+                            "updatedAt": 1781263000
+                        }
+                    ],
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-old-2",
+                            "sessionId": "session-tree-old-2",
+                            "updatedAt": 1781263100
+                        }
+                    ],
+                    "nextCursor": "cursor-page-3"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-live-1",
+                            "sessionId": "session-tree-1",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "turns": []
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "result": {
+                    "turn": completed_turn("turn-1", "page-three command")
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            None,
+            "command-1",
+            "Find me on page three",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].summary, "Codex: page-three command");
+        assert_eq!(events[1].kind, "command.finished");
+
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first thread/list request");
+        let second_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second thread/list request");
+        let third_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("third thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+
+        assert_eq!(
+            first_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            None
+        );
+        assert_eq!(
+            second_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+        assert_eq!(
+            third_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-3")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-live-1")
+        );
+    }
+
+    #[test]
     fn app_server_command_reports_failed_turn() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let url = run_fake_app_server(vec![
@@ -4067,6 +4182,203 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].summary, "Codex: done after notification");
         assert_eq!(events[1].kind, "command.finished");
+    }
+
+    #[test]
+    fn app_server_command_interrupts_active_turn_when_cancelled() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-live-1",
+                            "sessionId": "session-tree-1",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "turns": []
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "turn": in_progress_turn("turn-1")
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {}
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                None,
+                "command-1",
+                "Keep running",
+                worker_cancel,
+            )
+        });
+
+        let _list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let _resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let _turn_start_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("turn/start request");
+
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let interrupt_request = requests
+            .recv_timeout(Duration::from_secs(3))
+            .expect("turn/interrupt request");
+        let events = worker.join().expect("app-server command worker");
+
+        assert_eq!(
+            interrupt_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("turn/interrupt")
+        );
+        assert_eq!(
+            interrupt_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-live-1")
+        );
+        assert_eq!(
+            interrupt_request
+                .pointer("/params/turnId")
+                .and_then(serde_json::Value::as_str),
+            Some("turn-1")
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "command.failed");
+        assert_eq!(
+            events[0].summary,
+            "Codex app-server turn was cancelled because the connector connection closed."
+        );
+    }
+
+    #[test]
+    fn app_server_command_omits_local_command_execution_output() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let url = run_fake_app_server(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-live-1",
+                            "sessionId": "session-tree-1",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "turns": []
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "turn": {
+                        "id": "turn-1",
+                        "items": [
+                            {
+                                "type": "commandExecution",
+                                "id": "item-command-1",
+                                "aggregatedOutput": "secret stdout should stay local"
+                            },
+                            {
+                                "type": "agentMessage",
+                                "id": "item-agent-1",
+                                "text": "safe assistant summary",
+                                "phase": null,
+                                "memoryCitation": null
+                            }
+                        ],
+                        "itemsView": "full",
+                        "status": "completed",
+                        "error": null,
+                        "startedAt": 1781263443,
+                        "completedAt": 1781263444,
+                        "durationMs": 1000
+                    }
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            None,
+            "command-1",
+            "Run local command",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].summary, "Codex: safe assistant summary");
+        assert_eq!(events[1].kind, "command.finished");
+        assert!(events.iter().all(|event| {
+            !event.summary.contains("secret stdout")
+                && !event.summary.contains("Codex app-server command output")
+        }));
     }
 
     fn run_fake_app_server(responses: Vec<serde_json::Value>) -> String {

@@ -39,7 +39,7 @@ mode = "codex_exec"
 mode = "app_server"
 ```
 
-The connector currently sends only lifecycle events and the final assistant message summary back to Cloudflare for app-server execution. The CLI adapter also sends a token-usage summary when Codex JSONL includes one. It does not upload full Codex stdout/stderr, local transcripts, artefacts, or per-token logs.
+The connector currently sends only lifecycle events and the final assistant message summary back to Cloudflare for app-server execution. It does not upload app-server `commandExecution` output by default. The CLI adapter also sends a token-usage summary when Codex JSONL includes one. It does not upload full Codex stdout/stderr, local transcripts, artefacts, or per-token logs.
 Codex prompts are passed over stdin for `codex_exec` and through `turn/start` for `app_server`; connector config keeps a runtime timeout for each Codex command.
 
 ## Cost Controls To Keep
