@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { BootstrapPayload, HostSessionSummary } from "@chaop/protocol";
 import {
+  historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
   localThreadWorkspaceId,
@@ -133,6 +134,53 @@ test("localThreadConnectorId drops stale connector selections", () => {
 
   assert.equal(localThreadConnectorId(data, "workspace-docs", "connector-a"), undefined);
   assert.equal(localThreadConnectorId(data, "workspace-docs", "connector-b"), "connector-b");
+});
+
+test("historyBackfillNotice summarises imported history", () => {
+  assert.equal(
+    historyBackfillNotice({
+      attempted: true,
+      imported_event_count: 2
+    }),
+    "Attached. Imported 2 history events."
+  );
+});
+
+test("historyBackfillNotice calls out truncated backfill", () => {
+  assert.equal(
+    historyBackfillNotice({
+      attempted: true,
+      imported_event_count: 30,
+      truncated: true
+    }),
+    "Attached. Imported 30 history events; older history was truncated."
+  );
+});
+
+test("historyBackfillNotice handles empty and failed backfills", () => {
+  assert.equal(
+    historyBackfillNotice({
+      attempted: true,
+      imported_event_count: 0
+    }),
+    "Attached. History backfill found no importable events."
+  );
+  assert.equal(
+    historyBackfillNotice({
+      attempted: false,
+      imported_event_count: 0
+    }),
+    undefined
+  );
+  assert.equal(
+    historyBackfillNotice({
+      attempted: true,
+      imported_event_count: 0,
+      error: "Connector timed out"
+    }),
+    undefined
+  );
+  assert.equal(historyBackfillNotice(undefined), undefined);
 });
 
 function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {

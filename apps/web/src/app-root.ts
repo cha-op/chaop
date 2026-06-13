@@ -29,6 +29,7 @@ import {
   unarchiveTask
 } from "./api.js";
 import {
+  historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
   localThreadWorkspaceId,
@@ -79,6 +80,9 @@ export class ChaopApp extends LitElement {
 
   @state()
   private actionError: string | undefined;
+
+  @state()
+  private actionNotice: string | undefined;
 
   @state()
   private realtimeState: RealtimeState = "connecting";
@@ -172,6 +176,7 @@ export class ChaopApp extends LitElement {
         <main>
           ${this.renderTopBar()}
           ${this.actionError ? html`<div class="action-alert" role="alert">${this.actionError}</div>` : nothing}
+          ${this.actionNotice ? html`<div class="action-notice" role="status">${this.actionNotice}</div>` : nothing}
           ${this.view === "operations-map" ? this.renderOperationsMap() : nothing}
           ${this.view === "task-board" ? this.renderTaskBoard() : nothing}
           ${this.view === "host-sessions" ? this.renderHostSessions() : nothing}
@@ -614,6 +619,7 @@ export class ChaopApp extends LitElement {
     const task = this.taskForThread(thread.id);
     this.commandState = "submitting";
     this.actionError = undefined;
+    this.actionNotice = undefined;
     try {
       const response = await createCommand({
         workspace_id: thread.workspace_id,
@@ -677,6 +683,7 @@ export class ChaopApp extends LitElement {
 
   private readonly submitLocalThreadCreate = async (event: Event): Promise<void> => {
     event.preventDefault();
+    this.actionNotice = undefined;
     const form = event.currentTarget as HTMLFormElement;
     const workspaceId = String(new FormData(form).get("workspace_id") ?? "");
     if (!workspaceId) {
@@ -694,6 +701,7 @@ export class ChaopApp extends LitElement {
     const connectorId = localThreadConnectorId(this.data, workspaceId, this.newThreadConnectorId);
     this.newThreadState = "creating";
     this.actionError = undefined;
+    this.actionNotice = undefined;
     let response: CreateLocalThreadResponse;
     try {
       response = await createLocalThread({
@@ -720,6 +728,7 @@ export class ChaopApp extends LitElement {
 
   private async toggleTaskArchive(task: TaskSummary): Promise<void> {
     this.actionError = undefined;
+    this.actionNotice = undefined;
     try {
       const response = task.archived_at
         ? await unarchiveTask(task.id)
@@ -734,11 +743,14 @@ export class ChaopApp extends LitElement {
 
   private async attachSession(session: HostSessionSummary): Promise<void> {
     this.actionError = undefined;
+    this.actionNotice = undefined;
     try {
       const response = await attachHostSession(session.session_id, { connector_id: session.connector_id });
       this.mergeAttachedSession(response);
       if (response.backfill?.error) {
         this.actionError = `Attached, but history backfill failed: ${response.backfill.error}`;
+      } else {
+        this.actionNotice = historyBackfillNotice(response.backfill);
       }
       this.openThread(response.thread.id);
     } catch (error) {
@@ -748,6 +760,7 @@ export class ChaopApp extends LitElement {
 
   private async detachSession(session: HostSessionSummary): Promise<void> {
     this.actionError = undefined;
+    this.actionNotice = undefined;
     try {
       const response = await detachHostSession(session.session_id, { connector_id: session.connector_id });
       this.mergeDetachedSession(response);
@@ -759,6 +772,7 @@ export class ChaopApp extends LitElement {
 
   private readonly refreshHostSessionInventory = async (): Promise<void> => {
     this.actionError = undefined;
+    this.actionNotice = undefined;
     this.hostSessionsRefreshState = "refreshing";
     this.hostSessionsRefreshSummary = undefined;
     try {

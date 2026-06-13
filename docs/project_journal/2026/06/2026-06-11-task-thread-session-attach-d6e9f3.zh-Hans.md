@@ -91,6 +91,7 @@ superseded_by:
 - Rust connector 只读取被请求的本机 Codex session。它优先读取匹配的 rollout 文件，跳过注入的 developer/context records、reasoning records 和 tool output records，只返回简短的 user、assistant 和 tool call 摘要；如果找不到 rollout，则 fallback 到该 session 在 `history.jsonl` 里的近期 prompt。
 - Worker 会把返回的摘要作为幂等的 `command.output` thread events 写入，event id 使用确定性的 backfill id，因此重复 attach/backfill 不会重复导入历史。Backfill events 会保留本机原始时间戳，并且要求 connector 声明 `host_session_backfill_v2` capability；该 capability 只会在 session inventory 开启时声明。
 - Browser 会立即合并 attach response 中导入的 backfill events；如果 backfill 失败，会保留已成功 attachment，并单独显示 warning。Thread Centre 也会通过 thread-scoped events API 重新读取当前 thread 的 event tail，所以旧 backfill history 即使比全局 recent-event feed 更旧，刷新后仍然可见。
+- 合并后的 hardening 会在 Browser 中为成功的 history backfill 显示中性提示，包括导入的 event 数量、没有可导入 events 的情况，以及有界截断；失败的 backfill 仍然显示为 warning。
 - 已 attach Host Session tasks 在 Chaop 里 archive/unarchive 时，现在会先更新 D1，再尝试通过 connector 把可解析的本机 Codex app-server thread 同步到 `thread/archive` 和 `thread/unarchive` methods。同步失败会作为 warning 回传，因此本地 archive 状态仍然可用；仅存在于 Chaop 本地的 tasks 和 history-only Host Sessions 仍然只改 D1，connector 不会修改本机 history files。
 - Review follow-up 让 archive sync 分页扫描 app-server `thread/list`，不再只检查最前面的二百条 rows，因此较旧但已经 attach 的 app-server threads 仍然可以在调用 `thread/archive` 或 `thread/unarchive` 前被解析到。
 - Review follow-up 会把 app-server inventory presence 与 title source 分开记录，因此即使某个 app-server thread 的显示标题来自 metadata 或 history，它在后续 inventory refresh 后仍可参与 archive/unarchive 同步。
