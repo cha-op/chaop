@@ -35,7 +35,15 @@ test("command target connector source is added by forward migration", async () =
   );
   assert.match(
     migration,
-    /UPDATE commands\s+SET target_connector_id_source = 'explicit'\s+WHERE target_connector_id IS NOT NULL/
+    /SET target_connector_id_source = 'explicit'\s+WHERE target_connector_id IS NOT NULL\s+AND NOT EXISTS/
+  );
+  assert.match(
+    migration,
+    /SET target_connector_id_source = 'attached',\s+lease_target_host_session_id =/
+  );
+  assert.match(
+    migration,
+    /AND hs\.connector_id = commands\.target_connector_id/
   );
 });
 

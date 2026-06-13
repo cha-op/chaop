@@ -79,6 +79,7 @@ superseded_by:
 - Offline frozen-diff review found that a command already bound to a stored app-server session target could still be leased against a newer current attachment before any release/retarget flow cleared that stored target. Pending dispatch now requires stored app-server lease targets to be empty or match the selected Host Session session id before dispatch or lease update.
 - A follow-up frozen-diff review found that explicitly targeted commands could still depend on an attached Host Session without using the guarded insert path. Command creation now guards every command that read an attachment before insert while preserving `explicit` target-source semantics.
 - The same review found stale rejected `command.started` acknowledgements could generate a final failure event without polling the connector's next pending command. The Durable Object now treats final events returned by the DB result as a same-connector dispatch trigger too.
+- A follow-up independent review found migration `0008` could not distinguish legacy auto-selected `target_connector_id` values from user-explicit targets. The migration now leaves attached commands with mismatched legacy targets as default `auto`, marks matching attachment targets as `attached`, and only preserves `explicit` for legacy targets without an attached Host Session.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -127,6 +128,7 @@ superseded_by:
 - Worker DB tests assert pending dispatch skips commands whose stored app-server target differs from the current attachment.
 - Worker route tests assert explicit attached command targets are rejected if the attachment changes before insert.
 - Worker Durable Object tests assert rejected `command.started` events that generate `command.failed` results still poll pending work for that connector.
+- Migration tests and a local SQLite smoke check cover the refined legacy `target_connector_id_source` upgrade classification.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.
