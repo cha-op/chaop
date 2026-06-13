@@ -1425,8 +1425,6 @@ fn find_app_server_thread_ids_in_pages_for_command(
     cancel: &AtomicBool,
 ) -> Result<AppServerArchiveCompletePageScan, AppServerCommandError> {
     let mut seen_threads = HashSet::new();
-    let mut seen_match_thread_ids = HashSet::new();
-    let mut session_thread_ids = Vec::new();
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     loop {
@@ -1454,10 +1452,11 @@ fn find_app_server_thread_ids_in_pages_for_command(
                 matched_exact_thread: true,
             });
         }
-        for session_thread_id in matches.session_thread_ids {
-            if seen_match_thread_ids.insert(session_thread_id.clone()) {
-                session_thread_ids.push(session_thread_id);
-            }
+        if let Some(session_thread_id) = matches.session_thread_ids.into_iter().next() {
+            return Ok(AppServerArchiveCompletePageScan {
+                thread_ids: vec![session_thread_id],
+                matched_exact_thread: false,
+            });
         }
 
         let page_len = app_server_thread_list_data(&response)
@@ -1471,14 +1470,14 @@ fn find_app_server_thread_ids_in_pages_for_command(
         let next_cursor = app_server_thread_list_next_cursor(&response);
         if next_cursor.is_none() || page_len == 0 || new_key_count == 0 {
             return Ok(AppServerArchiveCompletePageScan {
-                thread_ids: session_thread_ids,
+                thread_ids: Vec::new(),
                 matched_exact_thread: false,
             });
         }
         let next_cursor = next_cursor.expect("checked above");
         if !seen_cursors.insert(next_cursor.clone()) {
             return Ok(AppServerArchiveCompletePageScan {
-                thread_ids: session_thread_ids,
+                thread_ids: Vec::new(),
                 matched_exact_thread: false,
             });
         }
@@ -3912,7 +3911,8 @@ mod tests {
                             "cwd": "/tmp/project",
                             "updatedAt": 1781263443
                         }
-                    ]
+                    ],
+                    "nextCursor": "cursor-page-2"
                 }
             }),
             json!({

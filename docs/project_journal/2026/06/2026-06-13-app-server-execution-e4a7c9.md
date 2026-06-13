@@ -41,13 +41,17 @@ superseded_by:
 - PR readiness review found and fixed a dispatch consistency bug where command creation selected the latest attached Host Session but command leasing could join an older duplicate attachment row; leasing now uses the same task-first, latest-updated Host Session selection.
 - PR readiness review also aligned command leasing with command creation for task commands whose thread is attached but whose task attachment is missing; leasing now falls back from task attachment to thread attachment only when no task-attached Host Session exists.
 - Offline frozen-diff review found and fixed a pending-command detach race; detaching an app-server Host Session now fails pending or expired-leased Codex commands that can no longer resolve any replacement app-server attachment, instead of leaving them permanently pending.
+- Final PR readiness review tightened that detach cleanup further: only replacement app-server Host Sessions owned by the same target connector can preserve a pending command.
+- Final offline review found that app-server command startup kept paging after a session match; the command resolver now returns as soon as the target app-server session is found.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
 - Worker tests assert command leasing joins only the latest task-first attached Host Session.
 - Worker tests assert command leasing preserves the task-first, thread-fallback attachment selection SQL.
 - Worker route tests cover app-server Host Session detach failing pending attachment-dependent Codex commands.
+- Worker route tests assert detached-command replacement matching is scoped to the command target connector.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
+- Rust tests assert app-server command session resolution stops paging once the target session is found.
 - Rust tests cover the `turn/start` cancellation window before the connector has read the turn id.
 - Full `pnpm test`, Rust workspace tests, build, journal validation, and PR readiness review before merge.
 

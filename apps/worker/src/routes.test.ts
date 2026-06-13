@@ -2474,7 +2474,9 @@ function hostSessionDetachDb(): D1Database & {
         assert.match(sql, /cmd\.state = 'pending'/);
         assert.match(sql, /NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /hs\.id <> \?/);
+        assert.match(sql, /hs\.connector_id = cmd\.target_connector_id/);
         assert.match(sql, /hst\.id <> \?/);
+        assert.match(sql, /hst\.connector_id = cmd\.target_connector_id/);
         return {
           bind(
             workspaceId: string,

@@ -405,6 +405,7 @@ async function failCommandsForDetachedAppServerHostSession(
            WHERE hs.workspace_id = cmd.workspace_id
              AND hs.id <> ?
              AND hs.app_server_present = 1
+             AND hs.connector_id = cmd.target_connector_id
              AND (
                (cmd.task_id IS NOT NULL AND hs.attached_task_id = cmd.task_id)
                OR (
@@ -418,6 +419,7 @@ async function failCommandsForDetachedAppServerHostSession(
                      WHERE hst.workspace_id = cmd.workspace_id
                        AND hst.id <> ?
                        AND hst.app_server_present = 1
+                       AND hst.connector_id = cmd.target_connector_id
                        AND hst.attached_task_id = cmd.task_id
                    )
                  )
