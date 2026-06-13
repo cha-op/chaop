@@ -330,7 +330,11 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
         };
       }
 
-      if (/UPDATE commands/.test(sql) && /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/.test(sql)) {
+      if (
+        /UPDATE commands/.test(sql) &&
+        /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/.test(sql) &&
+        !/SET state = 'pending'/.test(sql)
+      ) {
         return {
           bind() {
             return {
@@ -346,6 +350,8 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
         assert.match(sql, /target_connector_id = CASE WHEN \? THEN NULL ELSE target_connector_id END/);
         assert.match(sql, /target_connector_id_source = CASE WHEN \? THEN 'auto' ELSE target_connector_id_source END/);
         assert.match(sql, /lease_target_host_session_id = \?/);
+        assert.match(sql, /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /hs\.session_id <> \?/);
         return {
           bind(
             clearTargetConnectorId: number,
@@ -353,7 +359,8 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             updatedAt: string,
             commandId: string,
             connectorId: string,
-            targetHostSessionId: string
+            targetHostSessionId: string,
+            replacementExcludedSessionId: string
           ) {
             assert.equal(clearTargetConnectorId, 1);
             assert.equal(clearTargetConnectorIdSource, 1);
@@ -361,6 +368,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             assert.equal(commandId, "command-1");
             assert.equal(connectorId, "connector-stale");
             assert.equal(targetHostSessionId, "session-old");
+            assert.equal(replacementExcludedSessionId, "session-old");
             return {
               async run() {
                 counters.leaseReleases += 1;

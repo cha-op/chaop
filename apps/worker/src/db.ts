@@ -1287,7 +1287,50 @@ async function releaseRejectedAppServerStartLease(
        AND lease_owner_connector_id = ?
        AND state = 'leased'
        AND lease_target_host_session_id IS NOT NULL
-       AND lease_target_host_session_id = ?`
+       AND lease_target_host_session_id = ?
+       AND EXISTS (
+         SELECT 1
+         FROM host_sessions hs
+         INNER JOIN connectors c ON c.id = hs.connector_id
+         INNER JOIN workspace_connectors wc
+           ON wc.workspace_id = commands.workspace_id
+          AND wc.connector_id = hs.connector_id
+         WHERE hs.id = COALESCE(
+           (
+             SELECT hs_task.id
+             FROM host_sessions hs_task
+             WHERE hs_task.workspace_id = commands.workspace_id
+               AND commands.task_id IS NOT NULL
+               AND hs_task.attached_task_id = commands.task_id
+             ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+             LIMIT 1
+           ),
+           (
+             SELECT hs_thread.id
+             FROM host_sessions hs_thread
+             WHERE hs_thread.workspace_id = commands.workspace_id
+               AND commands.thread_id IS NOT NULL
+               AND hs_thread.attached_thread_id = commands.thread_id
+               AND (
+                 commands.task_id IS NULL
+                 OR NOT EXISTS (
+                   SELECT 1
+                   FROM host_sessions hst
+                   WHERE hst.workspace_id = commands.workspace_id
+                     AND hst.attached_task_id = commands.task_id
+                 )
+               )
+             ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+             LIMIT 1
+           )
+         )
+           AND hs.session_id <> ?
+           AND hs.app_server_present = 1
+           AND wc.can_execute = 1
+           AND c.status <> 'offline'
+           AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
+           AND (commands.target_connector_id IS NULL OR hs.connector_id = commands.target_connector_id)
+       )`
   )
     .bind(
       clearImplicitTarget,
@@ -1295,6 +1338,7 @@ async function releaseRejectedAppServerStartLease(
       now,
       command.id,
       connectorId,
+      command.lease_target_host_session_id,
       command.lease_target_host_session_id
     )
     .run();

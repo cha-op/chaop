@@ -64,6 +64,7 @@ superseded_by:
 - 后续 independent review 发现 detach cleanup 的 `SELECT` 与 failure `UPDATE` 之间仍可能发生 command 被重新 lease 或 retarget 的 race。现在 guarded failure update 会在写入 task/event side effects 前重新验证 command workspace、type、target connector、scope、lease ownership，以及当前 replacement Host Session selection。
 - 后续 frozen-diff review 发现 rejected stale app-server start 释放 lease fields 后，仍会保留 command creation 时写入的 stale implicit `target_connector_id`。现在释放该 stale app-server lease 时只会清空 attached-session 推导出的 target，所以立即 re-dispatch 可以按当前 attachment 重新选择 connector，同时显式指定 target 的 command 不会漂移到其他 connector。
 - 后续 independent review 发现 guarded detach failure update 把 `lease_target_host_session_id` 与内部 `host_sessions.id` 比较，而 command 中保存的是 app-server session id。现在 guarded update 用 `hostSession.session_id` 做 lease-target matching，只在 replacement selection 排除被 detach row 时使用 `hostSession.id`。
+- Codex review-gate 又发现一个 stale-start release race：rejected app-server `command.started` acknowledgement 现在只有在当前 task/thread target 能解析到可执行的 replacement app-server Host Session 时，才会 release 回 pending。若没有 replacement，command 会保持 app-server scope，交给 detach cleanup 失败处理，而不会变成 generic `codex_exec` command。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -93,6 +94,8 @@ superseded_by:
 - Worker DB 与 Durable Object tests 断言 rejected stale app-server start 在释放 app-server lease 以便立即 re-dispatch 时，只会清空 attached-session 推导出的 stale target connector。
 - Worker DB tests 断言 stale app-server start 被拒后仍会保留显式 command target，避免用户指定的 target connector 漂移到其他 host。
 - Worker route tests 断言 guarded detach failure update 会为 `lease_target_host_session_id` 绑定已存的 app-server session id，而不是内部 Host Session row id。
+- Worker DB tests 断言 rejected stale app-server start 在旧 app-server Host Session 已 detach 且没有可执行 replacement 时，不会释放 lease。
+- Worker Durable Object tests 断言当 replacement app-server Host Session 可用时，rejected targeted app-server start 仍会 release 并重新 dispatch。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。

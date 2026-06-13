@@ -64,6 +64,7 @@ superseded_by:
 - Follow-up independent review found detach cleanup could still fail a command after it was re-leased or retargeted between the cleanup `SELECT` and failure `UPDATE`. The guarded failure update now revalidates command workspace, type, target connector, scope, lease ownership, and current replacement Host Session selection before writing task or event side effects.
 - Follow-up frozen-diff review found rejected stale app-server starts released lease fields but left the stale implicit `target_connector_id` from command creation. Releasing that stale app-server lease now clears only attached-session inferred targets, so immediate re-dispatch can follow the current attachment without allowing explicitly targeted commands to drift to another connector.
 - Follow-up independent review found the guarded detach failure update compared `lease_target_host_session_id` to the internal `host_sessions.id` instead of the app-server session id stored in commands. The guarded update now uses `hostSession.session_id` for lease-target matching and reserves `hostSession.id` only for excluding the detached row from replacement selection.
+- Codex review-gate found one more stale-start release race: rejected app-server `command.started` acknowledgements now release back to pending only when the current task/thread target resolves to an executable replacement app-server Host Session. If no replacement exists, the command stays app-server-scoped for detach cleanup instead of becoming a generic `codex_exec` command.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -93,6 +94,8 @@ superseded_by:
 - Worker DB and Durable Object tests assert rejected stale app-server starts clear only attached-session inferred target connectors while releasing the app-server lease for immediate re-dispatch.
 - Worker DB tests assert explicit command targets are preserved when stale app-server starts are rejected, preventing host drift after a user-selected target connector.
 - Worker route tests assert guarded detach failure updates bind the stored app-server session id for `lease_target_host_session_id`, not the internal Host Session row id.
+- Worker DB tests assert rejected stale app-server starts do not release the lease when the old app-server Host Session was detached and no executable replacement exists.
+- Worker Durable Object tests assert rejected targeted app-server starts still release and re-dispatch when a replacement app-server Host Session is available.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.
