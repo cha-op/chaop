@@ -403,7 +403,16 @@ async function failCommandsForDetachedAppServerHostSession(
          AND (cmd.target_connector_id = ? OR cmd.target_connector_id IS NULL)
          AND (
            cmd.state = 'pending'
-           OR cmd.state = 'leased'
+           OR (
+             cmd.state = 'leased'
+             AND (
+               cmd.lease_target_host_session_id = ?
+               OR (
+                 cmd.lease_target_host_session_id IS NULL
+                 AND cmd.lease_owner_connector_id = ?
+               )
+             )
+           )
          )
          AND (
            (? IS NOT NULL AND cmd.task_id = ?)
@@ -444,6 +453,8 @@ async function failCommandsForDetachedAppServerHostSession(
        ORDER BY cmd.created_at ASC`
     ).bind(
       hostSession.workspace_id,
+      hostSession.connector_id,
+      hostSession.session_id,
       hostSession.connector_id,
       taskId,
       taskId,

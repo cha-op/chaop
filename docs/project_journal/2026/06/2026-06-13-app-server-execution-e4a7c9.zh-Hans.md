@@ -56,6 +56,7 @@ superseded_by:
 - Independent review 发现外部注册的 connector 如果同时声明 `codex_exec` 和 `codex_app_server_exec`，仍可能跳过 `command.started` Host Session revalidation。现在 Worker 会在 command lease 时保存本次选中的 app-server Host Session id，并要求该 leased target 的 started event 回传同一个 target，之后 guarded state update 才能执行。
 - 后续 review 发现这个修复里的 guarded update 仍需要比较 event target 与 lease-time target，而不只是比较当前 attachment。现在 guarded `command.started` update 会在同一条 SQL 中同时检查 `lease_target_host_session_id` 是否等于 event target。
 - Independent review 发现没有 app-server lease target 的普通 Codex lease 仍可能接受带 target 的 `command.started` event，因为 guarded SQL 把 `NULL` lease target 当成 permissive。现在 guarded update 要求 lease-time app-server target 非空，且必须等于 event target。
+- Independent review 发现 detach cleanup 可能失败由其他 connector 租走、且并不依赖被 detach app-server Host Session 的 nullable-target leased command。现在 leased cleanup 分支要求 lease-time Host Session target 匹配，或在 legacy null lease target 情况下要求 lease owner 就是被 detach 的 connector。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -70,6 +71,7 @@ superseded_by:
 - Worker tests 断言 app-server-leased `command.started` event 如果缺少 leased target session id 会被拒绝，同时没有 app-server lease target 的普通 Codex start 仍会被接受。
 - Worker tests 断言 app-server-leased `command.started` event 即使 event target 匹配当前 attachment，只要它不同于 lease-time target，也会被拒绝。
 - Worker tests 断言普通 Codex lease 即使当前 attachment 匹配 event target，也会拒绝带 app-server target 的 `command.started` event。
+- Worker route tests 断言 Host Session detach 不会失败由其他 connector 租走的 nullable-target leased command。
 - Worker DB tests 断言当前 Host Session attachment 消失后，app-server-only `command.started` events 会被拒绝。
 - Worker DB tests 断言同一个 connector 把另一个 Host Session reattach 到 command scope 后，app-server-only `command.started` events 会被拒绝。
 - Worker DB tests 断言 app-server-only `command.started` events 只有在 guarded command-state update 仍能把当前 target Host Session 解析到 event `target_host_session_id` 时才会被接受。

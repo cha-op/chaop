@@ -769,6 +769,30 @@ test("host session detach clears the attached task and thread when D1 is bound",
   assert.equal(db.eventInserts, 1);
 });
 
+test("host session detach keeps nullable-target leases owned by another connector", async () => {
+  const db = hostSessionDetachDb({ returnDetachedCommands: false });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
 test("CORS preflight returns configured browser headers", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/commands", {
@@ -2495,7 +2519,7 @@ function hostSessionAttachBackfillDb(
   return db as D1Database & { readonly eventInserts: number };
 }
 
-function hostSessionDetachDb(): D1Database & {
+function hostSessionDetachDb(options: { returnDetachedCommands?: boolean } = {}): D1Database & {
   readonly commandFailures: number;
   readonly taskUpdates: number;
   readonly eventInserts: number;
@@ -2546,6 +2570,8 @@ function hostSessionDetachDb(): D1Database & {
         assert.match(sql, /cmd\.target_connector_id IS NULL/);
         assert.match(sql, /cmd\.state = 'pending'/);
         assert.match(sql, /cmd\.state = 'leased'/);
+        assert.match(sql, /cmd\.lease_target_host_session_id = \?/);
+        assert.match(sql, /cmd\.lease_owner_connector_id = \?/);
         assert.doesNotMatch(sql, /cmd\.lease_until IS NOT NULL/);
         assert.match(sql, /NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
@@ -2562,6 +2588,8 @@ function hostSessionDetachDb(): D1Database & {
           bind(
             workspaceId: string,
             connectorId: string,
+            leaseTargetHostSessionId: string,
+            legacyLeaseOwnerConnectorId: string,
             taskIdPresent: string | null,
             taskId: string | null,
             threadIdPresent: string | null,
@@ -2571,6 +2599,8 @@ function hostSessionDetachDb(): D1Database & {
           ) {
             assert.equal(workspaceId, "workspace-api");
             assert.equal(connectorId, "connector-online");
+            assert.equal(leaseTargetHostSessionId, "session-1");
+            assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
             assert.equal(taskIdPresent, "task-host-1");
             assert.equal(taskId, "task-host-1");
             assert.equal(threadIdPresent, "thread-host-1");
@@ -2580,7 +2610,7 @@ function hostSessionDetachDb(): D1Database & {
             return {
               async all() {
                 return {
-                  results: [
+                  results: options.returnDetachedCommands === false ? [] : [
                     {
                       id: "command-detached",
                       workspace_id: "workspace-api",
