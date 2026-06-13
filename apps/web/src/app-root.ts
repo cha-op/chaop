@@ -26,7 +26,7 @@ import {
   refreshHostSessions,
   unarchiveTask
 } from "./api.js";
-import { mergeBootstrapPayload } from "./state.js";
+import { localThreadWorkspaceId, mergeBootstrapPayload } from "./state.js";
 
 type View = "operations-map" | "task-board" | "host-sessions" | "thread-centre" | "budget-board";
 type TaskBoardMode = "active" | "archive";
@@ -424,7 +424,7 @@ export class ChaopApp extends LitElement {
             <h2>Threads</h2>
             <span>${this.activeThreads().length} active</span>
           </div>
-          ${this.renderCreateThreadForm("stacked")}
+          ${this.renderCreateThreadForm("stacked", thread.id)}
           <div class="thread-list">
             ${this.activeThreads().map((item) => this.threadListItem(item))}
           </div>
@@ -619,11 +619,12 @@ export class ChaopApp extends LitElement {
     }
   };
 
-  private renderCreateThreadForm(layout: "compact" | "stacked") {
-    const workspace = this.data?.workspaces[0];
+  private renderCreateThreadForm(layout: "compact" | "stacked", selectedThreadId?: string) {
+    const workspaceId = localThreadWorkspaceId(this.data, selectedThreadId);
     const connectors = this.data?.connectors ?? [];
     return html`
       <form class=${`create-thread-form ${layout}`} @submit=${this.submitLocalThreadCreate}>
+        <input type="hidden" name="workspace_id" .value=${workspaceId ?? ""} />
         <input
           aria-label="New thread title"
           .value=${this.newThreadTitle}
@@ -648,7 +649,7 @@ export class ChaopApp extends LitElement {
         <button
           type="submit"
           class="primary-action"
-          ?disabled=${this.newThreadState === "creating" || !workspace}
+          ?disabled=${this.newThreadState === "creating" || !workspaceId}
         >
           ${this.newThreadState === "creating" ? "Creating..." : "New local thread"}
         </button>
@@ -658,8 +659,9 @@ export class ChaopApp extends LitElement {
 
   private readonly submitLocalThreadCreate = async (event: Event): Promise<void> => {
     event.preventDefault();
-    const workspace = this.data?.workspaces[0];
-    if (!workspace) {
+    const form = event.currentTarget as HTMLFormElement;
+    const workspaceId = String(new FormData(form).get("workspace_id") ?? "");
+    if (!workspaceId) {
       this.newThreadState = "failed";
       this.actionError = "No workspace is available for local thread creation";
       return;
@@ -671,7 +673,7 @@ export class ChaopApp extends LitElement {
     let response: CreateLocalThreadResponse;
     try {
       response = await createLocalThread({
-        workspace_id: workspace.id,
+        workspace_id: workspaceId,
         title,
         connector_id: this.newThreadConnectorId || undefined
       });

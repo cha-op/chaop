@@ -23,6 +23,17 @@ export function mergeBootstrapPayload(
   };
 }
 
+export function localThreadWorkspaceId(
+  data: BootstrapPayload | undefined,
+  selectedThreadId?: string
+): string | undefined {
+  if (!data) return undefined;
+  const selectedThread = selectedThreadId
+    ? data.threads.find((thread) => thread.id === selectedThreadId)
+    : undefined;
+  return selectedThread?.workspace_id ?? data.workspaces[0]?.id;
+}
+
 function mergeById<T extends { id: string }>(
   incoming: T[],
   current: T[],

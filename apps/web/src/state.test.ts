@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { BootstrapPayload, HostSessionSummary } from "@chaop/protocol";
-import { mergeBootstrapPayload } from "./state.ts";
+import { localThreadWorkspaceId, mergeBootstrapPayload } from "./state.ts";
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
   const currentSession = hostSession("session-old");
@@ -35,6 +35,33 @@ test("mergeBootstrapPayload keeps realtime host sessions newer than bootstrap sy
   assert.deepEqual(merged.host_sessions, [currentSession]);
 });
 
+test("localThreadWorkspaceId uses the selected thread workspace", () => {
+  const data = payload({
+    workspaces: [
+      workspace("workspace-api"),
+      workspace("workspace-docs")
+    ],
+    threads: [
+      thread("thread-api", "workspace-api"),
+      thread("thread-docs", "workspace-docs")
+    ]
+  });
+
+  assert.equal(localThreadWorkspaceId(data, "thread-docs"), "workspace-docs");
+});
+
+test("localThreadWorkspaceId falls back to the first workspace", () => {
+  const data = payload({
+    workspaces: [
+      workspace("workspace-api"),
+      workspace("workspace-docs")
+    ],
+    threads: [thread("thread-docs", "workspace-docs")]
+  });
+
+  assert.equal(localThreadWorkspaceId(data, "missing-thread"), "workspace-api");
+});
+
 function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   return {
     user: {
@@ -62,6 +89,27 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
     },
     server_time: "2026-06-12T10:00:00.000Z",
     ...overrides
+  };
+}
+
+function workspace(id: string) {
+  return {
+    id,
+    name: id,
+    connector_ids: [],
+    active_thread_count: 0
+  };
+}
+
+function thread(id: string, workspaceId: string) {
+  return {
+    id,
+    workspace_id: workspaceId,
+    title: id,
+    state: "active" as const,
+    last_seq: 0,
+    updated_at: "2026-06-12T10:00:00.000Z",
+    realtime_mode: "realtime" as const
   };
 }
 
