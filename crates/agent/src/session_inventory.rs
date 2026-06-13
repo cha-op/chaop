@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tungstenite::{Message, connect};
 
+const APP_SERVER_THREAD_SOURCE_KINDS: [&str; 3] = ["cli", "vscode", "appServer"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentHostSessionsReport {
     pub sessions: Vec<AgentHostSession>,
@@ -520,6 +522,7 @@ fn load_app_server_sessions(
                 "archived": null,
                 "limit": limit,
                 "sortDirection": "desc",
+                "sourceKinds": APP_SERVER_THREAD_SOURCE_KINDS,
                 "useStateDbOnly": true
             }
         })
@@ -883,7 +886,9 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc::{self, Receiver};
     use std::thread;
+    use std::time::Duration;
     use tungstenite::{Message, accept};
 
     #[test]
@@ -984,7 +989,7 @@ mod tests {
 
     #[test]
     fn loads_app_server_sessions_after_initialization() {
-        let url = run_fake_app_server(vec![json!({
+        let (url, requests) = run_fake_app_server_with_requests(vec![json!({
             "jsonrpc": "2.0",
             "id": 1,
             "result": {
@@ -1001,7 +1006,25 @@ mod tests {
 
         let sessions = load_app_server_sessions(&url, 20, 1).expect("sessions");
         let session = sessions.get("session-1").expect("session");
+        let request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let source_kinds = request
+            .pointer("/params/sourceKinds")
+            .and_then(serde_json::Value::as_array)
+            .expect("sourceKinds array");
 
+        assert_eq!(
+            request.get("method").and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            source_kinds
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["cli", "vscode", "appServer"]
+        );
         assert_eq!(session.name.as_deref(), Some("Server title"));
         assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(
@@ -1206,8 +1229,15 @@ mod tests {
     }
 
     fn run_fake_app_server(responses: Vec<serde_json::Value>) -> String {
+        run_fake_app_server_with_requests(responses).0
+    }
+
+    fn run_fake_app_server_with_requests(
+        responses: Vec<serde_json::Value>,
+    ) -> (String, Receiver<serde_json::Value>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
         let address = listener.local_addr().expect("fake app-server address");
+        let (requests_tx, requests_rx) = mpsc::channel();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept fake app-server client");
             let mut socket = accept(stream).expect("accept websocket");
@@ -1263,13 +1293,14 @@ mod tests {
             assert!(initialized.get("id").is_none());
 
             for response in responses {
-                let _request = read_fake_app_server_message(&mut socket);
+                let request = read_fake_app_server_message(&mut socket);
+                let _ = requests_tx.send(request);
                 socket
                     .send(Message::Text(response.to_string().into()))
                     .expect("send app-server response");
             }
         });
-        format!("ws://{address}")
+        (format!("ws://{address}"), requests_rx)
     }
 
     fn read_fake_app_server_message(
