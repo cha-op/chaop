@@ -12,7 +12,7 @@ Current slice:
 - Rust connector crate that can connect to the Worker, receive command dispatches, run placeholder execution by default, and opt in to local `codex exec` execution through private configuration.
 - Initial D1 schema migration set under `migrations/d1/`.
 
-This slice now persists command lifecycle rows in D1, relays pending commands through the Durable Object, and closes the loop with the Rust connector. Local Codex CLI execution is opt-in per connector with `execution.mode = "codex_exec"`; experimental Codex app-server protocol integration and R2 artefact capture remain later slices.
+This slice now persists command lifecycle rows in D1, relays pending commands through the Durable Object, closes the loop with the Rust connector, attaches local Codex sessions, and can create new local Codex app-server threads through a connector with `session_inventory.app_server_url` configured. Local Codex CLI execution is opt-in per connector with `execution.mode = "codex_exec"`; R2 artefact capture remains a later slice.
 
 Start locally:
 

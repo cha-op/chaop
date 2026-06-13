@@ -3,7 +3,7 @@ id: 20260611-d6e9f3-zh-Hans
 title: Task Thread Session Attach 切片
 status: active
 created: 2026-06-11
-updated: 2026-06-12
+updated: 2026-06-13
 branch:
 pr:
 supersedes: []
@@ -67,8 +67,24 @@ superseded_by:
 - Browser command request validation 现在会在写入 DB 前拒绝 thread、task 和 target connector 字段里的空字符串 optional ids。
 - Session inventory 现在会从 `session_index.jsonl` 和 `history.jsonl` 读取有上限的近期 tail，不再每次扫描都把完整文件读入内存。默认周期扫描间隔现在是 60 秒；Host Sessions 的手动 refresh 仍会请求在线 connectors 立即重扫。
 
+## 2026-06-13 本机 Thread 创建
+- Chaop 现在有 Browser API，可以通过声明了 `app_server_threads` 的在线 connector 创建新的本机 Codex app-server thread。
+- `WorkspaceDO` 现在在已有 agent WebSocket 上支持有界 request/response RPC：Worker 发送 `thread.create`，connector 回复 `thread.create_result`；创建失败时，API 会返回清晰的 timeout 或 connector 错误。
+- Rust connector 现在会使用 `session_inventory.app_server_url` 调用 app-server `thread/start`，再用 `thread/name/set` 写入请求的 title，并把创建出的 session 作为轻量 host-session metadata 回传。
+- Review follow-up 收紧了 cwd 边界：新建本机 thread 会从 connector 私有 `workspace_root` 启动，Browser 请求不能提供任意 cwd。App-server title 更新改为 best-effort，因此 `thread/start` 成功后即使 `thread/name/set` 失败，也仍会 attach 已创建的 thread。创建出的 host session 也会按请求 workspace upsert，避免多 workspace connector 把新 task/thread attach 到另一个 workspace。
+- Review follow-up 也会从 `thread/list` 读取 app-server-only inventory rows 的 `cwd` 和 `updatedAt`，避免 connector 在创建成功后的即时 refresh 又用空 cwd 或 epoch timestamp 覆盖刚 attach 好的 session。
+- Review follow-up 还会在普通 connector inventory refresh 期间保留已 attach host sessions 的 workspace 归属，避免新建成功后的 inventory report 又把 created session 移回 connector 默认 workspace。
+- Review follow-up 会为本机 thread RPC 选择同一 connector 的最新 WebSocket，降低 connector 重启期间命中过期 socket 而超时的概率，并确保测试 fixture 不包含本机 workspace 路径。
+- Worker 的 D1 helper 会 upsert 创建出的 app-server session，并复用已有 attach 流程，所以新 session 会立即变成 task/thread 组合。
+- Task Board 和 Thread Command Centre 现在提供聚焦的 `New local thread` 表单；创建成功后会直接打开真实 thread。
+- Review follow-up 让 app-server client 对齐已记录的协议：会在 `thread/list` 或 `thread/start` 前先发送 `initialize` 和 `initialized`，并接受没有 legacy `sessionId` 的官方 `Thread.id` 响应。
+- Review follow-up 让 app-server inventory scan 显式请求 `cli`、`vscode` 和 `appServer` source kinds，确保 Chaop 创建的 threads 在 connector 重启后仍能被发现。
+- Review follow-up 让 Thread Centre 的创建表单使用当前选中 thread 的 workspace，并把 connector 选项过滤到该 workspace；当旧 connector selection 不再属于当前 workspace 时，会回退到 Auto。
+- Review follow-up 现在会用 `app_server_timeout_seconds` 限制普通 `ws://` app-server TCP 连接，避免黑洞式本机 app-server URL 无限阻塞 connector 的主 WebSocket loop。
+- Review follow-up 会在 bootstrap 中暴露 connector capabilities，并把 `New local thread` 的 connector 选项过滤到 `app_server_threads`，让手动选择与后端 eligibility check 保持一致。
+- 部署指南现在记录了本地 `codex app-server --listen ws://127.0.0.1:9876` 前提，以及私有 connector `app_server_url` 配置。
+
 ## 下一步
-- 下一步优先做明确的新建 Codex thread 流程。Chaop 应该能从 Task Board 或 Thread Command Centre 创建本机 Codex/app-server thread，把创建出来的 session 绑定回 task/thread 组合，并且在本机 app-server 不可用时返回清晰的 connector/app-server 错误。
 - 新建 thread 跑通后，再做旧 session history backfill，让 attach 的旧 sessions 可以显示有用的历史 output，同时默认不上传宽泛的本机 transcripts。
 - History backfill 之后，再通过 connector 把 Chaop archive/unarchive 同步到本机 Codex app-server archive 状态。本机 history 文件保持只读。
 - 在 app-server protocol path 可以干净覆盖 create、resume、archive 和 event/history reads 之前，Codex CLI adapter 继续作为当前可用的 execution fallback。

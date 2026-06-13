@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ensureConnectorInventory, markConnectorDisconnected, recordAgentEvent, recordHostSessions } from "./db.js";
+import {
+  LocalThreadTargetError,
+  chooseConnectorForLocalThread,
+  ensureConnectorInventory,
+  markConnectorDisconnected,
+  recordAgentEvent,
+  recordHostSessions
+} from "./db.js";
 import type { Env } from "./types.js";
 
 test("recordAgentEvent ignores stale events from a connector that lost the lease", async () => {
@@ -86,7 +93,7 @@ test("ensureConnectorInventory retires duplicate connectors through disconnect c
   await ensureConnectorInventory({ DB: db } as Env, "connector-new", {
     connector_name: "mac-studio",
     hostname: "mac-studio.local",
-    workspace_root: "/Users/joey/Program/Codex-workspace",
+    workspace_root: "/workspace/codex",
     capabilities: ["placeholder_commands"]
   });
 
@@ -108,7 +115,7 @@ test("recordHostSessions preserves stored sessions outside the latest top-N repo
           session_id: "session-new",
           title: "New session",
           title_source: "metadata",
-          cwd: "/Users/joey/Program/new",
+          cwd: "/workspace/new",
           updated_at: "2026-06-12T11:00:00.000Z"
         }
       ]
@@ -125,6 +132,52 @@ test("recordHostSessions preserves stored sessions outside the latest top-N repo
     reported: 1,
     stored: 1
   });
+});
+
+test("recordHostSessions preserves attached session workspace during inventory refresh", async () => {
+  const db = hostSessionsInventoryDb({ workspaceId: "workspace-other" });
+
+  await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Attached session refresh",
+          title_source: "app_server",
+          cwd: "/workspace/refreshed",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(db.workspaceOf("session-attached"), "workspace-api");
+  assert.equal(db.titleOf("session-attached"), "Attached session refresh");
+});
+
+test("chooseConnectorForLocalThread selects app-server capable connectors", async () => {
+  const connectorId = await chooseConnectorForLocalThread(
+    { DB: localThreadConnectorDb({ id: "connector-online" }) } as Env,
+    { id: "user-1", email: "operator@example.com", name: "Operator" },
+    { workspace_id: "workspace-api" }
+  );
+
+  assert.equal(connectorId, "connector-online");
+});
+
+test("chooseConnectorForLocalThread rejects connectors without app-server support", async () => {
+  await assert.rejects(
+    () =>
+      chooseConnectorForLocalThread(
+        { DB: localThreadConnectorDb(null) } as Env,
+        { id: "user-1", email: "operator@example.com", name: "Operator" },
+        { workspace_id: "workspace-api", connector_id: "connector-placeholder" }
+      ),
+    LocalThreadTargetError
+  );
 });
 
 function agentEventGuardDb(command: {
@@ -580,7 +633,7 @@ function duplicateConnectorRetirementDb() {
                       session_id: "session-1",
                       title: "Attached session",
                       title_source: "history",
-                      cwd: "/Users/joey/Program/project",
+                      cwd: "/workspace/project",
                       attached_task_id: "task-old",
                       attached_thread_id: "thread-old",
                       updated_at: "2026-06-12T10:00:00.000Z"
@@ -660,7 +713,8 @@ function duplicateConnectorRetirementDb() {
   return db as D1Database & typeof counters;
 }
 
-function hostSessionsInventoryDb() {
+function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
+  const selectedWorkspaceId = options.workspaceId ?? "workspace-api";
   type StoredHostSession = {
     id: string;
     connector_id: string;
@@ -686,7 +740,7 @@ function hostSessionsInventoryDb() {
         session_id: "session-attached",
         title: "Attached session",
         title_source: "history",
-        cwd: "/Users/joey/Program/attached",
+        cwd: "/workspace/attached",
         attached_task_id: "task-attached",
         attached_thread_id: "thread-attached",
         updated_at: "2026-06-12T10:00:00.000Z"
@@ -697,6 +751,12 @@ function hostSessionsInventoryDb() {
     sync: undefined as { connectorId: string; reported: number; stored: number } | undefined,
     hasSession(sessionId: string) {
       return sessions.has(sessionId);
+    },
+    workspaceOf(sessionId: string) {
+      return sessions.get(sessionId)?.workspace_id;
+    },
+    titleOf(sessionId: string) {
+      return sessions.get(sessionId)?.title;
     }
   };
 
@@ -721,7 +781,7 @@ function hostSessionsInventoryDb() {
             assert.equal(connectorId, "connector-online");
             return {
               async first() {
-                return { workspace_id: "workspace-api" };
+                return { workspace_id: selectedWorkspaceId };
               }
             };
           }
@@ -744,21 +804,29 @@ function hostSessionsInventoryDb() {
           ) {
             assert.equal(connectorId, "connector-online");
             assert.equal(hostname, "mac-studio.local");
-            assert.equal(workspaceId, "workspace-api");
+            assert.equal(workspaceId, selectedWorkspaceId);
             assert.equal(discoveredAt, "2026-06-12T11:00:05.000Z");
+            assert.match(
+              sql,
+              /CASE\s+WHEN host_sessions\.attached_task_id IS NOT NULL OR host_sessions\.attached_thread_id IS NOT NULL/
+            );
             return {
               async run() {
+                const existing = sessions.get(sessionId);
                 sessions.set(sessionId, {
                   id,
                   connector_id: connectorId,
                   hostname,
-                  workspace_id: workspaceId,
+                  workspace_id:
+                    existing?.attached_task_id || existing?.attached_thread_id
+                      ? existing.workspace_id
+                      : workspaceId,
                   session_id: sessionId,
                   title,
                   title_source: titleSource,
                   cwd,
-                  attached_task_id: null,
-                  attached_thread_id: null,
+                  attached_task_id: existing?.attached_task_id ?? null,
+                  attached_thread_id: existing?.attached_thread_id ?? null,
                   updated_at: updatedAt
                 });
                 return { success: true };
@@ -821,8 +889,72 @@ function hostSessionsInventoryDb() {
     },
     hasSession(sessionId: string) {
       return counters.hasSession(sessionId);
+    },
+    workspaceOf(sessionId: string) {
+      return counters.workspaceOf(sessionId);
+    },
+    titleOf(sessionId: string) {
+      return counters.titleOf(sessionId);
     }
   };
 
   return db as D1Database & typeof counters;
+}
+
+function localThreadConnectorDb(row: { id: string } | null): D1Database {
+  return {
+    prepare(sql: string) {
+      if (/INSERT INTO users/.test(sql)) {
+        return {
+          bind(userId: string, email: string, name: string) {
+            assert.equal(userId, "user-1");
+            assert.equal(email, "operator@example.com");
+            assert.equal(name, "Operator");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id FROM workspaces/.test(sql)) {
+        return {
+          bind(workspaceId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            return {
+              async first() {
+                return { id: workspaceId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT c\.id/.test(sql) && /app_server_threads/.test(sql)) {
+        assert.match(sql, /workspace_connectors/);
+        assert.match(sql, /wc\.can_execute = 1/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /capabilities_json LIKE/);
+        return {
+          bind(first: string, second?: string) {
+            if (second !== undefined) {
+              assert.equal(first, "connector-placeholder");
+              assert.equal(second, "workspace-api");
+            } else {
+              assert.equal(first, "workspace-api");
+            }
+            return {
+              async first() {
+                return row;
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    }
+  } as unknown as D1Database;
 }

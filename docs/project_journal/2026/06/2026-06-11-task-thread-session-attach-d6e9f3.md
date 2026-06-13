@@ -3,7 +3,7 @@ id: 20260611-d6e9f3
 title: Task Thread Session Attach Slice
 status: active
 created: 2026-06-11
-updated: 2026-06-12
+updated: 2026-06-13
 branch:
 pr:
 supersedes: []
@@ -67,8 +67,24 @@ superseded_by:
 - Browser command request validation now rejects empty optional ids for thread, task, and target connector fields before DB insert.
 - Session inventory now reads bounded recent tails from `session_index.jsonl` and `history.jsonl` instead of loading the full files every scan. The default periodic scan interval is now 60 seconds, while manual Host Sessions refresh still asks online connectors to rescan immediately.
 
+## 2026-06-13 Local Thread Creation
+- Chaop now has a Browser API for creating a new local Codex app-server thread through an online connector that advertises `app_server_threads`.
+- `WorkspaceDO` now supports a bounded request/response RPC over the existing agent WebSocket: Worker sends `thread.create`, the connector replies with `thread.create_result`, and the API returns a clear timeout or connector error when creation fails.
+- The Rust connector now uses `session_inventory.app_server_url` to call app-server `thread/start`, applies a requested title with `thread/name/set`, and reports the created session back as lightweight host-session metadata.
+- Review follow-up tightened the cwd boundary: new local threads start from the connector's private `workspace_root`, while Browser requests cannot supply an arbitrary cwd. App-server title updates are best-effort so a successful `thread/start` is still attached if `thread/name/set` fails. The created host session is also upserted with the request workspace so multi-workspace connectors cannot attach the new task/thread to a different workspace.
+- Review follow-up also keeps app-server-only inventory rows useful after creation by reading `cwd` and `updatedAt` from `thread/list`, so the connector's immediate refresh does not overwrite the freshly attached session with empty cwd or epoch timestamps.
+- Review follow-up preserves the workspace of already attached host sessions during ordinary connector inventory refreshes, so a post-create inventory report cannot move the created session back to the connector's default workspace.
+- Review follow-up makes local thread RPC choose the newest WebSocket for a connector, reducing stale-socket timeouts during connector restarts, and keeps test fixtures free of machine-local workspace paths.
+- Worker D1 helpers upsert the created app-server session and reuse the existing attach flow so the new session immediately becomes a task/thread pair.
+- Task Board and Thread Command Centre now expose a focused `New local thread` form; successful creation opens the real thread.
+- Review follow-up aligns the app-server client with the documented protocol by sending `initialize` and `initialized` before `thread/list` or `thread/start`, and by accepting official `Thread.id` responses without a legacy `sessionId`.
+- Review follow-up makes app-server inventory scans request `cli`, `vscode`, and `appServer` source kinds so Chaop-created threads remain discoverable after connector restarts.
+- Review follow-up makes the Thread Centre create form use the selected thread's workspace and filters connector choices to that workspace, falling back to Auto when a stale connector selection no longer belongs there.
+- Review follow-up bounds plain `ws://` app-server TCP connects with `app_server_timeout_seconds`, so a blackholed local app-server URL cannot block the connector's main WebSocket loop indefinitely.
+- Review follow-up exposes connector capabilities in bootstrap and filters `New local thread` connector choices to `app_server_threads`, so manual selection matches the backend eligibility check.
+- Deployment guidance now documents the local `codex app-server --listen ws://127.0.0.1:9876` prerequisite and the private connector `app_server_url` setting.
+
 ## Next Steps
-- Prioritise the explicit new Codex thread flow next. Chaop should be able to create a local Codex/app-server thread from Task Board or Thread Command Centre, bind the created session back to a task/thread pair, and report a clear connector/app-server error when local app-server is unavailable.
 - After new-thread creation works, add old-session history backfill so attached sessions can show useful previous output without uploading broad local transcripts by default.
 - After history backfill, sync Chaop archive/unarchive to the local Codex app-server archive state through the connector. Keep local history files read-only.
 - Keep the Codex CLI adapter as the current working execution fallback until the app-server protocol path can cover create, resume, archive, and event/history reads cleanly.

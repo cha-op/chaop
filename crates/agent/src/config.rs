@@ -123,6 +123,9 @@ impl AgentConfig {
         if self.execution.mode == ExecutionMode::CodexExec {
             capabilities.push("codex_exec".to_owned());
         }
+        if self.session_inventory.app_server_url.is_some() {
+            capabilities.push("app_server_threads".to_owned());
+        }
 
         BootstrapRequest {
             connector_name: self.connector_name.clone(),
@@ -277,5 +280,33 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
         let request = config.bootstrap_request("mac-studio.local");
 
         assert!(request.capabilities.contains(&"codex_exec".to_owned()));
+    }
+
+    #[test]
+    fn advertises_app_server_threads_when_configured() {
+        let config = AgentConfig {
+            connector_name: "mac-studio".to_owned(),
+            control_url: "wss://api.example.com/ws/agent".to_owned(),
+            bootstrap_url: "https://api.example.com/connector/bootstrap".to_owned(),
+            workspace_root: "/Users/you/Program".into(),
+            token_file: "/Users/you/.chaop/connector.token".into(),
+            spool_db: "/Users/you/.chaop/connector-spool.sqlite".into(),
+            bootstrap: super::BootstrapConfig {
+                secret_file: "/Users/you/.chaop/bootstrap.secret".into(),
+            },
+            execution: super::ExecutionConfig::default(),
+            session_inventory: super::SessionInventoryConfig {
+                app_server_url: Some("ws://127.0.0.1:9876".to_owned()),
+                ..super::SessionInventoryConfig::default()
+            },
+        };
+
+        let request = config.bootstrap_request("mac-studio.local");
+
+        assert!(
+            request
+                .capabilities
+                .contains(&"app_server_threads".to_owned())
+        );
     }
 }

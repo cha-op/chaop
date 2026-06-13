@@ -12,7 +12,7 @@
 Browser GUI -> Cloudflare Access -> Worker / Durable Object -> D1 / R2 -> Rust connector -> Worker / Durable Object -> Browser GUI
 ```
 
-当前实现状态：仓库可以把 command lifecycle 写入 D1，通过 Durable Object dispatch pending command，接收 Rust connector 发回的 lifecycle events，并把本机 Codex sessions attach 成 task/thread 视图。只有当私有 connector 配置包含 `execution.mode = "codex_exec"` 时，它才会执行本机 Codex CLI 工作。它可以可选读取 Codex app-server 的 `Thread.name` 作为 session title，但暂时还没有把执行迁移到 experimental app-server protocol。R2 artefact capture 仍然保留给后续切片。
+当前实现状态：仓库可以把 command lifecycle 写入 D1，通过 Durable Object dispatch pending command，接收 Rust connector 发回的 lifecycle events，把本机 Codex sessions attach 成 task/thread 视图，并且在 connector 配置了 `session_inventory.app_server_url` 时创建新的本机 Codex app-server thread。只有当私有 connector 配置包含 `execution.mode = "codex_exec"` 时，它才会执行本机 Codex CLI 工作。R2 artefact capture 仍然保留给后续切片。
 
 不要把密钥提交到 Git。敏感值只通过本地忽略文件、密码管理器，或者直接执行 `wrangler secret put` 来提供。
 
@@ -353,7 +353,26 @@ extra_args = ["--skip-git-repo-check"]
 Prompt 会通过 stdin 传给 Codex，不放在命令行参数里。除非有明确运维理由，不要放宽 timeout 和 output cap。
 由 `launchctl` 或其他 service manager 启动的常驻 connector，请使用绝对 `codex_command` 路径。这类进程不一定继承交互式 shell 的 `PATH`；如果找不到 executable，Codex exec 会在使用 workspace `cwd` 之前就失败。
 
-Session inventory 默认开启。Connector 会从 `CODEX_HOME` 或 `~/.codex` 读取本机 Codex metadata，上报 session id、title、cwd、更新时间和 title 来源，不上传 rollout transcripts。Title 解析优先使用 metadata 或 rollout 里的标题，其次使用可选 app-server `Thread.name`，再其次使用本地 history 里的近期 prompt，最后 fallback 到 cwd 和 session id。只有当你已经用本地 WebSocket listener 运行 `codex app-server`，并希望 Chaop 使用 app-server 标题时，才设置 `app_server_url`。`app_server_timeout_seconds` 应保持较短，避免 app-server 未运行时阻塞 connector 启动。`report_interval_seconds` 控制周期性本机重扫间隔；周期路径只有 inventory 变化时才会上报。Host Sessions 的 refresh 按钮会请求在线 connectors 立即重扫并上报。
+Session inventory 默认开启。Connector 会从 `CODEX_HOME` 或 `~/.codex` 读取本机 Codex metadata，上报 session id、title、cwd、更新时间和 title 来源，不上传 rollout transcripts。Title 解析优先使用 metadata 或 rollout 里的标题，其次使用可选 app-server `Thread.name`，再其次使用本地 history 里的近期 prompt，最后 fallback 到 cwd 和 session id。
+
+当 Chaop 需要创建新的本机 Codex app-server thread，或需要使用 app-server title 时，设置 `session_inventory.app_server_url`。只有配置了这个 URL 的 connector 才会声明 `app_server_threads` capability；如果没有在线 connector 声明这个 capability，Worker 会拒绝新建本机 thread 请求。`app_server_timeout_seconds` 应保持较短，避免 app-server 停止时阻塞 connector 启动或 thread 创建。
+
+新建本机 thread 一律使用 connector 配置里的 `workspace_root` 作为启动 cwd；Browser API 不接受也不会转发任意 cwd。
+
+使用只有 connector host 能访问的私有 listener 启动本地 app-server：
+
+```bash
+codex app-server --listen ws://127.0.0.1:9876
+```
+
+然后在私有 connector 配置里设置对应 URL：
+
+```toml
+[session_inventory]
+app_server_url = "ws://127.0.0.1:9876"
+```
+
+`report_interval_seconds` 控制周期性本机重扫间隔；周期路径只有 inventory 变化时才会上报。Host Sessions 的 refresh 按钮会请求在线 connectors 立即重扫并上报。
 
 在仓库外创建本地文件目录：
 
@@ -429,6 +448,7 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - 如果 connector 返回 `401`，检查 `AGENT_BOOTSTRAP_SECRET`，并确认 `/connector/bootstrap` 和 `/ws/agent` 没有被 Browser Access 拦截。
 - 如果 Codex exec 返回 `Codex executable not found`，请把 `execution.codex_command` 设置成 connector process 可执行的绝对路径，例如当前 macOS 部署中的 `/opt/homebrew/bin/codex`。这和被 attach session 的 `cwd` 是两回事。
 - 如果 connector 已连接但一直收不到 command，检查 connector bootstrap 是否已经写入 workspace membership，command 是否 target 到可执行 connector，以及已部署 Worker 是否绑定 `WorkspaceDO`。
+- 如果 New local thread 返回 app-server 错误，检查 `codex app-server --listen ws://127.0.0.1:9876` 是否正在运行、`session_inventory.app_server_url` 是否匹配，以及修改配置后是否已经重启 connector。
 - 如果 Host Sessions 页面为空或过期，先使用 Host Sessions refresh 按钮，再等待最多 `session_inventory.report_interval_seconds`，并检查 connector 是否已经在本切片后重启、`session_inventory.enabled` 是否为 true，以及运行 connector 的用户是否可以读取 `CODEX_HOME` 或 `~/.codex`。
 - 如果 attach 之后的历史 Host Session 只显示少量 events，这是当前切片的预期边界：attachment 只导入 session metadata 和 title。历史 rollout/transcript backfill 和完整 artefact capture 留到后续切片。
 - 如果 D1 migration 失败，确认 D1 database UUID 已写入 Worker 配置。

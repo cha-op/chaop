@@ -6,6 +6,7 @@ import {
   type BootstrapPayload,
   type CommandSummary,
   type ConnectorSummary,
+  type CreateLocalThreadResponse,
   type HostSessionsUpdatePayload,
   type HostSessionSummary,
   type TaskState,
@@ -19,12 +20,18 @@ import {
   attachHostSession,
   browserSocketUrl,
   createCommand,
+  createLocalThread,
   detachHostSession,
   loadBootstrap,
   refreshHostSessions,
   unarchiveTask
 } from "./api.js";
-import { mergeBootstrapPayload } from "./state.js";
+import {
+  localThreadConnectorId,
+  localThreadConnectors,
+  localThreadWorkspaceId,
+  mergeBootstrapPayload
+} from "./state.js";
 
 type View = "operations-map" | "task-board" | "host-sessions" | "thread-centre" | "budget-board";
 type TaskBoardMode = "active" | "archive";
@@ -79,6 +86,15 @@ export class ChaopApp extends LitElement {
 
   @state()
   private hostSessionsRefreshSummary: string | undefined;
+
+  @state()
+  private newThreadTitle = "New Codex thread";
+
+  @state()
+  private newThreadConnectorId = "";
+
+  @state()
+  private newThreadState: "idle" | "creating" | "failed" = "idle";
 
   @state()
   private hostSessionsRealtimeSyncedAt: string | undefined;
@@ -276,6 +292,7 @@ export class ChaopApp extends LitElement {
               (category) => html`<span style=${`--category:${category.colour}`}>${category.name}</span>`
             )}
           </div>
+          ${this.renderCreateThreadForm("compact")}
           <div class="mode-control compact" role="group" aria-label="Task board mode">
             ${this.taskBoardModeButton("active", "Active")}
             ${this.taskBoardModeButton("archive", "Archive")}
@@ -412,6 +429,7 @@ export class ChaopApp extends LitElement {
             <h2>Threads</h2>
             <span>${this.activeThreads().length} active</span>
           </div>
+          ${this.renderCreateThreadForm("stacked", thread.id)}
           <div class="thread-list">
             ${this.activeThreads().map((item) => this.threadListItem(item))}
           </div>
@@ -603,6 +621,83 @@ export class ChaopApp extends LitElement {
     } catch (error) {
       this.commandState = "failed";
       this.actionError = actionErrorMessage("Command failed", error);
+    }
+  };
+
+  private renderCreateThreadForm(layout: "compact" | "stacked", selectedThreadId?: string) {
+    const workspaceId = localThreadWorkspaceId(this.data, selectedThreadId);
+    const connectors = localThreadConnectors(this.data, workspaceId);
+    const selectedConnectorId = localThreadConnectorId(this.data, workspaceId, this.newThreadConnectorId) ?? "";
+    return html`
+      <form class=${`create-thread-form ${layout}`} @submit=${this.submitLocalThreadCreate}>
+        <input type="hidden" name="workspace_id" .value=${workspaceId ?? ""} />
+        <input
+          aria-label="New thread title"
+          .value=${this.newThreadTitle}
+          ?disabled=${this.newThreadState === "creating"}
+          @input=${(event: InputEvent) => {
+            this.newThreadTitle = (event.target as HTMLInputElement).value;
+          }}
+        />
+        <select
+          aria-label="Connector"
+          .value=${selectedConnectorId}
+          ?disabled=${this.newThreadState === "creating" || connectors.length === 0}
+          @change=${(event: Event) => {
+            this.newThreadConnectorId = (event.target as HTMLSelectElement).value;
+          }}
+        >
+          <option value="">Auto connector</option>
+          ${connectors.map(
+            (connector) => html`<option value=${connector.id}>${connector.name} · ${connector.hostname}</option>`
+          )}
+        </select>
+        <button
+          type="submit"
+          class="primary-action"
+          ?disabled=${this.newThreadState === "creating" || !workspaceId}
+        >
+          ${this.newThreadState === "creating" ? "Creating..." : "New local thread"}
+        </button>
+      </form>
+    `;
+  }
+
+  private readonly submitLocalThreadCreate = async (event: Event): Promise<void> => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const workspaceId = String(new FormData(form).get("workspace_id") ?? "");
+    if (!workspaceId) {
+      this.newThreadState = "failed";
+      this.actionError = "No workspace is available for local thread creation";
+      return;
+    }
+
+    const title = this.newThreadTitle.trim() || "New Codex thread";
+    const connectorId = localThreadConnectorId(this.data, workspaceId, this.newThreadConnectorId);
+    this.newThreadState = "creating";
+    this.actionError = undefined;
+    let response: CreateLocalThreadResponse;
+    try {
+      response = await createLocalThread({
+        workspace_id: workspaceId,
+        title,
+        connector_id: connectorId
+      });
+    } catch (error) {
+      this.newThreadState = "failed";
+      this.actionError = actionErrorMessage("Thread creation failed", error);
+      return;
+    }
+
+    this.mergeAttachedSession(response);
+    this.newThreadState = "idle";
+    this.newThreadTitle = "New Codex thread";
+    this.openThread(response.thread.id);
+    try {
+      await this.load();
+    } catch (error) {
+      this.actionError = actionErrorMessage("Thread refresh failed", error);
     }
   };
 

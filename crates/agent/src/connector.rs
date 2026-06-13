@@ -2,7 +2,7 @@ use crate::config::{AgentConfig, ExecutionMode};
 use crate::executor::{codex_exec_result_events_with_cancel, codex_exec_started_event};
 use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
-use crate::session_inventory::build_host_sessions_report;
+use crate::session_inventory::{build_host_sessions_report, create_app_server_thread};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -38,6 +38,12 @@ struct Envelope {
 #[derive(Debug, Deserialize)]
 struct CommandDispatch {
     command: CommandPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadCreateDispatch {
+    request_id: String,
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +189,12 @@ fn handle_text_message(
         return Ok(false);
     }
 
+    if envelope.kind == "thread.create" {
+        let dispatch: ThreadCreateDispatch = serde_json::from_value(envelope.payload)?;
+        handle_thread_create(socket, &dispatch, config, last_host_sessions_message)?;
+        return Ok(false);
+    }
+
     if envelope.kind != "command.dispatch" {
         return Ok(false);
     }
@@ -226,6 +238,46 @@ fn handle_text_message(
         deferred_messages,
     )?;
     Ok(true)
+}
+
+fn handle_thread_create(
+    socket: &mut AgentSocket,
+    dispatch: &ThreadCreateDispatch,
+    config: &AgentConfig,
+    last_host_sessions_message: &mut Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match create_app_server_thread(config, dispatch.title.as_deref()) {
+        Ok(session) => {
+            socket.send(Message::Text(
+                json!({
+                    "kind": "thread.create_result",
+                    "payload": {
+                        "request_id": dispatch.request_id,
+                        "ok": true,
+                        "session": session
+                    }
+                })
+                .to_string()
+                .into(),
+            ))?;
+            send_host_sessions(socket, config, last_host_sessions_message, true)?;
+        }
+        Err(error) => {
+            socket.send(Message::Text(
+                json!({
+                    "kind": "thread.create_result",
+                    "payload": {
+                        "request_id": dispatch.request_id,
+                        "ok": false,
+                        "error": error.to_string()
+                    }
+                })
+                .to_string()
+                .into(),
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 fn wait_for_codex_exec_events(
@@ -320,6 +372,9 @@ fn handle_background_text_message(
     let envelope: Envelope = serde_json::from_str(text)?;
     if envelope.kind == "host_sessions.refresh" {
         send_host_sessions(socket, config, last_host_sessions_message, true)?;
+    } else if envelope.kind == "thread.create" {
+        let dispatch: ThreadCreateDispatch = serde_json::from_value(envelope.payload)?;
+        handle_thread_create(socket, &dispatch, config, last_host_sessions_message)?;
     } else {
         deferred_messages.push_back(text.to_owned());
     }

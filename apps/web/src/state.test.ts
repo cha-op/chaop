@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { BootstrapPayload, HostSessionSummary } from "@chaop/protocol";
-import { mergeBootstrapPayload } from "./state.ts";
+import {
+  localThreadConnectorId,
+  localThreadConnectors,
+  localThreadWorkspaceId,
+  mergeBootstrapPayload
+} from "./state.ts";
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
   const currentSession = hostSession("session-old");
@@ -35,6 +40,84 @@ test("mergeBootstrapPayload keeps realtime host sessions newer than bootstrap sy
   assert.deepEqual(merged.host_sessions, [currentSession]);
 });
 
+test("localThreadWorkspaceId uses the selected thread workspace", () => {
+  const data = payload({
+    workspaces: [
+      workspace("workspace-api"),
+      workspace("workspace-docs")
+    ],
+    threads: [
+      thread("thread-api", "workspace-api"),
+      thread("thread-docs", "workspace-docs")
+    ]
+  });
+
+  assert.equal(localThreadWorkspaceId(data, "thread-docs"), "workspace-docs");
+});
+
+test("localThreadWorkspaceId falls back to the first workspace", () => {
+  const data = payload({
+    workspaces: [
+      workspace("workspace-api"),
+      workspace("workspace-docs")
+    ],
+    threads: [thread("thread-docs", "workspace-docs")]
+  });
+
+  assert.equal(localThreadWorkspaceId(data, "missing-thread"), "workspace-api");
+});
+
+test("localThreadConnectors filters connectors by workspace", () => {
+  const data = payload({
+    connectors: [
+      connector("connector-a", ["app_server_threads"]),
+      connector("connector-b", ["app_server_threads"])
+    ],
+    workspaces: [
+      workspace("workspace-api", ["connector-a"]),
+      workspace("workspace-docs", ["connector-b"])
+    ]
+  });
+
+  assert.deepEqual(
+    localThreadConnectors(data, "workspace-docs").map((item) => item.id),
+    ["connector-b"]
+  );
+});
+
+test("localThreadConnectors only includes app-server capable connectors", () => {
+  const data = payload({
+    connectors: [
+      connector("connector-a", ["placeholder_commands"]),
+      connector("connector-b", ["app_server_threads"])
+    ],
+    workspaces: [
+      workspace("workspace-api", ["connector-a", "connector-b"])
+    ]
+  });
+
+  assert.deepEqual(
+    localThreadConnectors(data, "workspace-api").map((item) => item.id),
+    ["connector-b"]
+  );
+});
+
+test("localThreadConnectorId drops stale connector selections", () => {
+  const data = payload({
+    connectors: [
+      connector("connector-a", ["app_server_threads"]),
+      connector("connector-b", ["app_server_threads"])
+    ],
+    workspaces: [
+      workspace("workspace-api", ["connector-a"]),
+      workspace("workspace-docs", ["connector-b"])
+    ]
+  });
+
+  assert.equal(localThreadConnectorId(data, "workspace-docs", "connector-a"), undefined);
+  assert.equal(localThreadConnectorId(data, "workspace-docs", "connector-b"), "connector-b");
+});
+
 function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   return {
     user: {
@@ -62,6 +145,41 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
     },
     server_time: "2026-06-12T10:00:00.000Z",
     ...overrides
+  };
+}
+
+function connector(id: string, capabilities: string[] = []) {
+  return {
+    id,
+    name: id,
+    hostname: `${id}.local`,
+    status: "online" as const,
+    capabilities,
+    logical_agent_count: 1,
+    active_command_count: 0,
+    realtime_mode: "realtime" as const,
+    budget_state: "normal" as const
+  };
+}
+
+function workspace(id: string, connectorIds: string[] = []) {
+  return {
+    id,
+    name: id,
+    connector_ids: connectorIds,
+    active_thread_count: 0
+  };
+}
+
+function thread(id: string, workspaceId: string) {
+  return {
+    id,
+    workspace_id: workspaceId,
+    title: id,
+    state: "active" as const,
+    last_seq: 0,
+    updated_at: "2026-06-12T10:00:00.000Z",
+    realtime_mode: "realtime" as const
   };
 }
 

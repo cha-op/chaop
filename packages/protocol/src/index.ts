@@ -89,6 +89,7 @@ export type ConnectorSummary = {
   name: string;
   hostname: string;
   status: "online" | "offline" | "degraded";
+  capabilities: string[];
   logical_agent_count: number;
   active_command_count: number;
   realtime_mode: RealtimeMode;
@@ -167,6 +168,18 @@ export type RefreshHostSessionsResponse = {
   requested: true;
   dispatched_to: number;
   server_time: string;
+};
+
+export type CreateLocalThreadRequest = {
+  workspace_id: string;
+  title?: string | undefined;
+  connector_id?: string | undefined;
+};
+
+export type CreateLocalThreadResponse = {
+  host_session: HostSessionSummary;
+  task: TaskSummary;
+  thread: ThreadSummary;
 };
 
 export type CommandSummary = {
@@ -307,6 +320,19 @@ export type AgentHostSession = {
 
 export type AgentHostSessionsReport = {
   sessions: AgentHostSession[];
+};
+
+export type LocalThreadCreateDispatch = {
+  request_id: string;
+  workspace_id: string;
+  title?: string | undefined;
+};
+
+export type LocalThreadCreateResult = {
+  request_id: string;
+  ok: boolean;
+  session?: AgentHostSession | undefined;
+  error?: string | undefined;
 };
 
 export type ThrottleNotice = {

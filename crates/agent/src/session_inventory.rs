@@ -4,10 +4,17 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tungstenite::{Message, connect};
+use tungstenite::{
+    Message, WebSocket, client::client, connect, handshake::HandshakeError, http::Uri,
+    stream::MaybeTlsStream,
+};
+
+const APP_SERVER_THREAD_SOURCE_KINDS: [&str; 3] = ["cli", "vscode", "appServer"];
+
+type AppServerSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentHostSessionsReport {
@@ -89,12 +96,12 @@ pub fn build_host_sessions_report(
     )?;
     let history_sessions =
         read_history_sessions(&codex_home, config.session_inventory.max_sessions)?;
-    let app_server_titles = config
+    let app_server_sessions = config
         .session_inventory
         .app_server_url
         .as_deref()
         .and_then(|url| {
-            load_app_server_titles(
+            load_app_server_sessions(
                 url,
                 config.session_inventory.max_sessions,
                 config.session_inventory.app_server_timeout_seconds,
@@ -103,13 +110,15 @@ pub fn build_host_sessions_report(
         })
         .unwrap_or_default();
 
-    for session_id in app_server_titles.keys() {
-        drafts
+    for (session_id, app_session) in &app_server_sessions {
+        let draft = drafts
             .entry(session_id.clone())
             .or_insert_with(|| SessionDraft {
                 session_id: session_id.clone(),
                 ..SessionDraft::default()
             });
+        draft.cwd = first_non_empty_raw(draft.cwd.take(), app_session.cwd.clone());
+        draft.updated_at = max_string(app_session.updated_at.clone(), draft.updated_at.take());
     }
 
     for (session_id, history) in &history_sessions {
@@ -125,7 +134,9 @@ pub fn build_host_sessions_report(
     let mut sessions = drafts
         .into_values()
         .map(|draft| {
-            let app_title = app_server_titles.get(&draft.session_id).cloned();
+            let app_title = app_server_sessions
+                .get(&draft.session_id)
+                .and_then(|session| session.name.clone());
             resolve_session(draft, app_title, &history_sessions)
         })
         .collect::<Vec<_>>();
@@ -499,13 +510,14 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn load_app_server_titles(
+fn load_app_server_sessions(
     url: &str,
     limit: usize,
     timeout_seconds: u64,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    let (mut socket, _) = connect(url)?;
-    configure_socket_timeout(&mut socket, Duration::from_secs(timeout_seconds.max(1)))?;
+) -> Result<HashMap<String, AppServerSession>, Box<dyn std::error::Error>> {
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+    let mut socket = connect_app_server(url, timeout)?;
+    initialize_app_server_connection(&mut socket)?;
     socket.send(Message::Text(
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -515,6 +527,7 @@ fn load_app_server_titles(
                 "archived": null,
                 "limit": limit,
                 "sortDirection": "desc",
+                "sourceKinds": APP_SERVER_THREAD_SOURCE_KINDS,
                 "useStateDbOnly": true
             }
         })
@@ -527,7 +540,7 @@ fn load_app_server_titles(
             Message::Text(text) => {
                 let value = serde_json::from_str::<Value>(text.as_ref())?;
                 if value.get("id").and_then(Value::as_i64) == Some(1) {
-                    return Ok(app_server_titles_from_response(&value));
+                    return Ok(app_server_sessions_from_response(&value));
                 }
             }
             Message::Close(_) => return Ok(HashMap::new()),
@@ -536,8 +549,62 @@ fn load_app_server_titles(
     }
 }
 
+fn connect_app_server(
+    url: &str,
+    timeout: Duration,
+) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
+    let uri = url.parse::<Uri>()?;
+    if uri.scheme_str() == Some("ws") {
+        return connect_plain_app_server(url, &uri, timeout);
+    }
+
+    let (mut socket, _) = connect(url)?;
+    configure_socket_timeout(&mut socket, timeout)?;
+    Ok(socket)
+}
+
+fn connect_plain_app_server(
+    url: &str,
+    uri: &Uri,
+    timeout: Duration,
+) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
+    let host = uri.host().ok_or("app-server URL did not include a host")?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = uri.port_u16().unwrap_or(80);
+    let mut last_error = None;
+
+    for addr in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+                let (socket, _) = match client(url, MaybeTlsStream::Plain(stream)) {
+                    Ok(result) => result,
+                    Err(HandshakeError::Failure(error)) => return Err(error.into()),
+                    Err(HandshakeError::Interrupted(_)) => {
+                        return Err("app-server websocket handshake was interrupted".into());
+                    }
+                };
+                return Ok(socket);
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(match last_error {
+        Some(error) => format!("unable to connect to app-server {url}: {error}").into(),
+        None => format!("app-server URL {url} resolved to no socket addresses").into(),
+    })
+}
+
 fn configure_socket_timeout(
-    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    socket: &mut AppServerSocket,
     timeout: Duration,
 ) -> std::io::Result<()> {
     match socket.get_mut() {
@@ -553,25 +620,253 @@ fn configure_socket_timeout(
     }
 }
 
-fn app_server_titles_from_response(value: &Value) -> HashMap<String, String> {
-    let mut titles = HashMap::new();
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppServerSession {
+    name: Option<String>,
+    cwd: Option<String>,
+    updated_at: Option<String>,
+}
+
+fn app_server_sessions_from_response(value: &Value) -> HashMap<String, AppServerSession> {
+    let mut sessions = HashMap::new();
     let Some(data) = value
         .get("result")
         .and_then(|result| result.get("data"))
         .and_then(Value::as_array)
     else {
-        return titles;
+        return sessions;
     };
     for thread in data {
-        let Some(session_id) = thread.get("sessionId").and_then(Value::as_str) else {
+        let Some(session_id) = app_server_thread_session_id(thread) else {
             continue;
         };
-        let Some(name) = compact_title(thread.get("name").and_then(Value::as_str)) else {
-            continue;
-        };
-        titles.insert(session_id.to_owned(), name);
+        sessions.insert(
+            session_id.to_owned(),
+            AppServerSession {
+                name: compact_title(thread.get("name").and_then(Value::as_str)),
+                cwd: thread
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                updated_at: app_server_thread_timestamp(thread),
+            },
+        );
     }
-    titles
+    sessions
+}
+
+fn app_server_thread_session_id(thread: &Value) -> Option<&str> {
+    thread
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .or_else(|| thread.get("id").and_then(Value::as_str))
+}
+
+#[cfg(test)]
+fn app_server_titles_from_response(value: &Value) -> HashMap<String, String> {
+    app_server_sessions_from_response(value)
+        .into_iter()
+        .filter_map(|(session_id, session)| session.name.map(|name| (session_id, name)))
+        .collect()
+}
+
+pub fn create_app_server_thread(
+    config: &AgentConfig,
+    title: Option<&str>,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    let url = config
+        .session_inventory
+        .app_server_url
+        .as_deref()
+        .ok_or("session_inventory.app_server_url is required for local thread creation")?;
+    let cwd = config.workspace_root.to_string_lossy().into_owned();
+    create_app_server_thread_at(
+        url,
+        title,
+        &cwd,
+        config.session_inventory.app_server_timeout_seconds,
+    )
+}
+
+fn create_app_server_thread_at(
+    url: &str,
+    title: Option<&str>,
+    cwd: &str,
+    timeout_seconds: u64,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+    let mut socket = connect_app_server(url, timeout)?;
+    initialize_app_server_connection(&mut socket)?;
+    let start_response = send_app_server_request(
+        &mut socket,
+        1,
+        "thread/start",
+        serde_json::json!({
+            "cwd": cwd,
+            "ephemeral": false,
+            "threadSource": "user"
+        }),
+    )?;
+    let started = app_server_thread_from_response(&start_response)?;
+    let requested_title = compact_title(title);
+
+    if let Some(title) = requested_title.as_deref() {
+        let _ = send_app_server_request(
+            &mut socket,
+            2,
+            "thread/name/set",
+            serde_json::json!({
+                "threadId": started.id,
+                "name": title
+            }),
+        );
+    }
+
+    Ok(AgentHostSession {
+        session_id: started.session_id.clone(),
+        title: requested_title
+            .or_else(|| compact_title(started.name.as_deref()))
+            .unwrap_or_else(|| {
+                fallback_title(&SessionDraft {
+                    session_id: started.session_id.clone(),
+                    cwd: started.cwd.clone(),
+                    ..SessionDraft::default()
+                })
+            }),
+        title_source: TitleSource::AppServer,
+        cwd: started.cwd,
+        updated_at: started.updated_at,
+    })
+}
+
+fn initialize_app_server_connection(
+    socket: &mut AppServerSocket,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = send_app_server_request(
+        socket,
+        0,
+        "initialize",
+        serde_json::json!({
+            "clientInfo": {
+                "name": "chaop-agent",
+                "title": "Chaop connector",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "requestAttestation": false
+            }
+        }),
+    )?;
+    socket.send(Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized"
+        })
+        .to_string()
+        .into(),
+    ))?;
+    Ok(())
+}
+
+fn send_app_server_request(
+    socket: &mut AppServerSocket,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    socket.send(Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        })
+        .to_string()
+        .into(),
+    ))?;
+
+    loop {
+        match socket.read()? {
+            Message::Text(text) => {
+                let value = serde_json::from_str::<Value>(text.as_ref())?;
+                if value.get("id").and_then(Value::as_i64) != Some(id) {
+                    continue;
+                }
+                if let Some(error) = value.get("error") {
+                    return Err(app_server_error(method, error).into());
+                }
+                return Ok(value);
+            }
+            Message::Close(_) => {
+                return Err(format!("app-server closed before {method} completed").into());
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppServerThread {
+    id: String,
+    session_id: String,
+    name: Option<String>,
+    cwd: Option<String>,
+    updated_at: String,
+}
+
+fn app_server_thread_from_response(
+    value: &Value,
+) -> Result<AppServerThread, Box<dyn std::error::Error>> {
+    let thread = value
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .ok_or("app-server thread/start response did not include result.thread")?;
+    let id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("app-server thread/start response did not include thread.id")?;
+    let session_id = app_server_thread_session_id(thread).unwrap_or(id);
+    Ok(AppServerThread {
+        id: id.to_owned(),
+        session_id: session_id.to_owned(),
+        name: thread
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        cwd: thread
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        updated_at: app_server_thread_timestamp(thread)
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_owned()),
+    })
+}
+
+fn app_server_thread_timestamp(thread: &Value) -> Option<String> {
+    ["updatedAt", "createdAt"]
+        .into_iter()
+        .find_map(|key| thread.get(key).and_then(value_to_unix_seconds))
+        .and_then(unix_seconds_to_iso)
+}
+
+fn value_to_unix_seconds(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| {
+            value
+                .as_u64()
+                .and_then(|seconds| i64::try_from(seconds).ok())
+        })
+        .or_else(|| value.as_f64().map(|seconds| seconds.floor() as i64))
+}
+
+fn app_server_error(method: &str, error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown app-server error");
+    format!("app-server {method} failed: {message}")
 }
 
 fn metadata_title(payload: &Value) -> Option<String> {
@@ -640,14 +935,20 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        HistorySession, SessionDraft, TitleSource, app_server_titles_from_response,
-        build_host_sessions_report, read_recent_lines, resolve_session, rollout_paths,
-        unix_seconds_to_iso,
+        HistorySession, SessionDraft, TitleSource, app_server_sessions_from_response,
+        app_server_thread_from_response, app_server_titles_from_response,
+        build_host_sessions_report, create_app_server_thread_at, load_app_server_sessions,
+        read_recent_lines, resolve_session, rollout_paths, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
+    use std::time::Duration;
+    use tungstenite::{Message, accept};
 
     #[test]
     fn title_resolution_prefers_metadata_over_history() {
@@ -702,8 +1003,8 @@ mod tests {
             "id": 1,
             "result": {
                 "data": [
-                    { "sessionId": "session-1", "name": "App server title" },
-                    { "sessionId": "session-2", "name": null }
+                    { "id": "session-1", "name": "App server title" },
+                    { "id": "session-2", "name": null }
                 ]
             }
         });
@@ -715,6 +1016,164 @@ mod tests {
             Some("App server title")
         );
         assert!(!titles.contains_key("session-2"));
+    }
+
+    #[test]
+    fn parses_app_server_thread_inventory_metadata() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "id": "session-1",
+                        "name": null,
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                ]
+            }
+        });
+
+        let sessions = app_server_sessions_from_response(&response);
+        let session = sessions.get("session-1").expect("session");
+
+        assert_eq!(session.name, None);
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(
+            session.updated_at.as_deref(),
+            Some("2026-06-12T11:24:03.000Z")
+        );
+    }
+
+    #[test]
+    fn loads_app_server_sessions_after_initialization() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "id": "session-1",
+                        "name": "Server title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                ]
+            }
+        })]);
+
+        let sessions = load_app_server_sessions(&url, 20, 1).expect("sessions");
+        let session = sessions.get("session-1").expect("session");
+        let request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let source_kinds = request
+            .pointer("/params/sourceKinds")
+            .and_then(serde_json::Value::as_array)
+            .expect("sourceKinds array");
+
+        assert_eq!(
+            request.get("method").and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            source_kinds
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["cli", "vscode", "appServer"]
+        );
+        assert_eq!(session.name.as_deref(), Some("Server title"));
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(
+            session.updated_at.as_deref(),
+            Some("2026-06-12T11:24:03.000Z")
+        );
+    }
+
+    #[test]
+    fn parses_app_server_thread_start_response() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "thread": {
+                    "id": "thread-1",
+                    "name": "Created title",
+                    "cwd": "/tmp/project",
+                    "updatedAt": 1781263443
+                }
+            }
+        });
+
+        let thread = app_server_thread_from_response(&response).expect("thread");
+
+        assert_eq!(thread.id, "thread-1");
+        assert_eq!(thread.session_id, "thread-1");
+        assert_eq!(thread.name.as_deref(), Some("Created title"));
+        assert_eq!(thread.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(thread.updated_at, "2026-06-12T11:24:03.000Z");
+    }
+
+    #[test]
+    fn creates_app_server_thread_and_sets_name() {
+        let url = run_fake_app_server(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "thread": {
+                        "id": "thread-1",
+                        "name": null,
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {}
+            }),
+        ]);
+
+        let session = create_app_server_thread_at(&url, Some("Requested title"), "/tmp/project", 1)
+            .expect("created thread");
+
+        assert_eq!(session.session_id, "thread-1");
+        assert_eq!(session.title, "Requested title");
+        assert_eq!(session.title_source, TitleSource::AppServer);
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
+    }
+
+    #[test]
+    fn keeps_created_app_server_thread_when_name_set_fails() {
+        let url = run_fake_app_server(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "thread": {
+                        "id": "thread-1",
+                        "name": "Server title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": { "message": "name update unavailable" }
+            }),
+        ]);
+
+        let session = create_app_server_thread_at(&url, Some("Requested title"), "/tmp/project", 1)
+            .expect("created thread despite name failure");
+
+        assert_eq!(session.session_id, "thread-1");
+        assert_eq!(session.title, "Requested title");
     }
 
     #[test]
@@ -826,5 +1285,90 @@ mod tests {
         assert_eq!(report.sessions[0].title_source, TitleSource::History);
         assert_eq!(report.sessions[1].title, "History title from first prompt");
         assert_eq!(report.sessions[2].title, "Metadata index title");
+    }
+
+    fn run_fake_app_server(responses: Vec<serde_json::Value>) -> String {
+        run_fake_app_server_with_requests(responses).0
+    }
+
+    fn run_fake_app_server_with_requests(
+        responses: Vec<serde_json::Value>,
+    ) -> (String, Receiver<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+        let address = listener.local_addr().expect("fake app-server address");
+        let (requests_tx, requests_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("id").and_then(serde_json::Value::as_i64),
+                Some(0)
+            );
+            assert_eq!(
+                initialize.get("method").and_then(serde_json::Value::as_str),
+                Some("initialize")
+            );
+            assert_eq!(
+                initialize
+                    .get("params")
+                    .and_then(|params| params.get("clientInfo"))
+                    .and_then(|info| info.get("name"))
+                    .and_then(serde_json::Value::as_str),
+                Some("chaop-agent")
+            );
+            assert_eq!(
+                initialize
+                    .get("params")
+                    .and_then(|params| params.get("capabilities"))
+                    .and_then(|capabilities| capabilities.get("experimentalApi"))
+                    .and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {
+                            "userAgent": "codex-test",
+                            "codexHome": "/tmp/codex",
+                            "platformFamily": "unix",
+                            "platformOs": "macos"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized
+                    .get("method")
+                    .and_then(serde_json::Value::as_str),
+                Some("initialized")
+            );
+            assert!(initialized.get("id").is_none());
+
+            for response in responses {
+                let request = read_fake_app_server_message(&mut socket);
+                let _ = requests_tx.send(request);
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .expect("send app-server response");
+            }
+        });
+        (format!("ws://{address}"), requests_rx)
+    }
+
+    fn read_fake_app_server_message(
+        socket: &mut tungstenite::WebSocket<TcpStream>,
+    ) -> serde_json::Value {
+        let message = socket.read().expect("read app-server request");
+        let Message::Text(text) = message else {
+            panic!("expected text message");
+        };
+        serde_json::from_str(text.as_ref()).expect("valid app-server json")
     }
 }

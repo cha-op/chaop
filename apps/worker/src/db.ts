@@ -6,8 +6,11 @@ import type {
   BootstrapPayload,
   CommandSummary,
   ConnectorSummary,
+  CreateLocalThreadRequest,
+  CreateLocalThreadResponse,
   CreateCommandRequest,
   CreateCommandResponse,
+  AgentHostSession,
   DetachHostSessionResponse,
   HostSessionSummary,
   HostSessionSyncSummary,
@@ -26,6 +29,10 @@ const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 
 export class CommandTargetError extends Error {
+  readonly status = 404;
+}
+
+export class LocalThreadTargetError extends Error {
   readonly status = 404;
 }
 
@@ -83,7 +90,8 @@ export async function recordHostSessions(
   env: Env,
   connectorId: string,
   report: AgentHostSessionsReport,
-  syncedAt = new Date().toISOString()
+  syncedAt = new Date().toISOString(),
+  options: { workspaceId?: string | undefined } = {}
 ): Promise<{ host_sessions: HostSessionSummary[]; synced_at: string }> {
   if (!env.DB) return { host_sessions: [], synced_at: syncedAt };
 
@@ -106,7 +114,7 @@ export async function recordHostSessions(
   )
     .bind(connectorId)
     .first<{ workspace_id: string }>();
-  const workspaceId = workspace?.workspace_id ?? DEFAULT_WORKSPACE_ID;
+  const workspaceId = options.workspaceId ?? workspace?.workspace_id ?? DEFAULT_WORKSPACE_ID;
   const upserted: HostSessionSummary[] = [];
   const reportedSessions = report.sessions.slice(0, 200);
 
@@ -119,7 +127,11 @@ export async function recordHostSessions(
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(connector_id, session_id) DO UPDATE SET
          hostname = excluded.hostname,
-         workspace_id = excluded.workspace_id,
+         workspace_id = CASE
+           WHEN host_sessions.attached_task_id IS NOT NULL OR host_sessions.attached_thread_id IS NOT NULL
+           THEN host_sessions.workspace_id
+           ELSE excluded.workspace_id
+         END,
          title = excluded.title,
          title_source = excluded.title_source,
          cwd = excluded.cwd,
@@ -345,6 +357,51 @@ export async function detachHostSessionInDb(
       updated_at: now
     }
   };
+}
+
+export async function chooseConnectorForLocalThread(
+  env: Env,
+  user: BrowserIdentity,
+  request: CreateLocalThreadRequest
+): Promise<string> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for local thread creation");
+  }
+
+  await ensureUser(env, user);
+
+  const workspace = await env.DB.prepare(
+    "SELECT id FROM workspaces WHERE id = ? LIMIT 1"
+  )
+    .bind(request.workspace_id)
+    .first<{ id: string }>();
+  if (!workspace) {
+    throw new LocalThreadTargetError("Workspace not available");
+  }
+
+  const connector = request.connector_id
+    ? await findLocalThreadConnector(env, request.workspace_id, request.connector_id)
+    : await findBestLocalThreadConnector(env, request.workspace_id);
+
+  if (!connector) {
+    throw new LocalThreadTargetError("No online connector with app-server thread support is available");
+  }
+
+  return connector.id;
+}
+
+export async function attachCreatedLocalThreadInDb(
+  env: Env,
+  connectorId: string,
+  workspaceId: string,
+  session: AgentHostSession
+): Promise<CreateLocalThreadResponse> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for local thread creation");
+  }
+
+  await recordHostSessions(env, connectorId, { sessions: [session] }, new Date().toISOString(), { workspaceId });
+  return attachHostSessionInDb(env, session.session_id, connectorId);
 }
 
 export async function ensureConnectorInventory(
@@ -811,7 +868,7 @@ async function listConnectors(env: Env): Promise<ConnectorSummary[]> {
   const rows = await allRows<ConnectorRow>(
     env.DB!.prepare(
       `SELECT id, name, hostname, status, realtime_mode, budget_state,
-        logical_agent_count, active_command_count, last_seen_at
+        logical_agent_count, active_command_count, capabilities_json, last_seen_at
        FROM connectors
        WHERE status <> 'offline'
        ORDER BY CASE status WHEN 'online' THEN 0 WHEN 'degraded' THEN 1 ELSE 2 END, updated_at DESC`
@@ -822,12 +879,23 @@ async function listConnectors(env: Env): Promise<ConnectorSummary[]> {
     name: row.name,
     hostname: row.hostname,
     status: row.status,
+    capabilities: parseCapabilities(row.capabilities_json),
     logical_agent_count: row.logical_agent_count,
     active_command_count: row.active_command_count,
     realtime_mode: row.realtime_mode,
     budget_state: row.budget_state,
     last_seen_at: row.last_seen_at ?? undefined
   }));
+}
+
+function parseCapabilities(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 async function listWorkspaces(env: Env): Promise<WorkspaceSummary[]> {
@@ -1033,6 +1101,42 @@ async function chooseConnectorForWorkspace(
     .bind(workspaceId, commandType)
     .first<{ id: string }>();
   return row?.id;
+}
+
+async function findBestLocalThreadConnector(
+  env: Env,
+  workspaceId: string
+): Promise<{ id: string } | undefined> {
+  const row = await env.DB!.prepare(
+    `SELECT c.id
+     FROM connectors c
+     INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
+     WHERE wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+       AND c.capabilities_json LIKE '%"app_server_threads"%'
+     ORDER BY c.last_seen_at DESC, c.updated_at DESC
+     LIMIT 1`
+  )
+    .bind(workspaceId)
+    .first<{ id: string }>();
+  return row ?? undefined;
+}
+
+async function findLocalThreadConnector(
+  env: Env,
+  workspaceId: string,
+  connectorId: string
+): Promise<{ id: string } | undefined> {
+  const row = await env.DB!.prepare(
+    `SELECT c.id
+     FROM connectors c
+     INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
+     WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+       AND c.capabilities_json LIKE '%"app_server_threads"%'
+     LIMIT 1`
+  )
+    .bind(connectorId, workspaceId)
+    .first<{ id: string }>();
+  return row ?? undefined;
 }
 
 async function resolveCommandScope(
@@ -1259,6 +1363,7 @@ type ConnectorRow = {
   name: string;
   hostname: string;
   status: ConnectorSummary["status"];
+  capabilities_json: string | null;
   logical_agent_count: number;
   active_command_count: number;
   realtime_mode: ConnectorSummary["realtime_mode"];

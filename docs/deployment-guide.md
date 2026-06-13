@@ -12,7 +12,7 @@ The first slice is Cloudflare-first. The Rust connector supports placeholder exe
 Browser GUI -> Cloudflare Access -> Worker / Durable Object -> D1 / R2 -> Rust connector -> Worker / Durable Object -> Browser GUI
 ```
 
-Current implementation status: the repository can persist command lifecycle rows in D1, dispatch pending commands through the Durable Object, receive lifecycle events from the Rust connector, and attach local Codex sessions as task/thread views. It can run local Codex CLI work only when the connector has `execution.mode = "codex_exec"` in private configuration. It can optionally read Codex app-server `Thread.name` values for session titles, but it does not yet use the experimental app-server protocol for execution. R2 artefact capture is still reserved for a later slice.
+Current implementation status: the repository can persist command lifecycle rows in D1, dispatch pending commands through the Durable Object, receive lifecycle events from the Rust connector, attach local Codex sessions as task/thread views, and create new local Codex app-server threads when the connector has `session_inventory.app_server_url` configured. It can run local Codex CLI work only when the connector has `execution.mode = "codex_exec"` in private configuration. R2 artefact capture is still reserved for a later slice.
 
 Keep secrets out of Git. Share sensitive values only through a local ignored file, a password manager, or direct `wrangler secret put` commands.
 
@@ -353,7 +353,26 @@ Only add optional settings when the local Codex CLI needs them. `codex_exec` can
 Prompts are passed to Codex over stdin, not command-line arguments. Keep the timeout and output cap in place unless there is a specific operator reason to widen them.
 Use an absolute `codex_command` path for long-lived connectors launched by `launchctl` or another service manager. Those processes may not inherit the interactive shell `PATH`; if the executable cannot be found, Codex exec commands fail before any workspace `cwd` is used.
 
-Session inventory is enabled by default. The connector reads local Codex metadata from `CODEX_HOME` or `~/.codex`, reports session id, title, cwd, update time, and title source, and does not upload rollout transcripts. Title resolution prefers metadata or rollout titles, then optional app-server `Thread.name`, then a recent local history prompt, and finally a cwd/session-id fallback. Set `app_server_url` only if you already run `codex app-server` with a local WebSocket listener and want Chaop to use app-server titles. Keep `app_server_timeout_seconds` short so a stopped app-server cannot block connector startup. `report_interval_seconds` controls the periodic local rescan interval; the connector only sends the periodic report when the inventory changes. The Host Sessions refresh button asks online connectors to rescan and report immediately.
+Session inventory is enabled by default. The connector reads local Codex metadata from `CODEX_HOME` or `~/.codex`, reports session id, title, cwd, update time, and title source, and does not upload rollout transcripts. Title resolution prefers metadata or rollout titles, then optional app-server `Thread.name`, then a recent local history prompt, and finally a cwd/session-id fallback.
+
+Set `session_inventory.app_server_url` when Chaop should create new local Codex app-server threads or use app-server titles. The connector advertises the `app_server_threads` capability only when this URL is configured, and the Worker rejects new local thread requests when no online connector has that capability. Keep `app_server_timeout_seconds` short so a stopped app-server cannot block connector startup or thread creation.
+
+New local threads always start in the connector's configured `workspace_root`; the Browser API does not accept or forward an arbitrary cwd.
+
+Start the local app-server with a private listener that only the connector host can reach:
+
+```bash
+codex app-server --listen ws://127.0.0.1:9876
+```
+
+Then set the matching private connector config:
+
+```toml
+[session_inventory]
+app_server_url = "ws://127.0.0.1:9876"
+```
+
+`report_interval_seconds` controls the periodic local rescan interval; the connector only sends the periodic report when the inventory changes. The Host Sessions refresh button asks online connectors to rescan and report immediately.
 
 Create local files outside the repository:
 
@@ -429,6 +448,7 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether `/connector/bootstrap` and `/ws/agent` are excluded from Browser Access.
 - If Codex exec returns `Codex executable not found`, set `execution.codex_command` to an absolute path that the connector process can execute, for example `/opt/homebrew/bin/codex` on this macOS deployment. This is separate from the attached session `cwd`.
 - If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
+- If New local thread fails with an app-server error, check that `codex app-server --listen ws://127.0.0.1:9876` is running, `session_inventory.app_server_url` matches it, and the connector was restarted after the config change.
 - If Host Sessions is empty or stale, use the Host Sessions refresh button, wait up to `session_inventory.report_interval_seconds`, check that the connector was restarted after this slice, `session_inventory.enabled` is true, and the connector user can read `CODEX_HOME` or `~/.codex`.
 - If an attached historical Host Session shows only a few events, that is expected in the current slice: attachment imports session metadata and title only. Historical rollout/transcript backfill and full artefact capture are deferred.
 - If D1 migration fails, confirm the D1 database UUID is present in the Worker config.

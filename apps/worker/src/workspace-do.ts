@@ -4,6 +4,8 @@ import {
   type AgentHostSessionsReport,
   type CommandDispatch,
   type HostSessionsUpdatePayload,
+  type LocalThreadCreateDispatch,
+  type LocalThreadCreateResult,
   type ThreadEvent
 } from "@chaop/protocol";
 import {
@@ -14,7 +16,24 @@ import {
 } from "./db.js";
 import type { Env } from "./types.js";
 
+const THREAD_CREATE_TIMEOUT_MS = 15_000;
+
+type SocketAttachment = {
+  socketType?: string;
+  connectorId?: string;
+  connectedAt?: number;
+};
+
 export class WorkspaceDO implements DurableObject {
+  private readonly pendingThreadCreates = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      resolve: (result: LocalThreadCreateResult) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly env: Env
@@ -30,6 +49,10 @@ export class WorkspaceDO implements DurableObject {
       return this.refreshHostSessions();
     }
 
+    if (url.pathname === "/internal/create-local-thread") {
+      return this.createLocalThread(request);
+    }
+
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected WebSocket upgrade", { status: 426 });
     }
@@ -42,7 +65,7 @@ export class WorkspaceDO implements DurableObject {
     const tags = connectorId ? [socketType, `${socketType}:${connectorId}`] : [socketType];
 
     this.ctx.acceptWebSocket(server, tags);
-    server.serializeAttachment({ socketType, connectorId });
+    server.serializeAttachment({ socketType, connectorId, connectedAt: Date.now() });
     server.send(
       JSON.stringify(
         createEnvelope("server.hello", { type: "worker", id: "workspace-do-global" }, { socket_type: socketType })
@@ -60,7 +83,7 @@ export class WorkspaceDO implements DurableObject {
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const text = typeof message === "string" ? message : new TextDecoder().decode(message);
-    const attachment = ws.deserializeAttachment() as { socketType?: string; connectorId?: string } | undefined;
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
     if (attachment?.socketType === "agent" && attachment.connectorId) {
       await this.handleAgentMessage(ws, attachment.connectorId, text);
       return;
@@ -151,6 +174,19 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    if (message.kind === "thread.create_result" && isLocalThreadCreateResult(message.payload)) {
+      this.resolveLocalThreadCreate(message.payload);
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            kind: "thread.create_result",
+            request_id: message.payload.request_id
+          })
+        )
+      );
+      return;
+    }
+
     ws.send(JSON.stringify(createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, { received: text.length })));
   }
 
@@ -189,6 +225,74 @@ export class WorkspaceDO implements DurableObject {
     });
   }
 
+  private async createLocalThread(request: Request): Promise<Response> {
+    const payload = await request.json().catch(() => ({})) as Partial<LocalThreadCreateDispatch> & {
+      connector_id?: unknown;
+    };
+    const connectorId = typeof payload.connector_id === "string" ? payload.connector_id : undefined;
+    if (!connectorId) {
+      return jsonResponse({ error: "Missing connector_id" }, 400);
+    }
+    if (!isLocalThreadCreateDispatch(payload)) {
+      return jsonResponse({ error: "Invalid local thread create payload" }, 400);
+    }
+
+    const sockets = agentSocketsForConnector(this.ctx, connectorId);
+    const socket = sockets[0];
+    if (!socket) {
+      return jsonResponse({ error: "Connector is not connected" }, 404);
+    }
+
+    try {
+      const result = await this.waitForLocalThreadCreate(payload.request_id, () => {
+        socket.send(
+          JSON.stringify(
+            createEnvelope("thread.create", { type: "worker", id: "workspace-do-global" }, payload, {
+              target: { type: "connector", id: connectorId },
+              workspace_id: payload.workspace_id
+            })
+          )
+        );
+      });
+      if (!result.ok || !result.session) {
+        return jsonResponse({ error: result.error ?? "Connector could not create the local thread" }, 502);
+      }
+      return jsonResponse({ session: result.session });
+    } catch (error) {
+      return jsonResponse({ error: error instanceof Error ? error.message : "Connector did not respond" }, 504);
+    }
+  }
+
+  private async waitForLocalThreadCreate(
+    requestId: string,
+    send: () => void
+  ): Promise<LocalThreadCreateResult> {
+    return await new Promise<LocalThreadCreateResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingThreadCreates.delete(requestId);
+        reject(new Error("Connector timed out while creating the local thread"));
+      }, THREAD_CREATE_TIMEOUT_MS);
+      this.pendingThreadCreates.set(requestId, { timer, resolve, reject });
+      try {
+        send();
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingThreadCreates.delete(requestId);
+        reject(error instanceof Error ? error : new Error("Connector send failed"));
+      }
+    });
+  }
+
+  private resolveLocalThreadCreate(result: LocalThreadCreateResult): void {
+    const pending = this.pendingThreadCreates.get(result.request_id);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingThreadCreates.delete(result.request_id);
+    pending.resolve(result);
+  }
+
   private async sendPendingCommands(ws: WebSocket, connectorId: string): Promise<void> {
     const commands = await pendingCommandsForConnector(this.env, connectorId);
     for (const command of commands) {
@@ -215,6 +319,20 @@ export function hasPeerAgentSocket(
   return ctx.getWebSockets(`agent:${connectorId}`).some((candidate) => candidate !== socket);
 }
 
+export function agentSocketsForConnector(
+  ctx: Pick<DurableObjectState, "getWebSockets">,
+  connectorId: string
+): WebSocket[] {
+  return [...ctx.getWebSockets(`agent:${connectorId}`)].sort(
+    (left, right) => socketConnectedAt(right) - socketConnectedAt(left)
+  );
+}
+
+function socketConnectedAt(socket: WebSocket): number {
+  const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+  return typeof attachment?.connectedAt === "number" ? attachment.connectedAt : 0;
+}
+
 export function threadEventMessage(event: ThreadEvent): string {
   return JSON.stringify(
     createEnvelope("thread.event", { type: "worker", id: "workspace-do-global" }, { event }, {
@@ -239,6 +357,13 @@ function parseMessage(text: string): { kind?: string; payload?: unknown } | unde
   }
 }
 
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" }
+  });
+}
+
 function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
@@ -250,6 +375,29 @@ function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
       record.kind === "command.failed") &&
     (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
     typeof record.summary === "string"
+  );
+}
+
+function isLocalThreadCreateDispatch(value: unknown): value is LocalThreadCreateDispatch {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    record.request_id.length > 0 &&
+    typeof record.workspace_id === "string" &&
+    record.workspace_id.length > 0 &&
+    (record.title === undefined || (typeof record.title === "string" && record.title.trim().length > 0))
+  );
+}
+
+function isLocalThreadCreateResult(value: unknown): value is LocalThreadCreateResult {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    typeof record.ok === "boolean" &&
+    (record.error === undefined || typeof record.error === "string") &&
+    (record.session === undefined || isAgentHostSession(record.session))
   );
 }
 

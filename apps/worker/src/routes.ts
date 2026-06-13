@@ -1,11 +1,14 @@
 import {
   createEnvelope,
+  type AgentHostSession,
   type AttachHostSessionRequest,
   type AgentBootstrapRequest,
   type AgentBootstrapResponse,
   type CreateCommandRequest,
   type CreateCommandResponse,
+  type CreateLocalThreadRequest,
   type DetachHostSessionRequest,
+  type LocalThreadCreateResult,
   type RefreshHostSessionsResponse
 } from "@chaop/protocol";
 import {
@@ -16,9 +19,12 @@ import {
 } from "./auth.js";
 import {
   CommandTargetError,
+  LocalThreadTargetError,
   NotFoundError,
   archiveTaskInDb,
+  attachCreatedLocalThreadInDb,
   attachHostSessionInDb,
+  chooseConnectorForLocalThread,
   createCommandInDb,
   detachHostSessionInDb,
   ensureConnectorInventory,
@@ -139,6 +145,42 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return json(request, env, response, 202);
     } catch (error) {
       if (error instanceof CommandTargetError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      throw error;
+    }
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/local-threads") {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+    if (!env.WORKSPACE_DO) return json(request, env, { error: "Workspace Durable Object binding is unavailable" }, 503);
+
+    const payload = await readJson(request);
+    if (!payload.ok) {
+      return json(request, env, { error: payload.message }, 400);
+    }
+    if (!isCreateLocalThreadRequest(payload.value)) {
+      return json(request, env, { error: "Invalid local thread payload" }, 400);
+    }
+
+    const threadRequest = payload.value;
+    try {
+      const connectorId = await chooseConnectorForLocalThread(env, auth.user, threadRequest);
+      const session = await requestLocalThreadCreate(env, connectorId, threadRequest);
+      const response = await attachCreatedLocalThreadInDb(env, connectorId, threadRequest.workspace_id, session);
+      return json(request, env, response, 201);
+    } catch (error) {
+      if (error instanceof LocalThreadTargetError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      if (error instanceof ConnectorRpcError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      if (error instanceof NotFoundError) {
         return json(request, env, { error: error.message }, error.status);
       }
       throw error;
@@ -405,6 +447,47 @@ async function requestHostSessionRefresh(env: Env): Promise<number> {
   return typeof body.dispatched_to === "number" ? body.dispatched_to : 0;
 }
 
+class ConnectorRpcError extends Error {
+  constructor(
+    message: string,
+    public readonly status = 502
+  ) {
+    super(message);
+  }
+}
+
+async function requestLocalThreadCreate(
+  env: Env,
+  connectorId: string,
+  request: CreateLocalThreadRequest
+): Promise<AgentHostSession> {
+  if (!env.WORKSPACE_DO) {
+    throw new ConnectorRpcError("Workspace Durable Object binding is unavailable", 503);
+  }
+
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  const response = await stub.fetch("https://workspace-do/internal/create-local-thread", {
+    method: "POST",
+    body: JSON.stringify({
+      connector_id: connectorId,
+      request_id: `thread-create-${cryptoRandomId().slice(0, 16)}`,
+      workspace_id: request.workspace_id,
+      title: request.title
+    })
+  });
+  const body = await response.json().catch(() => ({})) as Partial<LocalThreadCreateResult> & { error?: unknown };
+
+  if (!response.ok) {
+    const message = typeof body.error === "string" ? body.error : "Connector could not create the local thread";
+    throw new ConnectorRpcError(message, response.status);
+  }
+  if (!body.session || !isAgentHostSession(body.session)) {
+    throw new ConnectorRpcError("Connector returned an invalid local thread response", 502);
+  }
+  return body.session;
+}
+
 async function readJson(
   request: Request
 ): Promise<{ ok: true; value: unknown } | { ok: false; message: string }> {
@@ -452,6 +535,15 @@ function isCreateCommandRequest(value: unknown): value is CreateCommandRequest {
   );
 }
 
+function isCreateLocalThreadRequest(value: unknown): value is CreateLocalThreadRequest {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.workspace_id) &&
+    optionalString(value.title) &&
+    optionalString(value.connector_id)
+  );
+}
+
 function isAttachHostSessionRequest(value: unknown): value is AttachHostSessionRequest {
   return isRecord(value) && optionalString(value.connector_id);
 }
@@ -474,6 +566,20 @@ function optionalString(value: unknown): value is string | undefined {
 
 function optionalCommandType(value: unknown): value is CreateCommandRequest["type"] {
   return value === undefined || value === "placeholder" || value === "codex";
+}
+
+function isAgentHostSession(value: unknown): value is AgentHostSession {
+  if (!isRecord(value)) return false;
+  return (
+    isNonEmptyString(value.session_id) &&
+    isNonEmptyString(value.title) &&
+    (value.title_source === "metadata" ||
+      value.title_source === "app_server" ||
+      value.title_source === "history" ||
+      value.title_source === "fallback") &&
+    optionalString(value.cwd) &&
+    isNonEmptyString(value.updated_at)
+  );
 }
 
 function stableConnectorId(name: string, hostname: string): string {

@@ -40,7 +40,7 @@ superseded_by:
 - `pnpm build`
 - `pnpm test`
 - `git diff --check`
-- `project_journal.py validate --repo /Users/joey/Program/Codex-workspace/cha-op/chaop`
+- `project_journal.py validate --repo <repo>`
 - Headless Chromium/CDP verification loaded `http://127.0.0.1:5173/#thread-centre` against local Worker dev and observed `Live`.
 
 ## Evidence
