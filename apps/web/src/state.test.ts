@@ -70,8 +70,8 @@ test("localThreadWorkspaceId falls back to the first workspace", () => {
 test("localThreadConnectors filters connectors by workspace", () => {
   const data = payload({
     connectors: [
-      connector("connector-a"),
-      connector("connector-b")
+      connector("connector-a", ["app_server_threads"]),
+      connector("connector-b", ["app_server_threads"])
     ],
     workspaces: [
       workspace("workspace-api", ["connector-a"]),
@@ -85,11 +85,28 @@ test("localThreadConnectors filters connectors by workspace", () => {
   );
 });
 
+test("localThreadConnectors only includes app-server capable connectors", () => {
+  const data = payload({
+    connectors: [
+      connector("connector-a", ["placeholder_commands"]),
+      connector("connector-b", ["app_server_threads"])
+    ],
+    workspaces: [
+      workspace("workspace-api", ["connector-a", "connector-b"])
+    ]
+  });
+
+  assert.deepEqual(
+    localThreadConnectors(data, "workspace-api").map((item) => item.id),
+    ["connector-b"]
+  );
+});
+
 test("localThreadConnectorId drops stale connector selections", () => {
   const data = payload({
     connectors: [
-      connector("connector-a"),
-      connector("connector-b")
+      connector("connector-a", ["app_server_threads"]),
+      connector("connector-b", ["app_server_threads"])
     ],
     workspaces: [
       workspace("workspace-api", ["connector-a"]),
@@ -131,12 +148,13 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   };
 }
 
-function connector(id: string) {
+function connector(id: string, capabilities: string[] = []) {
   return {
     id,
     name: id,
     hostname: `${id}.local`,
     status: "online" as const,
+    capabilities,
     logical_agent_count: 1,
     active_command_count: 0,
     realtime_mode: "realtime" as const,

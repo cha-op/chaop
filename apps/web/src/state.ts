@@ -43,7 +43,9 @@ export function localThreadConnectors(
   const workspace = data.workspaces.find((item) => item.id === workspaceId);
   if (!workspace) return [];
   const connectorIds = new Set(workspace.connector_ids);
-  return data.connectors.filter((connector) => connectorIds.has(connector.id));
+  return data.connectors.filter(
+    (connector) => connectorIds.has(connector.id) && connector.capabilities.includes("app_server_threads")
+  );
 }
 
 export function localThreadConnectorId(

@@ -80,6 +80,8 @@ superseded_by:
 - Review follow-up aligns the app-server client with the documented protocol by sending `initialize` and `initialized` before `thread/list` or `thread/start`, and by accepting official `Thread.id` responses without a legacy `sessionId`.
 - Review follow-up makes app-server inventory scans request `cli`, `vscode`, and `appServer` source kinds so Chaop-created threads remain discoverable after connector restarts.
 - Review follow-up makes the Thread Centre create form use the selected thread's workspace and filters connector choices to that workspace, falling back to Auto when a stale connector selection no longer belongs there.
+- Review follow-up bounds plain `ws://` app-server TCP connects with `app_server_timeout_seconds`, so a blackholed local app-server URL cannot block the connector's main WebSocket loop indefinitely.
+- Review follow-up exposes connector capabilities in bootstrap and filters `New local thread` connector choices to `app_server_threads`, so manual selection matches the backend eligibility check.
 - Deployment guidance now documents the local `codex app-server --listen ws://127.0.0.1:9876` prerequisite and the private connector `app_server_url` setting.
 
 ## Next Steps

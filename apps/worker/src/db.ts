@@ -868,7 +868,7 @@ async function listConnectors(env: Env): Promise<ConnectorSummary[]> {
   const rows = await allRows<ConnectorRow>(
     env.DB!.prepare(
       `SELECT id, name, hostname, status, realtime_mode, budget_state,
-        logical_agent_count, active_command_count, last_seen_at
+        logical_agent_count, active_command_count, capabilities_json, last_seen_at
        FROM connectors
        WHERE status <> 'offline'
        ORDER BY CASE status WHEN 'online' THEN 0 WHEN 'degraded' THEN 1 ELSE 2 END, updated_at DESC`
@@ -879,12 +879,23 @@ async function listConnectors(env: Env): Promise<ConnectorSummary[]> {
     name: row.name,
     hostname: row.hostname,
     status: row.status,
+    capabilities: parseCapabilities(row.capabilities_json),
     logical_agent_count: row.logical_agent_count,
     active_command_count: row.active_command_count,
     realtime_mode: row.realtime_mode,
     budget_state: row.budget_state,
     last_seen_at: row.last_seen_at ?? undefined
   }));
+}
+
+function parseCapabilities(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 async function listWorkspaces(env: Env): Promise<WorkspaceSummary[]> {
@@ -1352,6 +1363,7 @@ type ConnectorRow = {
   name: string;
   hostname: string;
   status: ConnectorSummary["status"];
+  capabilities_json: string | null;
   logical_agent_count: number;
   active_command_count: number;
   realtime_mode: ConnectorSummary["realtime_mode"];

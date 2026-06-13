@@ -80,6 +80,8 @@ superseded_by:
 - Review follow-up 让 app-server client 对齐已记录的协议：会在 `thread/list` 或 `thread/start` 前先发送 `initialize` 和 `initialized`，并接受没有 legacy `sessionId` 的官方 `Thread.id` 响应。
 - Review follow-up 让 app-server inventory scan 显式请求 `cli`、`vscode` 和 `appServer` source kinds，确保 Chaop 创建的 threads 在 connector 重启后仍能被发现。
 - Review follow-up 让 Thread Centre 的创建表单使用当前选中 thread 的 workspace，并把 connector 选项过滤到该 workspace；当旧 connector selection 不再属于当前 workspace 时，会回退到 Auto。
+- Review follow-up 现在会用 `app_server_timeout_seconds` 限制普通 `ws://` app-server TCP 连接，避免黑洞式本机 app-server URL 无限阻塞 connector 的主 WebSocket loop。
+- Review follow-up 会在 bootstrap 中暴露 connector capabilities，并把 `New local thread` 的 connector 选项过滤到 `app_server_threads`，让手动选择与后端 eligibility check 保持一致。
 - 部署指南现在记录了本地 `codex app-server --listen ws://127.0.0.1:9876` 前提，以及私有 connector `app_server_url` 配置。
 
 ## 下一步

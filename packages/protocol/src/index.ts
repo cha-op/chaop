@@ -89,6 +89,7 @@ export type ConnectorSummary = {
   name: string;
   hostname: string;
   status: "online" | "offline" | "degraded";
+  capabilities: string[];
   logical_agent_count: number;
   active_command_count: number;
   realtime_mode: RealtimeMode;

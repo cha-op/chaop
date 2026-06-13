@@ -4,12 +4,17 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tungstenite::{Message, connect};
+use tungstenite::{
+    Message, WebSocket, client::client, connect, handshake::HandshakeError, http::Uri,
+    stream::MaybeTlsStream,
+};
 
 const APP_SERVER_THREAD_SOURCE_KINDS: [&str; 3] = ["cli", "vscode", "appServer"];
+
+type AppServerSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentHostSessionsReport {
@@ -510,8 +515,8 @@ fn load_app_server_sessions(
     limit: usize,
     timeout_seconds: u64,
 ) -> Result<HashMap<String, AppServerSession>, Box<dyn std::error::Error>> {
-    let (mut socket, _) = connect(url)?;
-    configure_socket_timeout(&mut socket, Duration::from_secs(timeout_seconds.max(1)))?;
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+    let mut socket = connect_app_server(url, timeout)?;
     initialize_app_server_connection(&mut socket)?;
     socket.send(Message::Text(
         serde_json::json!({
@@ -544,8 +549,62 @@ fn load_app_server_sessions(
     }
 }
 
+fn connect_app_server(
+    url: &str,
+    timeout: Duration,
+) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
+    let uri = url.parse::<Uri>()?;
+    if uri.scheme_str() == Some("ws") {
+        return connect_plain_app_server(url, &uri, timeout);
+    }
+
+    let (mut socket, _) = connect(url)?;
+    configure_socket_timeout(&mut socket, timeout)?;
+    Ok(socket)
+}
+
+fn connect_plain_app_server(
+    url: &str,
+    uri: &Uri,
+    timeout: Duration,
+) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
+    let host = uri.host().ok_or("app-server URL did not include a host")?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = uri.port_u16().unwrap_or(80);
+    let mut last_error = None;
+
+    for addr in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+                let (socket, _) = match client(url, MaybeTlsStream::Plain(stream)) {
+                    Ok(result) => result,
+                    Err(HandshakeError::Failure(error)) => return Err(error.into()),
+                    Err(HandshakeError::Interrupted(_)) => {
+                        return Err("app-server websocket handshake was interrupted".into());
+                    }
+                };
+                return Ok(socket);
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(match last_error {
+        Some(error) => format!("unable to connect to app-server {url}: {error}").into(),
+        None => format!("app-server URL {url} resolved to no socket addresses").into(),
+    })
+}
+
 fn configure_socket_timeout(
-    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    socket: &mut AppServerSocket,
     timeout: Duration,
 ) -> std::io::Result<()> {
     match socket.get_mut() {
@@ -635,8 +694,8 @@ fn create_app_server_thread_at(
     cwd: &str,
     timeout_seconds: u64,
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
-    let (mut socket, _) = connect(url)?;
-    configure_socket_timeout(&mut socket, Duration::from_secs(timeout_seconds.max(1)))?;
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+    let mut socket = connect_app_server(url, timeout)?;
     initialize_app_server_connection(&mut socket)?;
     let start_response = send_app_server_request(
         &mut socket,
@@ -681,7 +740,7 @@ fn create_app_server_thread_at(
 }
 
 fn initialize_app_server_connection(
-    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    socket: &mut AppServerSocket,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = send_app_server_request(
         socket,
@@ -711,7 +770,7 @@ fn initialize_app_server_connection(
 }
 
 fn send_app_server_request(
-    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    socket: &mut AppServerSocket,
     id: i64,
     method: &str,
     params: Value,
