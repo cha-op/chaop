@@ -2750,8 +2750,8 @@ function hostSessionDetachDb(options: {
             assert.equal(commandId, "command-detached");
             assert.equal(workspaceId, "workspace-api");
             assert.equal(connectorId, "connector-online");
-            assert.equal(pendingLeaseTargetHostSessionId, "host-session-1");
-            assert.equal(leasedLeaseTargetHostSessionId, "host-session-1");
+            assert.equal(pendingLeaseTargetHostSessionId, "session-1");
+            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
             assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
             assert.equal(taskIdPresent, "task-host-1");
             assert.equal(taskId, "task-host-1");

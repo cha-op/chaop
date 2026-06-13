@@ -63,6 +63,7 @@ superseded_by:
 - Codex review-gate found remaining hardening gaps before merge: app-server assistant deltas are now capped by `codex_output_max_bytes`, detach cleanup revalidates replacement Host Sessions in the guarded failure update, leased detach cleanup refreshes connector activity counts, pending-command Host Session selection no longer uses SQLite outer references in subquery `ORDER BY`, and the cost guide now shows copyable separate TOML mode snippets.
 - Follow-up independent review found detach cleanup could still fail a command after it was re-leased or retargeted between the cleanup `SELECT` and failure `UPDATE`. The guarded failure update now revalidates command workspace, type, target connector, scope, lease ownership, and current replacement Host Session selection before writing task or event side effects.
 - Follow-up frozen-diff review found rejected stale app-server starts released lease fields but left the stale implicit `target_connector_id` from command creation. Releasing that stale app-server lease now also clears `target_connector_id`, so immediate re-dispatch can follow the current attachment.
+- Follow-up independent review found the guarded detach failure update compared `lease_target_host_session_id` to the internal `host_sessions.id` instead of the app-server session id stored in commands. The guarded update now uses `hostSession.session_id` for lease-target matching and reserves `hostSession.id` only for excluding the detached row from replacement selection.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -90,6 +91,7 @@ superseded_by:
 - Worker route tests assert Host Session detach refreshes connector activity after failing a leased command.
 - Worker route tests assert Host Session detach skips task, event, and connector-activity side effects when the guarded command failure update loses a race.
 - Worker DB and Durable Object tests assert rejected stale app-server starts clear the stale target connector while releasing the app-server lease for immediate re-dispatch.
+- Worker route tests assert guarded detach failure updates bind the stored app-server session id for `lease_target_host_session_id`, not the internal Host Session row id.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.
