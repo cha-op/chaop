@@ -94,6 +94,27 @@ test("recordAgentEvent accepts app-server starts for the current target session"
   assert.equal(db.eventInserts, 1);
 });
 
+test("recordAgentEvent rejects app-server starts without the leased target session", async () => {
+  const db = appServerStartAfterDetachDb({
+    connector_id: "connector-online",
+    session_id: "session-old",
+    app_server_present: 1
+  });
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    kind: "command.started",
+    priority: "P1",
+    summary: "Starting"
+  });
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.event, undefined);
+  assert.equal(db.commandUpdates, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
 test("recordAgentEvent accepts events from the active lease owner", async () => {
   const db = agentEventGuardDb({
     leaseOwnerConnectorId: "connector-online",
@@ -110,6 +131,32 @@ test("recordAgentEvent accepts events from the active lease owner", async () => 
   assert.equal(result.accepted, true);
   assert.equal(result.event?.kind, "command.finished");
   assert.equal(result.event?.summary, "Finished");
+  assert.equal(db.commandUpdates, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+});
+
+test("recordAgentEvent accepts ordinary codex starts without an app-server lease target", async () => {
+  const db = agentEventGuardDb(
+    {
+      leaseOwnerConnectorId: "connector-online",
+      state: "leased"
+    },
+    {
+      expectedCommandState: "running",
+      expectedTaskState: "running"
+    }
+  );
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    kind: "command.started",
+    priority: "P1",
+    summary: "Starting"
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.event?.kind, "command.started");
   assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
@@ -442,7 +489,8 @@ function agentEventGuardDb(command: {
                   type: "codex",
                   target_connector_id: null,
                   lease_owner_connector_id: command.leaseOwnerConnectorId,
-                  state: command.state
+                  state: command.state,
+                  lease_target_host_session_id: null
                 };
               }
             };
@@ -589,7 +637,8 @@ function appServerStartAfterDetachDb(currentTarget?: {
                   type: "codex",
                   target_connector_id: "connector-online",
                   lease_owner_connector_id: "connector-online",
-                  state: "leased"
+                  state: "leased",
+                  lease_target_host_session_id: "session-old"
                 };
               }
             };
@@ -1212,12 +1261,14 @@ function pendingCommandDispatchDb() {
           bind(
             connectorId: string,
             leaseUntil: string,
+            leaseTargetHostSessionId: string | null,
             updatedAt: string,
             commandId: string,
             now: string
           ) {
             assert.equal(connectorId, "connector-online");
             assert.match(leaseUntil, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(leaseTargetHostSessionId, "session-tree-1");
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
             assert.match(now, /^\d{4}-\d{2}-\d{2}T/);

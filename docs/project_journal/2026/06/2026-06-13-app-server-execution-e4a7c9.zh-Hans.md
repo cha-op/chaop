@@ -53,6 +53,7 @@ superseded_by:
 - Independent PR review 发现 reattach-after-dispatch race：同一个 connector 可能先收到指向某个 app-server Host Session 的 command，随后又把另一个 Host Session attach 到同一 task/thread，最后才发送 `command.started`。现在 app-server `command.started` event 会带 `target_host_session_id`，Worker acknowledgement 只有在该 session 仍匹配当前 task/thread target 时才会接受 start。
 - 后续 independent review 发现 `command.started` Host Session identity check 与 command state update 之间仍有 TOCTOU window。现在 Worker 会把当前 Host Session target check 合并进同一条 guarded `UPDATE commands ... WHERE ... EXISTS (...)`，只有该 update 仍能解析到 event `target_host_session_id` 时才把 command 置为 `running`。
 - Detached-command replacement matching 现在也要求 replacement connector 可执行、在线，并声明 `codex_app_server_exec`，所以 cleanup 不会被 command leasing 实际无法 dispatch 的 attached Host Session 错误压制。
+- Independent review 发现外部注册的 connector 如果同时声明 `codex_exec` 和 `codex_app_server_exec`，仍可能跳过 `command.started` Host Session revalidation。现在 Worker 会在 command lease 时保存本次选中的 app-server Host Session id，并要求该 leased target 的 started event 回传同一个 target，之后 guarded state update 才能执行。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -64,6 +65,7 @@ superseded_by:
 - Worker route tests 断言 detached-command cleanup 会立即覆盖 leased commands，而不是等 lease expiry。
 - Worker route tests 断言 Host Session detach 会先清空 attachment，然后才执行 command cleanup query。
 - Worker Durable Object tests 断言 stale agent command events 会收到带 `accepted: false` 的 `server.ack`。
+- Worker tests 断言 app-server-leased `command.started` event 如果缺少 leased target session id 会被拒绝，同时没有 app-server lease target 的普通 Codex start 仍会被接受。
 - Worker DB tests 断言当前 Host Session attachment 消失后，app-server-only `command.started` events 会被拒绝。
 - Worker DB tests 断言同一个 connector 把另一个 Host Session reattach 到 command scope 后，app-server-only `command.started` events 会被拒绝。
 - Worker DB tests 断言 app-server-only `command.started` events 只有在 guarded command-state update 仍能把当前 target Host Session 解析到 event `target_host_session_id` 时才会被接受。

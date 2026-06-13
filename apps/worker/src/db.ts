@@ -829,9 +829,9 @@ async function insertCommandInDb(
     const result = await env.DB!.prepare(
       `INSERT INTO commands (
          id, workspace_id, thread_id, task_id, type, prompt, state,
-         target_connector_id, created_by, created_at, updated_at
+         target_connector_id, lease_target_host_session_id, created_by, created_at, updated_at
        )
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?
        WHERE EXISTS (
          SELECT 1
          FROM host_sessions hs
@@ -895,8 +895,8 @@ async function insertCommandInDb(
   await env.DB!.prepare(
     `INSERT INTO commands (
        id, workspace_id, thread_id, task_id, type, prompt, state,
-       target_connector_id, created_by, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       target_connector_id, lease_target_host_session_id, created_by, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
   )
     .bind(
       command.id,
@@ -997,14 +997,18 @@ export async function pendingCommandsForConnector(
   for (const row of rows) {
     const result = await env.DB.prepare(
       `UPDATE commands
-       SET state = 'leased', lease_owner_connector_id = ?, lease_until = ?, updated_at = ?
+       SET state = 'leased',
+           lease_owner_connector_id = ?,
+           lease_until = ?,
+           lease_target_host_session_id = ?,
+           updated_at = ?
        WHERE id = ?
          AND (
            state = 'pending'
            OR (state = 'leased' AND lease_until IS NOT NULL AND lease_until < ?)
          )`
     )
-      .bind(connectorId, leaseUntil, now, row.id, now)
+      .bind(connectorId, leaseUntil, appServerLeaseTargetHostSessionId(row), now, row.id, now)
       .run();
     if ((result.meta as { changes?: number } | undefined)?.changes) {
       leasedRows.push(row);
@@ -1032,7 +1036,7 @@ export async function recordAgentEvent(
   if (!env.DB) return { accepted: false };
 
   const command = await env.DB.prepare(
-    `SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state
+    `SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state, lease_target_host_session_id
      FROM commands
      WHERE id = ?
      LIMIT 1`
@@ -1046,6 +1050,7 @@ export async function recordAgentEvent(
       type: CommandSummary["type"];
       target_connector_id: string | null;
       lease_owner_connector_id: string | null;
+      lease_target_host_session_id: string | null;
       state: CommandSummary["state"];
     }>();
 
@@ -1055,12 +1060,7 @@ export async function recordAgentEvent(
   }
   if (command.lease_owner_connector_id !== connectorId) return { accepted: false };
   if (!isActiveCommandState(command.state)) return { accepted: false };
-  const requireCurrentAppServerStartTarget = await requiresCurrentAppServerStartTarget(
-    env,
-    connectorId,
-    command,
-    event
-  );
+  const requireCurrentAppServerStartTarget = requiresCurrentAppServerStartTarget(command, event);
   if (requireCurrentAppServerStartTarget && !event.target_host_session_id) return { accepted: false };
 
   const now = new Date().toISOString();
@@ -1793,6 +1793,11 @@ function commandTargetHostSessionFromRow(row: PendingCommandRow): CommandTargetH
   };
 }
 
+function appServerLeaseTargetHostSessionId(row: PendingCommandRow): string | null {
+  const targetHostSession = commandTargetHostSessionFromRow(row);
+  return targetHostSession?.app_server_present === true ? targetHostSession.session_id : null;
+}
+
 async function updateCommandStateForAgentEvent(
   env: Env,
   connectorId: string,
@@ -1882,41 +1887,17 @@ async function updateCommandStateForAgentEvent(
     .run();
 }
 
-async function requiresCurrentAppServerStartTarget(
-  env: Env,
-  connectorId: string,
+function requiresCurrentAppServerStartTarget(
   command: {
+    lease_target_host_session_id: string | null;
     type: CommandSummary["type"];
   },
   event: AgentCommandEvent
-): Promise<boolean> {
+): boolean {
   if (event.kind !== "command.started" || command.type !== "codex") {
     return false;
   }
-  return await connectorRequiresAppServerStartValidation(env, connectorId);
-}
-
-async function connectorRequiresAppServerStartValidation(env: Env, connectorId: string): Promise<boolean> {
-  const row = await env.DB!.prepare(
-    `SELECT capabilities_json
-     FROM connectors
-     WHERE id = ?
-     LIMIT 1`
-  )
-    .bind(connectorId)
-    .first<{ capabilities_json: string | null }>();
-  if (!row?.capabilities_json) return false;
-
-  try {
-    const capabilities = JSON.parse(row.capabilities_json) as unknown;
-    return (
-      Array.isArray(capabilities) &&
-      capabilities.includes("codex_app_server_exec") &&
-      !capabilities.includes("codex_exec")
-    );
-  } catch {
-    return false;
-  }
+  return Boolean(command.lease_target_host_session_id || event.target_host_session_id);
 }
 
 function hostSessionFromRow(row: HostSessionRow): HostSessionSummary {
