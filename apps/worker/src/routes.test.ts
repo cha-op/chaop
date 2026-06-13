@@ -1572,6 +1572,7 @@ function commandTargetDb(
                 return attachedTaskConnectorId
                   ? {
                     connector_id: attachedTaskConnectorId,
+                    session_id: "session-attached-task",
                     app_server_present: attachedTaskAppServerPresent ? 1 : 0
                   }
                   : null;
@@ -1591,6 +1592,7 @@ function commandTargetDb(
                 return attachedThreadConnectorId
                   ? {
                     connector_id: attachedThreadConnectorId,
+                    session_id: "session-attached-thread",
                     app_server_present: attachedThreadAppServerPresent ? 1 : 0
                   }
                   : null;
@@ -1665,16 +1667,26 @@ function commandTargetDb(
 
       if (/INSERT INTO commands/.test(sql)) {
         return {
-          bind(
-            commandId: string,
-            workspaceId: string,
-            threadId: string | null,
-            taskId: string | null,
-            commandType: string,
-            prompt: string,
-            state: string,
-            targetConnectorId: string | null
-          ) {
+          bind(...args: unknown[]) {
+            const [
+              commandId,
+              workspaceId,
+              threadId,
+              taskId,
+              commandType,
+              prompt,
+              state,
+              targetConnectorId
+            ] = args as [
+              string,
+              string,
+              string | null,
+              string | null,
+              string,
+              string,
+              string,
+              string | null
+            ];
             assert.match(commandId, /^command-/);
             assert.equal(workspaceId, "workspace-api");
             assert.equal(threadId, "thread-orders-500");
@@ -1683,10 +1695,13 @@ function commandTargetDb(
             assert.equal(typeof prompt, "string");
             assert.equal(state, "pending");
             if (/WHERE EXISTS/.test(sql)) {
+              const leaseTargetHostSessionId = args[8];
               assert.equal(targetConnectorId, "connector-attached");
+              assert.equal(leaseTargetHostSessionId, "session-attached-thread");
               assert.match(sql, /hs\.app_server_present = 1/);
               assert.match(sql, /hs\.id = \(\s+SELECT hs2\.id/);
               assert.match(sql, /hs\.connector_id = \?/);
+              assert.match(sql, /hs\.session_id = \?/);
               assert.match(sql, /ORDER BY\s+CASE WHEN \? IS NOT NULL AND hs2\.attached_task_id = \?/);
               assert.match(sql, /OR NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hst/);
             }
@@ -2572,6 +2587,7 @@ function hostSessionDetachDb(options: { returnDetachedCommands?: boolean } = {})
         assert.match(sql, /cmd\.state = 'leased'/);
         assert.match(sql, /cmd\.lease_target_host_session_id = \?/);
         assert.match(sql, /cmd\.lease_owner_connector_id = \?/);
+        assert.match(sql, /cmd\.state = 'pending'\s+AND cmd\.lease_target_host_session_id = \?/);
         assert.doesNotMatch(sql, /cmd\.lease_until IS NOT NULL/);
         assert.match(sql, /NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
@@ -2579,16 +2595,22 @@ function hostSessionDetachDb(options: { returnDetachedCommands?: boolean } = {})
         assert.match(sql, /wc\.can_execute = 1/);
         assert.match(sql, /c\.status <> 'offline'/);
         assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
-        assert.match(sql, /hs\.id <> \?/);
+        assert.match(sql, /WHERE hs\.id = \(\s+SELECT hs2\.id/);
+        assert.match(sql, /hs2\.id <> \?/);
+        assert.match(sql, /CASE\s+WHEN cmd\.task_id IS NOT NULL AND hs2\.attached_task_id = cmd\.task_id THEN 0/);
+        assert.match(sql, /hs2\.updated_at DESC,\s+hs2\.id DESC/);
+        assert.match(sql, /LIMIT 1/);
         assert.match(sql, /cmd\.target_connector_id IS NULL OR hs\.connector_id = cmd\.target_connector_id/);
         assert.match(sql, /hst\.id <> \?/);
         assert.doesNotMatch(sql, /hst\.connector_id = cmd\.target_connector_id/);
         assert.doesNotMatch(sql, /hst\.app_server_present = 1/);
+        assert.doesNotMatch(sql, /hs\.attached_task_id = cmd\.task_id/);
         return {
           bind(
             workspaceId: string,
             connectorId: string,
-            leaseTargetHostSessionId: string,
+            pendingLeaseTargetHostSessionId: string,
+            leasedLeaseTargetHostSessionId: string,
             legacyLeaseOwnerConnectorId: string,
             taskIdPresent: string | null,
             taskId: string | null,
@@ -2599,7 +2621,8 @@ function hostSessionDetachDb(options: { returnDetachedCommands?: boolean } = {})
           ) {
             assert.equal(workspaceId, "workspace-api");
             assert.equal(connectorId, "connector-online");
-            assert.equal(leaseTargetHostSessionId, "session-1");
+            assert.equal(pendingLeaseTargetHostSessionId, "session-1");
+            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
             assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
             assert.equal(taskIdPresent, "task-host-1");
             assert.equal(taskId, "task-host-1");

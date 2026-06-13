@@ -57,6 +57,9 @@ superseded_by:
 - Follow-up review of that fix found the guarded update still needed to compare the event target against the lease-time target, not only the current attachment. The guarded `command.started` update now also checks `lease_target_host_session_id` against the event target in the same SQL statement.
 - Independent review found that a targeted `command.started` event could still be accepted for an ordinary Codex lease with no app-server lease target because the guarded SQL treated a `NULL` lease target as permissive. The guarded update now requires a non-null lease-time app-server target that equals the event target.
 - Independent review found detach cleanup could fail nullable-target leased commands owned by another connector and unrelated to the detached app-server Host Session. The leased cleanup branch now requires either a matching lease-time Host Session target or, for legacy null lease targets, the detached connector as lease owner.
+- Follow-up independent review found detach cleanup replacement suppression still used any matching leaseable Host Session instead of the exact task-first/latest Host Session that command leasing would select. Detached-command cleanup now uses the same scalar Host Session target selection before checking app-server execution eligibility.
+- Follow-up independent review found rejected stale app-server `command.started` acknowledgements could leave the command leased until an unrelated future trigger. Rejected targeted starts now release the app-server lease back to pending, and the Durable Object immediately re-dispatches pending commands across available agent sockets.
+- Follow-up frozen-diff review found detach cleanup still inferred pending command dependency from task/thread scope, which could fail ordinary pending `codex_exec` commands created before a Host Session was attached. App-server command creation now persists the intended Host Session id, and detach cleanup only fails pending commands whose stored app-server target matches the detached session.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -72,6 +75,10 @@ superseded_by:
 - Worker tests assert app-server-leased `command.started` events are rejected when the event target matches the current attachment but differs from the lease-time target.
 - Worker tests assert ordinary Codex leases reject targeted app-server `command.started` events, even when the current attachment matches the event target.
 - Worker route tests assert Host Session detach does not fail nullable-target leased commands that are owned by another connector.
+- Worker route tests assert detach cleanup replacement suppression uses the same scalar task-first/latest Host Session target selection as command leasing.
+- Worker route tests assert app-server command creation persists the intended Host Session target id and detach cleanup only matches pending commands with that explicit target.
+- Worker DB tests assert rejected stale app-server `command.started` events release the app-server lease for immediate re-dispatch.
+- Worker Durable Object tests assert rejected targeted app-server starts trigger pending command dispatch across available agent sockets.
 - Worker DB tests assert app-server-only `command.started` events are rejected after the current Host Session attachment is gone.
 - Worker DB tests assert app-server-only `command.started` events are rejected after the same connector reattaches a different Host Session to the command scope.
 - Worker DB tests assert app-server-only `command.started` events are accepted only when the guarded command-state update still resolves the current target Host Session to the event `target_host_session_id`.

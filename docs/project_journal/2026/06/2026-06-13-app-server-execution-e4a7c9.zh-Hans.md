@@ -57,6 +57,9 @@ superseded_by:
 - 后续 review 发现这个修复里的 guarded update 仍需要比较 event target 与 lease-time target，而不只是比较当前 attachment。现在 guarded `command.started` update 会在同一条 SQL 中同时检查 `lease_target_host_session_id` 是否等于 event target。
 - Independent review 发现没有 app-server lease target 的普通 Codex lease 仍可能接受带 target 的 `command.started` event，因为 guarded SQL 把 `NULL` lease target 当成 permissive。现在 guarded update 要求 lease-time app-server target 非空，且必须等于 event target。
 - Independent review 发现 detach cleanup 可能失败由其他 connector 租走、且并不依赖被 detach app-server Host Session 的 nullable-target leased command。现在 leased cleanup 分支要求 lease-time Host Session target 匹配，或在 legacy null lease target 情况下要求 lease owner 就是被 detach 的 connector。
+- 后续 independent review 发现 detach cleanup 的 replacement suppression 仍使用任意匹配且可 lease 的 Host Session，而不是 command leasing 实际会选择的 task-first/latest Host Session。现在 detached-command cleanup 会先使用同一套标量 Host Session target selection，再检查 app-server execution eligibility。
+- 后续 independent review 发现 stale app-server `command.started` 被拒后，command 可能继续停在 leased，直到未来出现无关触发。现在 rejected targeted start 会把 app-server lease 释放回 pending，Durable Object 随即对所有可用 agent sockets 触发 pending command dispatch。
+- 后续 frozen-diff review 发现 detach cleanup 仍从 task/thread scope 推断 pending command 是否依赖该 session，可能误失败在 Host Session attach 前创建的普通 pending `codex_exec` command。现在 app-server command creation 会持久化 intended Host Session id，detach cleanup 只会失败 stored app-server target 匹配被 detach session 的 pending command。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -72,6 +75,10 @@ superseded_by:
 - Worker tests 断言 app-server-leased `command.started` event 即使 event target 匹配当前 attachment，只要它不同于 lease-time target，也会被拒绝。
 - Worker tests 断言普通 Codex lease 即使当前 attachment 匹配 event target，也会拒绝带 app-server target 的 `command.started` event。
 - Worker route tests 断言 Host Session detach 不会失败由其他 connector 租走的 nullable-target leased command。
+- Worker route tests 断言 detach cleanup 的 replacement suppression 使用与 command leasing 相同的标量 task-first/latest Host Session target selection。
+- Worker route tests 断言 app-server command creation 会持久化 intended Host Session target id，且 detach cleanup 只匹配带有该显式 target 的 pending command。
+- Worker DB tests 断言 rejected stale app-server `command.started` events 会释放 app-server lease，以便立即 re-dispatch。
+- Worker Durable Object tests 断言 rejected targeted app-server starts 会对所有可用 agent sockets 触发 pending command dispatch。
 - Worker DB tests 断言当前 Host Session attachment 消失后，app-server-only `command.started` events 会被拒绝。
 - Worker DB tests 断言同一个 connector 把另一个 Host Session reattach 到 command scope 后，app-server-only `command.started` events 会被拒绝。
 - Worker DB tests 断言 app-server-only `command.started` events 只有在 guarded command-state update 仍能把当前 target Host Session 解析到 event `target_host_session_id` 时才会被接受。

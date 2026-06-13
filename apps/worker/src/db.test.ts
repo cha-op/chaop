@@ -44,8 +44,9 @@ test("recordAgentEvent rejects app-server starts after the attachment is detache
   });
 
   assert.equal(result.accepted, false);
+  assert.equal(result.dispatch_pending, true);
   assert.equal(result.event, undefined);
-  assert.equal(db.commandUpdates, 0);
+  assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 0);
   assert.equal(db.eventInserts, 0);
 });
@@ -66,8 +67,9 @@ test("recordAgentEvent rejects app-server starts after the connector reattaches 
   });
 
   assert.equal(result.accepted, false);
+  assert.equal(result.dispatch_pending, true);
   assert.equal(result.event, undefined);
-  assert.equal(db.commandUpdates, 0);
+  assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 0);
   assert.equal(db.eventInserts, 0);
 });
@@ -88,8 +90,9 @@ test("recordAgentEvent rejects app-server starts that differ from the leased tar
   });
 
   assert.equal(result.accepted, false);
+  assert.equal(result.dispatch_pending, true);
   assert.equal(result.event, undefined);
-  assert.equal(db.commandUpdates, 0);
+  assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 0);
   assert.equal(db.eventInserts, 0);
 });
@@ -131,8 +134,9 @@ test("recordAgentEvent rejects app-server starts without the leased target sessi
   });
 
   assert.equal(result.accepted, false);
+  assert.equal(result.dispatch_pending, true);
   assert.equal(result.event, undefined);
-  assert.equal(db.commandUpdates, 0);
+  assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 0);
   assert.equal(db.eventInserts, 0);
 });
@@ -203,6 +207,7 @@ test("recordAgentEvent rejects targeted app-server starts for ordinary codex lea
   });
 
   assert.equal(result.accepted, false);
+  assert.equal(result.dispatch_pending, false);
   assert.equal(result.event, undefined);
   assert.equal(db.commandUpdates, 0);
   assert.equal(db.taskUpdates, 0);
@@ -670,6 +675,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
     taskUpdates: 0,
     eventInserts: 0
   };
+  let releasedLease = false;
   const db = {
     prepare(sql: string) {
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
@@ -702,6 +708,36 @@ function appServerStartAfterDetachDb(currentTarget?: {
             return {
               async first() {
                 return { capabilities_json: JSON.stringify(["codex_app_server_exec"]) };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
+        assert.match(sql, /lease_owner_connector_id = NULL/);
+        assert.match(sql, /lease_until = NULL/);
+        assert.match(sql, /lease_target_host_session_id = NULL/);
+        assert.match(sql, /state = 'leased'/);
+        assert.match(sql, /lease_target_host_session_id IS NOT NULL/);
+        assert.match(sql, /lease_target_host_session_id = \?/);
+        return {
+          bind(
+            updatedAt: string,
+            commandId: string,
+            ownerConnectorId: string,
+            targetHostSessionId: string | null
+          ) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(ownerConnectorId, "connector-online");
+            assert.equal(targetHostSessionId, leaseTargetHostSessionId);
+            const changes = leaseTargetHostSessionId !== null ? 1 : 0;
+            return {
+              async run() {
+                releasedLease = changes > 0;
+                counters.commandUpdates += changes;
+                return { meta: { changes } };
               }
             };
           }
@@ -828,7 +864,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
             assert.equal(connectorId, "connector-online");
             return {
               async first() {
-                return { active_count: 1 };
+                return { active_count: releasedLease ? 0 : 1 };
               }
             };
           }
@@ -838,7 +874,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
       if (/UPDATE connectors/.test(sql) && /active_command_count/.test(sql)) {
         return {
           bind(activeCount: number, updatedAt: string, connectorId: string) {
-            assert.equal(activeCount, 1);
+            assert.equal(activeCount, releasedLease ? 0 : 1);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(connectorId, "connector-online");
             return {

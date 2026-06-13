@@ -50,6 +50,7 @@ export class NotFoundError extends Error {
 
 export type RecordAgentEventResult = {
   accepted: boolean;
+  dispatch_pending?: boolean;
   event?: ThreadEvent;
 };
 
@@ -402,7 +403,10 @@ async function failCommandsForDetachedAppServerHostSession(
          AND cmd.type = 'codex'
          AND (cmd.target_connector_id = ? OR cmd.target_connector_id IS NULL)
          AND (
-           cmd.state = 'pending'
+           (
+             cmd.state = 'pending'
+             AND cmd.lease_target_host_session_id = ?
+           )
            OR (
              cmd.state = 'leased'
              AND (
@@ -425,35 +429,48 @@ async function failCommandsForDetachedAppServerHostSession(
            INNER JOIN workspace_connectors wc
              ON wc.workspace_id = cmd.workspace_id
             AND wc.connector_id = hs.connector_id
-           WHERE hs.workspace_id = cmd.workspace_id
-             AND hs.id <> ?
+           WHERE hs.id = (
+             SELECT hs2.id
+             FROM host_sessions hs2
+             WHERE hs2.workspace_id = cmd.workspace_id
+               AND hs2.id <> ?
+               AND (
+                 (cmd.task_id IS NOT NULL AND hs2.attached_task_id = cmd.task_id)
+                 OR (
+                   cmd.thread_id IS NOT NULL
+                   AND hs2.attached_thread_id = cmd.thread_id
+                   AND (
+                     cmd.task_id IS NULL
+                     OR NOT EXISTS (
+                       SELECT 1
+                       FROM host_sessions hst
+                       WHERE hst.workspace_id = cmd.workspace_id
+                         AND hst.id <> ?
+                         AND hst.attached_task_id = cmd.task_id
+                     )
+                   )
+                 )
+               )
+             ORDER BY
+               CASE
+                 WHEN cmd.task_id IS NOT NULL AND hs2.attached_task_id = cmd.task_id THEN 0
+                 ELSE 1
+               END,
+               hs2.updated_at DESC,
+               hs2.id DESC
+             LIMIT 1
+           )
              AND hs.app_server_present = 1
              AND wc.can_execute = 1
              AND c.status <> 'offline'
              AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
              AND (cmd.target_connector_id IS NULL OR hs.connector_id = cmd.target_connector_id)
-             AND (
-               (cmd.task_id IS NOT NULL AND hs.attached_task_id = cmd.task_id)
-               OR (
-                 cmd.thread_id IS NOT NULL
-                 AND hs.attached_thread_id = cmd.thread_id
-                 AND (
-                   cmd.task_id IS NULL
-                   OR NOT EXISTS (
-                    SELECT 1
-                    FROM host_sessions hst
-                    WHERE hst.workspace_id = cmd.workspace_id
-                      AND hst.id <> ?
-                      AND hst.attached_task_id = cmd.task_id
-                   )
-                 )
-               )
-             )
          )
        ORDER BY cmd.created_at ASC`
     ).bind(
       hostSession.workspace_id,
       hostSession.connector_id,
+      hostSession.session_id,
       hostSession.session_id,
       hostSession.connector_id,
       taskId,
@@ -773,6 +790,8 @@ export async function createCommandInDb(
   const commandType = request.type ?? "placeholder";
   const scope = await resolveCommandScope(env, request);
   const attachedTarget = await findAttachedCommandTarget(env, scope);
+  const appServerTargetHostSessionId =
+    attachedTarget?.app_server_present === true && commandType === "codex" ? attachedTarget.session_id : null;
   const targetConnectorId =
     request.target_connector_id
     ?? attachedTarget?.connector_id
@@ -807,7 +826,7 @@ export async function createCommandInDb(
   };
 
   const inserted = await insertCommandInDb(env, user.id, command, {
-    requireCurrentAppServerTarget: attachedTarget?.app_server_present === true && command.type === "codex"
+    appServerTargetHostSessionId
   });
   if (!inserted) {
     throw new CommandTargetError("Attached host session changed before command creation", 409);
@@ -831,9 +850,9 @@ async function insertCommandInDb(
   env: Env,
   userId: string,
   command: CommandSummary,
-  options: { requireCurrentAppServerTarget: boolean }
+  options: { appServerTargetHostSessionId?: string | null }
 ): Promise<boolean> {
-  if (options.requireCurrentAppServerTarget) {
+  if (options.appServerTargetHostSessionId) {
     if (!command.target_connector_id) {
       return false;
     }
@@ -842,7 +861,7 @@ async function insertCommandInDb(
          id, workspace_id, thread_id, task_id, type, prompt, state,
          target_connector_id, lease_target_host_session_id, created_by, created_at, updated_at
        )
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE EXISTS (
          SELECT 1
          FROM host_sessions hs
@@ -873,6 +892,7 @@ async function insertCommandInDb(
            LIMIT 1
          )
            AND hs.connector_id = ?
+           AND hs.session_id = ?
            AND hs.app_server_present = 1
        )`
     )
@@ -885,6 +905,7 @@ async function insertCommandInDb(
         command.prompt,
         command.state,
         command.target_connector_id,
+        options.appServerTargetHostSessionId,
         userId,
         command.created_at,
         command.updated_at,
@@ -897,7 +918,8 @@ async function insertCommandInDb(
         command.task_id ?? null,
         command.task_id ?? null,
         command.task_id ?? null,
-        command.target_connector_id
+        command.target_connector_id,
+        options.appServerTargetHostSessionId
       )
       .run();
     return Boolean((result.meta as { changes?: number } | undefined)?.changes);
@@ -1072,9 +1094,13 @@ export async function recordAgentEvent(
   if (command.lease_owner_connector_id !== connectorId) return { accepted: false };
   if (!isActiveCommandState(command.state)) return { accepted: false };
   const requireCurrentAppServerStartTarget = requiresCurrentAppServerStartTarget(command, event);
-  if (requireCurrentAppServerStartTarget && !event.target_host_session_id) return { accepted: false };
 
   const now = new Date().toISOString();
+  if (requireCurrentAppServerStartTarget && !event.target_host_session_id) {
+    const dispatchPending = await releaseRejectedAppServerStartLease(env, connectorId, command, now);
+    return { accepted: false, dispatch_pending: dispatchPending };
+  }
+
   const nextState = commandStateForEvent(event.kind);
 
   if (nextState) {
@@ -1082,7 +1108,11 @@ export async function recordAgentEvent(
       requireCurrentAppServerStartTarget
     });
     if (!((result.meta as { changes?: number } | undefined)?.changes)) {
-      return { accepted: false };
+      const dispatchPending =
+        requireCurrentAppServerStartTarget && event.kind === "command.started"
+          ? await releaseRejectedAppServerStartLease(env, connectorId, command, now)
+          : false;
+      return { accepted: false, dispatch_pending: dispatchPending };
     }
   }
 
@@ -1123,6 +1153,41 @@ export async function recordAgentEvent(
     result.event = threadEvent;
   }
   return result;
+}
+
+async function releaseRejectedAppServerStartLease(
+  env: Env,
+  connectorId: string,
+  command: {
+    id: string;
+    lease_target_host_session_id: string | null;
+  },
+  now: string
+): Promise<boolean> {
+  if (!command.lease_target_host_session_id) {
+    return false;
+  }
+
+  const result = await env.DB!.prepare(
+    `UPDATE commands
+     SET state = 'pending',
+         lease_owner_connector_id = NULL,
+         lease_until = NULL,
+         lease_target_host_session_id = NULL,
+         updated_at = ?
+     WHERE id = ?
+       AND lease_owner_connector_id = ?
+       AND state = 'leased'
+       AND lease_target_host_session_id IS NOT NULL
+       AND lease_target_host_session_id = ?`
+  )
+    .bind(now, command.id, connectorId, command.lease_target_host_session_id)
+    .run();
+  const released = Boolean((result.meta as { changes?: number } | undefined)?.changes);
+  if (released) {
+    await updateConnectorActivity(env, connectorId);
+  }
+  return released;
 }
 
 export async function markConnectorDisconnected(env: Env, connectorId: string): Promise<ThreadEvent[]> {
@@ -1542,20 +1607,21 @@ async function chooseConnectorForWorkspace(
 async function findAttachedCommandTarget(
   env: Env,
   scope: { workspaceId: string; threadId?: string | undefined; taskId?: string | undefined }
-): Promise<{ connector_id: string; app_server_present: boolean } | undefined> {
+): Promise<{ connector_id: string; session_id: string; app_server_present: boolean } | undefined> {
   if (scope.taskId) {
     const row = await env.DB!.prepare(
-      `SELECT hs.connector_id, hs.app_server_present
+      `SELECT hs.connector_id, hs.session_id, hs.app_server_present
        FROM host_sessions hs
        WHERE hs.workspace_id = ? AND hs.attached_task_id = ?
        ORDER BY hs.updated_at DESC, hs.id DESC
        LIMIT 1`
     )
       .bind(scope.workspaceId, scope.taskId)
-      .first<{ connector_id: string; app_server_present: number | boolean | null }>();
+      .first<{ connector_id: string; session_id: string; app_server_present: number | boolean | null }>();
     if (row?.connector_id) {
       return {
         connector_id: row.connector_id,
+        session_id: row.session_id,
         app_server_present: row.app_server_present === 1 || row.app_server_present === true
       };
     }
@@ -1563,17 +1629,18 @@ async function findAttachedCommandTarget(
 
   if (scope.threadId) {
     const row = await env.DB!.prepare(
-      `SELECT hs.connector_id, hs.app_server_present
+      `SELECT hs.connector_id, hs.session_id, hs.app_server_present
        FROM host_sessions hs
        WHERE hs.workspace_id = ? AND hs.attached_thread_id = ?
        ORDER BY hs.updated_at DESC, hs.id DESC
        LIMIT 1`
     )
       .bind(scope.workspaceId, scope.threadId)
-      .first<{ connector_id: string; app_server_present: number | boolean | null }>();
+      .first<{ connector_id: string; session_id: string; app_server_present: number | boolean | null }>();
     if (row?.connector_id) {
       return {
         connector_id: row.connector_id,
+        session_id: row.session_id,
         app_server_present: row.app_server_present === 1 || row.app_server_present === true
       };
     }

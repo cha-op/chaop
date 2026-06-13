@@ -201,6 +201,70 @@ test("agent event ack rejects stale command events", async () => {
   });
 });
 
+test("rejected targeted app-server starts trigger pending dispatch to available agents", async () => {
+  const staleSent: string[] = [];
+  const replacementSent: string[] = [];
+  const staleSocket = {
+    send(message: string) {
+      staleSent.push(message);
+    },
+    deserializeAttachment() {
+      return { socketType: "agent", connectorId: "connector-stale", connectedAt: 100 };
+    }
+  } as unknown as WebSocket;
+  const replacementSocket = {
+    send(message: string) {
+      replacementSent.push(message);
+    },
+    deserializeAttachment() {
+      return { socketType: "agent", connectorId: "connector-replacement", connectedAt: 200 };
+    }
+  } as unknown as WebSocket;
+  const ctx = {
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "agent");
+      return [staleSocket, replacementSocket];
+    }
+  } as unknown as DurableObjectState;
+  const db = rejectedTargetedStartDispatchDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(staleSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      target_host_session_id: "session-old",
+      kind: "command.started",
+      priority: "P1",
+      summary: "Starting stale target"
+    }
+  }));
+
+  assert.equal(staleSent.length, 1);
+  const ack = JSON.parse(staleSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, {
+    command_id: "command-1",
+    kind: "command.started",
+    accepted: false
+  });
+  assert.equal(replacementSent.length, 1);
+  const dispatch = JSON.parse(replacementSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command?: { id?: string }; target_host_session?: { session_id?: string } };
+    target?: { type?: string; id?: string };
+  };
+  assert.equal(dispatch.kind, "command.dispatch");
+  assert.equal(dispatch.payload?.command?.id, "command-1");
+  assert.equal(dispatch.payload?.target_host_session?.session_id, "session-new");
+  assert.deepEqual(dispatch.target, { type: "connector", id: "connector-replacement" });
+  assert.equal(db.leaseReleases, 1);
+  assert.equal(db.commandLeases, 1);
+});
+
 function staleCommandEventDb(): D1Database {
   return {
     prepare(sql: string) {
@@ -229,6 +293,173 @@ function staleCommandEventDb(): D1Database {
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     }
   } as D1Database;
+}
+
+function rejectedTargetedStartDispatchDb(): D1Database & {
+  readonly leaseReleases: number;
+  readonly commandLeases: number;
+} {
+  const counters = {
+    leaseReleases: 0,
+    commandLeases: 0
+  };
+  return {
+    prepare(sql: string) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
+        return {
+          bind(commandId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                return {
+                  id: "command-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  task_id: "task-1",
+                  type: "codex",
+                  target_connector_id: null,
+                  lease_owner_connector_id: "connector-stale",
+                  state: "leased",
+                  lease_target_host_session_id: "session-old"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                return { meta: { changes: 0 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
+        assert.match(sql, /lease_target_host_session_id = \?/);
+        return {
+          bind(updatedAt: string, commandId: string, connectorId: string, targetHostSessionId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(connectorId, "connector-stale");
+            assert.equal(targetHostSessionId, "session-old");
+            return {
+              async run() {
+                counters.leaseReleases += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
+        return {
+          bind(
+            now: string,
+            targetConnectorId: string,
+            hostSessionConnectorId: string,
+            executableConnectorId: string
+          ) {
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(targetConnectorId, hostSessionConnectorId);
+            assert.equal(hostSessionConnectorId, executableConnectorId);
+            return {
+              async all() {
+                if (targetConnectorId !== "connector-replacement") {
+                  return { results: [] };
+                }
+                return {
+                  results: [
+                    {
+                      id: "command-1",
+                      workspace_id: "workspace-api",
+                      thread_id: "thread-1",
+                      task_id: "task-1",
+                      type: "codex",
+                      prompt: "Continue on the replacement session",
+                      state: "pending",
+                      target_connector_id: null,
+                      created_at: "2026-06-13T10:00:00.000Z",
+                      updated_at: "2026-06-13T10:00:00.000Z",
+                      target_host_session_id: "session-new",
+                      target_host_session_app_server_present: 1,
+                      target_host_session_cwd: "/workspace/project"
+                    }
+                  ]
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'leased'/.test(sql)) {
+        return {
+          bind(
+            connectorId: string,
+            leaseUntil: string,
+            leaseTargetHostSessionId: string,
+            updatedAt: string,
+            commandId: string,
+            now: string
+          ) {
+            assert.equal(connectorId, "connector-replacement");
+            assert.match(leaseUntil, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(leaseTargetHostSessionId, "session-new");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                counters.commandLeases += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            return {
+              async first() {
+                return { active_count: connectorId === "connector-replacement" ? 1 : 0 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /active_command_count/.test(sql)) {
+        return {
+          bind(activeCount: number, updatedAt: string, connectorId: string) {
+            assert.equal(activeCount, connectorId === "connector-replacement" ? 1 : 0);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get leaseReleases() {
+      return counters.leaseReleases;
+    },
+    get commandLeases() {
+      return counters.commandLeases;
+    }
+  } as D1Database & typeof counters;
 }
 
 function socketWithAttachment(attachment: unknown): WebSocket {

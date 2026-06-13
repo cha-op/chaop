@@ -135,19 +135,7 @@ export class WorkspaceDO implements DurableObject {
 
   private async dispatchPending(request: Request): Promise<Response> {
     const payload = await request.json().catch(() => ({})) as { connector_id?: string };
-    if (payload.connector_id) {
-      const sockets = this.ctx.getWebSockets(`agent:${payload.connector_id}`);
-      await Promise.all(sockets.map((socket) => this.sendPendingCommands(socket, payload.connector_id!)));
-      return new Response(JSON.stringify({ dispatched_to: sockets.length }), {
-        headers: { "content-type": "application/json; charset=utf-8" }
-      });
-    }
-
-    const sockets = this.ctx.getWebSockets("agent");
-    await Promise.all(sockets.map((socket) => {
-      const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
-      return attachment?.connectorId ? this.sendPendingCommands(socket, attachment.connectorId) : undefined;
-    }));
+    const sockets = await this.sendPendingCommandsToAgents(payload.connector_id);
     return new Response(JSON.stringify({ dispatched_to: sockets.length }), {
       headers: { "content-type": "application/json; charset=utf-8" }
     });
@@ -202,6 +190,8 @@ export class WorkspaceDO implements DurableObject {
         message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
       if (result.accepted && finalCommandEvent) {
         await this.sendPendingCommands(ws, connectorId);
+      } else if (!result.accepted && result.dispatch_pending) {
+        await this.sendPendingCommandsToAgents();
       }
       return;
     }
@@ -500,6 +490,21 @@ export class WorkspaceDO implements DurableObject {
         )
       );
     }
+  }
+
+  private async sendPendingCommandsToAgents(connectorId?: string): Promise<WebSocket[]> {
+    if (connectorId) {
+      const sockets = this.ctx.getWebSockets(`agent:${connectorId}`);
+      await Promise.all(sockets.map((socket) => this.sendPendingCommands(socket, connectorId)));
+      return sockets;
+    }
+
+    const sockets = this.ctx.getWebSockets("agent");
+    await Promise.all(sockets.map((socket) => {
+      const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
+      return attachment?.connectorId ? this.sendPendingCommands(socket, attachment.connectorId) : undefined;
+    }));
+    return sockets;
   }
 }
 
