@@ -393,7 +393,7 @@ async function failCommandsForDetachedAppServerHostSession(
          AND cmd.target_connector_id = ?
          AND (
            cmd.state = 'pending'
-           OR (cmd.state = 'leased' AND cmd.lease_until IS NOT NULL AND cmd.lease_until < ?)
+           OR cmd.state = 'leased'
          )
          AND (
            (? IS NOT NULL AND cmd.task_id = ?)
@@ -430,7 +430,6 @@ async function failCommandsForDetachedAppServerHostSession(
     ).bind(
       hostSession.workspace_id,
       hostSession.connector_id,
-      now,
       taskId,
       taskId,
       threadId,
@@ -445,12 +444,9 @@ async function failCommandsForDetachedAppServerHostSession(
       `UPDATE commands
        SET state = 'failed', lease_owner_connector_id = NULL, lease_until = NULL, updated_at = ?
        WHERE id = ?
-         AND (
-           state = 'pending'
-           OR (state = 'leased' AND lease_until IS NOT NULL AND lease_until < ?)
-         )`
+         AND state IN ('pending', 'leased')`
     )
-      .bind(now, command.id, now)
+      .bind(now, command.id)
       .run();
     if (!((result.meta as { changes?: number } | undefined)?.changes)) {
       continue;

@@ -2472,6 +2472,8 @@ function hostSessionDetachDb(): D1Database & {
         assert.match(sql, /cmd\.type = 'codex'/);
         assert.match(sql, /cmd\.target_connector_id = \?/);
         assert.match(sql, /cmd\.state = 'pending'/);
+        assert.match(sql, /cmd\.state = 'leased'/);
+        assert.doesNotMatch(sql, /cmd\.lease_until IS NOT NULL/);
         assert.match(sql, /NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /hs\.id <> \?/);
         assert.match(sql, /hs\.connector_id = cmd\.target_connector_id/);
@@ -2481,7 +2483,6 @@ function hostSessionDetachDb(): D1Database & {
           bind(
             workspaceId: string,
             connectorId: string,
-            now: string,
             taskIdPresent: string | null,
             taskId: string | null,
             threadIdPresent: string | null,
@@ -2491,7 +2492,6 @@ function hostSessionDetachDb(): D1Database & {
           ) {
             assert.equal(workspaceId, "workspace-api");
             assert.equal(connectorId, "connector-online");
-            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(taskIdPresent, "task-host-1");
             assert.equal(taskId, "task-host-1");
             assert.equal(threadIdPresent, "thread-host-1");
@@ -2523,11 +2523,11 @@ function hostSessionDetachDb(): D1Database & {
       }
 
       if (/UPDATE commands/.test(sql) && /state = 'failed'/.test(sql)) {
+        assert.match(sql, /state IN \('pending', 'leased'\)/);
         return {
-          bind(updatedAt: string, commandId: string, now: string) {
+          bind(updatedAt: string, commandId: string) {
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-detached");
-            assert.equal(now, updatedAt);
             return {
               async run() {
                 counters.commandFailures += 1;
