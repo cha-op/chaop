@@ -44,6 +44,8 @@ superseded_by:
 - Final PR readiness review 进一步收紧了 detach cleanup：只有同一个 target connector 拥有的 replacement app-server Host Session 才能保留 pending command。
 - Final offline review 发现 app-server command startup 在找到 session match 后仍继续翻页；现在 command resolver 会在找到目标 app-server session 后立即返回。
 - Final independent review 发现并修复了 lease-before-dispatch detach window；detaching app-server Host Session 现在会同时失败依赖该 attachment 的 pending 和 leased-but-not-running Codex commands。
+- Final frozen-diff review 发现仍有 detach/dispatch acknowledgement race；Worker command-event acknowledgement 现在会带 `accepted`，Rust connector 在 `command.started` 因 stale 被拒绝时会中止本地执行。
+- Detached-command replacement matching 现在只让外层 replacement 限定在 command target connector，同时沿用 command leasing 的 connector-agnostic task-first existence check，所以 cross-connector task attachment 不会错误允许 thread fallback。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -52,8 +54,10 @@ superseded_by:
 - Worker route tests 覆盖 app-server Host Session detach 会让依赖该 attachment 的 pending Codex command 失败。
 - Worker route tests 断言 detached-command replacement matching 会限定在 command target connector 内。
 - Worker route tests 断言 detached-command cleanup 会立即覆盖 leased commands，而不是等 lease expiry。
+- Worker Durable Object tests 断言 stale agent command events 会收到带 `accepted: false` 的 `server.ack`。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。
+- Rust tests 断言 rejected command-event acknowledgements 会被识别，不会被当作 successful ack。
 - Rust tests 覆盖 connector 还没读取 turn id 时的 `turn/start` 取消窗口。
 - 合并前跑完整 `pnpm test`、Rust workspace tests、build、journal validation 和 PR readiness review。
 

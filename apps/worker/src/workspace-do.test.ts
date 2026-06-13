@@ -166,6 +166,70 @@ test("sync thread archive dispatches to the selected agent socket and resolves t
   assert.deepEqual(ack.payload, { kind: "thread.archive_sync_result", request_id: "archive-1" });
 });
 
+test("agent event ack rejects stale command events", async () => {
+  const sent: string[] = [];
+  const agentSocket = {
+    send(message: string) {
+      sent.push(message);
+    },
+    deserializeAttachment() {
+      return { socketType: "agent", connectorId: "connector-online", connectedAt: 300 };
+    }
+  } as unknown as WebSocket;
+  const workspace = new WorkspaceDO({} as DurableObjectState, { DB: staleCommandEventDb() } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "command.started",
+      priority: "P1",
+      summary: "Starting"
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, {
+    command_id: "command-1",
+    kind: "command.started",
+    accepted: false
+  });
+});
+
+function staleCommandEventDb(): D1Database {
+  return {
+    prepare(sql: string) {
+      if (/SELECT id, workspace_id, thread_id, task_id, target_connector_id, lease_owner_connector_id, state/.test(sql)) {
+        return {
+          bind(commandId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                return {
+                  id: "command-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  task_id: "task-1",
+                  target_connector_id: "connector-online",
+                  lease_owner_connector_id: null,
+                  state: "failed"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    }
+  } as D1Database;
+}
+
 function socketWithAttachment(attachment: unknown): WebSocket {
   return {
     deserializeAttachment() {

@@ -256,14 +256,16 @@ fn handle_text_message(
     if dispatch.command.command_type == CommandType::Codex
         && config.execution.mode == ExecutionMode::CodexExec
     {
-        dispatch_events(
+        if !dispatch_events(
             socket,
             &dispatch.command,
             vec![codex_exec_started_event(&config.workspace_root)],
             config,
             last_host_sessions_message,
             deferred_messages,
-        )?;
+        )? {
+            return Ok(true);
+        }
         let events = wait_for_codex_exec_events(
             socket,
             config,
@@ -307,7 +309,7 @@ fn handle_text_message(
             )?;
             return Ok(true);
         }
-        dispatch_events(
+        if !dispatch_events(
             socket,
             &dispatch.command,
             vec![app_server_command_started_event(
@@ -316,7 +318,9 @@ fn handle_text_message(
             config,
             last_host_sessions_message,
             deferred_messages,
-        )?;
+        )? {
+            return Ok(true);
+        }
         let events = wait_for_app_server_command_events(
             socket,
             config,
@@ -706,7 +710,7 @@ fn dispatch_events(
     config: &AgentConfig,
     last_host_sessions_message: &mut Option<String>,
     deferred_messages: &mut VecDeque<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     for event in events {
         if event.kind == "command.accepted" {
             continue;
@@ -724,16 +728,18 @@ fn dispatch_events(
             .to_string()
             .into(),
         ))?;
-        wait_for_ack(
+        if !wait_for_ack(
             socket,
             &command.id,
             &event.kind,
             config,
             last_host_sessions_message,
             deferred_messages,
-        )?;
+        )? {
+            return Ok(false);
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn configure_socket(socket: &mut AgentSocket) -> std::io::Result<()> {
@@ -775,15 +781,15 @@ fn wait_for_ack(
     config: &AgentConfig,
     last_host_sessions_message: &mut Option<String>,
     deferred_messages: &mut VecDeque<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     set_socket_read_timeout(socket, Some(Duration::from_secs(10)))?;
     loop {
         match socket.read()? {
             Message::Text(text) => {
                 match classify_ack_wait_text(text.as_ref(), command_id, event_kind)? {
-                    AckWaitAction::Matched => {
+                    AckWaitAction::Matched { accepted } => {
                         set_socket_read_timeout(socket, None)?;
-                        return Ok(());
+                        return Ok(accepted);
                     }
                     AckWaitAction::HostSessionsRefresh => {
                         send_host_sessions(socket, config, last_host_sessions_message, true)?;
@@ -809,7 +815,7 @@ fn wait_for_ack(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AckWaitAction {
-    Matched,
+    Matched { accepted: bool },
     HostSessionsRefresh,
     Defer,
 }
@@ -835,7 +841,12 @@ fn classify_ack_wait_text(
             .and_then(|value| value.as_str())
             == Some(event_kind)
     {
-        return Ok(AckWaitAction::Matched);
+        let accepted = envelope
+            .payload
+            .get("accepted")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        return Ok(AckWaitAction::Matched { accepted });
     }
     Ok(AckWaitAction::Defer)
 }
@@ -988,7 +999,19 @@ mod tests {
         )
         .expect("classified");
 
-        assert_eq!(action, AckWaitAction::Matched);
+        assert_eq!(action, AckWaitAction::Matched { accepted: true });
+    }
+
+    #[test]
+    fn ack_wait_matches_rejected_ack() {
+        let action = classify_ack_wait_text(
+            r#"{"kind":"server.ack","payload":{"command_id":"command-1","kind":"command.started","accepted":false}}"#,
+            "command-1",
+            "command.started",
+        )
+        .expect("classified");
+
+        assert_eq!(action, AckWaitAction::Matched { accepted: false });
     }
 
     fn test_config() -> AgentConfig {

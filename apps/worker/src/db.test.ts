@@ -19,14 +19,15 @@ test("recordAgentEvent ignores stale events from a connector that lost the lease
     state: "leased"
   });
 
-  const event = await recordAgentEvent({ DB: db } as Env, "connector-old", {
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-old", {
     command_id: "command-1",
     kind: "command.finished",
     priority: "P1",
     summary: "Late completion"
   });
 
-  assert.equal(event, undefined);
+  assert.equal(result.accepted, false);
+  assert.equal(result.event, undefined);
   assert.equal(db.commandUpdates, 0);
   assert.equal(db.eventInserts, 0);
 });
@@ -37,15 +38,16 @@ test("recordAgentEvent accepts events from the active lease owner", async () => 
     state: "leased"
   });
 
-  const event = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
     command_id: "command-1",
     kind: "command.finished",
     priority: "P1",
     summary: "Finished"
   });
 
-  assert.equal(event?.kind, "command.finished");
-  assert.equal(event?.summary, "Finished");
+  assert.equal(result.accepted, true);
+  assert.equal(result.event?.kind, "command.finished");
+  assert.equal(result.event?.summary, "Finished");
   assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
@@ -63,14 +65,15 @@ test("recordAgentEvent marks failed command tasks as failed", async () => {
     }
   );
 
-  const event = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
     command_id: "command-1",
     kind: "command.failed",
     priority: "P1",
     summary: "Failed"
   });
 
-  assert.equal(event?.kind, "command.failed");
+  assert.equal(result.accepted, true);
+  assert.equal(result.event?.kind, "command.failed");
   assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);

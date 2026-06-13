@@ -43,6 +43,11 @@ export class NotFoundError extends Error {
   readonly status = 404;
 }
 
+export type RecordAgentEventResult = {
+  accepted: boolean;
+  event?: ThreadEvent;
+};
+
 export async function loadBootstrapFromDb(
   env: Env,
   user: BrowserIdentity
@@ -414,13 +419,12 @@ async function failCommandsForDetachedAppServerHostSession(
                  AND (
                    cmd.task_id IS NULL
                    OR NOT EXISTS (
-                     SELECT 1
-                     FROM host_sessions hst
-                     WHERE hst.workspace_id = cmd.workspace_id
-                       AND hst.id <> ?
-                       AND hst.app_server_present = 1
-                       AND hst.connector_id = cmd.target_connector_id
-                       AND hst.attached_task_id = cmd.task_id
+                    SELECT 1
+                    FROM host_sessions hst
+                    WHERE hst.workspace_id = cmd.workspace_id
+                      AND hst.id <> ?
+                      AND hst.app_server_present = 1
+                      AND hst.attached_task_id = cmd.task_id
                    )
                  )
                )
@@ -928,8 +932,8 @@ export async function recordAgentEvent(
   env: Env,
   connectorId: string,
   event: AgentCommandEvent
-): Promise<ThreadEvent | undefined> {
-  if (!env.DB) return undefined;
+): Promise<RecordAgentEventResult> {
+  if (!env.DB) return { accepted: false };
 
   const command = await env.DB.prepare(
     `SELECT id, workspace_id, thread_id, task_id, target_connector_id, lease_owner_connector_id, state
@@ -948,10 +952,12 @@ export async function recordAgentEvent(
       state: CommandSummary["state"];
     }>();
 
-  if (!command) return undefined;
-  if (command.target_connector_id && command.target_connector_id !== connectorId) return undefined;
-  if (command.lease_owner_connector_id !== connectorId) return undefined;
-  if (!isActiveCommandState(command.state)) return undefined;
+  if (!command) return { accepted: false };
+  if (command.target_connector_id && command.target_connector_id !== connectorId) {
+    return { accepted: false };
+  }
+  if (command.lease_owner_connector_id !== connectorId) return { accepted: false };
+  if (!isActiveCommandState(command.state)) return { accepted: false };
 
   const now = new Date().toISOString();
   const nextState = commandStateForEvent(event.kind);
@@ -967,7 +973,7 @@ export async function recordAgentEvent(
       .bind(nextState, connectorId, now, command.id, connectorId)
       .run();
     if (!((result.meta as { changes?: number } | undefined)?.changes)) {
-      return undefined;
+      return { accepted: false };
     }
   }
 
@@ -1003,7 +1009,11 @@ export async function recordAgentEvent(
     .bind(now, now, connectorId)
     .run();
   await updateConnectorActivity(env, connectorId);
-  return threadEvent;
+  const result: RecordAgentEventResult = { accepted: true };
+  if (threadEvent) {
+    result.event = threadEvent;
+  }
+  return result;
 }
 
 export async function markConnectorDisconnected(env: Env, connectorId: string): Promise<ThreadEvent[]> {

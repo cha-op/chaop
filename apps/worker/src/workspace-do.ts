@@ -185,19 +185,22 @@ export class WorkspaceDO implements DurableObject {
     }
 
     if (message.kind === "agent.event" && isAgentCommandEvent(message.payload)) {
-      const event = await recordAgentEvent(this.env, connectorId, message.payload);
+      const result = await recordAgentEvent(this.env, connectorId, message.payload);
       ws.send(
         JSON.stringify(
           createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
             command_id: message.payload.command_id,
-            kind: message.payload.kind
+            kind: message.payload.kind,
+            accepted: result.accepted
           })
         )
       );
-      if (event) {
-        this.broadcastToBrowsers(threadEventMessage(event));
+      if (result.event) {
+        this.broadcastToBrowsers(threadEventMessage(result.event));
       }
-      if (message.payload.kind === "command.finished" || message.payload.kind === "command.failed") {
+      const finalCommandEvent =
+        message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
+      if (result.accepted && finalCommandEvent) {
         await this.sendPendingCommands(ws, connectorId);
       }
       return;
