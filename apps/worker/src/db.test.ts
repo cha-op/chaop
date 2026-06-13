@@ -184,6 +184,31 @@ test("recordAgentEvent accepts ordinary codex starts without an app-server lease
   assert.equal(db.eventInserts, 1);
 });
 
+test("recordAgentEvent rejects targeted app-server starts for ordinary codex leases", async () => {
+  const db = appServerStartAfterDetachDb(
+    {
+      connector_id: "connector-online",
+      session_id: "session-old",
+      app_server_present: 1
+    },
+    { leaseTargetHostSessionId: null }
+  );
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    target_host_session_id: "session-old",
+    kind: "command.started",
+    priority: "P1",
+    summary: "Starting"
+  });
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.event, undefined);
+  assert.equal(db.commandUpdates, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
 test("recordAgentEvent marks failed command tasks as failed", async () => {
   const db = agentEventGuardDb(
     {
@@ -637,7 +662,9 @@ function appServerStartAfterDetachDb(currentTarget?: {
   connector_id: string;
   session_id: string;
   app_server_present: number;
-}) {
+}, options: { leaseTargetHostSessionId?: string | null } = {}) {
+  const leaseTargetHostSessionId =
+    options.leaseTargetHostSessionId === undefined ? "session-old" : options.leaseTargetHostSessionId;
   const counters = {
     commandUpdates: 0,
     taskUpdates: 0,
@@ -660,7 +687,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
                   target_connector_id: "connector-online",
                   lease_owner_connector_id: "connector-online",
                   state: "leased",
-                  lease_target_host_session_id: "session-old"
+                  lease_target_host_session_id: leaseTargetHostSessionId
                 };
               }
             };
@@ -683,6 +710,8 @@ function appServerStartAfterDetachDb(currentTarget?: {
 
       if (/UPDATE commands/.test(sql)) {
         assert.match(sql, /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /lease_target_host_session_id IS NOT NULL/);
+        assert.match(sql, /lease_target_host_session_id = \?/);
         assert.match(sql, /hs\.session_id = \?/);
         assert.match(sql, /hs2\.updated_at DESC,\s+hs2\.id DESC/);
         return {
@@ -692,7 +721,6 @@ function appServerStartAfterDetachDb(currentTarget?: {
             updatedAt: string,
             commandId: string,
             ownerConnectorId: string,
-            leaseTargetHostSessionId: string | null,
             eventTargetHostSessionId: string | null,
             workspaceId: string,
             taskIdPresent: string | null,
@@ -711,7 +739,6 @@ function appServerStartAfterDetachDb(currentTarget?: {
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
             assert.equal(ownerConnectorId, "connector-online");
-            assert.equal(leaseTargetHostSessionId, "session-old");
             assert.equal(workspaceId, "workspace-api");
             assert.equal(taskIdPresent, "task-1");
             assert.equal(taskId, "task-1");
@@ -723,6 +750,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
             assert.equal(taskIdForOrderMatch, "task-1");
             assert.equal(targetConnectorId, "connector-online");
             const changes =
+              leaseTargetHostSessionId !== null &&
               leaseTargetHostSessionId === eventTargetHostSessionId &&
               currentTarget?.connector_id === targetConnectorId &&
               currentTarget.session_id === targetHostSessionId &&

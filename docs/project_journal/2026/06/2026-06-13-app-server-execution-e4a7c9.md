@@ -55,6 +55,7 @@ superseded_by:
 - Detached-command replacement matching now also requires the replacement connector to be executable, online, and advertising `codex_app_server_exec`, so cleanup is not suppressed by an attached Host Session that command leasing cannot actually dispatch to.
 - Independent review found that `command.started` Host Session revalidation could still be skipped for an externally registered connector that advertised both `codex_exec` and `codex_app_server_exec`. Worker now stores the app-server Host Session id selected at command lease time and requires started events for that leased target to echo the same target before the guarded state update can run.
 - Follow-up review of that fix found the guarded update still needed to compare the event target against the lease-time target, not only the current attachment. The guarded `command.started` update now also checks `lease_target_host_session_id` against the event target in the same SQL statement.
+- Independent review found that a targeted `command.started` event could still be accepted for an ordinary Codex lease with no app-server lease target because the guarded SQL treated a `NULL` lease target as permissive. The guarded update now requires a non-null lease-time app-server target that equals the event target.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -68,6 +69,7 @@ superseded_by:
 - Worker Durable Object tests assert stale agent command events receive `server.ack` with `accepted: false`.
 - Worker tests assert app-server-leased `command.started` events without the leased target session id are rejected, while ordinary Codex starts without an app-server lease target remain accepted.
 - Worker tests assert app-server-leased `command.started` events are rejected when the event target matches the current attachment but differs from the lease-time target.
+- Worker tests assert ordinary Codex leases reject targeted app-server `command.started` events, even when the current attachment matches the event target.
 - Worker DB tests assert app-server-only `command.started` events are rejected after the current Host Session attachment is gone.
 - Worker DB tests assert app-server-only `command.started` events are rejected after the same connector reattaches a different Host Session to the command scope.
 - Worker DB tests assert app-server-only `command.started` events are accepted only when the guarded command-state update still resolves the current target Host Session to the event `target_host_session_id`.
