@@ -90,6 +90,8 @@ superseded_by:
 - Final rerun reviews found two more completeness gaps: schema-drift app-server rows or cursors could still be accepted as a successful full inventory, and Worker treated missing legacy `inventory_scope` or missing app-server inventory evidence as enough to clear omitted sessions whose title came from app-server. The agent now rejects thread/list rows without an executable thread `id`, non-string or empty cursors, and repeated cursors; Worker treats missing scope as incremental, requires explicit `app_server_inventory_ok: true` for omitted-session cleanup, and clears omitted sessions by current `app_server_present` state rather than title source.
 - Offline frozen-diff review found duplicate connector migration could still strand pending explicit app-server commands on the retired connector id. Host Session migration now retargets pending explicit Codex app-server commands with the migrated `lease_target_host_session_id` to the replacement connector, alongside attached-inferred commands.
 - Independent review found same-session reports could still demote a known app-server Host Session when the report lacked explicit app-server inventory evidence. Worker now requires `app_server_inventory_ok: true` before using a reported app-server absence to clear existing app-server presence, while still allowing successful app-server inventory to reflect real archive/unarchive state.
+- A rerun independent review found duplicate connector migration could also demote a destination Host Session that already had `app_server_present=1` when the source duplicate row was stale false. Migration conflict updates now preserve destination app-server presence, and explicit app-server command retargeting relies on the migrated destination Host Session check instead of the stale source row flag.
+- A rerun offline frozen-diff review found placeholder commands could inherit app-server lease targets even though detach cleanup only handles Codex app-server commands. Worker now writes `lease_target_host_session_id` only for Codex dispatches, while placeholder dispatches can still carry Host Session context without becoming app-server lease-bound.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -142,6 +144,8 @@ superseded_by:
 - Worker DB and route tests assert app-server release paths write the replacement app-server `session_id` into `lease_target_host_session_id` instead of clearing the app-server target.
 - Worker DB tests assert duplicate connector retirement retargets pending attached-inferred commands to the migrated connector/session.
 - Worker DB tests assert duplicate connector retirement retargets pending explicit app-server commands with the migrated session target.
+- Worker DB tests assert duplicate connector retirement preserves destination app-server presence and still retargets explicit app-server commands when the stale source row reports `app_server_present=0`.
+- Worker DB tests assert placeholder commands dispatched through attached app-server Host Sessions do not store app-server lease targets.
 - Worker DB tests assert inventory refresh clears stale `app_server_present` when a later report no longer marks the session as app-server present.
 - Worker DB tests assert app-server-only Host Sessions omitted from later inventory reports are demoted from app-server-present state.
 - Worker DB tests assert incremental Host Session reports do not demote unrelated app-server-only sessions.

@@ -90,6 +90,8 @@ superseded_by:
 - 最终 rerun reviews 又发现两个完整性缺口：schema drift 的 app-server row 或 cursor 仍可能被接受为成功的 full inventory；Worker 会把旧版缺省 `inventory_scope` 或缺少 app-server inventory 证据的 full report 当成足以清理 omitted sessions 的证据，同时只清理 title 来自 app-server 的行。现在 agent 会拒绝缺少可执行 thread `id` 的 thread/list row、非字符串或空 cursor、重复 cursor；Worker 会把缺省 scope 当作 incremental，要求显式 `app_server_inventory_ok: true` 才能执行 omitted-session cleanup，并按当前 `app_server_present` 状态而不是 title source 清理 omitted sessions。
 - Offline frozen-diff review 发现 duplicate connector migration 仍可能让 pending explicit app-server command 停在已 retired 的 connector id 上。现在 Host Session migration 除了迁移 attached-inferred commands，也会把带有已迁移 `lease_target_host_session_id` 的 pending explicit Codex app-server commands 重新指向 replacement connector。
 - Independent review 发现同一个 session 的 report 如果缺少明确 app-server inventory 证据，仍可能把已知 app-server Host Session demote。现在 Worker 必须看到 `app_server_inventory_ok: true`，才会用 report 里的 app-server absence 清掉已有 app-server presence；成功的 app-server inventory 仍可以反映真实 archive/unarchive 状态。
+- 重新运行的 independent review 发现 duplicate connector migration 也可能在 source duplicate row 是 stale false 时，把 destination 已有 `app_server_present=1` 的 Host Session demote。现在 migration conflict update 会保留 destination 的 app-server presence；explicit app-server command retargeting 也改为依赖迁移后的 destination Host Session 检查，而不是 stale source row flag。
+- 重新运行的 offline frozen-diff review 发现 placeholder commands 可能继承 app-server lease target，但 detach cleanup 只处理 Codex app-server commands。现在 Worker 只会为 Codex dispatch 写入 `lease_target_host_session_id`；placeholder dispatch 仍可携带 Host Session context，但不会变成 app-server lease-bound command。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -142,6 +144,8 @@ superseded_by:
 - Worker DB 与 route tests 断言 app-server release paths 会把 replacement app-server `session_id` 写入 `lease_target_host_session_id`，而不是清空 app-server target。
 - Worker DB tests 断言 duplicate connector retirement 会把 pending attached-inferred commands 重新指向迁移后的 connector/session。
 - Worker DB tests 断言 duplicate connector retirement 会把带有已迁移 session target 的 pending explicit app-server commands 重新指向新 connector。
+- Worker DB tests 断言 duplicate connector retirement 在 stale source row 报告 `app_server_present=0` 时仍会保留 destination app-server presence，并继续 retarget explicit app-server commands。
+- Worker DB tests 断言通过 attached app-server Host Session dispatch 的 placeholder commands 不会保存 app-server lease target。
 - Worker DB tests 断言后续 inventory report 不再标记 session app-server present 时，会清掉 stale `app_server_present`。
 - Worker DB tests 断言只存在于 app-server 的 Host Sessions 如果从后续 inventory report 中消失，会从 app-server-present 状态 demote。
 - Worker DB tests 断言 incremental Host Session report 不会 demote 无关的 app-server-only sessions。

@@ -2223,7 +2223,10 @@ async function migrateHostSessionsToConnector(
          workspace_id = excluded.workspace_id,
          title = excluded.title,
          title_source = excluded.title_source,
-         app_server_present = excluded.app_server_present,
+         app_server_present = CASE
+           WHEN host_sessions.app_server_present = 1 THEN 1
+           ELSE excluded.app_server_present
+         END,
          cwd = excluded.cwd,
          attached_task_id = COALESCE(host_sessions.attached_task_id, excluded.attached_task_id),
          attached_thread_id = COALESCE(host_sessions.attached_thread_id, excluded.attached_thread_id),
@@ -2322,10 +2325,6 @@ async function retargetExplicitAppServerCommandsForMigratedHostSession(
   toConnectorId: string,
   now: string
 ): Promise<void> {
-  if (!row.app_server_present) {
-    return;
-  }
-
   await env.DB!.prepare(
     `UPDATE commands
      SET target_connector_id = ?,
@@ -2859,6 +2858,9 @@ function targetHostSessionIsAppServer(row: PendingCommandRow): boolean {
 }
 
 function appServerLeaseTargetHostSessionId(row: PendingCommandRow): string | null {
+  if (row.type !== "codex") {
+    return null;
+  }
   const targetHostSession = commandTargetHostSessionFromRow(row);
   return targetHostSession?.app_server_present === true ? targetHostSession.session_id : null;
 }

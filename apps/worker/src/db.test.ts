@@ -372,6 +372,22 @@ test("ensureConnectorInventory retires duplicate connectors through disconnect c
   assert.equal(db.retiredConnectorTokens, 1);
 });
 
+test("ensureConnectorInventory preserves app-server presence while retiring stale duplicate connectors", async () => {
+  const db = duplicateConnectorRetirementDb({ sourceAppServerPresent: 0 });
+
+  await ensureConnectorInventory({ DB: db } as Env, "connector-new", {
+    connector_name: "mac-studio",
+    hostname: "mac-studio.local",
+    workspace_root: "/workspace/codex",
+    capabilities: ["placeholder_commands"]
+  });
+
+  assert.equal(db.migratedHostSessions, 1);
+  assert.equal(db.retargetedAttachedCommands, 1);
+  assert.equal(db.retargetedExplicitAppServerCommands, 1);
+  assert.equal(db.deletedOldHostSessions, 1);
+});
+
 test("pendingCommandsForConnector includes the task-first attached host session target", async () => {
   const db = pendingCommandDispatchDb();
 
@@ -382,6 +398,18 @@ test("pendingCommandsForConnector includes the task-first attached host session 
   assert.equal(dispatches[0]?.target_host_session?.session_id, "session-tree-1");
   assert.equal(dispatches[0]?.target_host_session?.app_server_present, true);
   assert.equal(dispatches[0]?.target_host_session?.cwd, "/workspace/project");
+  assert.equal(db.commandLeaseUpdates, 1);
+  assert.equal(db.connectorActivityUpdates, 1);
+});
+
+test("pendingCommandsForConnector does not store app-server lease targets for placeholder commands", async () => {
+  const db = pendingCommandDispatchDb({ commandType: "placeholder" });
+
+  const dispatches = await pendingCommandsForConnector({ DB: db } as Env, "connector-online");
+
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0]?.command.type, "placeholder");
+  assert.equal(dispatches[0]?.target_host_session?.session_id, "session-tree-1");
   assert.equal(db.commandLeaseUpdates, 1);
   assert.equal(db.connectorActivityUpdates, 1);
 });
@@ -1483,7 +1511,7 @@ function connectorDisconnectedDb() {
   return db as D1Database & typeof counters;
 }
 
-function duplicateConnectorRetirementDb() {
+function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: number } = {}) {
   const counters = {
     commandFailures: 0,
     eventInserts: 0,
@@ -1642,7 +1670,7 @@ function duplicateConnectorRetirementDb() {
                       session_id: "session-1",
                       title: "Attached session",
                       title_source: "history",
-                      app_server_present: 1,
+                      app_server_present: options.sourceAppServerPresent ?? 1,
                       cwd: "/workspace/project",
                       attached_task_id: "task-old",
                       attached_thread_id: "thread-old",
@@ -1657,6 +1685,10 @@ function duplicateConnectorRetirementDb() {
       }
 
       if (/INSERT INTO host_sessions/.test(sql)) {
+        assert.match(
+          sql,
+          /CASE\s+WHEN host_sessions\.app_server_present = 1 THEN 1\s+ELSE excluded\.app_server_present\s+END/
+        );
         return {
           bind(hostSessionId: string, connectorId: string, hostname: string) {
             assert.equal(hostSessionId, "host-session-session-1-connector-new");
@@ -1813,6 +1845,7 @@ function pendingCommandDispatchDb(options: {
   commandTargetConnectorId?: string | null;
   targetConnectorIdSource?: "explicit" | "attached" | "auto";
   targetHostSessionAppServerPresent?: 0 | 1;
+  commandType?: "placeholder" | "codex";
   commandLeaseUpdateChanges?: 0 | 1;
   storedLeaseTargetHostSessionId?: string | null;
 } = {}) {
@@ -1820,6 +1853,7 @@ function pendingCommandDispatchDb(options: {
   const commandTargetConnectorId = options.commandTargetConnectorId ?? connectorIdUnderTest;
   const targetConnectorIdSource = options.targetConnectorIdSource ?? "attached";
   const targetHostSessionAppServerPresent = options.targetHostSessionAppServerPresent ?? 1;
+  const commandType = options.commandType ?? "codex";
   const counters = {
     commandLeaseUpdates: 0,
     connectorActivityUpdates: 0
@@ -1883,7 +1917,7 @@ function pendingCommandDispatchDb(options: {
                       workspace_id: "workspace-api",
                       thread_id: "thread-1",
                       task_id: "task-1",
-                      type: "codex",
+                      type: commandType,
                       prompt: "Summarise this thread",
                       state: "pending",
                       target_connector_id: commandTargetConnectorId,
@@ -1945,7 +1979,7 @@ function pendingCommandDispatchDb(options: {
             assert.equal(targetHostSessionIsAppServerForSource, targetHostSessionAppServerPresent);
             assert.equal(connectorId, connectorIdUnderTest);
             assert.match(leaseUntil, /^\d{4}-\d{2}-\d{2}T/);
-            assert.equal(leaseTargetHostSessionId, "session-tree-1");
+            assert.equal(leaseTargetHostSessionId, commandType === "codex" ? "session-tree-1" : null);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
             assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
