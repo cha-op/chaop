@@ -137,7 +137,7 @@ export async function recordHostSessions(
   const inventoryScope = report.inventory_scope ?? "incremental";
   const canClearMissingAppServerSessions =
     inventoryScope === "full" &&
-    report.app_server_inventory_ok !== false &&
+    report.app_server_inventory_ok === true &&
     reportedSessions.length === report.sessions.length;
   const preserveAppServerPresence = report.app_server_inventory_ok === false;
 

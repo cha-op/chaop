@@ -1059,9 +1059,9 @@ fn validate_app_server_thread_list_response(
                 format!("app-server thread/list response data[{index}] was not an object").into(),
             );
         }
-        if app_server_thread_session_id(thread).is_none() {
+        if app_server_thread_id(thread).is_none() {
             return Err(format!(
-                "app-server thread/list response data[{index}] did not include a thread id"
+                "app-server thread/list response data[{index}] did not include thread.id"
             )
             .into());
         }
@@ -1091,7 +1091,14 @@ fn app_server_thread_session_id(thread: &Value) -> Option<&str> {
     thread
         .get("sessionId")
         .and_then(Value::as_str)
-        .or_else(|| thread.get("id").and_then(Value::as_str))
+        .filter(|session_id| !session_id.trim().is_empty())
+        .or_else(|| app_server_thread_id(thread))
+}
+
+fn app_server_thread_id(thread: &Value) -> Option<&str> {
+    thread
+        .get("id")
+        .and_then(Value::as_str)
         .filter(|session_id| !session_id.trim().is_empty())
 }
 
@@ -2911,7 +2918,30 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "app-server thread/list response data[0] did not include a thread id"
+            "app-server thread/list response data[0] did not include thread.id"
+        );
+    }
+
+    #[test]
+    fn load_app_server_sessions_fails_on_thread_list_row_without_thread_id() {
+        let url = run_fake_app_server(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "sessionId": "session-tree-1",
+                        "name": "Missing executable thread id"
+                    }
+                ]
+            }
+        })]);
+
+        let error = load_app_server_sessions(&url, 20, 1).expect_err("missing thread id");
+
+        assert_eq!(
+            error.to_string(),
+            "app-server thread/list response data[0] did not include thread.id"
         );
     }
 

@@ -556,6 +556,36 @@ test("recordHostSessions preserves app-server-only sessions from legacy reports 
   assert.equal(db.demotedSessions, 0);
 });
 
+test("recordHostSessions preserves app-server-only sessions from full reports without app-server evidence", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "metadata"
+  });
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "full",
+      sessions: [
+        {
+          session_id: "session-new",
+          title: "New session",
+          title_source: "metadata",
+          cwd: "/workspace/new",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 1);
+  assert.equal(db.hasSession("session-attached"), true);
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
+});
+
 test("recordHostSessions preserves app-server-only sessions from incremental reports", async () => {
   const db = hostSessionsInventoryDb({
     initialAppServerPresent: 1,
