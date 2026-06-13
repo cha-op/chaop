@@ -769,6 +769,29 @@ test("host session detach clears the attached task and thread when D1 is bound",
   assert.equal(db.eventInserts, 1);
 });
 
+test("host session detach refreshes connector activity after failing a leased command", async () => {
+  const db = hostSessionDetachDb({ detachedCommandState: "leased" });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.connectorActivityUpdates, 1);
+});
+
 test("host session detach keeps nullable-target leases owned by another connector", async () => {
   const db = hostSessionDetachDb({ returnDetachedCommands: false });
   const response = await handleRequest(
@@ -2534,13 +2557,18 @@ function hostSessionAttachBackfillDb(
   return db as D1Database & { readonly eventInserts: number };
 }
 
-function hostSessionDetachDb(options: { returnDetachedCommands?: boolean } = {}): D1Database & {
+function hostSessionDetachDb(options: {
+  returnDetachedCommands?: boolean;
+  detachedCommandState?: "pending" | "leased";
+} = {}): D1Database & {
   readonly commandFailures: number;
+  readonly connectorActivityUpdates: number;
   readonly taskUpdates: number;
   readonly eventInserts: number;
 } {
   const counters = {
     commandFailures: 0,
+    connectorActivityUpdates: 0,
     taskUpdates: 0,
     eventInserts: 0
   };
@@ -2595,10 +2623,12 @@ function hostSessionDetachDb(options: { returnDetachedCommands?: boolean } = {})
         assert.match(sql, /wc\.can_execute = 1/);
         assert.match(sql, /c\.status <> 'offline'/);
         assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
-        assert.match(sql, /WHERE hs\.id = \(\s+SELECT hs2\.id/);
-        assert.match(sql, /hs2\.id <> \?/);
-        assert.match(sql, /CASE\s+WHEN cmd\.task_id IS NOT NULL AND hs2\.attached_task_id = cmd\.task_id THEN 0/);
-        assert.match(sql, /hs2\.updated_at DESC,\s+hs2\.id DESC/);
+        assert.match(sql, /WHERE hs\.id = COALESCE\(/);
+        assert.match(sql, /hs_task\.id <> \?/);
+        assert.match(sql, /hs_thread\.id <> \?/);
+        assert.doesNotMatch(sql, /CASE\s+WHEN cmd\.task_id IS NOT NULL/);
+        assert.match(sql, /ORDER BY hs_task\.updated_at DESC,\s+hs_task\.id DESC/);
+        assert.match(sql, /ORDER BY hs_thread\.updated_at DESC,\s+hs_thread\.id DESC/);
         assert.match(sql, /LIMIT 1/);
         assert.match(sql, /cmd\.target_connector_id IS NULL OR hs\.connector_id = cmd\.target_connector_id/);
         assert.match(sql, /hst\.id <> \?/);
@@ -2633,19 +2663,20 @@ function hostSessionDetachDb(options: { returnDetachedCommands?: boolean } = {})
             return {
               async all() {
                 return {
-                  results: options.returnDetachedCommands === false ? [] : [
-                    {
-                      id: "command-detached",
+	                  results: options.returnDetachedCommands === false ? [] : [
+	                    {
+	                      id: "command-detached",
                       workspace_id: "workspace-api",
                       thread_id: "thread-host-1",
                       task_id: "task-host-1",
                       type: "codex",
                       prompt: "Continue this attached session",
-                      state: "pending",
-                      target_connector_id: "connector-online",
-                      created_at: "2026-06-12T10:01:00.000Z",
-                      updated_at: "2026-06-12T10:01:00.000Z"
-                    }
+	                      state: options.detachedCommandState ?? "pending",
+	                      target_connector_id: "connector-online",
+	                      lease_owner_connector_id: "connector-online",
+	                      created_at: "2026-06-12T10:01:00.000Z",
+	                      updated_at: "2026-06-12T10:01:00.000Z"
+	                    }
                   ]
                 };
               }
@@ -2654,21 +2685,85 @@ function hostSessionDetachDb(options: { returnDetachedCommands?: boolean } = {})
         };
       }
 
-      if (/UPDATE commands/.test(sql) && /state = 'failed'/.test(sql)) {
-        assert.match(sql, /state IN \('pending', 'leased'\)/);
-        return {
-          bind(updatedAt: string, commandId: string) {
-            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
-            assert.equal(commandId, "command-detached");
-            return {
-              async run() {
-                counters.commandFailures += 1;
-                return { meta: { changes: 1 } };
-              }
-            };
-          }
-        };
-      }
+	      if (/UPDATE commands/.test(sql) && /state = 'failed'/.test(sql)) {
+	        assert.match(sql, /state IN \('pending', 'leased'\)/);
+	        assert.match(sql, /AND NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+	        assert.match(sql, /WHERE hs\.id = COALESCE\(/);
+	        return {
+	          bind(
+	            updatedAt: string,
+	            commandId: string,
+	            workspaceId: string,
+	            taskWorkspaceId: string,
+	            taskIdPresent: string | null,
+	            taskId: string | null,
+	            excludedTaskHostSessionId: string,
+	            threadWorkspaceId: string,
+	            threadIdPresent: string | null,
+	            threadId: string | null,
+	            excludedThreadHostSessionId: string,
+	            taskFallbackPresent: string | null,
+	            taskFallbackWorkspaceId: string,
+	            excludedFallbackHostSessionId: string,
+	            taskFallbackId: string | null,
+	            targetConnectorIdPresent: string | null,
+	            targetConnectorId: string | null
+	          ) {
+	            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+	            assert.equal(commandId, "command-detached");
+	            assert.equal(workspaceId, "workspace-api");
+	            assert.equal(taskWorkspaceId, "workspace-api");
+	            assert.equal(taskIdPresent, "task-host-1");
+	            assert.equal(taskId, "task-host-1");
+	            assert.equal(excludedTaskHostSessionId, "host-session-1");
+	            assert.equal(threadWorkspaceId, "workspace-api");
+	            assert.equal(threadIdPresent, "thread-host-1");
+	            assert.equal(threadId, "thread-host-1");
+	            assert.equal(excludedThreadHostSessionId, "host-session-1");
+	            assert.equal(taskFallbackPresent, "task-host-1");
+	            assert.equal(taskFallbackWorkspaceId, "workspace-api");
+	            assert.equal(excludedFallbackHostSessionId, "host-session-1");
+	            assert.equal(taskFallbackId, "task-host-1");
+	            assert.equal(targetConnectorIdPresent, "connector-online");
+	            assert.equal(targetConnectorId, "connector-online");
+	            return {
+	              async run() {
+	                counters.commandFailures += 1;
+	                return { meta: { changes: 1 } };
+	              }
+	            };
+	          }
+	        };
+	      }
+
+	      if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
+	        return {
+	          bind(connectorId: string) {
+	            assert.equal(connectorId, "connector-online");
+	            return {
+	              async first() {
+	                return { active_count: 0 };
+	              }
+	            };
+	          }
+	        };
+	      }
+
+	      if (/UPDATE connectors/.test(sql) && /active_command_count/.test(sql)) {
+	        return {
+	          bind(activeCount: number, updatedAt: string, connectorId: string) {
+	            assert.equal(activeCount, 0);
+	            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+	            assert.equal(connectorId, "connector-online");
+	            return {
+	              async run() {
+	                counters.connectorActivityUpdates += 1;
+	                return { success: true };
+	              }
+	            };
+	          }
+	        };
+	      }
 
       if (/UPDATE tasks/.test(sql) && /state = 'failed'/.test(sql)) {
         return {
@@ -2749,9 +2844,12 @@ function hostSessionDetachDb(options: { returnDetachedCommands?: boolean } = {})
 
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
-    get commandFailures() {
-      return counters.commandFailures;
-    },
+	    get commandFailures() {
+	      return counters.commandFailures;
+	    },
+	    get connectorActivityUpdates() {
+	      return counters.connectorActivityUpdates;
+	    },
     get taskUpdates() {
       return counters.taskUpdates;
     },

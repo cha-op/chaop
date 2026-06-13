@@ -1295,16 +1295,14 @@ function pendingCommandDispatchDb() {
     prepare(sql: string) {
       if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
         assert.match(sql, /hs\.session_id AS target_host_session_id/);
-        assert.match(sql, /ON hs\.id = \(/);
-        assert.match(sql, /cmd\.task_id IS NOT NULL AND hs2\.attached_task_id = cmd\.task_id/);
-        assert.match(sql, /cmd\.thread_id IS NOT NULL\s+AND hs2\.attached_thread_id = cmd\.thread_id/);
+        assert.match(sql, /ON hs\.id = COALESCE\(/);
+        assert.match(sql, /cmd\.task_id IS NOT NULL\s+AND hs_task\.attached_task_id = cmd\.task_id/);
+        assert.match(sql, /cmd\.thread_id IS NOT NULL\s+AND hs_thread\.attached_thread_id = cmd\.thread_id/);
         assert.match(sql, /OR NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hst/);
         assert.match(sql, /hst\.workspace_id = cmd\.workspace_id\s+AND hst\.attached_task_id = cmd\.task_id/);
-        assert.match(
-          sql,
-          /CASE\s+WHEN cmd\.task_id IS NOT NULL AND hs2\.attached_task_id = cmd\.task_id THEN 0\s+ELSE 1\s+END/
-        );
-        assert.match(sql, /hs2\.updated_at DESC,\s+hs2\.id DESC/);
+        assert.doesNotMatch(sql, /CASE\s+WHEN cmd\.task_id IS NOT NULL/);
+        assert.match(sql, /ORDER BY hs_task\.updated_at DESC,\s+hs_task\.id DESC/);
+        assert.match(sql, /ORDER BY hs_thread\.updated_at DESC,\s+hs_thread\.id DESC/);
         assert.match(sql, /hs\.connector_id IS NULL OR hs\.connector_id = \?/);
         assert.match(sql, /codex_app_server_exec/);
         assert.match(sql, /c\.capabilities_json LIKE/);

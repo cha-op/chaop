@@ -35,7 +35,12 @@ The main repository defaults to placeholder execution. Real Codex execution is o
 ```toml
 [execution]
 mode = "codex_exec"
-# or:
+```
+
+or:
+
+```toml
+[execution]
 mode = "app_server"
 ```
 

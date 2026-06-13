@@ -35,7 +35,12 @@
 ```toml
 [execution]
 mode = "codex_exec"
-# 或：
+```
+
+或：
+
+```toml
+[execution]
 mode = "app_server"
 ```
 

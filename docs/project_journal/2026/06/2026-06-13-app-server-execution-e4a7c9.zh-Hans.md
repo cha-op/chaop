@@ -60,6 +60,7 @@ superseded_by:
 - 后续 independent review 发现 detach cleanup 的 replacement suppression 仍使用任意匹配且可 lease 的 Host Session，而不是 command leasing 实际会选择的 task-first/latest Host Session。现在 detached-command cleanup 会先使用同一套标量 Host Session target selection，再检查 app-server execution eligibility。
 - 后续 independent review 发现 stale app-server `command.started` 被拒后，command 可能继续停在 leased，直到未来出现无关触发。现在 rejected targeted start 会把 app-server lease 释放回 pending，Durable Object 随即对所有可用 agent sockets 触发 pending command dispatch。
 - 后续 frozen-diff review 发现 detach cleanup 仍从 task/thread scope 推断 pending command 是否依赖该 session，可能误失败在 Host Session attach 前创建的普通 pending `codex_exec` command。现在 app-server command creation 会持久化 intended Host Session id，detach cleanup 只会失败 stored app-server target 匹配被 detach session 的 pending command。
+- Codex review-gate 在合并前发现剩余 hardening gaps：app-server assistant deltas 现在会按 `codex_output_max_bytes` 限制本地累计；detach cleanup 的 guarded failure update 会重新验证 replacement Host Session；leased detach cleanup 会刷新 connector activity count；pending-command Host Session selection 不再在 subquery `ORDER BY` 中使用 SQLite 不接受的 outer reference；cost guide 也改成可直接复制的两个独立 TOML mode snippets。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -83,7 +84,10 @@ superseded_by:
 - Worker DB tests 断言同一个 connector 把另一个 Host Session reattach 到 command scope 后，app-server-only `command.started` events 会被拒绝。
 - Worker DB tests 断言 app-server-only `command.started` events 只有在 guarded command-state update 仍能把当前 target Host Session 解析到 event `target_host_session_id` 时才会被接受。
 - Worker route tests 断言当 attached Host Session 在 command insert 前变化时，app-server command creation 会返回 `409 Conflict`。
+- Worker DB tests 断言 pending command dispatch 使用 SQLite-compatible task-first Host Session selection，不再依赖 outer-reference `ORDER BY`。
+- Worker route tests 断言 Host Session detach 在失败 leased command 后会刷新 connector activity。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
+- Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。
 - Rust tests 断言 rejected command-event acknowledgements 会被识别，不会被当作 successful ack。
 - Rust tests 断言 app-server `command.started` event payload 会标识目标 Host Session，且不会把该字段带到非 started events 上。

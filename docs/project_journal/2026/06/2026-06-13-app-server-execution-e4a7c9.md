@@ -60,6 +60,7 @@ superseded_by:
 - Follow-up independent review found detach cleanup replacement suppression still used any matching leaseable Host Session instead of the exact task-first/latest Host Session that command leasing would select. Detached-command cleanup now uses the same scalar Host Session target selection before checking app-server execution eligibility.
 - Follow-up independent review found rejected stale app-server `command.started` acknowledgements could leave the command leased until an unrelated future trigger. Rejected targeted starts now release the app-server lease back to pending, and the Durable Object immediately re-dispatches pending commands across available agent sockets.
 - Follow-up frozen-diff review found detach cleanup still inferred pending command dependency from task/thread scope, which could fail ordinary pending `codex_exec` commands created before a Host Session was attached. App-server command creation now persists the intended Host Session id, and detach cleanup only fails pending commands whose stored app-server target matches the detached session.
+- Codex review-gate found remaining hardening gaps before merge: app-server assistant deltas are now capped by `codex_output_max_bytes`, detach cleanup revalidates replacement Host Sessions in the guarded failure update, leased detach cleanup refreshes connector activity counts, pending-command Host Session selection no longer uses SQLite outer references in subquery `ORDER BY`, and the cost guide now shows copyable separate TOML mode snippets.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -83,7 +84,10 @@ superseded_by:
 - Worker DB tests assert app-server-only `command.started` events are rejected after the same connector reattaches a different Host Session to the command scope.
 - Worker DB tests assert app-server-only `command.started` events are accepted only when the guarded command-state update still resolves the current target Host Session to the event `target_host_session_id`.
 - Worker route tests assert app-server command creation returns `409 Conflict` when the attached Host Session changes before the command insert.
+- Worker DB tests assert pending command dispatch uses SQLite-compatible task-first Host Session selection without an outer-reference `ORDER BY`.
+- Worker route tests assert Host Session detach refreshes connector activity after failing a leased command.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
+- Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.
 - Rust tests assert rejected command-event acknowledgements are recognised instead of treated as successful acks.
 - Rust tests assert app-server `command.started` event payloads identify the target Host Session, without leaking that field onto non-started events.

@@ -395,9 +395,10 @@ async function failCommandsForDetachedAppServerHostSession(
     return;
   }
 
-  const commands = await allRows<CommandRow>(
+  const commands = await allRows<CommandRow & { lease_owner_connector_id: string | null }>(
     env.DB!.prepare(
-      `SELECT id, workspace_id, thread_id, task_id, type, prompt, state, target_connector_id, created_at, updated_at
+      `SELECT id, workspace_id, thread_id, task_id, type, prompt, state,
+              target_connector_id, lease_owner_connector_id, created_at, updated_at
        FROM commands cmd
        WHERE cmd.workspace_id = ?
          AND cmd.type = 'codex'
@@ -429,36 +430,37 @@ async function failCommandsForDetachedAppServerHostSession(
            INNER JOIN workspace_connectors wc
              ON wc.workspace_id = cmd.workspace_id
             AND wc.connector_id = hs.connector_id
-           WHERE hs.id = (
-             SELECT hs2.id
-             FROM host_sessions hs2
-             WHERE hs2.workspace_id = cmd.workspace_id
-               AND hs2.id <> ?
-               AND (
-                 (cmd.task_id IS NOT NULL AND hs2.attached_task_id = cmd.task_id)
-                 OR (
-                   cmd.thread_id IS NOT NULL
-                   AND hs2.attached_thread_id = cmd.thread_id
-                   AND (
-                     cmd.task_id IS NULL
-                     OR NOT EXISTS (
-                       SELECT 1
-                       FROM host_sessions hst
-                       WHERE hst.workspace_id = cmd.workspace_id
-                         AND hst.id <> ?
-                         AND hst.attached_task_id = cmd.task_id
-                     )
+           WHERE hs.id = COALESCE(
+             (
+               SELECT hs_task.id
+               FROM host_sessions hs_task
+               WHERE hs_task.workspace_id = cmd.workspace_id
+                 AND cmd.task_id IS NOT NULL
+                 AND hs_task.attached_task_id = cmd.task_id
+                 AND hs_task.id <> ?
+               ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+               LIMIT 1
+             ),
+             (
+               SELECT hs_thread.id
+               FROM host_sessions hs_thread
+               WHERE hs_thread.workspace_id = cmd.workspace_id
+                 AND cmd.thread_id IS NOT NULL
+                 AND hs_thread.attached_thread_id = cmd.thread_id
+                 AND hs_thread.id <> ?
+                 AND (
+                   cmd.task_id IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1
+                     FROM host_sessions hst
+                     WHERE hst.workspace_id = cmd.workspace_id
+                       AND hst.id <> ?
+                       AND hst.attached_task_id = cmd.task_id
                    )
                  )
-               )
-             ORDER BY
-               CASE
-                 WHEN cmd.task_id IS NOT NULL AND hs2.attached_task_id = cmd.task_id THEN 0
-                 ELSE 1
-               END,
-               hs2.updated_at DESC,
-               hs2.id DESC
-             LIMIT 1
+               ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+               LIMIT 1
+             )
            )
              AND hs.app_server_present = 1
              AND wc.can_execute = 1
@@ -478,6 +480,7 @@ async function failCommandsForDetachedAppServerHostSession(
       threadId,
       threadId,
       hostSession.id,
+      hostSession.id,
       hostSession.id
     )
   );
@@ -487,12 +490,79 @@ async function failCommandsForDetachedAppServerHostSession(
       `UPDATE commands
        SET state = 'failed', lease_owner_connector_id = NULL, lease_until = NULL, updated_at = ?
        WHERE id = ?
-         AND state IN ('pending', 'leased')`
+         AND state IN ('pending', 'leased')
+         AND NOT EXISTS (
+           SELECT 1
+           FROM host_sessions hs
+           INNER JOIN connectors c ON c.id = hs.connector_id
+           INNER JOIN workspace_connectors wc
+             ON wc.workspace_id = ?
+            AND wc.connector_id = hs.connector_id
+           WHERE hs.id = COALESCE(
+             (
+               SELECT hs_task.id
+               FROM host_sessions hs_task
+               WHERE hs_task.workspace_id = ?
+                 AND ? IS NOT NULL
+                 AND hs_task.attached_task_id = ?
+                 AND hs_task.id <> ?
+               ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+               LIMIT 1
+             ),
+             (
+               SELECT hs_thread.id
+               FROM host_sessions hs_thread
+               WHERE hs_thread.workspace_id = ?
+                 AND ? IS NOT NULL
+                 AND hs_thread.attached_thread_id = ?
+                 AND hs_thread.id <> ?
+                 AND (
+                   ? IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1
+                     FROM host_sessions hst
+                     WHERE hst.workspace_id = ?
+                       AND hst.id <> ?
+                       AND hst.attached_task_id = ?
+                   )
+                 )
+               ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+               LIMIT 1
+             )
+           )
+             AND hs.app_server_present = 1
+             AND wc.can_execute = 1
+             AND c.status <> 'offline'
+             AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
+             AND (? IS NULL OR hs.connector_id = ?)
+         )`
     )
-      .bind(now, command.id)
+      .bind(
+        now,
+        command.id,
+        command.workspace_id,
+        command.workspace_id,
+        command.task_id,
+        command.task_id,
+        hostSession.id,
+        command.workspace_id,
+        command.thread_id,
+        command.thread_id,
+        hostSession.id,
+        command.task_id,
+        command.workspace_id,
+        hostSession.id,
+        command.task_id,
+        command.target_connector_id,
+        command.target_connector_id
+      )
       .run();
     if (!((result.meta as { changes?: number } | undefined)?.changes)) {
       continue;
+    }
+
+    if (command.state === "leased" && command.lease_owner_connector_id) {
+      await updateConnectorActivity(env, command.lease_owner_connector_id);
     }
 
     if (command.task_id) {
@@ -964,34 +1034,34 @@ export async function pendingCommandsForConnector(
               hs.cwd AS target_host_session_cwd
        FROM commands cmd
        LEFT JOIN host_sessions hs
-         ON hs.id = (
-          SELECT hs2.id
-          FROM host_sessions hs2
-          WHERE hs2.workspace_id = cmd.workspace_id
-            AND (
-              (cmd.task_id IS NOT NULL AND hs2.attached_task_id = cmd.task_id)
-              OR (
-                cmd.thread_id IS NOT NULL
-                AND hs2.attached_thread_id = cmd.thread_id
-                AND (
-                  cmd.task_id IS NULL
-                  OR NOT EXISTS (
-                    SELECT 1
-                    FROM host_sessions hst
-                    WHERE hst.workspace_id = cmd.workspace_id
-                      AND hst.attached_task_id = cmd.task_id
-                  )
+         ON hs.id = COALESCE(
+          (
+            SELECT hs_task.id
+            FROM host_sessions hs_task
+            WHERE hs_task.workspace_id = cmd.workspace_id
+              AND cmd.task_id IS NOT NULL
+              AND hs_task.attached_task_id = cmd.task_id
+            ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+            LIMIT 1
+          ),
+          (
+            SELECT hs_thread.id
+            FROM host_sessions hs_thread
+            WHERE hs_thread.workspace_id = cmd.workspace_id
+              AND cmd.thread_id IS NOT NULL
+              AND hs_thread.attached_thread_id = cmd.thread_id
+              AND (
+                cmd.task_id IS NULL
+                OR NOT EXISTS (
+                  SELECT 1
+                  FROM host_sessions hst
+                  WHERE hst.workspace_id = cmd.workspace_id
+                    AND hst.attached_task_id = cmd.task_id
                 )
               )
-            )
-          ORDER BY
-            CASE
-              WHEN cmd.task_id IS NOT NULL AND hs2.attached_task_id = cmd.task_id THEN 0
-              ELSE 1
-            END,
-            hs2.updated_at DESC,
-            hs2.id DESC
-          LIMIT 1
+            ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+            LIMIT 1
+          )
         )
        WHERE (
            cmd.state = 'pending'

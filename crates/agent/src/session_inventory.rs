@@ -1198,6 +1198,7 @@ fn run_app_server_command(
         socket_timeout,
         deadline,
         timeout_seconds,
+        config.execution.codex_output_max_bytes,
         &cancel,
         &mut request_id,
     )
@@ -1492,10 +1493,11 @@ fn wait_for_app_server_turn_completion(
     timeout: Duration,
     deadline: Instant,
     timeout_seconds: u64,
+    output_max_bytes: usize,
     cancel: &AtomicBool,
     next_request_id: &mut i64,
 ) -> Result<Vec<ConnectorEvent>, AppServerCommandError> {
-    let mut output = AppServerTurnOutput::default();
+    let mut output = AppServerTurnOutput::new(output_max_bytes);
     loop {
         if cancel.load(Ordering::Relaxed) {
             send_app_server_turn_interrupt(socket, *next_request_id, thread_id, turn_id);
@@ -1570,7 +1572,7 @@ fn handle_app_server_turn_notification(
     match method {
         "item/agentMessage/delta" if notification_matches(params, thread_id, turn_id) => {
             if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                output.agent_message.push_str(delta);
+                output.push_agent_message_delta(delta);
             }
         }
         "turn/completed" if turn_completed_notification_matches(params, thread_id, turn_id) => {
@@ -1730,9 +1732,39 @@ fn compact_command_summary(value: &str, max_chars: usize) -> Option<String> {
     Some(truncated)
 }
 
-#[derive(Default)]
 struct AppServerTurnOutput {
     agent_message: String,
+    agent_message_max_bytes: usize,
+}
+
+impl AppServerTurnOutput {
+    fn new(agent_message_max_bytes: usize) -> Self {
+        Self {
+            agent_message: String::new(),
+            agent_message_max_bytes,
+        }
+    }
+
+    fn push_agent_message_delta(&mut self, delta: &str) {
+        let remaining = self
+            .agent_message_max_bytes
+            .saturating_sub(self.agent_message.len());
+        if remaining == 0 {
+            return;
+        }
+
+        let mut end = 0;
+        for (index, value) in delta.char_indices() {
+            let next_end = index + value.len_utf8();
+            if next_end > remaining {
+                break;
+            }
+            end = next_end;
+        }
+        if end > 0 {
+            self.agent_message.push_str(&delta[..end]);
+        }
+    }
 }
 
 fn ensure_app_server_command_budget(
@@ -2422,12 +2454,13 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, HistorySession, SessionDraft, TitleSource,
-        app_server_command_result_events_with_cancel, app_server_sessions_from_response,
-        app_server_thread_from_response, app_server_titles_from_response,
-        build_host_session_backfill, build_host_sessions_report, create_app_server_thread_at,
-        load_app_server_sessions, read_recent_lines, remaining_app_server_archive_timeout,
-        resolve_session, rollout_paths, set_app_server_thread_archived_at, unix_seconds_to_iso,
+        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AppServerTurnOutput, HistorySession, SessionDraft,
+        TitleSource, app_server_command_result_events_with_cancel,
+        app_server_sessions_from_response, app_server_thread_from_response,
+        app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
+        create_app_server_thread_at, load_app_server_sessions, read_recent_lines,
+        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
+        set_app_server_thread_archived_at, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
@@ -4294,6 +4327,18 @@ mod tests {
     }
 
     #[test]
+    fn app_server_turn_output_caps_delta_bytes() {
+        let mut output = AppServerTurnOutput::new(5);
+
+        output.push_agent_message_delta("abcd");
+        output.push_agent_message_delta("éfg");
+        output.push_agent_message_delta("x");
+
+        assert_eq!(output.agent_message, "abcdx");
+        assert!(output.agent_message.len() <= 5);
+    }
+
+    #[test]
     fn app_server_turn_wait_interrupts_when_cancelled_after_turn_id_is_known() {
         let (url, requests) = run_fake_app_server_single_request();
         let (mut socket, _) = tungstenite::connect(url.as_str()).expect("connect fake app-server");
@@ -4307,6 +4352,7 @@ mod tests {
             Duration::from_secs(1),
             Instant::now() + Duration::from_secs(5),
             5,
+            1024,
             &cancel,
             &mut next_request_id,
         );
