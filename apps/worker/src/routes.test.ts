@@ -1227,6 +1227,39 @@ test("command creation accepts attached app-server commands without codex_exec c
   assert.equal(body.command.target_connector_id, "connector-attached");
 });
 
+test("command creation rejects attached app-server commands when the attachment changes before insert", async () => {
+  const envWithDetachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        supportsCodex: false,
+        supportsAppServerExec: true,
+        guardedCommandInsertChanges: 0
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached app-server session"
+      })
+    }),
+    envWithDetachedSession
+  );
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: "Attached host session changed before command creation"
+  });
+});
+
 test("command creation rejects explicit targets that do not own an attached host session", async () => {
   const envWithAttachedSession: Env = {
     ...devEnv,
@@ -1438,6 +1471,7 @@ function commandTargetDb(
     attachedTaskAppServerPresent?: boolean;
     attachedThreadAppServerPresent?: boolean;
     supportsAppServerExec?: boolean;
+    guardedCommandInsertChanges?: number;
   } = {}
 ): D1Database {
   const supportsCodex = options.supportsCodex ?? true;
@@ -1605,7 +1639,41 @@ function commandTargetDb(
         };
       }
 
-      if (/INSERT INTO commands/.test(sql) || /INSERT INTO events/.test(sql)) {
+      if (/INSERT INTO commands/.test(sql)) {
+        return {
+          bind(
+            commandId: string,
+            workspaceId: string,
+            threadId: string | null,
+            taskId: string | null,
+            commandType: string,
+            prompt: string,
+            state: string,
+            targetConnectorId: string | null
+          ) {
+            assert.match(commandId, /^command-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-orders-500");
+            assert.equal(taskId, null);
+            assert.equal(commandType === "placeholder" || commandType === "codex", true);
+            assert.equal(typeof prompt, "string");
+            assert.equal(state, "pending");
+            if (/WHERE EXISTS/.test(sql)) {
+              assert.equal(targetConnectorId, "connector-attached");
+              assert.match(sql, /hs\.app_server_present = 1/);
+              assert.match(sql, /hs\.connector_id = \?/);
+              assert.match(sql, /OR NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hst/);
+            }
+            return {
+              async run() {
+                return { meta: { changes: options.guardedCommandInsertChanges ?? 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
         return {
           bind() {
             return {

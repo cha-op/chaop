@@ -49,6 +49,7 @@ superseded_by:
 - Independent PR review 发现 detach ordering race；detach 现在会先清空 Host Session attachment，再按照保存的旧 attachment 失败依赖它的 commands，所以并发 command creation 不会再选中正在 detach 的 session。
 - Independent PR review 发现 stale `command.started` race 仍可能在 cleanup 选中 leased command 后抢先成功。现在 app-server-only connector 的 start 会在接受 `command.started` 前重新验证当前 task/thread Host Session target。
 - Detached-command cleanup 也会覆盖 `target_connector_id IS NULL` 的 legacy 或 delayed app-server commands，同时保留 command leasing 可选择的任意当前 app-server Host Session replacement。
+- Independent PR review 发现还存在 create/detach 跨请求 race：command creation 可能先读到旧 app-server attachment，然后在 detach cleanup 扫描 commands 之后才 insert。现在 app-server Codex command creation 使用 guarded insert，只有当前 task/thread Host Session 仍解析到同一个 app-server target 时才会写入 command。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -60,6 +61,7 @@ superseded_by:
 - Worker route tests 断言 Host Session detach 会先清空 attachment，然后才执行 command cleanup query。
 - Worker Durable Object tests 断言 stale agent command events 会收到带 `accepted: false` 的 `server.ack`。
 - Worker DB tests 断言当前 Host Session attachment 消失后，app-server-only `command.started` events 会被拒绝。
+- Worker route tests 断言当 attached Host Session 在 command insert 前变化时，app-server command creation 会返回 `409 Conflict`。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。
 - Rust tests 断言 rejected command-event acknowledgements 会被识别，不会被当作 successful ack。

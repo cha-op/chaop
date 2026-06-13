@@ -32,7 +32,12 @@ const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 
 export class CommandTargetError extends Error {
-  readonly status = 404;
+  constructor(
+    message: string,
+    readonly status = 404
+  ) {
+    super(message);
+  }
 }
 
 export class LocalThreadTargetError extends Error {
@@ -784,7 +789,93 @@ export async function createCommandInDb(
     updated_at: now
   };
 
-  await env.DB.prepare(
+  const inserted = await insertCommandInDb(env, user.id, command, {
+    requireCurrentAppServerTarget: attachedTarget?.app_server_present === true && command.type === "codex"
+  });
+  if (!inserted) {
+    throw new CommandTargetError("Attached host session changed before command creation", 409);
+  }
+
+  if (command.thread_id) {
+    await appendEvent(env, {
+      workspace_id: command.workspace_id,
+      thread_id: command.thread_id,
+      command_id: command.id,
+      kind: "command.accepted",
+      priority: "P1",
+      summary: `Control plane accepted the ${command.type} command.`
+    });
+  }
+
+  return { response: { accepted: true, command }, targetConnectorId };
+}
+
+async function insertCommandInDb(
+  env: Env,
+  userId: string,
+  command: CommandSummary,
+  options: { requireCurrentAppServerTarget: boolean }
+): Promise<boolean> {
+  if (options.requireCurrentAppServerTarget) {
+    if (!command.target_connector_id) {
+      return false;
+    }
+    const result = await env.DB!.prepare(
+      `INSERT INTO commands (
+         id, workspace_id, thread_id, task_id, type, prompt, state,
+         target_connector_id, created_by, created_at, updated_at
+       )
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1
+         FROM host_sessions hs
+         WHERE hs.workspace_id = ?
+           AND hs.connector_id = ?
+           AND hs.app_server_present = 1
+           AND (
+             (? IS NOT NULL AND hs.attached_task_id = ?)
+             OR (
+               ? IS NOT NULL
+               AND hs.attached_thread_id = ?
+               AND (
+                 ? IS NULL
+                 OR NOT EXISTS (
+                   SELECT 1
+                   FROM host_sessions hst
+                   WHERE hst.workspace_id = hs.workspace_id
+                     AND hst.attached_task_id = ?
+                 )
+               )
+             )
+           )
+       )`
+    )
+      .bind(
+        command.id,
+        command.workspace_id,
+        command.thread_id ?? null,
+        command.task_id ?? null,
+        command.type,
+        command.prompt,
+        command.state,
+        command.target_connector_id,
+        userId,
+        command.created_at,
+        command.updated_at,
+        command.workspace_id,
+        command.target_connector_id,
+        command.task_id ?? null,
+        command.task_id ?? null,
+        command.thread_id ?? null,
+        command.thread_id ?? null,
+        command.task_id ?? null,
+        command.task_id ?? null
+      )
+      .run();
+    return Boolean((result.meta as { changes?: number } | undefined)?.changes);
+  }
+
+  await env.DB!.prepare(
     `INSERT INTO commands (
        id, workspace_id, thread_id, task_id, type, prompt, state,
        target_connector_id, created_by, created_at, updated_at
@@ -799,24 +890,12 @@ export async function createCommandInDb(
       command.prompt,
       command.state,
       command.target_connector_id ?? null,
-      user.id,
+      userId,
       command.created_at,
       command.updated_at
     )
     .run();
-
-  if (command.thread_id) {
-    await appendEvent(env, {
-      workspace_id: command.workspace_id,
-      thread_id: command.thread_id,
-      command_id: command.id,
-      kind: "command.accepted",
-      priority: "P1",
-      summary: `Control plane accepted the ${command.type} command.`
-    });
-  }
-
-  return { response: { accepted: true, command }, targetConnectorId };
+  return true;
 }
 
 export async function pendingCommandsForConnector(

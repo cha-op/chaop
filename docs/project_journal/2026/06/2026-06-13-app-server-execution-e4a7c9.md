@@ -49,6 +49,7 @@ superseded_by:
 - Independent PR review found a detach ordering race; detach now clears the Host Session attachment before failing commands that depended on the saved old attachment, so concurrent command creation cannot target a session that is already being detached.
 - Independent PR review found the stale `command.started` race could still win after cleanup selected a leased command. App-server-only connector starts now revalidate the current task/thread Host Session target before accepting `command.started`.
 - Detached-command cleanup also covers legacy or delayed app-server commands with `target_connector_id IS NULL`, while preserving replacement matching for any current app-server Host Session that command leasing could select.
+- Independent PR review found a remaining create/detach cross-request race where command creation could read an old app-server attachment, then insert after detach cleanup had already scanned commands. App-server Codex command creation now uses a guarded insert that only writes the command if the current task/thread Host Session still resolves to the same app-server target.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -60,6 +61,7 @@ superseded_by:
 - Worker route tests assert Host Session detach clears the attachment before command cleanup queries run.
 - Worker Durable Object tests assert stale agent command events receive `server.ack` with `accepted: false`.
 - Worker DB tests assert app-server-only `command.started` events are rejected after the current Host Session attachment is gone.
+- Worker route tests assert app-server command creation returns `409 Conflict` when the attached Host Session changes before the command insert.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.
 - Rust tests assert rejected command-event acknowledgements are recognised instead of treated as successful acks.
