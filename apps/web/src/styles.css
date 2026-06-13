@@ -334,6 +334,7 @@ h2 {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
   min-width: 0;
 }
 
@@ -586,6 +587,18 @@ textarea {
 .create-thread-form .primary-action {
   margin: 0;
   white-space: nowrap;
+}
+
+.create-thread-form .form-hint {
+  flex: 1 0 100%;
+  margin: -2px 0 0;
+  color: #64748b;
+  font-size: 0.84rem;
+  text-align: right;
+}
+
+.create-thread-form.stacked .form-hint {
+  text-align: left;
 }
 
 .command-status {

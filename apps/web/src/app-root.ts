@@ -636,6 +636,7 @@ export class ChaopApp extends LitElement {
     const workspaceId = localThreadWorkspaceId(this.data, selectedThreadId);
     const connectors = localThreadConnectors(this.data, workspaceId);
     const selectedConnectorId = localThreadConnectorId(this.data, workspaceId, this.newThreadConnectorId) ?? "";
+    const canCreate = Boolean(workspaceId && connectors.length > 0);
     return html`
       <form class=${`create-thread-form ${layout}`} @submit=${this.submitLocalThreadCreate}>
         <input type="hidden" name="workspace_id" .value=${workspaceId ?? ""} />
@@ -663,10 +664,13 @@ export class ChaopApp extends LitElement {
         <button
           type="submit"
           class="primary-action"
-          ?disabled=${this.newThreadState === "creating" || !workspaceId}
+          ?disabled=${this.newThreadState === "creating" || !canCreate}
         >
           ${this.newThreadState === "creating" ? "Creating..." : "New local thread"}
         </button>
+        ${!canCreate
+          ? html`<p class="form-hint">No online app-server connector is available.</p>`
+          : nothing}
       </form>
     `;
   }
@@ -678,6 +682,11 @@ export class ChaopApp extends LitElement {
     if (!workspaceId) {
       this.newThreadState = "failed";
       this.actionError = "No workspace is available for local thread creation";
+      return;
+    }
+    if (localThreadConnectors(this.data, workspaceId).length === 0) {
+      this.newThreadState = "failed";
+      this.actionError = "No online app-server connector is available for local thread creation";
       return;
     }
 

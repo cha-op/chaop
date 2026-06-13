@@ -102,6 +102,23 @@ test("localThreadConnectors only includes app-server capable connectors", () => 
   );
 });
 
+test("localThreadConnectors skips offline app-server connectors", () => {
+  const data = payload({
+    connectors: [
+      connector("connector-a", ["app_server_threads"], "offline"),
+      connector("connector-b", ["app_server_threads"], "degraded")
+    ],
+    workspaces: [
+      workspace("workspace-api", ["connector-a", "connector-b"])
+    ]
+  });
+
+  assert.deepEqual(
+    localThreadConnectors(data, "workspace-api").map((item) => item.id),
+    ["connector-b"]
+  );
+});
+
 test("localThreadConnectorId drops stale connector selections", () => {
   const data = payload({
     connectors: [
@@ -148,12 +165,16 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   };
 }
 
-function connector(id: string, capabilities: string[] = []) {
+function connector(
+  id: string,
+  capabilities: string[] = [],
+  status: "online" | "offline" | "degraded" = "online"
+) {
   return {
     id,
     name: id,
     hostname: `${id}.local`,
-    status: "online" as const,
+    status,
     capabilities,
     logical_agent_count: 1,
     active_command_count: 0,
