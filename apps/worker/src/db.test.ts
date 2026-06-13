@@ -786,6 +786,7 @@ test("recordHostSessions tracks current app-server presence independent from tit
     { DB: db } as Env,
     "connector-online",
     {
+      inventory_scope: "full",
       app_server_inventory_ok: true,
       sessions: [
         {
@@ -803,6 +804,37 @@ test("recordHostSessions tracks current app-server presence independent from tit
 
   assert.equal(db.titleOf("session-attached"), "History title after archive");
   assert.equal(db.appServerPresentOf("session-attached"), 0);
+});
+
+test("recordHostSessions preserves app-server presence for reported absence in incremental inventory", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "app_server"
+  });
+
+  await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "incremental",
+      app_server_inventory_ok: true,
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "History title from truncated inventory",
+          title_source: "history",
+          app_server_present: false,
+          cwd: "/workspace/refreshed",
+          updated_at: "2026-06-12T11:00:10.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(db.titleOf("session-attached"), "History title from truncated inventory");
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
 });
 
 test("recordHostSessionBackfillEvents imports events idempotently", async () => {

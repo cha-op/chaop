@@ -92,6 +92,7 @@ superseded_by:
 - Independent review 发现同一个 session 的 report 如果缺少明确 app-server inventory 证据，仍可能把已知 app-server Host Session demote。现在 Worker 必须看到 `app_server_inventory_ok: true`，才会用 report 里的 app-server absence 清掉已有 app-server presence；成功的 app-server inventory 仍可以反映真实 archive/unarchive 状态。
 - 重新运行的 independent review 发现 duplicate connector migration 也可能在 source duplicate row 是 stale false 时，把 destination 已有 `app_server_present=1` 的 Host Session demote。现在 migration conflict update 会保留 destination 的 app-server presence；explicit app-server command retargeting 也改为依赖迁移后的 destination Host Session 检查，而不是 stale source row flag。
 - 重新运行的 offline frozen-diff review 发现 placeholder commands 可能继承 app-server lease target，但 detach cleanup 只处理 Codex app-server commands。现在 Worker 只会为 Codex dispatch 写入 `lease_target_host_session_id`；placeholder dispatch 仍可携带 Host Session context，但不会变成 app-server lease-bound command。
+- 重新运行的 offline frozen-diff review 发现 app-server inventory 每次 report 都可能翻完整个 app-server history。现在 connector 会在发现 `max_sessions + 1` 个 app-server sessions 后停止，截断时把 report 标记为 incremental；Worker 也只会在 inventory 同时 full 且 successful 时，才用 report 里的 app-server absence demote 已保存的 presence。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -146,6 +147,7 @@ superseded_by:
 - Worker DB tests 断言 duplicate connector retirement 会把带有已迁移 session target 的 pending explicit app-server commands 重新指向新 connector。
 - Worker DB tests 断言 duplicate connector retirement 在 stale source row 报告 `app_server_present=0` 时仍会保留 destination app-server presence，并继续 retarget explicit app-server commands。
 - Worker DB tests 断言通过 attached app-server Host Session dispatch 的 placeholder commands 不会保存 app-server lease target。
+- Worker DB tests 断言成功但 incremental 的 app-server inventory 不会因为 report 里缺少 app-server presence 而 demote 已保存的 session。
 - Worker DB tests 断言后续 inventory report 不再标记 session app-server present 时，会清掉 stale `app_server_present`。
 - Worker DB tests 断言只存在于 app-server 的 Host Sessions 如果从后续 inventory report 中消失，会从 app-server-present 状态 demote。
 - Worker DB tests 断言 incremental Host Session report 不会 demote 无关的 app-server-only sessions。
@@ -164,6 +166,7 @@ superseded_by:
 - Rust tests 断言 app-server `command.started` event payload 会标识目标 Host Session，且不会把该字段带到非 started events 上。
 - Rust tests 断言 Host Session report 会标记 app-server inventory failure，而不是把失败折叠成 successful empty app-server snapshot。
 - Rust tests 断言 app-server inventory 会沿 `nextCursor` 翻页，会拒绝 malformed rows、缺少可执行 thread id 的 rows、malformed cursors 和 repeated cursors，遇到 `thread/list` error 或 malformed response 会失败，并且 disabled 或 truncated Host Session report 会标记为 incremental。
+- Rust tests 断言 app-server inventory 会在配置的 `max_sessions + 1` discovery bound 后停止，并在截断 app-server inventory 时标记 incremental，同时保留 `app_server_inventory_ok: true`。
 - Rust tests 覆盖 connector 还没读取 turn id 时的 `turn/start` 取消窗口。
 - 合并前跑完整 `pnpm test`、Rust workspace tests、build、journal validation 和 PR readiness review。
 

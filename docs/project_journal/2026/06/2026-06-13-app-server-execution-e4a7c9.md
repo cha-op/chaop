@@ -92,6 +92,7 @@ superseded_by:
 - Independent review found same-session reports could still demote a known app-server Host Session when the report lacked explicit app-server inventory evidence. Worker now requires `app_server_inventory_ok: true` before using a reported app-server absence to clear existing app-server presence, while still allowing successful app-server inventory to reflect real archive/unarchive state.
 - A rerun independent review found duplicate connector migration could also demote a destination Host Session that already had `app_server_present=1` when the source duplicate row was stale false. Migration conflict updates now preserve destination app-server presence, and explicit app-server command retargeting relies on the migrated destination Host Session check instead of the stale source row flag.
 - A rerun offline frozen-diff review found placeholder commands could inherit app-server lease targets even though detach cleanup only handles Codex app-server commands. Worker now writes `lease_target_host_session_id` only for Codex dispatches, while placeholder dispatches can still carry Host Session context without becoming app-server lease-bound.
+- A rerun offline frozen-diff review found app-server inventory could page through the entire app-server history on every report. The connector now stops after `max_sessions + 1` discovered app-server sessions, marks the report incremental when truncated, and Worker only uses reported app-server absence to demote stored presence when the inventory is both full and successful.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -146,6 +147,7 @@ superseded_by:
 - Worker DB tests assert duplicate connector retirement retargets pending explicit app-server commands with the migrated session target.
 - Worker DB tests assert duplicate connector retirement preserves destination app-server presence and still retargets explicit app-server commands when the stale source row reports `app_server_present=0`.
 - Worker DB tests assert placeholder commands dispatched through attached app-server Host Sessions do not store app-server lease targets.
+- Worker DB tests assert incremental successful app-server inventory does not demote reported sessions whose app-server presence is absent.
 - Worker DB tests assert inventory refresh clears stale `app_server_present` when a later report no longer marks the session as app-server present.
 - Worker DB tests assert app-server-only Host Sessions omitted from later inventory reports are demoted from app-server-present state.
 - Worker DB tests assert incremental Host Session reports do not demote unrelated app-server-only sessions.
@@ -164,6 +166,7 @@ superseded_by:
 - Rust tests assert app-server `command.started` event payloads identify the target Host Session, without leaking that field onto non-started events.
 - Rust tests assert Host Session reports mark app-server inventory failures instead of collapsing them into successful empty app-server snapshots.
 - Rust tests assert app-server inventory follows `nextCursor`, rejects malformed rows, rows without executable thread ids, malformed cursors, and repeated cursors, fails on `thread/list` errors or malformed responses, and marks disabled or truncated Host Session reports as incremental.
+- Rust tests assert app-server inventory stops after the configured `max_sessions + 1` discovery bound and marks truncated app-server inventory as incremental while preserving `app_server_inventory_ok: true`.
 - Rust tests cover the `turn/start` cancellation window before the connector has read the turn id.
 - Full `pnpm test`, Rust workspace tests, build, journal validation, and PR readiness review before merge.
 

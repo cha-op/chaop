@@ -133,18 +133,18 @@ pub fn build_host_sessions_report(
     )?;
     let history_sessions =
         read_history_sessions(&codex_home, config.session_inventory.max_sessions)?;
-    let (app_server_sessions, app_server_inventory_ok) =
+    let (app_server_sessions, app_server_inventory_ok, app_server_inventory_truncated) =
         if let Some(url) = config.session_inventory.app_server_url.as_deref() {
             match load_app_server_sessions(
                 url,
                 config.session_inventory.max_sessions,
                 config.session_inventory.app_server_timeout_seconds,
             ) {
-                Ok(sessions) => (sessions, Some(true)),
-                Err(_) => (HashMap::new(), Some(false)),
+                Ok(inventory) => (inventory.sessions, Some(true), inventory.truncated),
+                Err(_) => (HashMap::new(), Some(false), false),
             }
         } else {
-            (HashMap::new(), None)
+            (HashMap::new(), None, false)
         };
 
     for (session_id, app_session) in &app_server_sessions {
@@ -179,7 +179,9 @@ pub fn build_host_sessions_report(
         })
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-    let inventory_scope = if sessions.len() > config.session_inventory.max_sessions {
+    let inventory_scope = if app_server_inventory_truncated
+        || sessions.len() > config.session_inventory.max_sessions
+    {
         InventoryScope::Incremental
     } else {
         InventoryScope::Full
@@ -852,11 +854,12 @@ fn load_app_server_sessions(
     url: &str,
     limit: usize,
     timeout_seconds: u64,
-) -> Result<HashMap<String, AppServerSession>, Box<dyn std::error::Error>> {
+) -> Result<AppServerSessionInventory, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
     let mut socket = connect_app_server(url, timeout)?;
     initialize_app_server_connection(&mut socket)?;
     let page_limit = limit.max(1);
+    let session_limit = limit.max(1);
     let mut request_id = 1;
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
@@ -877,6 +880,12 @@ fn load_app_server_sessions(
         let value = read_app_server_inventory_page(&mut socket, request_id)?;
         for (session_id, session) in app_server_sessions_from_response(&value) {
             sessions.entry(session_id).or_insert(session);
+            if sessions.len() > session_limit {
+                return Ok(AppServerSessionInventory {
+                    sessions,
+                    truncated: true,
+                });
+            }
         }
         match app_server_thread_list_next_cursor(&value) {
             Some(next_cursor) => {
@@ -888,7 +897,12 @@ fn load_app_server_sessions(
                 }
                 cursor = Some(next_cursor);
             }
-            None => return Ok(sessions),
+            None => {
+                return Ok(AppServerSessionInventory {
+                    sessions,
+                    truncated: false,
+                });
+            }
         }
         request_id += 1;
     }
@@ -995,6 +1009,12 @@ struct AppServerSession {
     name: Option<String>,
     cwd: Option<String>,
     updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppServerSessionInventory {
+    sessions: HashMap<String, AppServerSession>,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2761,8 +2781,8 @@ mod tests {
             }
         })]);
 
-        let sessions = load_app_server_sessions(&url, 20, 1).expect("sessions");
-        let session = sessions.get("session-1").expect("session");
+        let inventory = load_app_server_sessions(&url, 20, 1).expect("sessions");
+        let session = inventory.sessions.get("session-1").expect("session");
         let request = requests
             .recv_timeout(Duration::from_secs(1))
             .expect("thread/list request");
@@ -2775,6 +2795,7 @@ mod tests {
             request.get("method").and_then(serde_json::Value::as_str),
             Some("thread/list")
         );
+        assert!(!inventory.truncated);
         assert_eq!(
             request
                 .pointer("/params/archived")
@@ -2803,7 +2824,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_app_server_sessions_until_next_cursor_is_exhausted() {
+    fn loads_app_server_sessions_until_limit_plus_one() {
         let (url, requests) = run_fake_app_server_with_requests(vec![
             json!({
                 "jsonrpc": "2.0",
@@ -2835,25 +2856,44 @@ mod tests {
                     "nextCursor": null
                 }
             }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "data": [
+                        {
+                            "id": "session-3",
+                            "name": "Third page",
+                            "cwd": "/tmp/page-3",
+                            "updatedAt": 1781268043
+                        }
+                    ],
+                    "nextCursor": null
+                }
+            }),
         ]);
 
-        let sessions = load_app_server_sessions(&url, 1, 1).expect("sessions");
+        let inventory = load_app_server_sessions(&url, 1, 1).expect("sessions");
         let first_request = requests
             .recv_timeout(Duration::from_secs(1))
             .expect("first request");
         let second_request = requests
             .recv_timeout(Duration::from_secs(1))
             .expect("second request");
+        let third_request = requests.recv_timeout(Duration::from_millis(100));
 
-        assert_eq!(sessions.len(), 2);
+        assert_eq!(inventory.sessions.len(), 2);
+        assert!(inventory.truncated);
         assert_eq!(
-            sessions
+            inventory
+                .sessions
                 .get("session-1")
                 .and_then(|session| session.name.as_deref()),
             Some("First page")
         );
         assert_eq!(
-            sessions
+            inventory
+                .sessions
                 .get("session-2")
                 .and_then(|session| session.name.as_deref()),
             Some("Second page")
@@ -2865,6 +2905,7 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("cursor-page-2")
         );
+        assert!(third_request.is_err());
     }
 
     #[test]
@@ -4100,6 +4141,80 @@ mod tests {
         assert_eq!(report.inventory_scope, InventoryScope::Incremental);
         assert_eq!(report.sessions.len(), 1);
         assert_eq!(report.sessions[0].session_id, "session-2");
+    }
+
+    #[test]
+    fn host_session_report_marks_truncated_app_server_inventory_as_incremental() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "session-1",
+                            "name": "First app-server thread",
+                            "updatedAt": 1781263443
+                        }
+                    ],
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "session-2",
+                            "name": "Second app-server thread",
+                            "updatedAt": 1781267043
+                        }
+                    ],
+                    "nextCursor": "cursor-page-3"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "data": [
+                        {
+                            "id": "session-3",
+                            "name": "Third app-server thread",
+                            "updatedAt": 1781268043
+                        }
+                    ],
+                    "nextCursor": null
+                }
+            }),
+        ]);
+        let mut config = test_config(tempdir.path());
+        config.session_inventory.max_sessions = 1;
+        config.session_inventory.app_server_url = Some(url);
+
+        let report = build_host_sessions_report(&config).expect("report");
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first request");
+        let second_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second request");
+        let third_request = requests.recv_timeout(Duration::from_millis(100));
+
+        assert_eq!(report.inventory_scope, InventoryScope::Incremental);
+        assert_eq!(report.app_server_inventory_ok, Some(true));
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].session_id, "session-2");
+        assert!(first_request.pointer("/params/cursor").is_none());
+        assert_eq!(
+            second_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+        assert!(third_request.is_err());
     }
 
     #[test]

@@ -139,7 +139,7 @@ export async function recordHostSessions(
     inventoryScope === "full" &&
     report.app_server_inventory_ok === true &&
     reportedSessions.length === report.sessions.length;
-  const canUseAppServerAbsence = report.app_server_inventory_ok === true;
+  const canUseAppServerAbsence = inventoryScope === "full" && report.app_server_inventory_ok === true;
 
   for (const session of reportedSessions) {
     const id = hostSessionId(connectorId, session.session_id);
