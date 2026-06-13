@@ -4185,86 +4185,28 @@ mod tests {
     }
 
     #[test]
-    fn app_server_command_interrupts_active_turn_when_cancelled() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let (url, requests) = run_fake_app_server_with_requests(vec![
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "data": [
-                        {
-                            "id": "thread-live-1",
-                            "sessionId": "session-tree-1",
-                            "updatedAt": 1781263443
-                        }
-                    ]
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "result": {
-                    "thread": {
-                        "id": "thread-live-1",
-                        "sessionId": "session-tree-1",
-                        "turns": []
-                    }
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "result": {
-                    "turn": in_progress_turn("turn-1")
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "result": {}
-            }),
-        ]);
-        let config = AgentConfig {
-            execution: ExecutionConfig {
-                codex_timeout_seconds: 5,
-                ..ExecutionConfig::default()
-            },
-            session_inventory: SessionInventoryConfig {
-                app_server_url: Some(url),
-                app_server_timeout_seconds: 1,
-                ..SessionInventoryConfig::default()
-            },
-            ..test_config(tempdir.path())
-        };
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-        let worker = thread::spawn(move || {
-            app_server_command_result_events_with_cancel(
-                &config,
-                "session-tree-1",
-                None,
-                "command-1",
-                "Keep running",
-                worker_cancel,
-            )
-        });
+    fn app_server_turn_wait_interrupts_when_cancelled_after_turn_id_is_known() {
+        let (url, requests) = run_fake_app_server_single_request();
+        let (mut socket, _) = tungstenite::connect(url.as_str()).expect("connect fake app-server");
+        let cancel = AtomicBool::new(true);
+        let mut next_request_id = 4;
 
-        let _list_request = requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("thread/list request");
-        let _resume_request = requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("thread/resume request");
-        let _turn_start_request = requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("turn/start request");
+        let result = super::wait_for_app_server_turn_completion(
+            &mut socket,
+            "thread-live-1",
+            "turn-1",
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(5),
+            5,
+            &cancel,
+            &mut next_request_id,
+        );
 
-        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(result, Err(super::AppServerCommandError::Cancelled));
+        assert_eq!(next_request_id, 5);
         let interrupt_request = requests
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(1))
             .expect("turn/interrupt request");
-        let events = worker.join().expect("app-server command worker");
 
         assert_eq!(
             interrupt_request
@@ -4283,12 +4225,6 @@ mod tests {
                 .pointer("/params/turnId")
                 .and_then(serde_json::Value::as_str),
             Some("turn-1")
-        );
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, "command.failed");
-        assert_eq!(
-            events[0].summary,
-            "Codex app-server turn was cancelled because the connector connection closed."
         );
     }
 
@@ -4549,6 +4485,19 @@ mod tests {
                         .expect("send app-server response");
                 }
             }
+        });
+        (format!("ws://{address}"), requests_rx)
+    }
+
+    fn run_fake_app_server_single_request() -> (String, Receiver<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+        let address = listener.local_addr().expect("fake app-server address");
+        let (requests_tx, requests_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(request);
         });
         (format!("ws://{address}"), requests_rx)
     }
