@@ -89,12 +89,12 @@ pub fn build_host_sessions_report(
     )?;
     let history_sessions =
         read_history_sessions(&codex_home, config.session_inventory.max_sessions)?;
-    let app_server_titles = config
+    let app_server_sessions = config
         .session_inventory
         .app_server_url
         .as_deref()
         .and_then(|url| {
-            load_app_server_titles(
+            load_app_server_sessions(
                 url,
                 config.session_inventory.max_sessions,
                 config.session_inventory.app_server_timeout_seconds,
@@ -103,13 +103,15 @@ pub fn build_host_sessions_report(
         })
         .unwrap_or_default();
 
-    for session_id in app_server_titles.keys() {
-        drafts
+    for (session_id, app_session) in &app_server_sessions {
+        let draft = drafts
             .entry(session_id.clone())
             .or_insert_with(|| SessionDraft {
                 session_id: session_id.clone(),
                 ..SessionDraft::default()
             });
+        draft.cwd = first_non_empty_raw(draft.cwd.take(), app_session.cwd.clone());
+        draft.updated_at = max_string(app_session.updated_at.clone(), draft.updated_at.take());
     }
 
     for (session_id, history) in &history_sessions {
@@ -125,7 +127,9 @@ pub fn build_host_sessions_report(
     let mut sessions = drafts
         .into_values()
         .map(|draft| {
-            let app_title = app_server_titles.get(&draft.session_id).cloned();
+            let app_title = app_server_sessions
+                .get(&draft.session_id)
+                .and_then(|session| session.name.clone());
             resolve_session(draft, app_title, &history_sessions)
         })
         .collect::<Vec<_>>();
@@ -499,11 +503,11 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn load_app_server_titles(
+fn load_app_server_sessions(
     url: &str,
     limit: usize,
     timeout_seconds: u64,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, AppServerSession>, Box<dyn std::error::Error>> {
     let (mut socket, _) = connect(url)?;
     configure_socket_timeout(&mut socket, Duration::from_secs(timeout_seconds.max(1)))?;
     socket.send(Message::Text(
@@ -527,7 +531,7 @@ fn load_app_server_titles(
             Message::Text(text) => {
                 let value = serde_json::from_str::<Value>(text.as_ref())?;
                 if value.get("id").and_then(Value::as_i64) == Some(1) {
-                    return Ok(app_server_titles_from_response(&value));
+                    return Ok(app_server_sessions_from_response(&value));
                 }
             }
             Message::Close(_) => return Ok(HashMap::new()),
@@ -553,25 +557,47 @@ fn configure_socket_timeout(
     }
 }
 
-fn app_server_titles_from_response(value: &Value) -> HashMap<String, String> {
-    let mut titles = HashMap::new();
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppServerSession {
+    name: Option<String>,
+    cwd: Option<String>,
+    updated_at: Option<String>,
+}
+
+fn app_server_sessions_from_response(value: &Value) -> HashMap<String, AppServerSession> {
+    let mut sessions = HashMap::new();
     let Some(data) = value
         .get("result")
         .and_then(|result| result.get("data"))
         .and_then(Value::as_array)
     else {
-        return titles;
+        return sessions;
     };
     for thread in data {
         let Some(session_id) = thread.get("sessionId").and_then(Value::as_str) else {
             continue;
         };
-        let Some(name) = compact_title(thread.get("name").and_then(Value::as_str)) else {
-            continue;
-        };
-        titles.insert(session_id.to_owned(), name);
+        sessions.insert(
+            session_id.to_owned(),
+            AppServerSession {
+                name: compact_title(thread.get("name").and_then(Value::as_str)),
+                cwd: thread
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                updated_at: app_server_thread_timestamp(thread),
+            },
+        );
     }
-    titles
+    sessions
+}
+
+#[cfg(test)]
+fn app_server_titles_from_response(value: &Value) -> HashMap<String, String> {
+    app_server_sessions_from_response(value)
+        .into_iter()
+        .filter_map(|(session_id, session)| session.name.map(|name| (session_id, name)))
+        .collect()
 }
 
 pub fn create_app_server_thread(
@@ -811,9 +837,10 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        HistorySession, SessionDraft, TitleSource, app_server_thread_from_response,
-        app_server_titles_from_response, build_host_sessions_report, create_app_server_thread_at,
-        read_recent_lines, resolve_session, rollout_paths, unix_seconds_to_iso,
+        HistorySession, SessionDraft, TitleSource, app_server_sessions_from_response,
+        app_server_thread_from_response, app_server_titles_from_response,
+        build_host_sessions_report, create_app_server_thread_at, read_recent_lines,
+        resolve_session, rollout_paths, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
@@ -889,6 +916,34 @@ mod tests {
             Some("App server title")
         );
         assert!(!titles.contains_key("session-2"));
+    }
+
+    #[test]
+    fn parses_app_server_thread_inventory_metadata() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "sessionId": "session-1",
+                        "name": null,
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                ]
+            }
+        });
+
+        let sessions = app_server_sessions_from_response(&response);
+        let session = sessions.get("session-1").expect("session");
+
+        assert_eq!(session.name, None);
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(
+            session.updated_at.as_deref(),
+            Some("2026-06-12T11:24:03.000Z")
+        );
     }
 
     #[test]
