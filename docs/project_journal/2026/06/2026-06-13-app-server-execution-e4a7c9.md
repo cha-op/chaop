@@ -65,6 +65,7 @@ superseded_by:
 - Follow-up frozen-diff review found rejected stale app-server starts released lease fields but left the stale implicit `target_connector_id` from command creation. Releasing that stale app-server lease now clears only attached-session inferred targets, so immediate re-dispatch can follow the current attachment without allowing explicitly targeted commands to drift to another connector.
 - Follow-up independent review found the guarded detach failure update compared `lease_target_host_session_id` to the internal `host_sessions.id` instead of the app-server session id stored in commands. The guarded update now uses `hostSession.session_id` for lease-target matching and reserves `hostSession.id` only for excluding the detached row from replacement selection.
 - Codex review-gate found one more stale-start release race: rejected app-server `command.started` acknowledgements now release back to pending only when the current task/thread target resolves to an executable replacement app-server Host Session. If no replacement exists, the command stays app-server-scoped for detach cleanup instead of becoming a generic `codex_exec` command.
+- Follow-up frozen-diff review found that stale-start release still constrained replacement Host Sessions to the old connector even when the command target was inferred from an attached session. Rejected starts now allow cross-connector replacement only for `attached` inferred targets; explicit targets remain pinned to the requested connector.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -96,6 +97,8 @@ superseded_by:
 - Worker route tests assert guarded detach failure updates bind the stored app-server session id for `lease_target_host_session_id`, not the internal Host Session row id.
 - Worker DB tests assert rejected stale app-server starts do not release the lease when the old app-server Host Session was detached and no executable replacement exists.
 - Worker Durable Object tests assert rejected targeted app-server starts still release and re-dispatch when a replacement app-server Host Session is available.
+- Worker DB tests assert attached-session inferred targets can release stale app-server starts to a replacement connector.
+- Worker DB tests assert explicit app-server targets remain bound to the requested connector and do not release to another connector.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.

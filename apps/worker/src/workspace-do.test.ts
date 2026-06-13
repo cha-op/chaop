@@ -352,6 +352,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
         assert.match(sql, /lease_target_host_session_id = \?/);
         assert.match(sql, /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /hs\.session_id <> \?/);
+        assert.match(sql, /\? OR commands\.target_connector_id IS NULL OR hs\.connector_id = commands\.target_connector_id/);
         return {
           bind(
             clearTargetConnectorId: number,
@@ -360,10 +361,12 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             commandId: string,
             connectorId: string,
             targetHostSessionId: string,
-            replacementExcludedSessionId: string
+            replacementExcludedSessionId: string,
+            replacementCanIgnoreOldTarget: number
           ) {
             assert.equal(clearTargetConnectorId, 1);
             assert.equal(clearTargetConnectorIdSource, 1);
+            assert.equal(replacementCanIgnoreOldTarget, 1);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
             assert.equal(connectorId, "connector-stale");

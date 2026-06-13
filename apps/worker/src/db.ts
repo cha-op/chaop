@@ -1329,7 +1329,7 @@ async function releaseRejectedAppServerStartLease(
            AND wc.can_execute = 1
            AND c.status <> 'offline'
            AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
-           AND (commands.target_connector_id IS NULL OR hs.connector_id = commands.target_connector_id)
+           AND (? OR commands.target_connector_id IS NULL OR hs.connector_id = commands.target_connector_id)
        )`
   )
     .bind(
@@ -1339,7 +1339,8 @@ async function releaseRejectedAppServerStartLease(
       command.id,
       connectorId,
       command.lease_target_host_session_id,
-      command.lease_target_host_session_id
+      command.lease_target_host_session_id,
+      clearImplicitTarget
     )
     .run();
   const released = Boolean((result.meta as { changes?: number } | undefined)?.changes);
