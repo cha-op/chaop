@@ -78,6 +78,7 @@ superseded_by:
 - Worker D1 helpers upsert the created app-server session and reuse the existing attach flow so the new session immediately becomes a task/thread pair.
 - Task Board and Thread Command Centre now expose a focused `New local thread` form; successful creation opens the real thread.
 - Review follow-up aligns the app-server client with the documented protocol by sending `initialize` and `initialized` before `thread/list` or `thread/start`, and by accepting official `Thread.id` responses without a legacy `sessionId`.
+- Post-merge hardening filters offline connectors out of the `New local thread` picker and disables the form when no online app-server connector is available, matching the Worker eligibility check before the user submits.
 - Review follow-up makes app-server inventory scans request `cli`, `vscode`, and `appServer` source kinds so Chaop-created threads remain discoverable after connector restarts.
 - Review follow-up makes the Thread Centre create form use the selected thread's workspace and filters connector choices to that workspace, falling back to Auto when a stale connector selection no longer belongs there.
 - Review follow-up bounds plain `ws://` app-server TCP connects with `app_server_timeout_seconds`, so a blackholed local app-server URL cannot block the connector's main WebSocket loop indefinitely.

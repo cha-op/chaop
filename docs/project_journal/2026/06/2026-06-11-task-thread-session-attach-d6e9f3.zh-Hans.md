@@ -78,6 +78,7 @@ superseded_by:
 - Worker 的 D1 helper 会 upsert 创建出的 app-server session，并复用已有 attach 流程，所以新 session 会立即变成 task/thread 组合。
 - Task Board 和 Thread Command Centre 现在提供聚焦的 `New local thread` 表单；创建成功后会直接打开真实 thread。
 - Review follow-up 让 app-server client 对齐已记录的协议：会在 `thread/list` 或 `thread/start` 前先发送 `initialize` 和 `initialized`，并接受没有 legacy `sessionId` 的官方 `Thread.id` 响应。
+- 合并后的 hardening 会从 `New local thread` 选择器中过滤掉 offline connectors；如果当前没有在线 app-server connector，表单会直接禁用并显示不可用状态，让提交前的行为与 Worker eligibility check 保持一致。
 - Review follow-up 让 app-server inventory scan 显式请求 `cli`、`vscode` 和 `appServer` source kinds，确保 Chaop 创建的 threads 在 connector 重启后仍能被发现。
 - Review follow-up 让 Thread Centre 的创建表单使用当前选中 thread 的 workspace，并把 connector 选项过滤到该 workspace；当旧 connector selection 不再属于当前 workspace 时，会回退到 Auto。
 - Review follow-up 现在会用 `app_server_timeout_seconds` 限制普通 `ws://` app-server TCP 连接，避免黑洞式本机 app-server URL 无限阻塞 connector 的主 WebSocket loop。

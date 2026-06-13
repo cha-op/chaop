@@ -44,7 +44,10 @@ export function localThreadConnectors(
   if (!workspace) return [];
   const connectorIds = new Set(workspace.connector_ids);
   return data.connectors.filter(
-    (connector) => connectorIds.has(connector.id) && connector.capabilities.includes("app_server_threads")
+    (connector) =>
+      connectorIds.has(connector.id) &&
+      connector.status !== "offline" &&
+      connector.capabilities.includes("app_server_threads")
   );
 }
 
