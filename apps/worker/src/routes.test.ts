@@ -2548,10 +2548,16 @@ function hostSessionDetachDb(): D1Database & {
         assert.match(sql, /cmd\.state = 'leased'/);
         assert.doesNotMatch(sql, /cmd\.lease_until IS NOT NULL/);
         assert.match(sql, /NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
+        assert.match(sql, /INNER JOIN workspace_connectors wc/);
+        assert.match(sql, /wc\.can_execute = 1/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
         assert.match(sql, /hs\.id <> \?/);
         assert.match(sql, /cmd\.target_connector_id IS NULL OR hs\.connector_id = cmd\.target_connector_id/);
         assert.match(sql, /hst\.id <> \?/);
         assert.doesNotMatch(sql, /hst\.connector_id = cmd\.target_connector_id/);
+        assert.doesNotMatch(sql, /hst\.app_server_present = 1/);
         return {
           bind(
             workspaceId: string,

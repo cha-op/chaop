@@ -412,9 +412,16 @@ async function failCommandsForDetachedAppServerHostSession(
          AND NOT EXISTS (
            SELECT 1
            FROM host_sessions hs
+           INNER JOIN connectors c ON c.id = hs.connector_id
+           INNER JOIN workspace_connectors wc
+             ON wc.workspace_id = cmd.workspace_id
+            AND wc.connector_id = hs.connector_id
            WHERE hs.workspace_id = cmd.workspace_id
              AND hs.id <> ?
              AND hs.app_server_present = 1
+             AND wc.can_execute = 1
+             AND c.status <> 'offline'
+             AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
              AND (cmd.target_connector_id IS NULL OR hs.connector_id = cmd.target_connector_id)
              AND (
                (cmd.task_id IS NOT NULL AND hs.attached_task_id = cmd.task_id)
@@ -428,7 +435,6 @@ async function failCommandsForDetachedAppServerHostSession(
                     FROM host_sessions hst
                     WHERE hst.workspace_id = cmd.workspace_id
                       AND hst.id <> ?
-                      AND hst.app_server_present = 1
                       AND hst.attached_task_id = cmd.task_id
                    )
                  )

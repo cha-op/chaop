@@ -52,6 +52,7 @@ superseded_by:
 - Independent PR review 发现还存在 create/detach 跨请求 race：command creation 可能先读到旧 app-server attachment，然后在 detach cleanup 扫描 commands 之后才 insert。现在 app-server Codex command creation 使用 guarded insert，只有按同一套 task-first/latest ordering 选出的当前 task/thread Host Session 仍解析到同一个 app-server target 时才会写入 command。
 - Independent PR review 发现 reattach-after-dispatch race：同一个 connector 可能先收到指向某个 app-server Host Session 的 command，随后又把另一个 Host Session attach 到同一 task/thread，最后才发送 `command.started`。现在 app-server `command.started` event 会带 `target_host_session_id`，Worker acknowledgement 只有在该 session 仍匹配当前 task/thread target 时才会接受 start。
 - 后续 independent review 发现 `command.started` Host Session identity check 与 command state update 之间仍有 TOCTOU window。现在 Worker 会把当前 Host Session target check 合并进同一条 guarded `UPDATE commands ... WHERE ... EXISTS (...)`，只有该 update 仍能解析到 event `target_host_session_id` 时才把 command 置为 `running`。
+- Detached-command replacement matching 现在也要求 replacement connector 可执行、在线，并声明 `codex_app_server_exec`，所以 cleanup 不会被 command leasing 实际无法 dispatch 的 attached Host Session 错误压制。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -59,6 +60,7 @@ superseded_by:
 - Worker tests 断言 command lease 保留 task-first、thread-fallback 的 attachment selection SQL。
 - Worker route tests 覆盖 app-server Host Session detach 会让依赖该 attachment 的 pending Codex command 失败。
 - Worker route tests 断言 detached-command replacement matching 会限定在 command target connector 内。
+- Worker route tests 断言 detached-command replacement matching 要求 executable online app-server connector capability，并使用与 command leasing 相同的 task-first blocking rule。
 - Worker route tests 断言 detached-command cleanup 会立即覆盖 leased commands，而不是等 lease expiry。
 - Worker route tests 断言 Host Session detach 会先清空 attachment，然后才执行 command cleanup query。
 - Worker Durable Object tests 断言 stale agent command events 会收到带 `accepted: false` 的 `server.ack`。

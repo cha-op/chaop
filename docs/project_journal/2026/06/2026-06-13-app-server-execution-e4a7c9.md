@@ -52,6 +52,7 @@ superseded_by:
 - Independent PR review found a remaining create/detach cross-request race where command creation could read an old app-server attachment, then insert after detach cleanup had already scanned commands. App-server Codex command creation now uses a guarded insert that only writes the command if the current task/thread Host Session selected by the same task-first/latest ordering still resolves to the same app-server target.
 - Independent PR review found a reattach-after-dispatch race: the same connector could receive a command for one app-server Host Session, then attach a different Host Session to the same task/thread before sending `command.started`. App-server `command.started` events now include `target_host_session_id`, and Worker acknowledgements reject starts unless that session still matches the current task/thread target.
 - Follow-up independent review found a remaining TOCTOU window between the `command.started` Host Session identity check and the command state update. Worker now folds the current Host Session target check into the same guarded `UPDATE commands ... WHERE ... EXISTS (...)` statement that moves the command to `running`.
+- Detached-command replacement matching now also requires the replacement connector to be executable, online, and advertising `codex_app_server_exec`, so cleanup is not suppressed by an attached Host Session that command leasing cannot actually dispatch to.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -59,6 +60,7 @@ superseded_by:
 - Worker tests assert command leasing preserves the task-first, thread-fallback attachment selection SQL.
 - Worker route tests cover app-server Host Session detach failing pending attachment-dependent Codex commands.
 - Worker route tests assert detached-command replacement matching is scoped to the command target connector.
+- Worker route tests assert detached-command replacement matching requires executable online app-server connector capability and uses the same task-first blocking rule as command leasing.
 - Worker route tests assert detached-command cleanup covers leased commands immediately instead of waiting for lease expiry.
 - Worker route tests assert Host Session detach clears the attachment before command cleanup queries run.
 - Worker Durable Object tests assert stale agent command events receive `server.ack` with `accepted: false`.
