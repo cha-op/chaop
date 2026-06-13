@@ -38,9 +38,11 @@ superseded_by:
 - Command session resolution scans app-server `thread/list` pages under the command timeout budget instead of reusing the archive sync page budget.
 - After a turn id is known, connector cancellation or command timeout best-effort sends app-server `turn/interrupt`.
 - App-server `commandExecution` output is intentionally not converted into Chaop command events by default.
+- PR readiness review found and fixed a dispatch consistency bug where command creation selected the latest attached Host Session but command leasing could join an older duplicate attachment row; leasing now uses the same task-first, latest-updated Host Session selection.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
+- Worker tests assert command leasing joins only the latest task-first attached Host Session.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Full `pnpm test`, Rust workspace tests, build, journal validation, and PR readiness review before merge.
 

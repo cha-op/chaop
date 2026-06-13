@@ -724,10 +724,16 @@ export async function pendingCommandsForConnector(
               hs.cwd AS target_host_session_cwd
        FROM commands cmd
        LEFT JOIN host_sessions hs
-         ON hs.workspace_id = cmd.workspace_id
-        AND (
-          (cmd.task_id IS NOT NULL AND hs.attached_task_id = cmd.task_id)
-          OR (cmd.thread_id IS NOT NULL AND hs.attached_thread_id = cmd.thread_id)
+         ON hs.id = (
+          SELECT hs2.id
+          FROM host_sessions hs2
+          WHERE hs2.workspace_id = cmd.workspace_id
+            AND (
+              (cmd.task_id IS NOT NULL AND hs2.attached_task_id = cmd.task_id)
+              OR (cmd.task_id IS NULL AND cmd.thread_id IS NOT NULL AND hs2.attached_thread_id = cmd.thread_id)
+            )
+          ORDER BY hs2.updated_at DESC, hs2.id DESC
+          LIMIT 1
         )
        WHERE (
            cmd.state = 'pending'
@@ -1298,7 +1304,7 @@ async function findAttachedCommandTarget(
       `SELECT hs.connector_id, hs.app_server_present
        FROM host_sessions hs
        WHERE hs.workspace_id = ? AND hs.attached_task_id = ?
-       ORDER BY hs.updated_at DESC
+       ORDER BY hs.updated_at DESC, hs.id DESC
        LIMIT 1`
     )
       .bind(scope.workspaceId, scope.taskId)
@@ -1316,7 +1322,7 @@ async function findAttachedCommandTarget(
       `SELECT hs.connector_id, hs.app_server_present
        FROM host_sessions hs
        WHERE hs.workspace_id = ? AND hs.attached_thread_id = ?
-       ORDER BY hs.updated_at DESC
+       ORDER BY hs.updated_at DESC, hs.id DESC
        LIMIT 1`
     )
       .bind(scope.workspaceId, scope.threadId)

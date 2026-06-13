@@ -890,6 +890,13 @@ function pendingCommandDispatchDb() {
     prepare(sql: string) {
       if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
         assert.match(sql, /hs\.session_id AS target_host_session_id/);
+        assert.match(sql, /ON hs\.id = \(/);
+        assert.match(sql, /cmd\.task_id IS NOT NULL AND hs2\.attached_task_id = cmd\.task_id/);
+        assert.match(
+          sql,
+          /cmd\.task_id IS NULL AND cmd\.thread_id IS NOT NULL AND hs2\.attached_thread_id = cmd\.thread_id/
+        );
+        assert.match(sql, /ORDER BY hs2\.updated_at DESC, hs2\.id DESC/);
         assert.match(sql, /hs\.connector_id IS NULL OR hs\.connector_id = \?/);
         assert.match(sql, /codex_app_server_exec/);
         assert.match(sql, /c\.capabilities_json LIKE/);
