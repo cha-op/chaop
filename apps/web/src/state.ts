@@ -1,6 +1,7 @@
 import type {
   BootstrapPayload,
   ConnectorSummary,
+  HostSessionBackfillSummary,
   HostSessionSummary,
   HostSessionSyncSummary,
   ThreadSummary
@@ -60,6 +61,20 @@ export function localThreadConnectorId(
   return localThreadConnectors(data, workspaceId).some((connector) => connector.id === selectedConnectorId)
     ? selectedConnectorId
     : undefined;
+}
+
+export function historyBackfillNotice(backfill: HostSessionBackfillSummary | undefined): string | undefined {
+  if (!backfill || !backfill.attempted || backfill.error) return undefined;
+  const count = backfill.imported_event_count;
+  if (count === 0) {
+    return backfill.truncated
+      ? "Attached. History backfill was truncated before any importable events were found."
+      : "Attached. History backfill found no importable events.";
+  }
+  const noun = count === 1 ? "event" : "events";
+  return backfill.truncated
+    ? `Attached. Imported ${count} history ${noun}; older history was truncated.`
+    : `Attached. Imported ${count} history ${noun}.`;
 }
 
 function mergeById<T extends { id: string }>(

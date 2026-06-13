@@ -137,14 +137,24 @@ main {
   color: #475569;
 }
 
-.action-alert {
+.action-alert,
+.action-notice {
   margin: 16px 24px 0;
-  border: 1px solid #fecaca;
   border-radius: 8px;
-  background: #fef2f2;
-  color: #991b1b;
   padding: 10px 12px;
   overflow-wrap: anywhere;
+}
+
+.action-alert {
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.action-notice {
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1e3a8a;
 }
 
 .page-grid {
