@@ -577,17 +577,13 @@ fn app_server_titles_from_response(value: &Value) -> HashMap<String, String> {
 pub fn create_app_server_thread(
     config: &AgentConfig,
     title: Option<&str>,
-    cwd: Option<&str>,
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
     let url = config
         .session_inventory
         .app_server_url
         .as_deref()
         .ok_or("session_inventory.app_server_url is required for local thread creation")?;
-    let cwd = cwd
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| config.workspace_root.to_string_lossy().into_owned());
+    let cwd = config.workspace_root.to_string_lossy().into_owned();
     create_app_server_thread_at(
         url,
         title,
@@ -618,7 +614,7 @@ fn create_app_server_thread_at(
     let requested_title = compact_title(title);
 
     if let Some(title) = requested_title.as_deref() {
-        send_app_server_request(
+        let _ = send_app_server_request(
             &mut socket,
             2,
             "thread/name/set",
@@ -626,7 +622,7 @@ fn create_app_server_thread_at(
                 "threadId": started.id,
                 "name": title
             }),
-        )?;
+        );
     }
 
     Ok(AgentHostSession {
@@ -816,13 +812,16 @@ fn default_codex_home() -> PathBuf {
 mod tests {
     use super::{
         HistorySession, SessionDraft, TitleSource, app_server_thread_from_response,
-        app_server_titles_from_response, build_host_sessions_report, read_recent_lines,
-        resolve_session, rollout_paths, unix_seconds_to_iso,
+        app_server_titles_from_response, build_host_sessions_report, create_app_server_thread_at,
+        read_recent_lines, resolve_session, rollout_paths, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
+    use std::net::TcpListener;
+    use std::thread;
+    use tungstenite::{Message, accept};
 
     #[test]
     fn title_resolution_prefers_metadata_over_history() {
@@ -915,6 +914,68 @@ mod tests {
         assert_eq!(thread.name.as_deref(), Some("Created title"));
         assert_eq!(thread.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(thread.updated_at, "2026-06-12T11:24:03.000Z");
+    }
+
+    #[test]
+    fn creates_app_server_thread_and_sets_name() {
+        let url = run_fake_app_server(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "thread": {
+                        "id": "thread-1",
+                        "sessionId": "session-1",
+                        "name": null,
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {}
+            }),
+        ]);
+
+        let session = create_app_server_thread_at(&url, Some("Requested title"), "/tmp/project", 1)
+            .expect("created thread");
+
+        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.title, "Requested title");
+        assert_eq!(session.title_source, TitleSource::AppServer);
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
+    }
+
+    #[test]
+    fn keeps_created_app_server_thread_when_name_set_fails() {
+        let url = run_fake_app_server(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "thread": {
+                        "id": "thread-1",
+                        "sessionId": "session-1",
+                        "name": "Server title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": { "message": "name update unavailable" }
+            }),
+        ]);
+
+        let session = create_app_server_thread_at(&url, Some("Requested title"), "/tmp/project", 1)
+            .expect("created thread despite name failure");
+
+        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.title, "Requested title");
     }
 
     #[test]
@@ -1026,5 +1087,22 @@ mod tests {
         assert_eq!(report.sessions[0].title_source, TitleSource::History);
         assert_eq!(report.sessions[1].title, "History title from first prompt");
         assert_eq!(report.sessions[2].title, "Metadata index title");
+    }
+
+    fn run_fake_app_server(responses: Vec<serde_json::Value>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+        let address = listener.local_addr().expect("fake app-server address");
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            for response in responses {
+                let message = socket.read().expect("read app-server request");
+                assert!(matches!(message, Message::Text(_)));
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .expect("send app-server response");
+            }
+        });
+        format!("ws://{address}")
     }
 }

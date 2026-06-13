@@ -173,7 +173,6 @@ export type CreateLocalThreadRequest = {
   workspace_id: string;
   title?: string | undefined;
   connector_id?: string | undefined;
-  cwd?: string | undefined;
 };
 
 export type CreateLocalThreadResponse = {
@@ -326,7 +325,6 @@ export type LocalThreadCreateDispatch = {
   request_id: string;
   workspace_id: string;
   title?: string | undefined;
-  cwd?: string | undefined;
 };
 
 export type LocalThreadCreateResult = {

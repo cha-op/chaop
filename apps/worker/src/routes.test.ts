@@ -181,6 +181,71 @@ test("local thread creation requires D1 before connector dispatch", async () => 
   assert.deepEqual(await response.json(), { error: "DB binding is required" });
 });
 
+test("local thread creation dispatches to an app-server capable connector and attaches the result", async () => {
+  let internalPath = "";
+  let dispatchBody: Record<string, unknown> | undefined;
+  const db = localThreadCreateDb();
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/local-threads", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com",
+        "x-chaop-dev-user": "operator@example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        title: "Investigate retry loop",
+        cwd: "/tmp/browser-supplied-cwd"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            dispatchBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            return new Response(
+              JSON.stringify({
+                session: {
+                  session_id: "session-created-1",
+                  title: "Investigate retry loop",
+                  title_source: "app_server",
+                  cwd: "/Users/joey/Program/Codex-workspace",
+                  updated_at: "2026-06-12T11:24:03.000Z"
+                }
+              }),
+              { headers: { "content-type": "application/json; charset=utf-8" } }
+            );
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    host_session: { session_id: string; attached_task_id?: string; attached_thread_id?: string };
+    task: { id: string; thread_id: string };
+    thread: { id: string; title: string };
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(internalPath, "/internal/create-local-thread");
+  assert.equal(dispatchBody?.connector_id, "connector-online");
+  assert.equal(dispatchBody?.workspace_id, "workspace-api");
+  assert.equal(dispatchBody?.title, "Investigate retry loop");
+  assert.equal(typeof dispatchBody?.request_id, "string");
+  assert.equal(Object.hasOwn(dispatchBody ?? {}, "cwd"), false);
+  assert.equal(body.host_session.session_id, "session-created-1");
+  assert.equal(body.host_session.attached_task_id, body.task.id);
+  assert.equal(body.host_session.attached_thread_id, body.thread.id);
+  assert.equal(body.task.thread_id, body.thread.id);
+  assert.equal(body.thread.title, "Investigate retry loop");
+  assert.equal(db.userWrites, 1);
+  assert.equal(db.syncWrites, 1);
+});
+
 test("host session detach clears the attached task and thread when D1 is bound", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/detach", {
@@ -909,6 +974,311 @@ function commandTargetDb(
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     }
   } as unknown as D1Database;
+}
+
+function localThreadCreateDb(): D1Database & { readonly userWrites: number; readonly syncWrites: number } {
+  const sessions = new Map<string, Record<string, unknown>>();
+  let threadRow: Record<string, unknown> | undefined;
+  let taskRow: Record<string, unknown> | undefined;
+  const counters = {
+    userWrites: 0,
+    syncWrites: 0
+  };
+
+  const db = {
+    prepare(sql: string) {
+      if (/INSERT INTO users/.test(sql)) {
+        return {
+          bind(userId: string, email: string, name: string) {
+            assert.equal(userId, "user-operator-example-com");
+            assert.equal(email, "operator@example.com");
+            assert.equal(name, "operator");
+            return {
+              async run() {
+                counters.userWrites += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id FROM workspaces/.test(sql)) {
+        return {
+          bind(workspaceId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            return {
+              async first() {
+                return { id: workspaceId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT c\.id/.test(sql) && /app_server_threads/.test(sql)) {
+        assert.match(sql, /workspace_connectors/);
+        assert.match(sql, /wc\.can_execute = 1/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /capabilities_json LIKE/);
+        return {
+          bind(workspaceId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            return {
+              async first() {
+                return { id: "connector-online" };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT hostname/.test(sql) && /FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { hostname: "mac-studio.local" };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT workspace_id/.test(sql) && /FROM workspace_connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { workspace_id: "workspace-api" };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO host_sessions/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            connectorId: string,
+            hostname: string,
+            workspaceId: string,
+            sessionId: string,
+            title: string,
+            titleSource: string,
+            cwd: string | null,
+            discoveredAt: string,
+            updatedAt: string
+          ) {
+            assert.equal(id, "host-session-session-created-1-connector-online");
+            assert.equal(connectorId, "connector-online");
+            assert.equal(hostname, "mac-studio.local");
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(sessionId, "session-created-1");
+            assert.equal(title, "Investigate retry loop");
+            assert.equal(titleSource, "app_server");
+            assert.equal(cwd, "/Users/joey/Program/Codex-workspace");
+            assert.match(discoveredAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(updatedAt, "2026-06-12T11:24:03.000Z");
+            return {
+              async run() {
+                sessions.set(sessionId, {
+                  id,
+                  connector_id: connectorId,
+                  hostname,
+                  workspace_id: workspaceId,
+                  session_id: sessionId,
+                  title,
+                  title_source: titleSource,
+                  cwd,
+                  attached_task_id: null,
+                  attached_thread_id: null,
+                  updated_at: updatedAt
+                });
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT hs\.id, hs\.connector_id/.test(sql) && /FROM host_sessions hs/.test(sql)) {
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        return {
+          bind(sessionId: string, connectorId: string) {
+            assert.equal(sessionId, "session-created-1");
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return sessions.get(sessionId);
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO host_session_syncs/.test(sql)) {
+        return {
+          bind(connectorId: string, syncedAt: string, reported: number, stored: number) {
+            assert.equal(connectorId, "connector-online");
+            assert.match(syncedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(reported, 1);
+            assert.equal(stored, 1);
+            return {
+              async run() {
+                counters.syncWrites += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /last_seen_at/.test(sql)) {
+        return {
+          bind(lastSeenAt: string, updatedAt: string, connectorId: string) {
+            assert.match(lastSeenAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO threads/.test(sql)) {
+        return {
+          bind(threadId: string, workspaceId: string, title: string, createdAt: string, updatedAt: string) {
+            assert.equal(threadId, "thread-host-session-created-1-connector-online");
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(title, "Investigate retry loop");
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                threadRow = {
+                  id: threadId,
+                  workspace_id: workspaceId,
+                  title,
+                  state: "idle",
+                  realtime_mode: "realtime",
+                  last_seq: 0,
+                  updated_at: updatedAt
+                };
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO tasks/.test(sql)) {
+        return {
+          bind(
+            taskId: string,
+            workspaceId: string,
+            threadId: string,
+            title: string,
+            connectorId: string,
+            createdAt: string,
+            updatedAt: string
+          ) {
+            assert.equal(taskId, "task-host-session-created-1-connector-online");
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-host-session-created-1-connector-online");
+            assert.equal(title, "Investigate retry loop");
+            assert.equal(connectorId, "connector-online");
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                taskRow = {
+                  id: taskId,
+                  workspace_id: workspaceId,
+                  thread_id: threadId,
+                  title,
+                  category_id: "maintenance",
+                  state: "idle",
+                  connector_id: connectorId,
+                  assigned_agent: "chaop-agent",
+                  realtime_mode: "realtime",
+                  budget_state: "normal",
+                  archived_at: null,
+                  updated_at: updatedAt
+                };
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE host_sessions/.test(sql) && /attached_task_id = \?/.test(sql)) {
+        return {
+          bind(taskId: string, threadId: string, updatedAt: string, hostSessionId: string) {
+            assert.equal(taskId, "task-host-session-created-1-connector-online");
+            assert.equal(threadId, "thread-host-session-created-1-connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(hostSessionId, "host-session-session-created-1-connector-online");
+            return {
+              async run() {
+                const session = sessions.get("session-created-1");
+                if (session) {
+                  session.attached_task_id = taskId;
+                  session.attached_thread_id = threadId;
+                  session.updated_at = updatedAt;
+                }
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, workspace_id, thread_id, title, category_id/.test(sql) && /FROM tasks/.test(sql)) {
+        return {
+          bind(taskId: string) {
+            assert.equal(taskId, "task-host-session-created-1-connector-online");
+            return {
+              async first() {
+                return taskRow;
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, workspace_id, title, state, last_seq/.test(sql) && /FROM threads/.test(sql)) {
+        return {
+          bind(threadId: string) {
+            assert.equal(threadId, "thread-host-session-created-1-connector-online");
+            return {
+              async first() {
+                return threadRow;
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get userWrites() {
+      return counters.userWrites;
+    },
+    get syncWrites() {
+      return counters.syncWrites;
+    }
+  };
+
+  return db as D1Database & { readonly userWrites: number; readonly syncWrites: number };
 }
 
 function hostSessionDetachDb(): D1Database {

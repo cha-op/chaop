@@ -357,6 +357,8 @@ Session inventory is enabled by default. The connector reads local Codex metadat
 
 Set `session_inventory.app_server_url` when Chaop should create new local Codex app-server threads or use app-server titles. The connector advertises the `app_server_threads` capability only when this URL is configured, and the Worker rejects new local thread requests when no online connector has that capability. Keep `app_server_timeout_seconds` short so a stopped app-server cannot block connector startup or thread creation.
 
+New local threads always start in the connector's configured `workspace_root`; the Browser API does not accept or forward an arbitrary cwd.
+
 Start the local app-server with a private listener that only the connector host can reach:
 
 ```bash

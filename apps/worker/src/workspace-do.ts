@@ -366,8 +366,7 @@ function isLocalThreadCreateDispatch(value: unknown): value is LocalThreadCreate
     record.request_id.length > 0 &&
     typeof record.workspace_id === "string" &&
     record.workspace_id.length > 0 &&
-    (record.title === undefined || (typeof record.title === "string" && record.title.trim().length > 0)) &&
-    (record.cwd === undefined || (typeof record.cwd === "string" && record.cwd.trim().length > 0))
+    (record.title === undefined || (typeof record.title === "string" && record.title.trim().length > 0))
   );
 }
 

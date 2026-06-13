@@ -44,7 +44,6 @@ struct CommandDispatch {
 struct ThreadCreateDispatch {
     request_id: String,
     title: Option<String>,
-    cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,7 +246,7 @@ fn handle_thread_create(
     config: &AgentConfig,
     last_host_sessions_message: &mut Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match create_app_server_thread(config, dispatch.title.as_deref(), dispatch.cwd.as_deref()) {
+    match create_app_server_thread(config, dispatch.title.as_deref()) {
         Ok(session) => {
             socket.send(Message::Text(
                 json!({

@@ -473,8 +473,7 @@ async function requestLocalThreadCreate(
       connector_id: connectorId,
       request_id: `thread-create-${cryptoRandomId().slice(0, 16)}`,
       workspace_id: request.workspace_id,
-      title: request.title,
-      cwd: request.cwd
+      title: request.title
     })
   });
   const body = await response.json().catch(() => ({})) as Partial<LocalThreadCreateResult> & { error?: unknown };
@@ -541,8 +540,7 @@ function isCreateLocalThreadRequest(value: unknown): value is CreateLocalThreadR
     isRecord(value) &&
     isNonEmptyString(value.workspace_id) &&
     optionalString(value.title) &&
-    optionalString(value.connector_id) &&
-    optionalString(value.cwd)
+    optionalString(value.connector_id)
   );
 }
 
