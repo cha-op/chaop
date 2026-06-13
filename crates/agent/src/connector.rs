@@ -4,6 +4,7 @@ use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
 use crate::session_inventory::{
     build_host_session_backfill, build_host_sessions_report, create_app_server_thread,
+    set_app_server_thread_archived,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -53,6 +54,13 @@ struct HostSessionBackfillDispatch {
     request_id: String,
     session_id: String,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadArchiveSyncDispatch {
+    request_id: String,
+    session_id: String,
+    archived: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +218,12 @@ fn handle_text_message(
         return Ok(false);
     }
 
+    if envelope.kind == "thread.archive_sync" {
+        let dispatch: ThreadArchiveSyncDispatch = serde_json::from_value(envelope.payload)?;
+        handle_thread_archive_sync(socket, &dispatch, config, last_host_sessions_message)?;
+        return Ok(false);
+    }
+
     if envelope.kind != "command.dispatch" {
         return Ok(false);
     }
@@ -334,6 +348,46 @@ fn handle_host_session_backfill(
     Ok(())
 }
 
+fn handle_thread_archive_sync(
+    socket: &mut AgentSocket,
+    dispatch: &ThreadArchiveSyncDispatch,
+    config: &AgentConfig,
+    last_host_sessions_message: &mut Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match set_app_server_thread_archived(config, &dispatch.session_id, dispatch.archived) {
+        Ok(synced) => {
+            socket.send(Message::Text(
+                json!({
+                    "kind": "thread.archive_sync_result",
+                    "payload": {
+                        "request_id": dispatch.request_id,
+                        "ok": true,
+                        "synced": synced
+                    }
+                })
+                .to_string()
+                .into(),
+            ))?;
+            send_host_sessions(socket, config, last_host_sessions_message, true)?;
+        }
+        Err(error) => {
+            socket.send(Message::Text(
+                json!({
+                    "kind": "thread.archive_sync_result",
+                    "payload": {
+                        "request_id": dispatch.request_id,
+                        "ok": false,
+                        "error": error.to_string()
+                    }
+                })
+                .to_string()
+                .into(),
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 fn wait_for_codex_exec_events(
     socket: &mut AgentSocket,
     config: &AgentConfig,
@@ -432,6 +486,9 @@ fn handle_background_text_message(
     } else if envelope.kind == "host_session.backfill" {
         let dispatch: HostSessionBackfillDispatch = serde_json::from_value(envelope.payload)?;
         handle_host_session_backfill(socket, &dispatch, config)?;
+    } else if envelope.kind == "thread.archive_sync" {
+        let dispatch: ThreadArchiveSyncDispatch = serde_json::from_value(envelope.payload)?;
+        handle_thread_archive_sync(socket, &dispatch, config, last_host_sessions_message)?;
     } else {
         deferred_messages.push_back(text.to_owned());
     }
@@ -546,7 +603,13 @@ fn wait_for_ack(
                     AckWaitAction::HostSessionsRefresh => {
                         send_host_sessions(socket, config, last_host_sessions_message, true)?;
                     }
-                    AckWaitAction::Defer => deferred_messages.push_back(text.to_string()),
+                    AckWaitAction::Defer => handle_background_text_message(
+                        socket,
+                        text.as_ref(),
+                        config,
+                        last_host_sessions_message,
+                        deferred_messages,
+                    )?,
                 }
             }
             Message::Ping(payload) => socket.send(Message::Pong(payload))?,

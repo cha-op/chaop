@@ -9,7 +9,7 @@ import type {
   DetachHostSessionRequest,
   DetachHostSessionResponse,
   RefreshHostSessionsResponse,
-  TaskSummary,
+  TaskArchiveResponse,
   ThreadEventsResponse
 } from "@chaop/protocol";
 import { fallbackBootstrap } from "./sample-data.js";
@@ -64,11 +64,11 @@ export async function createLocalThread(request: CreateLocalThreadRequest): Prom
   return postJson("/api/local-threads", request);
 }
 
-export async function archiveTask(taskId: string): Promise<{ task: TaskSummary }> {
+export async function archiveTask(taskId: string): Promise<TaskArchiveResponse> {
   return postJson(`/api/tasks/${encodeURIComponent(taskId)}/archive`, {});
 }
 
-export async function unarchiveTask(taskId: string): Promise<{ task: TaskSummary }> {
+export async function unarchiveTask(taskId: string): Promise<TaskArchiveResponse> {
   return postJson(`/api/tasks/${encodeURIComponent(taskId)}/unarchive`, {});
 }
 

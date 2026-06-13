@@ -123,9 +123,9 @@ export async function recordHostSessions(
     const id = hostSessionId(connectorId, session.session_id);
     await env.DB.prepare(
       `INSERT INTO host_sessions (
-         id, connector_id, hostname, workspace_id, session_id, title, title_source,
+         id, connector_id, hostname, workspace_id, session_id, title, title_source, app_server_present,
          cwd, discovered_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(connector_id, session_id) DO UPDATE SET
          hostname = excluded.hostname,
          workspace_id = CASE
@@ -135,6 +135,10 @@ export async function recordHostSessions(
          END,
          title = excluded.title,
          title_source = excluded.title_source,
+         app_server_present = CASE
+           WHEN host_sessions.app_server_present = 1 THEN 1
+           ELSE excluded.app_server_present
+         END,
          cwd = excluded.cwd,
          updated_at = excluded.updated_at`
     )
@@ -146,6 +150,7 @@ export async function recordHostSessions(
         session.session_id,
         session.title,
         session.title_source,
+        agentHostSessionAppServerPresent(session) ? 1 : 0,
         session.cwd ?? null,
         syncedAt,
         session.updated_at
@@ -359,6 +364,28 @@ export async function detachHostSessionInDb(
       updated_at: now
     }
   };
+}
+
+export async function findAttachedHostSessionForTaskInDb(
+  env: Env,
+  taskId: string
+): Promise<HostSessionSummary | undefined> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for host session lookup");
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
+       hs.app_server_present, hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
+     FROM host_sessions hs
+     INNER JOIN connectors c ON c.id = hs.connector_id
+     WHERE hs.attached_task_id = ?
+     ORDER BY hs.updated_at DESC
+     LIMIT 1`
+  )
+    .bind(taskId)
+    .first<HostSessionRow>();
+  return row ? hostSessionFromRow(row) : undefined;
 }
 
 export async function recordHostSessionBackfillEvents(
@@ -932,7 +959,7 @@ async function migrateHostSessionsToConnector(
   const rows = await allRows<HostSessionRow>(
     env.DB!.prepare(
       `SELECT id, connector_id, hostname, workspace_id, session_id, title, title_source, cwd,
-        attached_task_id, attached_thread_id, updated_at
+        app_server_present, attached_task_id, attached_thread_id, updated_at
        FROM host_sessions
        WHERE connector_id = ?`
     )
@@ -942,14 +969,18 @@ async function migrateHostSessionsToConnector(
   for (const row of rows) {
     await env.DB!.prepare(
       `INSERT INTO host_sessions (
-         id, connector_id, hostname, workspace_id, session_id, title, title_source,
+         id, connector_id, hostname, workspace_id, session_id, title, title_source, app_server_present,
          cwd, attached_task_id, attached_thread_id, discovered_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(connector_id, session_id) DO UPDATE SET
          hostname = excluded.hostname,
          workspace_id = excluded.workspace_id,
          title = excluded.title,
          title_source = excluded.title_source,
+         app_server_present = CASE
+           WHEN host_sessions.app_server_present = 1 THEN 1
+           ELSE excluded.app_server_present
+         END,
          cwd = excluded.cwd,
          attached_task_id = COALESCE(host_sessions.attached_task_id, excluded.attached_task_id),
          attached_thread_id = COALESCE(host_sessions.attached_thread_id, excluded.attached_thread_id),
@@ -963,6 +994,7 @@ async function migrateHostSessionsToConnector(
         row.session_id,
         row.title,
         row.title_source,
+        row.app_server_present ? 1 : 0,
         row.cwd,
         row.attached_task_id,
         row.attached_thread_id,
@@ -1061,7 +1093,7 @@ async function listHostSessions(env: Env): Promise<HostSessionSummary[]> {
   const rows = await allRows<HostSessionRow>(
     env.DB!.prepare(
       `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
-        hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
+        hs.app_server_present, hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
        FROM host_sessions hs
        INNER JOIN connectors c ON c.id = hs.connector_id
        WHERE c.status <> 'offline'
@@ -1152,7 +1184,7 @@ async function findHostSession(
   const statement = connectorId
     ? env.DB!.prepare(
       `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
-        hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
+        hs.app_server_present, hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
        FROM host_sessions hs
        INNER JOIN connectors c ON c.id = hs.connector_id
        WHERE hs.session_id = ? AND hs.connector_id = ? AND c.status <> 'offline'
@@ -1161,7 +1193,7 @@ async function findHostSession(
     ).bind(sessionId, connectorId)
     : env.DB!.prepare(
       `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
-        hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
+        hs.app_server_present, hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
        FROM host_sessions hs
        INNER JOIN connectors c ON c.id = hs.connector_id
        WHERE hs.session_id = ? AND c.status <> 'offline'
@@ -1423,11 +1455,16 @@ function hostSessionFromRow(row: HostSessionRow): HostSessionSummary {
     session_id: row.session_id,
     title: row.title,
     title_source: row.title_source,
+    app_server_present: Boolean(row.app_server_present),
     cwd: row.cwd ?? undefined,
     updated_at: row.updated_at,
     attached_task_id: row.attached_task_id ?? undefined,
     attached_thread_id: row.attached_thread_id ?? undefined
   };
+}
+
+function agentHostSessionAppServerPresent(session: AgentHostSession): boolean {
+  return session.app_server_present === true || session.title_source === "app_server";
 }
 
 function categorySortOrder(category: TaskCategory): number {
@@ -1531,8 +1568,9 @@ type TaskRow = Omit<TaskSummary, "thread_id" | "connector_id" | "assigned_agent"
 
 type HostSessionRow = Omit<
   HostSessionSummary,
-  "cwd" | "attached_task_id" | "attached_thread_id"
+  "app_server_present" | "cwd" | "attached_task_id" | "attached_thread_id"
 > & {
+  app_server_present: number | boolean | null;
   cwd: string | null;
   attached_task_id: string | null;
   attached_thread_id: string | null;

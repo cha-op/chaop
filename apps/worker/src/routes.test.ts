@@ -213,6 +213,7 @@ test("local thread creation dispatches to an app-server capable connector and at
                   session_id: "session-created-1",
                   title: "Investigate retry loop",
                   title_source: "app_server",
+                  app_server_present: true,
                   cwd: "/workspace/codex",
                   updated_at: "2026-06-12T11:24:03.000Z"
                 }
@@ -244,6 +245,353 @@ test("local thread creation dispatches to an app-server capable connector and at
   assert.equal(body.thread.title, "Investigate retry loop");
   assert.equal(db.userWrites, 1);
   assert.equal(db.syncWrites, 1);
+});
+
+test("task archive syncs attached app-server host session after updating D1", async () => {
+  let internalPath = "";
+  let dispatchBody: Record<string, unknown> | undefined;
+  const db = taskArchiveSyncDb({ titleSource: "metadata", appServerPresent: true });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/archive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            dispatchBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            return new Response(JSON.stringify({ ok: true }), {
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: { attempted: boolean; connector_id?: string; session_id?: string; archived: boolean };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(internalPath, "/internal/sync-thread-archive");
+  assert.equal(dispatchBody?.connector_id, "connector-online");
+  assert.equal(dispatchBody?.session_id, "thread-1");
+  assert.equal(dispatchBody?.archived, true);
+  assert.equal(typeof dispatchBody?.request_id, "string");
+  assert.equal(body.task.id, "task-host-1");
+  assert.match(body.task.archived_at ?? "", /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual(body.archive_sync, {
+    attempted: true,
+    connector_id: "connector-online",
+    session_id: "thread-1",
+    archived: true
+  });
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
+});
+
+test("task unarchive syncs attached app-server host session after updating D1", async () => {
+  let internalPath = "";
+  let dispatchBody: Record<string, unknown> | undefined;
+  const db = taskArchiveSyncDb({ initialArchivedAt: "2026-06-12T10:30:00.000Z" });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/unarchive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            dispatchBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            return new Response(JSON.stringify({ ok: true }), {
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: { attempted: boolean; connector_id?: string; session_id?: string; archived: boolean };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(internalPath, "/internal/sync-thread-archive");
+  assert.equal(dispatchBody?.connector_id, "connector-online");
+  assert.equal(dispatchBody?.session_id, "thread-1");
+  assert.equal(dispatchBody?.archived, false);
+  assert.equal(typeof dispatchBody?.request_id, "string");
+  assert.equal(body.task.id, "task-host-1");
+  assert.equal(body.task.archived_at, undefined);
+  assert.deepEqual(body.archive_sync, {
+    attempted: true,
+    connector_id: "connector-online",
+    session_id: "thread-1",
+    archived: false
+  });
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
+});
+
+test("task archive reports D1-only fallback when app-server thread is not resolved", async () => {
+  const db = taskArchiveSyncDb();
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/archive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            return new Response(JSON.stringify({ ok: true, synced: false }), {
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: { attempted: boolean; connector_id?: string; session_id?: string; archived: boolean; error?: string };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.task.id, "task-host-1");
+  assert.deepEqual(body.archive_sync, {
+    attempted: false,
+    connector_id: "connector-online",
+    session_id: "thread-1",
+    archived: true,
+    error: "No matching app-server thread was found"
+  });
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
+});
+
+test("task archive records sync warning when app-server archive sync fails", async () => {
+  const db = taskArchiveSyncDb();
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/archive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            return new Response(JSON.stringify({ error: "Connector is not connected" }), {
+              status: 404,
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: { attempted: boolean; connector_id?: string; session_id?: string; archived: boolean; error?: string };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.task.id, "task-host-1");
+  assert.match(body.task.archived_at ?? "", /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual(body.archive_sync, {
+    attempted: true,
+    connector_id: "connector-online",
+    session_id: "thread-1",
+    archived: true,
+    error: "Connector is not connected"
+  });
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
+});
+
+test("task archive falls back to D1 when connector cannot sync app-server archive", async () => {
+  const db = taskArchiveSyncDb({ supportsArchive: false });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/archive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("archive sync should not dispatch");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: { attempted: boolean; connector_id?: string; session_id?: string; archived: boolean; error?: string };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.task.id, "task-host-1");
+  assert.deepEqual(body.archive_sync, {
+    attempted: false,
+    connector_id: "connector-online",
+    session_id: "thread-1",
+    archived: true,
+    error: "Connector does not support app-server archive sync"
+  });
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
+});
+
+test("task archive does not dispatch archive sync for legacy app-server thread capability", async () => {
+  const db = taskArchiveSyncDb({ supportsArchive: false, supportsAppServerThreads: true });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/archive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("archive sync should not dispatch");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: { attempted: boolean; connector_id?: string; session_id?: string; archived: boolean };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.task.id, "task-host-1");
+  assert.deepEqual(body.archive_sync, {
+    attempted: false,
+    connector_id: "connector-online",
+    session_id: "thread-1",
+    archived: true,
+    error: "Connector does not support app-server archive sync"
+  });
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
+});
+
+test("task archive warns when attached connector is offline", async () => {
+  const db = taskArchiveSyncDb({ connectorStatus: "offline" });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/archive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("archive sync should not dispatch");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: { attempted: boolean; connector_id?: string; session_id?: string; archived: boolean; error?: string };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.task.id, "task-host-1");
+  assert.deepEqual(body.archive_sync, {
+    attempted: false,
+    connector_id: "connector-online",
+    session_id: "thread-1",
+    archived: true,
+    error: "Connector is offline"
+  });
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
+});
+
+test("task archive stays D1-only for non-app-server host sessions", async () => {
+  const db = taskArchiveSyncDb({ appServerPresent: false, titleSource: "history" });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/archive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("archive sync should not dispatch");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: unknown;
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.task.id, "task-host-1");
+  assert.match(body.task.archived_at ?? "", /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(body.archive_sync, undefined);
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
 });
 
 test("host session attach imports bounded history backfill events", async () => {
@@ -1210,6 +1558,7 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
             sessionId: string,
             title: string,
             titleSource: string,
+            appServerPresent: number,
             cwd: string | null,
             discoveredAt: string,
             updatedAt: string
@@ -1221,6 +1570,7 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
             assert.equal(sessionId, "session-created-1");
             assert.equal(title, "Investigate retry loop");
             assert.equal(titleSource, "app_server");
+            assert.equal(appServerPresent, 1);
             assert.equal(cwd, "/workspace/codex");
             assert.match(discoveredAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(updatedAt, "2026-06-12T11:24:03.000Z");
@@ -1234,6 +1584,7 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
                   session_id: sessionId,
                   title,
                   title_source: titleSource,
+                  app_server_present: appServerPresent,
                   cwd,
                   attached_task_id: null,
                   attached_thread_id: null,
@@ -1294,7 +1645,7 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
         };
       }
 
-      if (/SELECT capabilities_json/.test(sql) && /FROM connectors/.test(sql)) {
+      if (/capabilities_json/.test(sql) && /FROM connectors/.test(sql)) {
         return {
           bind(connectorId: string) {
             assert.equal(connectorId, "connector-online");
@@ -1433,6 +1784,193 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
   };
 
   return db as D1Database & { readonly userWrites: number; readonly syncWrites: number };
+}
+
+function taskArchiveSyncDb(
+  options: {
+    connectorStatus?: string | undefined;
+    initialArchivedAt?: string | null | undefined;
+    supportsArchive?: boolean | undefined;
+    supportsAppServerThreads?: boolean | undefined;
+    titleSource?: string | undefined;
+    appServerPresent?: boolean | undefined;
+  } = {}
+): D1Database & { readonly taskArchiveWrites: number; readonly threadArchiveWrites: number } {
+  const connectorStatus = options.connectorStatus ?? "online";
+  const supportsArchive = options.supportsArchive ?? true;
+  const supportsAppServerThreads = options.supportsAppServerThreads ?? false;
+  const titleSource = options.titleSource ?? "app_server";
+  const appServerPresent = options.appServerPresent ?? true;
+  const taskRow: {
+    id: string;
+    workspace_id: string;
+    thread_id: string;
+    title: string;
+    category_id: string;
+    state: string;
+    connector_id: string;
+    assigned_agent: string;
+    realtime_mode: string;
+    budget_state: string;
+    archived_at: string | null;
+    updated_at: string;
+  } = {
+    id: "task-host-1",
+    workspace_id: "workspace-api",
+    thread_id: "thread-host-1",
+    title: "Existing session",
+    category_id: "maintenance",
+    state: "idle",
+    connector_id: "connector-online",
+    assigned_agent: "chaop-agent",
+    realtime_mode: "realtime",
+    budget_state: "normal",
+    archived_at: options.initialArchivedAt ?? null,
+    updated_at: "2026-06-12T10:00:00.000Z"
+  };
+  const hostSession = {
+    id: "host-session-1",
+    connector_id: "connector-online",
+    hostname: "mac-studio.local",
+    workspace_id: "workspace-api",
+    session_id: "thread-1",
+    title: "Existing session",
+    title_source: titleSource,
+    app_server_present: appServerPresent ? 1 : 0,
+    cwd: "/workspace/project",
+    updated_at: "2026-06-12T10:00:00.000Z",
+    attached_task_id: "task-host-1",
+    attached_thread_id: "thread-host-1"
+  };
+  const counters = {
+    taskArchiveWrites: 0,
+    threadArchiveWrites: 0
+  };
+
+  const db = {
+    prepare(sql: string) {
+      if (/FROM host_sessions hs/.test(sql) && /hs\.attached_task_id = \?/.test(sql)) {
+        return {
+          bind(taskId: string) {
+            assert.equal(taskId, "task-host-1");
+            return {
+              async first() {
+                return hostSession;
+              }
+            };
+          }
+        };
+      }
+
+      if (/capabilities_json/.test(sql) && /FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                const capabilities = [];
+                if (supportsArchive) capabilities.push("app_server_archive");
+                if (supportsAppServerThreads) capabilities.push("app_server_threads");
+                return {
+                  status: connectorStatus,
+                  capabilities_json: JSON.stringify(capabilities)
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, workspace_id, thread_id, title, category_id/.test(sql) && /FROM tasks/.test(sql)) {
+        return {
+          bind(taskId: string) {
+            assert.equal(taskId, "task-host-1");
+            return {
+              async first() {
+                return taskRow;
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql) && /SET archived_at = \?/.test(sql)) {
+        return {
+          bind(archivedAt: string, updatedAt: string, taskId: string) {
+            assert.match(archivedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(updatedAt, archivedAt);
+            assert.equal(taskId, "task-host-1");
+            return {
+              async run() {
+                counters.taskArchiveWrites += 1;
+                taskRow.archived_at = archivedAt;
+                taskRow.updated_at = updatedAt;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql) && /SET archived_at = NULL/.test(sql)) {
+        return {
+          bind(updatedAt: string, taskId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId, "task-host-1");
+            return {
+              async run() {
+                counters.taskArchiveWrites += 1;
+                taskRow.archived_at = null;
+                taskRow.updated_at = updatedAt;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /SET state = 'archived'/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-host-1");
+            return {
+              async run() {
+                counters.threadArchiveWrites += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /SET state = \?/.test(sql)) {
+        return {
+          bind(state: string, updatedAt: string, threadId: string) {
+            assert.equal(state, "idle");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-host-1");
+            return {
+              async run() {
+                counters.threadArchiveWrites += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get taskArchiveWrites() {
+      return counters.taskArchiveWrites;
+    },
+    get threadArchiveWrites() {
+      return counters.threadArchiveWrites;
+    }
+  };
+
+  return db as D1Database & { readonly taskArchiveWrites: number; readonly threadArchiveWrites: number };
 }
 
 function hostSessionAttachBackfillDb(

@@ -128,6 +128,7 @@ impl AgentConfig {
         }
         if self.session_inventory.app_server_url.is_some() {
             capabilities.push("app_server_threads".to_owned());
+            capabilities.push("app_server_archive".to_owned());
         }
 
         BootstrapRequest {
@@ -353,6 +354,11 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
             request
                 .capabilities
                 .contains(&"app_server_threads".to_owned())
+        );
+        assert!(
+            request
+                .capabilities
+                .contains(&"app_server_archive".to_owned())
         );
     }
 }

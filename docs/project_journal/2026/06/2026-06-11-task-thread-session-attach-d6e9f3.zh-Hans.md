@@ -90,8 +90,17 @@ superseded_by:
 - Rust connector 只读取被请求的本机 Codex session。它优先读取匹配的 rollout 文件，跳过注入的 developer/context records、reasoning records 和 tool output records，只返回简短的 user、assistant 和 tool call 摘要；如果找不到 rollout，则 fallback 到该 session 在 `history.jsonl` 里的近期 prompt。
 - Worker 会把返回的摘要作为幂等的 `command.output` thread events 写入，event id 使用确定性的 backfill id，因此重复 attach/backfill 不会重复导入历史。Backfill events 会保留本机原始时间戳，并且要求 connector 声明 `host_session_backfill_v2` capability；该 capability 只会在 session inventory 开启时声明。
 - Browser 会立即合并 attach response 中导入的 backfill events；如果 backfill 失败，会保留已成功 attachment，并单独显示 warning。Thread Centre 也会通过 thread-scoped events API 重新读取当前 thread 的 event tail，所以旧 backfill history 即使比全局 recent-event feed 更旧，刷新后仍然可见。
+- 已 attach Host Session tasks 在 Chaop 里 archive/unarchive 时，现在会先更新 D1，再尝试通过 connector 把可解析的本机 Codex app-server thread 同步到 `thread/archive` 和 `thread/unarchive` methods。同步失败会作为 warning 回传，因此本地 archive 状态仍然可用；仅存在于 Chaop 本地的 tasks 和 history-only Host Sessions 仍然只改 D1，connector 不会修改本机 history files。
+- Review follow-up 让 archive sync 分页扫描 app-server `thread/list`，不再只检查最前面的二百条 rows，因此较旧但已经 attach 的 app-server threads 仍然可以在调用 `thread/archive` 或 `thread/unarchive` 前被解析到。
+- Review follow-up 会把 app-server inventory presence 与 title source 分开记录，因此即使某个 app-server thread 的显示标题来自 metadata 或 history，它在后续 inventory refresh 后仍可参与 archive/unarchive 同步。
+- Review follow-up 会把 archive sync 的 deadline 覆盖到 app-server WebSocket 连接和 protocol 初始化，而不只限制分页扫描和 archive mutation，从而让 Durable Object request budget 保持有界。
+- Review follow-up 会保持旧 D1 migrations 不变，把 `app_server_present` 列放到 forward `0006` migration，并且只恢复原本 `title_source` 已经是 `app_server` 的 legacy rows；Worker regression test 会覆盖这组 migration split。
+- Review follow-up 也会在 app-server JSON-RPC read loop 内继续执行 archive sync deadline，且过期 read 不会重置为完整 socket timeout，因此无关或嘈杂的 app-server messages 不能把本机 connector budget 拖到 Durable Object timeout 之外。
+- Review follow-up 会保留 app-server 按降序 `thread/list` 返回的第一条 `sessionId` row，因此同一个 session tree 里更旧的 sibling threads 不能覆盖最新 inventory title、cwd 或 timestamp。
+- Review follow-up 会在 Codex exec 或 command ack wait 活跃时，也通过 connector background control-message path 处理 `thread.archive_sync`；app-server `thread/list` 会按 `updated_at` 排序；root session tree archive 会保留 sibling threads；并且 archive sync 需要显式 `app_server_archive` capability，让较旧的 `app_server_threads` connectors 立即走 D1-only archive state fallback，而不是等待 timeout。
+- Review follow-up 会把 official app-server 返回的 exact `Thread.id` 且没有 legacy `sessionId` 的 row 视为 standalone exact archive match；只有当 `sessionId` 等于请求的 session tree id 时，才继续扫描 sibling rows。
+- Review follow-up 会避免在 source-state app-server scan 已触达分页预算时，把 target-state 里同一个 session tree 的其它 row 误判成 archive sync 已完成。Source 分页预算耗尽后，只有 exact `Thread.id` target match 仍可证明本机 app-server 状态已经同步。
 
 ## 下一步
-- History backfill 之后，再通过 connector 把 Chaop archive/unarchive 同步到本机 Codex app-server archive 状态。本机 history 文件保持只读。
 - 在 app-server protocol path 可以干净覆盖 create、resume、archive 和 event/history reads 之前，Codex CLI adapter 继续作为当前可用的 execution fallback。
 - R2 artefact capture 和 budget aggregation 排在这些核心控制闭环工作之后。
