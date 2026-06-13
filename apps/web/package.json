@@ -1,0 +1,21 @@
+{
+  "name": "@chaop/web",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @chaop/protocol build && vite --host 127.0.0.1",
+    "build": "pnpm --filter @chaop/protocol build && tsc -p tsconfig.json --noEmit && vite build",
+    "typecheck": "pnpm --filter @chaop/protocol build && tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run typecheck && node --test src/**/*.test.ts",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@chaop/protocol": "workspace:*",
+    "lit": "^3.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}
