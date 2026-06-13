@@ -343,8 +343,12 @@ export type AgentHostSession = {
   updated_at: string;
 };
 
+export type HostSessionInventoryScope = "full" | "incremental";
+
 export type AgentHostSessionsReport = {
   sessions: AgentHostSession[];
+  inventory_scope?: HostSessionInventoryScope | undefined;
+  app_server_inventory_ok?: boolean | undefined;
 };
 
 export type AgentBackfillEvent = {

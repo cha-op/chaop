@@ -525,6 +525,70 @@ test("recordHostSessions clears app-server-only sessions omitted from inventory 
   assert.equal(db.demotedSessions, 1);
 });
 
+test("recordHostSessions preserves app-server-only sessions from incremental reports", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "app_server"
+  });
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "incremental",
+      app_server_inventory_ok: true,
+      sessions: [
+        {
+          session_id: "session-new",
+          title: "New app-server session",
+          title_source: "app_server",
+          app_server_present: true,
+          cwd: "/workspace/new",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 1);
+  assert.equal(db.hasSession("session-attached"), true);
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
+});
+
+test("recordHostSessions preserves app-server presence when app-server inventory failed", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "app_server"
+  });
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "full",
+      app_server_inventory_ok: false,
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Metadata title during app-server outage",
+          title_source: "metadata",
+          app_server_present: false,
+          cwd: "/workspace/attached",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 1);
+  assert.equal(db.titleOf("session-attached"), "Metadata title during app-server outage");
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
+});
+
 test("recordHostSessions preserves attached session workspace during inventory refresh", async () => {
   const db = hostSessionsInventoryDb({ workspaceId: "workspace-other" });
 

@@ -390,7 +390,7 @@ Then set the matching private connector config:
 app_server_url = "ws://127.0.0.1:9876"
 ```
 
-`report_interval_seconds` controls the periodic local rescan interval; the connector only sends the periodic report when the inventory changes. The Host Sessions refresh button asks online connectors to rescan and report immediately.
+`report_interval_seconds` controls the periodic local rescan interval; the connector only sends the periodic report when the inventory changes. The Host Sessions refresh button asks online connectors to rescan and report immediately. App-server inventory reports are treated as complete only when the app-server list call succeeds; a transient app-server list failure does not clear known app-server presence for existing Host Sessions.
 
 Create local files outside the repository:
 

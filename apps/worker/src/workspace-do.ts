@@ -733,8 +733,15 @@ function isThreadEventKind(value: unknown): boolean {
 
 function isAgentHostSessionsReport(value: unknown): value is AgentHostSessionsReport {
   if (typeof value !== "object" || value === null) return false;
-  const sessions = (value as { sessions?: unknown }).sessions;
-  return Array.isArray(sessions) && sessions.every(isAgentHostSession);
+  const record = value as { sessions?: unknown; inventory_scope?: unknown; app_server_inventory_ok?: unknown };
+  return (
+    Array.isArray(record.sessions) &&
+    record.sessions.every(isAgentHostSession) &&
+    (record.inventory_scope === undefined ||
+      record.inventory_scope === "full" ||
+      record.inventory_scope === "incremental") &&
+    (record.app_server_inventory_ok === undefined || typeof record.app_server_inventory_ok === "boolean")
+  );
 }
 
 function isAgentHostSession(value: unknown): boolean {

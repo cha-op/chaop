@@ -85,6 +85,7 @@ superseded_by:
 - GitHub review-gate found that Chaop-driven app-server turns could wait forever on interactive approval requests. Connector `turn/start` now sends `approvalPolicy: "never"` so this slice stays non-interactive until Chaop has a first-class approval UI.
 - GitHub review-gate also found that sticky `app_server_present` could classify fresh commands as app-server work after the connector stopped reporting that session through app-server. Host Session inventory now treats `app_server_present` as current report state rather than an ever-seen bit.
 - Follow-up PR readiness reviews found stale app-server target holes: inventory demotion could strand commands already scoped to an app-server session, app-server-only sessions omitted from later inventory reports could keep a stale `app_server_present=true`, and explicit app-server commands could stay pending after their attachment moved before lease. Inventory freshness cleanup now demotes both reported-false and omitted app-server-only sessions, runs the same release/failure cleanup used by detach, and the Durable Object fails stale explicit app-server targets before dispatch, even when the targeted connector has no active socket.
+- Final follow-up reviews found three more inventory/release edge cases before merge: a single newly-created local app-server thread was being treated as a full inventory snapshot, transient app-server list failures were indistinguishable from a successful empty app-server inventory, and multi-command app-server release could miss a replacement connector dispatch. Host Session reports now carry `inventory_scope` and `app_server_inventory_ok`; Worker only clears omitted app-server-only sessions for complete successful snapshots, preserves known app-server presence during app-server inventory failures, and fans out post-release dispatch to every online executable app-server connector in the workspace so command-level filters choose the real recipient.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -138,6 +139,8 @@ superseded_by:
 - Worker DB tests assert duplicate connector retirement retargets pending attached-inferred commands to the migrated connector/session.
 - Worker DB tests assert inventory refresh clears stale `app_server_present` when a later report no longer marks the session as app-server present.
 - Worker DB tests assert app-server-only Host Sessions omitted from later inventory reports are demoted from app-server-present state.
+- Worker DB tests assert incremental Host Session reports do not demote unrelated app-server-only sessions.
+- Worker DB tests assert failed app-server inventory reports preserve known app-server presence instead of triggering cleanup.
 - Worker DB tests assert stale explicit app-server command targets fail before dispatch instead of remaining pending.
 - Worker Durable Object tests assert stale-target cleanup remains compatible with rejected-event dispatch polling.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
@@ -146,6 +149,7 @@ superseded_by:
 - Rust tests assert app-server command session resolution stops paging once the target session is found.
 - Rust tests assert rejected command-event acknowledgements are recognised instead of treated as successful acks.
 - Rust tests assert app-server `command.started` event payloads identify the target Host Session, without leaking that field onto non-started events.
+- Rust tests assert Host Session reports mark app-server inventory failures instead of collapsing them into successful empty app-server snapshots.
 - Rust tests cover the `turn/start` cancellation window before the connector has read the turn id.
 - Full `pnpm test`, Rust workspace tests, build, journal validation, and PR readiness review before merge.
 

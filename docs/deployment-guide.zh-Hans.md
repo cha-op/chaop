@@ -390,7 +390,7 @@ codex app-server --listen ws://127.0.0.1:9876
 app_server_url = "ws://127.0.0.1:9876"
 ```
 
-`report_interval_seconds` 控制周期性本机重扫间隔；周期路径只有 inventory 变化时才会上报。Host Sessions 的 refresh 按钮会请求在线 connectors 立即重扫并上报。
+`report_interval_seconds` 控制周期性本机重扫间隔；周期路径只有 inventory 变化时才会上报。Host Sessions 的 refresh 按钮会请求在线 connectors 立即重扫并上报。只有 app-server list 调用成功时，app-server inventory report 才会被当作完整快照；短暂 app-server list 失败不会清除已有 Host Sessions 的已知 app-server presence。
 
 在仓库外创建本地文件目录：
 

@@ -27,6 +27,9 @@ type AppServerSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentHostSessionsReport {
     pub sessions: Vec<AgentHostSession>,
+    pub inventory_scope: InventoryScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_server_inventory_ok: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -47,6 +50,13 @@ pub struct AgentBackfillEvent {
     pub summary: String,
     pub idempotency_key: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryScope {
+    Full,
+    Incremental,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +109,8 @@ pub fn build_host_sessions_report(
     if !config.session_inventory.enabled {
         return Ok(AgentHostSessionsReport {
             sessions: Vec::new(),
+            inventory_scope: InventoryScope::Full,
+            app_server_inventory_ok: None,
         });
     }
 
@@ -121,19 +133,19 @@ pub fn build_host_sessions_report(
     )?;
     let history_sessions =
         read_history_sessions(&codex_home, config.session_inventory.max_sessions)?;
-    let app_server_sessions = config
-        .session_inventory
-        .app_server_url
-        .as_deref()
-        .and_then(|url| {
-            load_app_server_sessions(
+    let (app_server_sessions, app_server_inventory_ok) =
+        if let Some(url) = config.session_inventory.app_server_url.as_deref() {
+            match load_app_server_sessions(
                 url,
                 config.session_inventory.max_sessions,
                 config.session_inventory.app_server_timeout_seconds,
-            )
-            .ok()
-        })
-        .unwrap_or_default();
+            ) {
+                Ok(sessions) => (sessions, Some(true)),
+                Err(_) => (HashMap::new(), Some(false)),
+            }
+        } else {
+            (HashMap::new(), None)
+        };
 
     for (session_id, app_session) in &app_server_sessions {
         let draft = drafts
@@ -169,7 +181,11 @@ pub fn build_host_sessions_report(
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     sessions.truncate(config.session_inventory.max_sessions);
 
-    Ok(AgentHostSessionsReport { sessions })
+    Ok(AgentHostSessionsReport {
+        sessions,
+        inventory_scope: InventoryScope::Full,
+        app_server_inventory_ok,
+    })
 }
 
 pub fn build_host_session_backfill(
@@ -2455,8 +2471,8 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AppServerTurnOutput, HistorySession, SessionDraft,
-        TitleSource, app_server_command_result_events_with_cancel,
+        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AppServerTurnOutput, HistorySession,
+        InventoryScope, SessionDraft, TitleSource, app_server_command_result_events_with_cancel,
         app_server_sessions_from_response, app_server_thread_from_response,
         app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
         create_app_server_thread_at, load_app_server_sessions, read_recent_lines,
@@ -3749,12 +3765,51 @@ mod tests {
 
         let report = build_host_sessions_report(&config).expect("report");
 
+        assert_eq!(report.inventory_scope, InventoryScope::Full);
+        assert_eq!(report.app_server_inventory_ok, None);
         assert_eq!(report.sessions.len(), 3);
         assert_eq!(report.sessions[0].session_id, "session-3");
         assert_eq!(report.sessions[0].title, "History-only prompt");
         assert_eq!(report.sessions[0].title_source, TitleSource::History);
         assert_eq!(report.sessions[1].title, "History title from first prompt");
         assert_eq!(report.sessions[2].title, "Metadata index title");
+    }
+
+    #[test]
+    fn host_session_report_marks_app_server_inventory_failure() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        fs::write(
+            codex_home.join("session_index.jsonl"),
+            r#"{"id":"session-1","thread_name":"Metadata index title","updated_at":"2026-06-12T10:00:00.000Z"}"#,
+        )
+        .expect("session index");
+
+        let config = AgentConfig {
+            connector_name: "mac-studio".to_owned(),
+            control_url: "wss://api.example.com/ws/agent".to_owned(),
+            bootstrap_url: "https://api.example.com/connector/bootstrap".to_owned(),
+            workspace_root: "/tmp/project".into(),
+            token_file: "/tmp/token".into(),
+            spool_db: "/tmp/spool.sqlite".into(),
+            bootstrap: BootstrapConfig {
+                secret_file: "/tmp/bootstrap.secret".into(),
+            },
+            execution: ExecutionConfig::default(),
+            session_inventory: SessionInventoryConfig {
+                codex_home: Some(codex_home.into()),
+                app_server_url: Some("not-a-url".to_owned()),
+                ..SessionInventoryConfig::default()
+            },
+        };
+
+        let report = build_host_sessions_report(&config).expect("report");
+
+        assert_eq!(report.inventory_scope, InventoryScope::Full);
+        assert_eq!(report.app_server_inventory_ok, Some(false));
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].session_id, "session-1");
+        assert!(!report.sessions[0].app_server_present);
     }
 
     #[test]

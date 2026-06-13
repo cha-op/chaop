@@ -811,13 +811,13 @@ test("host session detach refreshes connector activity after failing a leased co
   assert.equal(db.connectorActivityUpdates, 1);
 });
 
-test("host session detach releases attached-inferred commands when a replacement app-server session exists", async () => {
+test("host session detach dispatches app-server capable connectors after releasing attached-inferred commands", async () => {
   const db = hostSessionDetachDb({
     releaseDetachedCommands: true,
     returnDetachedCommands: false
   });
   let internalPath = "";
-  let dispatchedConnectorId = "";
+  const dispatchedConnectorIds: string[] = [];
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/detach", {
       method: "POST",
@@ -837,7 +837,7 @@ test("host session detach releases attached-inferred commands when a replacement
           fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
             internalPath = new URL(String(input)).pathname;
             const body = JSON.parse(String(init?.body ?? "{}")) as { connector_id?: string };
-            dispatchedConnectorId = body.connector_id ?? "";
+            dispatchedConnectorIds.push(body.connector_id ?? "");
             return new Response("{}");
           }
         }) as DurableObjectStub
@@ -854,7 +854,7 @@ test("host session detach releases attached-inferred commands when a replacement
   assert.equal(db.eventInserts, 0);
   assert.equal(db.connectorActivityUpdates, 1);
   assert.equal(internalPath, "/internal/dispatch-pending");
-  assert.equal(dispatchedConnectorId, "connector-replacement");
+  assert.deepEqual(dispatchedConnectorIds, ["connector-online", "connector-replacement"]);
 });
 
 test("host session detach does not release same-session leases owned by a replacement connector", async () => {
@@ -2984,52 +2984,21 @@ function hostSessionDetachDb(options: {
         };
       }
 
-      if (/SELECT DISTINCT hs\.connector_id/.test(sql)) {
-        assert.match(sql, /FROM host_sessions hs/);
-        assert.match(sql, /hs_task\.attached_task_id = \?/);
-        assert.match(sql, /hs_thread\.attached_thread_id = \?/);
-        assert.match(sql, /hs\.app_server_present = 1/);
+      if (/SELECT DISTINCT c\.id AS connector_id/.test(sql)) {
+        assert.match(sql, /FROM connectors c/);
+        assert.match(sql, /INNER JOIN workspace_connectors wc/);
+        assert.match(sql, /wc\.workspace_id = \?/);
         assert.match(sql, /wc\.can_execute = 1/);
         assert.match(sql, /c\.status <> 'offline'/);
         assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
         return {
-          bind(
-            taskWorkspaceId: string,
-            taskIdPresent: string | null,
-            taskId: string | null,
-            excludedTaskConnectorId: string,
-            excludedTaskSessionId: string,
-            threadWorkspaceId: string,
-            threadIdPresent: string | null,
-            threadId: string | null,
-            excludedThreadConnectorId: string,
-            excludedThreadSessionId: string,
-            fallbackTaskIdPresent: string | null,
-            fallbackWorkspaceId: string,
-            fallbackTaskId: string | null,
-            excludedFallbackConnectorId: string,
-            excludedFallbackSessionId: string
-          ) {
-            assert.equal(taskWorkspaceId, "workspace-api");
-            assert.equal(taskIdPresent, "task-host-1");
-            assert.equal(taskId, "task-host-1");
-            assert.equal(excludedTaskConnectorId, "connector-online");
-            assert.equal(excludedTaskSessionId, "session-1");
-            assert.equal(threadWorkspaceId, "workspace-api");
-            assert.equal(threadIdPresent, "thread-host-1");
-            assert.equal(threadId, "thread-host-1");
-            assert.equal(excludedThreadConnectorId, "connector-online");
-            assert.equal(excludedThreadSessionId, "session-1");
-            assert.equal(fallbackTaskIdPresent, "task-host-1");
-            assert.equal(fallbackWorkspaceId, "workspace-api");
-            assert.equal(fallbackTaskId, "task-host-1");
-            assert.equal(excludedFallbackConnectorId, "connector-online");
-            assert.equal(excludedFallbackSessionId, "session-1");
+          bind(workspaceId: string) {
+            assert.equal(workspaceId, "workspace-api");
             return {
               async all() {
                 return {
                   results: options.releaseDetachedCommands && !options.detachedLeaseOwnedByReplacement
-                    ? [{ connector_id: "connector-replacement" }]
+                    ? [{ connector_id: "connector-online" }, { connector_id: "connector-replacement" }]
                     : []
                 };
               }

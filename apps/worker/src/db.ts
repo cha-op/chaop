@@ -134,10 +134,20 @@ export async function recordHostSessions(
   const failedEvents: ThreadEvent[] = [];
   const reportedSessions = report.sessions.slice(0, 200);
   const reportedSessionIds = new Set(reportedSessions.map((session) => session.session_id));
+  const inventoryScope = report.inventory_scope ?? "full";
+  const canClearMissingAppServerSessions =
+    inventoryScope === "full" &&
+    report.app_server_inventory_ok !== false &&
+    reportedSessions.length === report.sessions.length;
+  const preserveAppServerPresence = report.app_server_inventory_ok === false;
 
   for (const session of reportedSessions) {
     const id = hostSessionId(connectorId, session.session_id);
     const previous = await findHostSession(env, session.session_id, connectorId);
+    const appServerPresent =
+      preserveAppServerPresence && previous?.app_server_present === true
+        ? 1
+        : agentHostSessionAppServerPresent(session) ? 1 : 0;
     await env.DB.prepare(
       `INSERT INTO host_sessions (
          id, connector_id, hostname, workspace_id, session_id, title, title_source, app_server_present,
@@ -164,7 +174,7 @@ export async function recordHostSessions(
         session.session_id,
         session.title,
         session.title_source,
-        agentHostSessionAppServerPresent(session) ? 1 : 0,
+        appServerPresent,
         session.cwd ?? null,
         syncedAt,
         session.updated_at
@@ -183,42 +193,44 @@ export async function recordHostSessions(
     }
   }
 
-  const staleAppServerOnlySessions = await allRows<HostSessionRow>(
-    env.DB.prepare(
-      `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
-        hs.app_server_present, hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
-       FROM host_sessions hs
-       INNER JOIN connectors c ON c.id = hs.connector_id
-       WHERE hs.connector_id = ?
-         AND hs.app_server_present = 1
-         AND hs.title_source = 'app_server'
-         AND c.status <> 'offline'`
-    ).bind(connectorId)
-  );
-  for (const row of staleAppServerOnlySessions) {
-    if (reportedSessionIds.has(row.session_id)) {
-      continue;
-    }
-    const result = await env.DB.prepare(
-      `UPDATE host_sessions
-       SET app_server_present = 0, updated_at = ?
-       WHERE id = ?
-         AND app_server_present = 1
-         AND title_source = 'app_server'`
-    )
-      .bind(syncedAt, row.id)
-      .run();
-    if (!((result.meta as { changes?: number } | undefined)?.changes)) {
-      continue;
-    }
-    const demoted = hostSessionFromRow({
-      ...row,
-      app_server_present: 0,
-      updated_at: syncedAt
-    });
-    upserted.push(demoted);
-    if (demoted.attached_task_id || demoted.attached_thread_id) {
-      await cleanupUnavailableAppServerHostSession(env, demoted, syncedAt, releasedConnectorIds, failedEvents);
+  if (canClearMissingAppServerSessions) {
+    const staleAppServerOnlySessions = await allRows<HostSessionRow>(
+      env.DB.prepare(
+        `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
+          hs.app_server_present, hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
+         FROM host_sessions hs
+         INNER JOIN connectors c ON c.id = hs.connector_id
+         WHERE hs.connector_id = ?
+           AND hs.app_server_present = 1
+           AND hs.title_source = 'app_server'
+           AND c.status <> 'offline'`
+      ).bind(connectorId)
+    );
+    for (const row of staleAppServerOnlySessions) {
+      if (reportedSessionIds.has(row.session_id)) {
+        continue;
+      }
+      const result = await env.DB.prepare(
+        `UPDATE host_sessions
+         SET app_server_present = 0, updated_at = ?
+         WHERE id = ?
+           AND app_server_present = 1
+           AND title_source = 'app_server'`
+      )
+        .bind(syncedAt, row.id)
+        .run();
+      if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+        continue;
+      }
+      const demoted = hostSessionFromRow({
+        ...row,
+        app_server_present: 0,
+        updated_at: syncedAt
+      });
+      upserted.push(demoted);
+      if (demoted.attached_task_id || demoted.attached_thread_id) {
+        await cleanupUnavailableAppServerHostSession(env, demoted, syncedAt, releasedConnectorIds, failedEvents);
+      }
     }
   }
 
@@ -606,78 +618,24 @@ async function releaseCommandsForDetachedAppServerHostSession(
   }
 
   await updateConnectorActivity(env, hostSession.connector_id);
-  return replacementAppServerConnectorIdsForDetachedHostSession(env, hostSession);
+  return executableAppServerConnectorIdsForWorkspace(env, hostSession.workspace_id);
 }
 
-async function replacementAppServerConnectorIdsForDetachedHostSession(
+async function executableAppServerConnectorIdsForWorkspace(
   env: Env,
-  hostSession: HostSessionSummary
+  workspaceId: string
 ): Promise<string[]> {
-  const taskId = hostSession.attached_task_id ?? null;
-  const threadId = hostSession.attached_thread_id ?? null;
-  if (!taskId && !threadId) return [];
-
   const rows = await allRows<{ connector_id: string }>(
     env.DB!.prepare(
-      `SELECT DISTINCT hs.connector_id
-       FROM host_sessions hs
-       INNER JOIN connectors c ON c.id = hs.connector_id
+      `SELECT DISTINCT c.id AS connector_id
+       FROM connectors c
        INNER JOIN workspace_connectors wc
-         ON wc.workspace_id = hs.workspace_id
-        AND wc.connector_id = hs.connector_id
-       WHERE hs.id = COALESCE(
-         (
-           SELECT hs_task.id
-           FROM host_sessions hs_task
-           WHERE hs_task.workspace_id = ?
-             AND ? IS NOT NULL
-             AND hs_task.attached_task_id = ?
-             AND (hs_task.connector_id <> ? OR hs_task.session_id <> ?)
-           ORDER BY hs_task.updated_at DESC, hs_task.id DESC
-           LIMIT 1
-         ),
-         (
-           SELECT hs_thread.id
-           FROM host_sessions hs_thread
-           WHERE hs_thread.workspace_id = ?
-             AND ? IS NOT NULL
-             AND hs_thread.attached_thread_id = ?
-             AND (hs_thread.connector_id <> ? OR hs_thread.session_id <> ?)
-             AND (
-               ? IS NULL
-               OR NOT EXISTS (
-                 SELECT 1
-                 FROM host_sessions hst
-                 WHERE hst.workspace_id = ?
-                   AND hst.attached_task_id = ?
-                   AND (hst.connector_id <> ? OR hst.session_id <> ?)
-               )
-             )
-           ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
-           LIMIT 1
-         )
-       )
-         AND hs.app_server_present = 1
+         ON wc.connector_id = c.id
+       WHERE wc.workspace_id = ?
          AND wc.can_execute = 1
          AND c.status <> 'offline'
          AND c.capabilities_json LIKE '%"codex_app_server_exec"%'`
-    ).bind(
-      hostSession.workspace_id,
-      taskId,
-      taskId,
-      hostSession.connector_id,
-      hostSession.session_id,
-      hostSession.workspace_id,
-      threadId,
-      threadId,
-      hostSession.connector_id,
-      hostSession.session_id,
-      taskId,
-      hostSession.workspace_id,
-      taskId,
-      hostSession.connector_id,
-      hostSession.session_id
-    )
+    ).bind(workspaceId)
   );
 
   return rows.map((row) => row.connector_id);
@@ -1079,7 +1037,13 @@ export async function attachCreatedLocalThreadInDb(
     throw new Error("DB binding is required for local thread creation");
   }
 
-  await recordHostSessions(env, connectorId, { sessions: [session] }, new Date().toISOString(), { workspaceId });
+  await recordHostSessions(
+    env,
+    connectorId,
+    { sessions: [session], inventory_scope: "incremental", app_server_inventory_ok: true },
+    new Date().toISOString(),
+    { workspaceId }
+  );
   const { attachment_created: _attachmentCreated, ...response } = await attachHostSessionInDb(
     env,
     session.session_id,
