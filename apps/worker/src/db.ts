@@ -1117,6 +1117,7 @@ export async function pendingCommandsForConnector(
                )
                OR (
                  COALESCE(hs.app_server_present, 0) <> 1
+                 AND cmd.lease_target_host_session_id IS NULL
                  AND c.capabilities_json LIKE '%"codex_exec"%'
                )
              )
@@ -1202,7 +1203,14 @@ export async function recordAgentEvent(
   const now = new Date().toISOString();
   if (requireCurrentAppServerStartTarget && !event.target_host_session_id) {
     const dispatchPending = await releaseRejectedAppServerStartLease(env, connectorId, command, now);
-    return { accepted: false, dispatch_pending: dispatchPending };
+    const failedEvent = dispatchPending
+      ? undefined
+      : await failRejectedExplicitAppServerStartLease(env, connectorId, command, now);
+    const result: RecordAgentEventResult = { accepted: false, dispatch_pending: dispatchPending };
+    if (failedEvent) {
+      result.event = failedEvent;
+    }
+    return result;
   }
 
   const nextState = commandStateForEvent(event.kind);
@@ -1216,7 +1224,15 @@ export async function recordAgentEvent(
         requireCurrentAppServerStartTarget && event.kind === "command.started"
           ? await releaseRejectedAppServerStartLease(env, connectorId, command, now)
           : false;
-      return { accepted: false, dispatch_pending: dispatchPending };
+      const failedEvent =
+        !dispatchPending && requireCurrentAppServerStartTarget && event.kind === "command.started"
+          ? await failRejectedExplicitAppServerStartLease(env, connectorId, command, now)
+          : undefined;
+      const rejectedResult: RecordAgentEventResult = { accepted: false, dispatch_pending: dispatchPending };
+      if (failedEvent) {
+        rejectedResult.event = failedEvent;
+      }
+      return rejectedResult;
     }
   }
 
@@ -1348,6 +1364,68 @@ async function releaseRejectedAppServerStartLease(
     await updateConnectorActivity(env, connectorId);
   }
   return released;
+}
+
+async function failRejectedExplicitAppServerStartLease(
+  env: Env,
+  connectorId: string,
+  command: {
+    id: string;
+    workspace_id: string;
+    thread_id: string | null;
+    task_id: string | null;
+    lease_target_host_session_id: string | null;
+    target_connector_id_source: CommandTargetConnectorIdSource | null;
+  },
+  now: string
+): Promise<ThreadEvent | undefined> {
+  if (command.target_connector_id_source !== "explicit" || !command.lease_target_host_session_id) {
+    return undefined;
+  }
+
+  const result = await env.DB!.prepare(
+    `UPDATE commands
+     SET state = 'failed',
+         lease_owner_connector_id = NULL,
+         lease_until = NULL,
+         updated_at = ?
+     WHERE id = ?
+       AND lease_owner_connector_id = ?
+       AND state = 'leased'
+       AND lease_target_host_session_id IS NOT NULL
+       AND lease_target_host_session_id = ?
+       AND target_connector_id_source = 'explicit'`
+  )
+    .bind(now, command.id, connectorId, command.lease_target_host_session_id)
+    .run();
+  if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+    return undefined;
+  }
+
+  await updateConnectorActivity(env, connectorId);
+
+  if (command.task_id) {
+    await env.DB!.prepare(
+      `UPDATE tasks
+       SET state = 'failed', updated_at = ?
+       WHERE id = ?`
+    )
+      .bind(now, command.task_id)
+      .run();
+  }
+
+  if (!command.thread_id) {
+    return undefined;
+  }
+
+  return await appendEvent(env, {
+    workspace_id: command.workspace_id,
+    thread_id: command.thread_id,
+    command_id: command.id,
+    kind: "command.failed",
+    priority: "P1",
+    summary: "Explicit app-server target changed before the command could start."
+  });
 }
 
 export async function markConnectorDisconnected(env: Env, connectorId: string): Promise<ThreadEvent[]> {

@@ -100,7 +100,7 @@ test("recordAgentEvent releases attached inferred targets to replacement connect
   assert.equal(db.eventInserts, 0);
 });
 
-test("recordAgentEvent keeps explicit targets bound to the requested connector", async () => {
+test("recordAgentEvent fails explicit targets that moved to a different connector", async () => {
   const db = appServerStartAfterDetachDb(
     {
       connector_id: "connector-replacement",
@@ -120,10 +120,11 @@ test("recordAgentEvent keeps explicit targets bound to the requested connector",
 
   assert.equal(result.accepted, false);
   assert.equal(result.dispatch_pending, false);
-  assert.equal(result.event, undefined);
-  assert.equal(db.commandUpdates, 0);
-  assert.equal(db.taskUpdates, 0);
-  assert.equal(db.eventInserts, 0);
+  assert.equal(result.event?.kind, "command.failed");
+  assert.equal(result.event?.summary, "Explicit app-server target changed before the command could start.");
+  assert.equal(db.commandUpdates, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
 });
 
 test("recordAgentEvent rejects app-server starts after the connector reattaches a different session", async () => {
@@ -357,6 +358,16 @@ test("pendingCommandsForConnector includes the task-first attached host session 
   assert.equal(dispatches[0]?.target_host_session?.cwd, "/workspace/project");
   assert.equal(db.commandLeaseUpdates, 1);
   assert.equal(db.connectorActivityUpdates, 1);
+});
+
+test("pendingCommandsForConnector does not downgrade expired app-server leases to codex_exec", async () => {
+  const db = expiredAppServerLeaseDispatchDb();
+
+  const dispatches = await pendingCommandsForConnector({ DB: db } as Env, "connector-online");
+
+  assert.equal(dispatches.length, 0);
+  assert.equal(db.commandLeaseUpdates, 0);
+  assert.equal(db.connectorActivityUpdates, 0);
 });
 
 test("recordHostSessions preserves stored sessions outside the latest top-N report", async () => {
@@ -756,6 +767,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
     eventInserts: 0
   };
   let releasedLease = false;
+  let failedCommand = false;
   const db = {
     prepare(sql: string) {
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
@@ -841,6 +853,36 @@ function appServerStartAfterDetachDb(currentTarget?: {
             return {
               async run() {
                 releasedLease = changes > 0;
+                counters.commandUpdates += changes;
+                return { meta: { changes } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'failed'/.test(sql)) {
+        assert.match(sql, /lease_owner_connector_id = NULL/);
+        assert.match(sql, /lease_until = NULL/);
+        assert.match(sql, /state = 'leased'/);
+        assert.match(sql, /lease_target_host_session_id IS NOT NULL/);
+        assert.match(sql, /lease_target_host_session_id = \?/);
+        assert.match(sql, /target_connector_id_source = 'explicit'/);
+        return {
+          bind(
+            updatedAt: string,
+            commandId: string,
+            ownerConnectorId: string,
+            targetHostSessionId: string | null
+          ) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(ownerConnectorId, "connector-online");
+            assert.equal(targetHostSessionId, leaseTargetHostSessionId);
+            const changes = targetConnectorIdSource === "explicit" && leaseTargetHostSessionId !== null ? 1 : 0;
+            return {
+              async run() {
+                failedCommand = changes > 0;
                 counters.commandUpdates += changes;
                 return { meta: { changes } };
               }
@@ -969,7 +1011,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
             assert.equal(connectorId, "connector-online");
             return {
               async first() {
-                return { active_count: releasedLease ? 0 : 1 };
+                return { active_count: releasedLease || failedCommand ? 0 : 1 };
               }
             };
           }
@@ -979,7 +1021,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
       if (/UPDATE connectors/.test(sql) && /active_command_count/.test(sql)) {
         return {
           bind(activeCount: number, updatedAt: string, connectorId: string) {
-            assert.equal(activeCount, releasedLease ? 0 : 1);
+            assert.equal(activeCount, releasedLease || failedCommand ? 0 : 1);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(connectorId, "connector-online");
             return {
@@ -1410,6 +1452,10 @@ function pendingCommandDispatchDb() {
         assert.match(sql, /ORDER BY hs_thread\.updated_at DESC,\s+hs_thread\.id DESC/);
         assert.match(sql, /hs\.connector_id IS NULL OR hs\.connector_id = \?/);
         assert.match(sql, /codex_app_server_exec/);
+        assert.match(
+          sql,
+          /COALESCE\(hs\.app_server_present, 0\) <> 1\s+AND cmd\.lease_target_host_session_id IS NULL\s+AND c\.capabilities_json LIKE '%"codex_exec"%'/m
+        );
         assert.match(sql, /c\.capabilities_json LIKE/);
         return {
           bind(
@@ -1514,6 +1560,51 @@ function pendingCommandDispatchDb() {
     }
   };
   return db as D1Database & typeof counters;
+}
+
+function expiredAppServerLeaseDispatchDb() {
+  const counters = {
+    commandLeaseUpdates: 0,
+    connectorActivityUpdates: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
+        assert.match(sql, /cmd\.state = 'leased' AND cmd\.lease_until IS NOT NULL AND cmd\.lease_until < \?/);
+        assert.match(
+          sql,
+          /COALESCE\(hs\.app_server_present, 0\) <> 1\s+AND cmd\.lease_target_host_session_id IS NULL\s+AND c\.capabilities_json LIKE '%"codex_exec"%'/m
+        );
+        return {
+          bind(
+            now: string,
+            targetConnectorId: string,
+            hostSessionConnectorId: string,
+            executableConnectorId: string
+          ) {
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(targetConnectorId, "connector-online");
+            assert.equal(hostSessionConnectorId, "connector-online");
+            assert.equal(executableConnectorId, "connector-online");
+            return {
+              async all() {
+                return { results: [] };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandLeaseUpdates() {
+      return counters.commandLeaseUpdates;
+    },
+    get connectorActivityUpdates() {
+      return counters.connectorActivityUpdates;
+    }
+  };
+  return db as unknown as D1Database & typeof counters;
 }
 
 function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
