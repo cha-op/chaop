@@ -4,6 +4,7 @@ import type {
   HostSessionBackfillSummary,
   HostSessionSummary,
   HostSessionSyncSummary,
+  TaskArchiveResponse,
   ThreadSummary
 } from "@chaop/protocol";
 
@@ -75,6 +76,23 @@ export function historyBackfillNotice(backfill: HostSessionBackfillSummary | und
   return backfill.truncated
     ? `Attached. Imported ${count} history ${noun}; older history was truncated.`
     : `Attached. Imported ${count} history ${noun}.`;
+}
+
+export function archiveSyncWarning(
+  action: "Archive" | "Unarchive",
+  response: TaskArchiveResponse
+): string | undefined {
+  const error = response.archive_sync?.error;
+  return error ? `${action} completed, but app-server sync did not: ${error}` : undefined;
+}
+
+export function archiveSyncNotice(
+  action: "Archive" | "Unarchive",
+  response: TaskArchiveResponse
+): string | undefined {
+  const sync = response.archive_sync;
+  if (!sync || !sync.attempted || sync.error) return undefined;
+  return `${action} completed. App-server sync completed.`;
 }
 
 function mergeById<T extends { id: string }>(

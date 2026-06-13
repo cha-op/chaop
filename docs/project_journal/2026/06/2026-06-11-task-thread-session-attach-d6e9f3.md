@@ -102,6 +102,7 @@ superseded_by:
 - Review follow-up routes `thread.archive_sync` through the connector's background control-message path while Codex exec or command ack waits are active, adds `updated_at` sorting to app-server `thread/list`, keeps sibling threads in a root session tree archive, and requires the explicit `app_server_archive` capability so older `app_server_threads` connectors fall back immediately to D1-only archive state instead of timing out.
 - Review follow-up treats official app-server rows with an exact `Thread.id` and no legacy `sessionId` as standalone exact archive matches, while still scanning sibling rows when `sessionId` equals the requested session tree id.
 - Review follow-up prevents a false archive-sync success when the source-state app-server scan hits the page budget and the target-state scan only finds another row in the same session tree. Exact `Thread.id` target matches can still confirm an already-synced state after a source page-budget miss.
+- Post-merge hardening adds a neutral Browser notice when app-server archive/unarchive sync completes, while preserving warning copy for D1-only fallbacks and connector sync failures.
 
 ## Next Steps
 - Use `docs/project_journal/2026/06/2026-06-13-app-server-execution-e4a7c9.md` for the app-server command execution closure.

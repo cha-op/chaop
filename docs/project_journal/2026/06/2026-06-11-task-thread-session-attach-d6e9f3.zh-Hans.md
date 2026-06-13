@@ -102,6 +102,7 @@ superseded_by:
 - Review follow-up 会在 Codex exec 或 command ack wait 活跃时，也通过 connector background control-message path 处理 `thread.archive_sync`；app-server `thread/list` 会按 `updated_at` 排序；root session tree archive 会保留 sibling threads；并且 archive sync 需要显式 `app_server_archive` capability，让较旧的 `app_server_threads` connectors 立即走 D1-only archive state fallback，而不是等待 timeout。
 - Review follow-up 会把 official app-server 返回的 exact `Thread.id` 且没有 legacy `sessionId` 的 row 视为 standalone exact archive match；只有当 `sessionId` 等于请求的 session tree id 时，才继续扫描 sibling rows。
 - Review follow-up 会避免在 source-state app-server scan 已触达分页预算时，把 target-state 里同一个 session tree 的其它 row 误判成 archive sync 已完成。Source 分页预算耗尽后，只有 exact `Thread.id` target match 仍可证明本机 app-server 状态已经同步。
+- 合并后的 hardening 会在 app-server archive/unarchive sync 完成时显示中性的 Browser 提示；D1-only fallback 和 connector sync failure 仍保留 warning copy。
 
 ## 下一步
 - App-server command execution 闭环记录在 `docs/project_journal/2026/06/2026-06-13-app-server-execution-e4a7c9.zh-Hans.md`。
