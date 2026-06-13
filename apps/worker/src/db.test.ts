@@ -496,6 +496,35 @@ test("recordHostSessions preserves stored sessions outside the latest top-N repo
   });
 });
 
+test("recordHostSessions clears app-server-only sessions omitted from inventory reports", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "app_server"
+  });
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-new",
+          title: "New session",
+          title_source: "metadata",
+          cwd: "/workspace/new",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 2);
+  assert.equal(db.hasSession("session-attached"), true);
+  assert.equal(db.appServerPresentOf("session-attached"), 0);
+  assert.equal(db.demotedSessions, 1);
+});
+
 test("recordHostSessions preserves attached session workspace during inventory refresh", async () => {
   const db = hostSessionsInventoryDb({ workspaceId: "workspace-other" });
 
@@ -1996,7 +2025,11 @@ function expiredAppServerLeaseDispatchDb() {
   return db as unknown as D1Database & typeof counters;
 }
 
-function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
+function hostSessionsInventoryDb(options: {
+  workspaceId?: string;
+  initialAppServerPresent?: number;
+  initialTitleSource?: string;
+} = {}) {
   const selectedWorkspaceId = options.workspaceId ?? "workspace-api";
   type StoredHostSession = {
     id: string;
@@ -2023,8 +2056,8 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
         workspace_id: "workspace-api",
         session_id: "session-attached",
         title: "Attached session",
-        title_source: "history",
-        app_server_present: 0,
+        title_source: options.initialTitleSource ?? "history",
+        app_server_present: options.initialAppServerPresent ?? 0,
         cwd: "/workspace/attached",
         attached_task_id: "task-attached",
         attached_thread_id: "thread-attached",
@@ -2034,6 +2067,7 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
   ]);
   const counters = {
     sync: undefined as { connectorId: string; reported: number; stored: number } | undefined,
+    demotedSessions: 0,
     hasSession(sessionId: string) {
       return sessions.has(sessionId);
     },
@@ -2127,6 +2161,26 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
         };
       }
 
+      if (/hs\.app_server_present = 1/.test(sql) && /hs\.title_source = 'app_server'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [...sessions.values()].filter(
+                    (session) =>
+                      session.connector_id === connectorId &&
+                      session.app_server_present === 1 &&
+                      session.title_source === "app_server"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
       if (/SELECT hs\.id, hs\.connector_id/.test(sql) && /FROM host_sessions hs/.test(sql)) {
         return {
           bind(sessionId: string, connectorId: string) {
@@ -2134,6 +2188,27 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
             return {
               async first() {
                 return sessions.get(sessionId);
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE host_sessions/.test(sql) && /SET app_server_present = 0/.test(sql)) {
+        return {
+          bind(updatedAt: string, hostSessionIdValue: string) {
+            assert.equal(updatedAt, "2026-06-12T11:00:05.000Z");
+            return {
+              async run() {
+                for (const session of sessions.values()) {
+                  if (session.id === hostSessionIdValue && session.app_server_present === 1 && session.title_source === "app_server") {
+                    session.app_server_present = 0;
+                    session.updated_at = updatedAt;
+                    counters.demotedSessions += 1;
+                    return { meta: { changes: 1 } };
+                  }
+                }
+                return { meta: { changes: 0 } };
               }
             };
           }
@@ -2217,6 +2292,9 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
     },
     appServerPresentOf(sessionId: string) {
       return counters.appServerPresentOf(sessionId);
+    },
+    get demotedSessions() {
+      return counters.demotedSessions;
     }
   };
 

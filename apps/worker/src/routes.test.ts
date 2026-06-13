@@ -2112,6 +2112,26 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
         };
       }
 
+      if (/hs\.app_server_present = 1/.test(sql) && /hs\.title_source = 'app_server'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [...sessions.values()].filter(
+                    (session) =>
+                      session.connector_id === connectorId &&
+                      session.app_server_present === 1 &&
+                      session.title_source === "app_server"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
       if (/SELECT hs\.id, hs\.connector_id/.test(sql) && /FROM host_sessions hs/.test(sql)) {
         assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
         assert.match(sql, /c\.status <> 'offline'/);

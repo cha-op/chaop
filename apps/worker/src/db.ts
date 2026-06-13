@@ -133,6 +133,7 @@ export async function recordHostSessions(
   const releasedConnectorIds = new Set<string>();
   const failedEvents: ThreadEvent[] = [];
   const reportedSessions = report.sessions.slice(0, 200);
+  const reportedSessionIds = new Set(reportedSessions.map((session) => session.session_id));
 
   for (const session of reportedSessions) {
     const id = hostSessionId(connectorId, session.session_id);
@@ -177,12 +178,47 @@ export async function recordHostSessions(
         stored.app_server_present !== true &&
         (stored.attached_task_id || stored.attached_thread_id)
       ) {
-        const released = await releaseCommandsForDetachedAppServerHostSession(env, stored, syncedAt);
-        for (const releasedConnectorId of released) {
-          releasedConnectorIds.add(releasedConnectorId);
-        }
-        failedEvents.push(...await failCommandsForDetachedAppServerHostSession(env, stored, syncedAt));
+        await cleanupUnavailableAppServerHostSession(env, stored, syncedAt, releasedConnectorIds, failedEvents);
       }
+    }
+  }
+
+  const staleAppServerOnlySessions = await allRows<HostSessionRow>(
+    env.DB.prepare(
+      `SELECT hs.id, hs.connector_id, hs.hostname, hs.workspace_id, hs.session_id, hs.title, hs.title_source,
+        hs.app_server_present, hs.cwd, hs.updated_at, hs.attached_task_id, hs.attached_thread_id
+       FROM host_sessions hs
+       INNER JOIN connectors c ON c.id = hs.connector_id
+       WHERE hs.connector_id = ?
+         AND hs.app_server_present = 1
+         AND hs.title_source = 'app_server'
+         AND c.status <> 'offline'`
+    ).bind(connectorId)
+  );
+  for (const row of staleAppServerOnlySessions) {
+    if (reportedSessionIds.has(row.session_id)) {
+      continue;
+    }
+    const result = await env.DB.prepare(
+      `UPDATE host_sessions
+       SET app_server_present = 0, updated_at = ?
+       WHERE id = ?
+         AND app_server_present = 1
+         AND title_source = 'app_server'`
+    )
+      .bind(syncedAt, row.id)
+      .run();
+    if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+      continue;
+    }
+    const demoted = hostSessionFromRow({
+      ...row,
+      app_server_present: 0,
+      updated_at: syncedAt
+    });
+    upserted.push(demoted);
+    if (demoted.attached_task_id || demoted.attached_thread_id) {
+      await cleanupUnavailableAppServerHostSession(env, demoted, syncedAt, releasedConnectorIds, failedEvents);
     }
   }
 
@@ -212,6 +248,20 @@ export async function recordHostSessions(
     released_connector_ids: [...releasedConnectorIds],
     failed_events: failedEvents
   };
+}
+
+async function cleanupUnavailableAppServerHostSession(
+  env: Env,
+  hostSession: HostSessionSummary,
+  now: string,
+  releasedConnectorIds: Set<string>,
+  failedEvents: ThreadEvent[]
+): Promise<void> {
+  const released = await releaseCommandsForDetachedAppServerHostSession(env, hostSession, now);
+  for (const releasedConnectorId of released) {
+    releasedConnectorIds.add(releasedConnectorId);
+  }
+  failedEvents.push(...await failCommandsForDetachedAppServerHostSession(env, hostSession, now));
 }
 
 export async function archiveTaskInDb(env: Env, taskId: string): Promise<TaskSummary> {

@@ -84,7 +84,7 @@ superseded_by:
 - Follow-up frozen-diff review found duplicate connector retirement migrated attached Host Sessions to the new connector but left pending attached-inferred commands targeting the retired connector. Host Session migration now retargets pending `attached` commands for the migrated task/thread scope to the new connector, guarded by the migrated connector/session still being the current attachment.
 - GitHub review-gate found that Chaop-driven app-server turns could wait forever on interactive approval requests. Connector `turn/start` now sends `approvalPolicy: "never"` so this slice stays non-interactive until Chaop has a first-class approval UI.
 - GitHub review-gate also found that sticky `app_server_present` could classify fresh commands as app-server work after the connector stopped reporting that session through app-server. Host Session inventory now treats `app_server_present` as current report state rather than an ever-seen bit.
-- Follow-up PR readiness reviews found two remaining stale app-server target holes: inventory demotion could strand commands already scoped to an app-server session, and explicit app-server commands could stay pending after their attachment moved before lease. Inventory demotion now runs the same release/failure cleanup used by detach, and the Durable Object fails stale explicit app-server targets before dispatch, even when the targeted connector has no active socket.
+- Follow-up PR readiness reviews found stale app-server target holes: inventory demotion could strand commands already scoped to an app-server session, app-server-only sessions omitted from later inventory reports could keep a stale `app_server_present=true`, and explicit app-server commands could stay pending after their attachment moved before lease. Inventory freshness cleanup now demotes both reported-false and omitted app-server-only sessions, runs the same release/failure cleanup used by detach, and the Durable Object fails stale explicit app-server targets before dispatch, even when the targeted connector has no active socket.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -137,6 +137,7 @@ superseded_by:
 - Worker DB and route tests assert app-server release paths write the replacement app-server `session_id` into `lease_target_host_session_id` instead of clearing the app-server target.
 - Worker DB tests assert duplicate connector retirement retargets pending attached-inferred commands to the migrated connector/session.
 - Worker DB tests assert inventory refresh clears stale `app_server_present` when a later report no longer marks the session as app-server present.
+- Worker DB tests assert app-server-only Host Sessions omitted from later inventory reports are demoted from app-server-present state.
 - Worker DB tests assert stale explicit app-server command targets fail before dispatch instead of remaining pending.
 - Worker Durable Object tests assert stale-target cleanup remains compatible with rejected-event dispatch polling.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
