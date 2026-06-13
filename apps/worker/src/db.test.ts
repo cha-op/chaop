@@ -528,7 +528,7 @@ test("recordHostSessions infers app-server presence for legacy app-server report
   assert.equal(db.appServerPresentOf("session-attached"), 1);
 });
 
-test("recordHostSessions keeps app-server presence independent from title source", async () => {
+test("recordHostSessions tracks current app-server presence independent from title source", async () => {
   const db = hostSessionsInventoryDb({ workspaceId: "workspace-other" });
 
   await recordHostSessions(
@@ -570,7 +570,7 @@ test("recordHostSessions keeps app-server presence independent from title source
   );
 
   assert.equal(db.titleOf("session-attached"), "History title after archive");
-  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.appServerPresentOf("session-attached"), 0);
 });
 
 test("recordHostSessionBackfillEvents imports events idempotently", async () => {
@@ -1935,7 +1935,7 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
                   session_id: sessionId,
                   title,
                   title_source: titleSource,
-                  app_server_present: existing?.app_server_present || appServerPresent,
+                  app_server_present: appServerPresent,
                   cwd,
                   attached_task_id: existing?.attached_task_id ?? null,
                   attached_thread_id: existing?.attached_thread_id ?? null,

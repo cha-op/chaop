@@ -1164,7 +1164,8 @@ fn run_app_server_command(
                 "text_elements": []
             }],
             "cwd": cwd.clone(),
-            "runtimeWorkspaceRoots": [cwd]
+            "runtimeWorkspaceRoots": [cwd],
+            "approvalPolicy": "never"
         }),
         socket_timeout,
         deadline,
@@ -4049,6 +4050,12 @@ mod tests {
                 .pointer("/params/clientUserMessageId")
                 .and_then(serde_json::Value::as_str),
             Some("command-1")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/approvalPolicy")
+                .and_then(serde_json::Value::as_str),
+            Some("never")
         );
         assert_eq!(
             turn_start_request

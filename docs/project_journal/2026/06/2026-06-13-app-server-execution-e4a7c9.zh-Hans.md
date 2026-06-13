@@ -82,6 +82,8 @@ superseded_by:
 - 后续 independent review 发现 migration `0008` 无法区分旧版 auto-selected `target_connector_id` 和用户显式 target。最终 migration 现在会把所有历史非空 `target_connector_id` 都视为 `explicit`，保留本切片前已经存在的 fixed-target 行为，而不是根据当前 Host Sessions 猜测 attached-session 意图。
 - 同一轮 review 还发现，把 stale app-server lease release 给 replacement Host Session 时会清空已保存的 app-server target；如果 replacement 在下一次 lease 前消失，command 可能降级成普通 `codex_exec`。现在 detach cleanup 和 rejected-start release 都会把 replacement app-server `session_id` 写入 `lease_target_host_session_id`，所以 command 只能继续由该 app-server target 接手，或者被 detach cleanup 标记 failed。
 - 后续 frozen-diff review 发现 duplicate connector retirement 会把 attached Host Sessions 迁移到新 connector，但 pending attached-inferred commands 仍然指向已 retired 的旧 connector。现在 Host Session migration 会把迁移后 task/thread scope 下的 pending `attached` commands 重新指向新 connector，并用已迁移 connector/session 仍是当前 attachment 作为 guard。
+- GitHub review-gate 发现 Chaop 发起的 app-server turn 可能一直等待 interactive approval request。现在 connector 的 `turn/start` 会发送 `approvalPolicy: "never"`，让本切片在 Chaop 拥有一等 approval UI 前保持非交互执行。
+- GitHub review-gate 也发现 sticky `app_server_present` 可能在 connector 不再通过 app-server 上报该 session 后，仍把新的 commands 分类为 app-server work。现在 Host Session inventory 会把 `app_server_present` 当作本次 report 的当前状态，而不是 ever-seen 标记。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -133,7 +135,9 @@ superseded_by:
 - Migration tests 和本地 SQLite smoke check 覆盖 conservative legacy `target_connector_id_source` upgrade classification。
 - Worker DB 与 route tests 断言 app-server release paths 会把 replacement app-server `session_id` 写入 `lease_target_host_session_id`，而不是清空 app-server target。
 - Worker DB tests 断言 duplicate connector retirement 会把 pending attached-inferred commands 重新指向迁移后的 connector/session。
+- Worker DB tests 断言后续 inventory report 不再标记 session app-server present 时，会清掉 stale `app_server_present`。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
+- Rust tests 断言 Chaop app-server `turn/start` request 会把 `approvalPolicy` 设为 `never`。
 - Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。
 - Rust tests 断言 rejected command-event acknowledgements 会被识别，不会被当作 successful ack。

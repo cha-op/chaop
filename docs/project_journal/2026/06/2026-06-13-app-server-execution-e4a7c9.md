@@ -82,6 +82,8 @@ superseded_by:
 - A follow-up independent review found migration `0008` could not distinguish legacy auto-selected `target_connector_id` values from user-explicit targets. The final migration now treats every historical non-null `target_connector_id` as `explicit`, preserving the fixed-target behaviour that existed before this slice instead of guessing attached-session intent from current Host Sessions.
 - The same review found that releasing a stale app-server lease to a replacement Host Session cleared the stored app-server target, which could later downgrade the command to plain `codex_exec` if the replacement disappeared before leasing. Both detach cleanup and rejected-start release now store the replacement app-server `session_id` in `lease_target_host_session_id`, so the command can only be picked up by that app-server target or failed by detach cleanup.
 - Follow-up frozen-diff review found duplicate connector retirement migrated attached Host Sessions to the new connector but left pending attached-inferred commands targeting the retired connector. Host Session migration now retargets pending `attached` commands for the migrated task/thread scope to the new connector, guarded by the migrated connector/session still being the current attachment.
+- GitHub review-gate found that Chaop-driven app-server turns could wait forever on interactive approval requests. Connector `turn/start` now sends `approvalPolicy: "never"` so this slice stays non-interactive until Chaop has a first-class approval UI.
+- GitHub review-gate also found that sticky `app_server_present` could classify fresh commands as app-server work after the connector stopped reporting that session through app-server. Host Session inventory now treats `app_server_present` as current report state rather than an ever-seen bit.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -133,7 +135,9 @@ superseded_by:
 - Migration tests and a local SQLite smoke check cover the conservative legacy `target_connector_id_source` upgrade classification.
 - Worker DB and route tests assert app-server release paths write the replacement app-server `session_id` into `lease_target_host_session_id` instead of clearing the app-server target.
 - Worker DB tests assert duplicate connector retirement retargets pending attached-inferred commands to the migrated connector/session.
+- Worker DB tests assert inventory refresh clears stale `app_server_present` when a later report no longer marks the session as app-server present.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
+- Rust tests assert Chaop app-server `turn/start` requests set `approvalPolicy` to `never`.
 - Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.
 - Rust tests assert rejected command-event acknowledgements are recognised instead of treated as successful acks.

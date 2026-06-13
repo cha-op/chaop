@@ -148,10 +148,7 @@ export async function recordHostSessions(
          END,
          title = excluded.title,
          title_source = excluded.title_source,
-         app_server_present = CASE
-           WHEN host_sessions.app_server_present = 1 THEN 1
-           ELSE excluded.app_server_present
-         END,
+         app_server_present = excluded.app_server_present,
          cwd = excluded.cwd,
          updated_at = excluded.updated_at`
     )
@@ -2021,10 +2018,7 @@ async function migrateHostSessionsToConnector(
          workspace_id = excluded.workspace_id,
          title = excluded.title,
          title_source = excluded.title_source,
-         app_server_present = CASE
-           WHEN host_sessions.app_server_present = 1 THEN 1
-           ELSE excluded.app_server_present
-         END,
+         app_server_present = excluded.app_server_present,
          cwd = excluded.cwd,
          attached_task_id = COALESCE(host_sessions.attached_task_id, excluded.attached_task_id),
          attached_thread_id = COALESCE(host_sessions.attached_thread_id, excluded.attached_thread_id),
