@@ -12,6 +12,8 @@ import {
   type HostSessionSummary,
   type LocalThreadCreateResult,
   type RefreshHostSessionsResponse,
+  type TaskArchiveResponse,
+  type TaskArchiveSyncSummary,
   type ThreadEventsResponse
 } from "@chaop/protocol";
 import {
@@ -31,6 +33,7 @@ import {
   createCommandInDb,
   detachHostSessionInDb,
   ensureConnectorInventory,
+  findAttachedHostSessionForTaskInDb,
   listThreadEventsInDb,
   loadBootstrapFromDb,
   recordHostSessionBackfillEvents,
@@ -204,12 +207,22 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     const taskId = decodeURIComponent(taskArchiveMatch[1] ?? "");
     try {
-      const task = taskArchiveMatch[2] === "archive"
-        ? await archiveTaskInDb(env, taskId)
-        : await unarchiveTaskInDb(env, taskId);
-      return json(request, env, { task }, 200);
+      const archived = taskArchiveMatch[2] === "archive";
+      const task = archived ? await archiveTaskInDb(env, taskId) : await unarchiveTaskInDb(env, taskId);
+      const hostSession = await findAttachedHostSessionForTaskInDb(env, taskId);
+      const archiveSync = hostSession?.app_server_present === true
+        ? await requestThreadArchiveSync(env, hostSession, archived)
+        : undefined;
+      const response: TaskArchiveResponse = {
+        task,
+        archive_sync: archiveSync
+      };
+      return json(request, env, response, 200);
     } catch (error) {
       if (error instanceof NotFoundError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      if (error instanceof ConnectorRpcError) {
         return json(request, env, { error: error.message }, error.status);
       }
       throw error;
@@ -536,6 +549,75 @@ async function requestLocalThreadCreate(
   return body.session;
 }
 
+async function requestThreadArchiveSync(
+  env: Env,
+  hostSession: HostSessionSummary,
+  archived: boolean
+): Promise<TaskArchiveSyncSummary> {
+  const availability = await appServerArchiveAvailability(env, hostSession.connector_id);
+  if (!availability.available) {
+    return {
+      attempted: false,
+      connector_id: hostSession.connector_id,
+      session_id: hostSession.session_id,
+      archived,
+      error: availability.error
+    };
+  }
+  if (!env.WORKSPACE_DO) {
+    return {
+      attempted: false,
+      connector_id: hostSession.connector_id,
+      session_id: hostSession.session_id,
+      archived,
+      error: "Workspace Durable Object binding is unavailable"
+    };
+  }
+
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  let response: Response;
+  try {
+    response = await stub.fetch("https://workspace-do/internal/sync-thread-archive", {
+      method: "POST",
+      body: JSON.stringify({
+        connector_id: hostSession.connector_id,
+        request_id: `thread-archive-${cryptoRandomId().slice(0, 16)}`,
+        session_id: hostSession.session_id,
+        archived
+      })
+    });
+  } catch (error) {
+    return {
+      attempted: true,
+      connector_id: hostSession.connector_id,
+      session_id: hostSession.session_id,
+      archived,
+      error: error instanceof Error ? error.message : "Connector could not sync the thread archive state"
+    };
+  }
+  const body = await response.json().catch(() => ({})) as { error?: unknown; synced?: unknown };
+
+  if (!response.ok) {
+    const message = typeof body.error === "string" ? body.error : "Connector could not sync the thread archive state";
+    return {
+      attempted: true,
+      connector_id: hostSession.connector_id,
+      session_id: hostSession.session_id,
+      archived,
+      error: message
+    };
+  }
+
+  return {
+    attempted: body.synced !== false,
+    connector_id: hostSession.connector_id,
+    session_id: hostSession.session_id,
+    archived,
+    error: body.synced === false ? "No matching app-server thread was found" : undefined
+  };
+}
+
 async function requestAndRecordHostSessionBackfill(
   env: Env,
   hostSession: HostSessionSummary
@@ -564,6 +646,46 @@ async function requestAndRecordHostSessionBackfill(
 }
 
 async function connectorSupportsHostSessionBackfill(env: Env, connectorId: string): Promise<boolean> {
+  return connectorHasCapability(env, connectorId, "host_session_backfill_v2");
+}
+
+async function connectorSupportsAppServerArchive(env: Env, connectorId: string): Promise<boolean> {
+  return (await appServerArchiveAvailability(env, connectorId)).available;
+}
+
+async function appServerArchiveAvailability(
+  env: Env,
+  connectorId: string
+): Promise<{ available: boolean; error: string }> {
+  if (!env.DB) {
+    return { available: false, error: "DB binding is required" };
+  }
+  const row = await env.DB.prepare(
+    `SELECT status, capabilities_json
+     FROM connectors
+     WHERE id = ?
+     LIMIT 1`
+  )
+    .bind(connectorId)
+    .first<{ status: string; capabilities_json: string | null }>();
+  if (!row) {
+    return { available: false, error: "Connector is not registered" };
+  }
+  if (row.status === "offline") {
+    return { available: false, error: "Connector is offline" };
+  }
+  try {
+    const capabilities = JSON.parse(row.capabilities_json ?? "[]") as unknown;
+    if (Array.isArray(capabilities) && capabilities.includes("app_server_archive")) {
+      return { available: true, error: "" };
+    }
+  } catch {
+    return { available: false, error: "Connector capability metadata is invalid" };
+  }
+  return { available: false, error: "Connector does not support app-server archive sync" };
+}
+
+async function connectorHasCapability(env: Env, connectorId: string, capability: string): Promise<boolean> {
   if (!env.DB) return false;
   const row = await env.DB.prepare(
     `SELECT capabilities_json
@@ -576,7 +698,7 @@ async function connectorSupportsHostSessionBackfill(env: Env, connectorId: strin
   if (!row?.capabilities_json) return false;
   try {
     const capabilities = JSON.parse(row.capabilities_json) as unknown;
-    return Array.isArray(capabilities) && capabilities.includes("host_session_backfill_v2");
+    return Array.isArray(capabilities) && capabilities.includes(capability);
   } catch {
     return false;
   }
@@ -711,6 +833,7 @@ function isAgentHostSession(value: unknown): value is AgentHostSession {
       value.title_source === "app_server" ||
       value.title_source === "history" ||
       value.title_source === "fallback") &&
+    (value.app_server_present === undefined || typeof value.app_server_present === "boolean") &&
     optionalString(value.cwd) &&
     isNonEmptyString(value.updated_at)
   );

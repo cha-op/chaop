@@ -144,6 +144,7 @@ export type HostSessionSummary = {
   session_id: string;
   title: string;
   title_source: HostSessionTitleSource;
+  app_server_present?: boolean | undefined;
   cwd?: string | undefined;
   updated_at: string;
   attached_task_id?: string | undefined;
@@ -180,6 +181,19 @@ export type CreateLocalThreadResponse = {
   host_session: HostSessionSummary;
   task: TaskSummary;
   thread: ThreadSummary;
+};
+
+export type TaskArchiveSyncSummary = {
+  attempted: boolean;
+  connector_id?: string | undefined;
+  session_id?: string | undefined;
+  archived: boolean;
+  error?: string | undefined;
+};
+
+export type TaskArchiveResponse = {
+  task: TaskSummary;
+  archive_sync?: TaskArchiveSyncSummary | undefined;
 };
 
 export type CommandSummary = {
@@ -316,6 +330,7 @@ export type AgentHostSession = {
   session_id: string;
   title: string;
   title_source: HostSessionTitleSource;
+  app_server_present?: boolean | undefined;
   cwd?: string | undefined;
   updated_at: string;
 };
@@ -343,6 +358,19 @@ export type HostSessionBackfillResult = {
   ok: boolean;
   events?: AgentBackfillEvent[] | undefined;
   truncated?: boolean | undefined;
+  error?: string | undefined;
+};
+
+export type ThreadArchiveSyncDispatch = {
+  request_id: string;
+  session_id: string;
+  archived: boolean;
+};
+
+export type ThreadArchiveSyncResult = {
+  request_id: string;
+  ok: boolean;
+  synced?: boolean | undefined;
   error?: string | undefined;
 };
 

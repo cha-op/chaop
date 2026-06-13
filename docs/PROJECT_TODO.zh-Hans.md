@@ -12,5 +12,5 @@
 - [done] 增加 GitHub Actions unit-test CI，跑 shared pnpm 和 Rust test gate。
 - [done] 增加明确的“新建 Codex thread”流程，让 Chaop 可以创建本机 Codex/app-server thread，而不只是 attach 已存在的本机 sessions。
 - [done] 为已 attach 的 Host Sessions 增加旧 session history backfill，同时默认不上传宽泛的本机 transcripts。
-- [todo] 通过 connector 将 Chaop archive/unarchive 操作同步到本机 Codex app-server archive 状态，同时保持本机 history 文件只读。
+- [done] 通过 connector 将 Chaop archive/unarchive 操作同步到本机 Codex app-server archive 状态，同时保持本机 history 文件只读。
 - [pending] 将 Codex CLI adapter 替换为真实 Codex app-server protocol execution。

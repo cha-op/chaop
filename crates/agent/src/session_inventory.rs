@@ -1,18 +1,21 @@
 use crate::config::AgentConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::{
     Message, WebSocket, client::client, connect, handshake::HandshakeError, http::Uri,
     stream::MaybeTlsStream,
 };
 
 const APP_SERVER_THREAD_SOURCE_KINDS: [&str; 3] = ["cli", "vscode", "appServer"];
+const APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE: usize = 200;
+const APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE: usize = 2;
+const APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS: u64 = 12;
 
 type AppServerSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -26,6 +29,7 @@ pub struct AgentHostSession {
     pub session_id: String,
     pub title: String,
     pub title_source: TitleSource,
+    pub app_server_present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub updated_at: String,
@@ -59,6 +63,7 @@ pub enum TitleSource {
 struct SessionDraft {
     session_id: String,
     metadata_title: Option<String>,
+    app_server_present: bool,
     cwd: Option<String>,
     updated_at: Option<String>,
 }
@@ -133,6 +138,7 @@ pub fn build_host_sessions_report(
                 ..SessionDraft::default()
             });
         draft.cwd = first_non_empty_raw(draft.cwd.take(), app_session.cwd.clone());
+        draft.app_server_present = true;
         draft.updated_at = max_string(app_session.updated_at.clone(), draft.updated_at.take());
     }
 
@@ -772,6 +778,7 @@ fn resolve_session(
         session_id: draft.session_id,
         title,
         title_source,
+        app_server_present: draft.app_server_present,
         cwd: draft.cwd,
         updated_at: draft
             .updated_at
@@ -828,13 +835,7 @@ fn load_app_server_sessions(
             "jsonrpc": "2.0",
             "id": 1,
             "method": "thread/list",
-            "params": {
-                "archived": null,
-                "limit": limit,
-                "sortDirection": "desc",
-                "sourceKinds": APP_SERVER_THREAD_SOURCE_KINDS,
-                "useStateDbOnly": true
-            }
+            "params": app_server_thread_list_params(limit, None, Some(false))
         })
         .to_string()
         .into(),
@@ -932,6 +933,30 @@ struct AppServerSession {
     updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppServerArchiveResolution {
+    NeedsUpdate(Vec<String>),
+    AlreadySynced,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppServerArchivePageScan {
+    Complete(AppServerArchiveCompletePageScan),
+    Exhausted { session_thread_ids: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppServerArchiveCompletePageScan {
+    thread_ids: Vec<String>,
+    matched_exact_thread: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AppServerArchivePageMatches {
+    exact_thread_id: Option<String>,
+    session_thread_ids: Vec<String>,
+}
+
 fn app_server_sessions_from_response(value: &Value) -> HashMap<String, AppServerSession> {
     let mut sessions = HashMap::new();
     let Some(data) = value
@@ -945,17 +970,16 @@ fn app_server_sessions_from_response(value: &Value) -> HashMap<String, AppServer
         let Some(session_id) = app_server_thread_session_id(thread) else {
             continue;
         };
-        sessions.insert(
-            session_id.to_owned(),
-            AppServerSession {
+        sessions
+            .entry(session_id.to_owned())
+            .or_insert_with(|| AppServerSession {
                 name: compact_title(thread.get("name").and_then(Value::as_str)),
                 cwd: thread
                     .get("cwd")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 updated_at: app_server_thread_timestamp(thread),
-            },
-        );
+            });
     }
     sessions
 }
@@ -990,6 +1014,235 @@ pub fn create_app_server_thread(
         title,
         &cwd,
         config.session_inventory.app_server_timeout_seconds,
+    )
+}
+
+pub fn set_app_server_thread_archived(
+    config: &AgentConfig,
+    thread_id: &str,
+    archived: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let url = config
+        .session_inventory
+        .app_server_url
+        .as_deref()
+        .ok_or("session_inventory.app_server_url is required for app-server archive sync")?;
+    set_app_server_thread_archived_at(
+        url,
+        thread_id,
+        archived,
+        config.session_inventory.app_server_timeout_seconds,
+    )
+}
+
+fn set_app_server_thread_archived_at(
+    url: &str,
+    thread_id: &str,
+    archived: bool,
+    timeout_seconds: u64,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS);
+    let timeout = app_server_archive_socket_timeout(timeout_seconds);
+    let mut socket =
+        connect_app_server(url, remaining_app_server_archive_timeout(timeout, deadline))?;
+    initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
+    let mut request_id = 1;
+    let Some(resolution) = resolve_app_server_thread_ids_for_archive(
+        &mut socket,
+        thread_id,
+        archived,
+        &mut request_id,
+        timeout,
+        deadline,
+    )?
+    else {
+        return Ok(false);
+    };
+    let method = if archived {
+        "thread/archive"
+    } else {
+        "thread/unarchive"
+    };
+    let AppServerArchiveResolution::NeedsUpdate(resolved_thread_ids) = resolution else {
+        return Ok(true);
+    };
+    for resolved_thread_id in resolved_thread_ids {
+        ensure_app_server_archive_budget(deadline)?;
+        let _ = send_app_server_request_before_deadline(
+            &mut socket,
+            request_id,
+            method,
+            serde_json::json!({
+                "threadId": resolved_thread_id
+            }),
+            timeout,
+            deadline,
+        )?;
+        request_id += 1;
+    }
+    Ok(true)
+}
+
+fn resolve_app_server_thread_ids_for_archive(
+    socket: &mut AppServerSocket,
+    thread_id: &str,
+    archived: bool,
+    next_request_id: &mut i64,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<Option<AppServerArchiveResolution>, Box<dyn std::error::Error>> {
+    let source_scan = find_app_server_thread_ids_in_pages(
+        socket,
+        thread_id,
+        Some(!archived),
+        next_request_id,
+        timeout,
+        deadline,
+    )?;
+    let source_scan_exhausted = matches!(source_scan, AppServerArchivePageScan::Exhausted { .. });
+    match source_scan {
+        AppServerArchivePageScan::Complete(scan) if !scan.thread_ids.is_empty() => {
+            return Ok(Some(AppServerArchiveResolution::NeedsUpdate(
+                scan.thread_ids,
+            )));
+        }
+        AppServerArchivePageScan::Exhausted { session_thread_ids }
+            if !session_thread_ids.is_empty() =>
+        {
+            return Err(
+                "app-server archive sync exceeded page budget while resolving a session tree"
+                    .into(),
+            );
+        }
+        AppServerArchivePageScan::Complete(_) | AppServerArchivePageScan::Exhausted { .. } => {}
+    }
+    match find_app_server_thread_ids_in_pages(
+        socket,
+        thread_id,
+        Some(archived),
+        next_request_id,
+        timeout,
+        deadline,
+    )? {
+        AppServerArchivePageScan::Complete(scan) if !scan.thread_ids.is_empty() => {
+            if source_scan_exhausted && !scan.matched_exact_thread {
+                return Err(
+                    "app-server archive sync exceeded page budget before resolving session tree state"
+                        .into(),
+                );
+            }
+            return Ok(Some(AppServerArchiveResolution::AlreadySynced));
+        }
+        AppServerArchivePageScan::Exhausted { session_thread_ids }
+            if !session_thread_ids.is_empty() =>
+        {
+            if source_scan_exhausted {
+                return Err(
+                    "app-server archive sync exceeded page budget before resolving session tree state"
+                        .into(),
+                );
+            }
+            return Ok(Some(AppServerArchiveResolution::AlreadySynced));
+        }
+        AppServerArchivePageScan::Exhausted { .. } => {
+            return Err(
+                "app-server archive sync exceeded page budget before resolving thread state".into(),
+            );
+        }
+        AppServerArchivePageScan::Complete(_) => {}
+    }
+    if source_scan_exhausted {
+        return Err(
+            "app-server archive sync exceeded page budget before resolving thread state".into(),
+        );
+    }
+    Ok(None)
+}
+
+fn find_app_server_thread_ids_in_pages(
+    socket: &mut AppServerSocket,
+    thread_id: &str,
+    archived_filter: Option<bool>,
+    next_request_id: &mut i64,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<AppServerArchivePageScan, Box<dyn std::error::Error>> {
+    let mut seen_threads = HashSet::new();
+    let mut seen_match_thread_ids = HashSet::new();
+    let mut session_thread_ids = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    for _ in 0..APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE {
+        ensure_app_server_archive_budget(deadline)?;
+        let response = send_app_server_thread_list_request(
+            socket,
+            *next_request_id,
+            APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE,
+            cursor.as_deref(),
+            archived_filter,
+            timeout,
+            deadline,
+        )?;
+        *next_request_id += 1;
+
+        let matches = app_server_archive_thread_ids_from_response(&response, thread_id);
+        if let Some(exact_thread_id) = matches.exact_thread_id {
+            return Ok(AppServerArchivePageScan::Complete(
+                AppServerArchiveCompletePageScan {
+                    thread_ids: vec![exact_thread_id],
+                    matched_exact_thread: true,
+                },
+            ));
+        }
+        for session_thread_id in matches.session_thread_ids {
+            if seen_match_thread_ids.insert(session_thread_id.clone()) {
+                session_thread_ids.push(session_thread_id);
+            }
+        }
+
+        let page_len = app_server_thread_list_data(&response)
+            .map(std::vec::Vec::len)
+            .unwrap_or(0);
+        let page_keys = app_server_thread_identity_keys_from_response(&response);
+        let new_key_count = page_keys
+            .into_iter()
+            .filter(|key| seen_threads.insert(key.to_owned()))
+            .count();
+        let next_cursor = app_server_thread_list_next_cursor(&response);
+        if next_cursor.is_none() || page_len == 0 || new_key_count == 0 {
+            return Ok(AppServerArchivePageScan::Complete(
+                AppServerArchiveCompletePageScan {
+                    thread_ids: session_thread_ids,
+                    matched_exact_thread: false,
+                },
+            ));
+        }
+        let next_cursor = next_cursor.expect("checked above");
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Ok(AppServerArchivePageScan::Complete(
+                AppServerArchiveCompletePageScan {
+                    thread_ids: session_thread_ids,
+                    matched_exact_thread: false,
+                },
+            ));
+        }
+        cursor = Some(next_cursor);
+    }
+    Ok(AppServerArchivePageScan::Exhausted { session_thread_ids })
+}
+
+fn ensure_app_server_archive_budget(deadline: Instant) -> Result<(), Box<dyn std::error::Error>> {
+    if Instant::now() >= deadline {
+        return Err("app-server archive sync exceeded local time budget".into());
+    }
+    Ok(())
+}
+
+fn app_server_archive_socket_timeout(timeout_seconds: u64) -> Duration {
+    Duration::from_secs(
+        timeout_seconds
+            .max(1)
+            .min(APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS),
     )
 }
 
@@ -1039,9 +1292,44 @@ fn create_app_server_thread_at(
                 })
             }),
         title_source: TitleSource::AppServer,
+        app_server_present: true,
         cwd: started.cwd,
         updated_at: started.updated_at,
     })
+}
+
+fn initialize_app_server_connection_before_deadline(
+    socket: &mut AppServerSocket,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = send_app_server_request_before_deadline(
+        socket,
+        0,
+        "initialize",
+        serde_json::json!({
+            "clientInfo": {
+                "name": "chaop-agent",
+                "title": "Chaop connector",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "requestAttestation": false
+            }
+        }),
+        timeout,
+        deadline,
+    )?;
+    socket.send(Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized"
+        })
+        .to_string()
+        .into(),
+    ))?;
+    Ok(())
 }
 
 fn initialize_app_server_connection(
@@ -1080,6 +1368,16 @@ fn send_app_server_request(
     method: &str,
     params: Value,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    send_app_server_request_inner(socket, id, method, params, None)
+}
+
+fn send_app_server_request_inner(
+    socket: &mut AppServerSocket,
+    id: i64,
+    method: &str,
+    params: Value,
+    archive_budget: Option<(Duration, Instant)>,
+) -> Result<Value, Box<dyn std::error::Error>> {
     socket.send(Message::Text(
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -1092,6 +1390,13 @@ fn send_app_server_request(
     ))?;
 
     loop {
+        if let Some((timeout, deadline)) = archive_budget {
+            ensure_app_server_archive_budget(deadline)?;
+            configure_socket_timeout(
+                socket,
+                remaining_app_server_archive_timeout(timeout, deadline),
+            )?;
+        }
         match socket.read()? {
             Message::Text(text) => {
                 let value = serde_json::from_str::<Value>(text.as_ref())?;
@@ -1109,6 +1414,68 @@ fn send_app_server_request(
             _ => {}
         }
     }
+}
+
+fn send_app_server_request_before_deadline(
+    socket: &mut AppServerSocket,
+    id: i64,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    ensure_app_server_archive_budget(deadline)?;
+    configure_socket_timeout(
+        socket,
+        remaining_app_server_archive_timeout(timeout, deadline),
+    )?;
+    send_app_server_request_inner(socket, id, method, params, Some((timeout, deadline)))
+}
+
+fn send_app_server_thread_list_request(
+    socket: &mut AppServerSocket,
+    id: i64,
+    limit: usize,
+    cursor: Option<&str>,
+    archived_filter: Option<bool>,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    send_app_server_request_before_deadline(
+        socket,
+        id,
+        "thread/list",
+        app_server_thread_list_params(limit, cursor, archived_filter),
+        timeout,
+        deadline,
+    )
+}
+
+fn remaining_app_server_archive_timeout(timeout: Duration, deadline: Instant) -> Duration {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Duration::from_millis(1);
+    }
+    remaining.min(timeout).max(Duration::from_millis(1))
+}
+
+fn app_server_thread_list_params(
+    limit: usize,
+    cursor: Option<&str>,
+    archived_filter: Option<bool>,
+) -> Value {
+    let mut params = serde_json::json!({
+        "archived": archived_filter,
+        "limit": limit,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "sourceKinds": APP_SERVER_THREAD_SOURCE_KINDS,
+        "useStateDbOnly": true
+    });
+    if let Some(cursor) = cursor {
+        params["cursor"] = serde_json::json!(cursor);
+    }
+    params
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1146,6 +1513,67 @@ fn app_server_thread_from_response(
         updated_at: app_server_thread_timestamp(thread)
             .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_owned()),
     })
+}
+
+fn app_server_archive_thread_ids_from_response(
+    value: &Value,
+    requested_id: &str,
+) -> AppServerArchivePageMatches {
+    let mut matches = AppServerArchivePageMatches::default();
+    let Some(threads) = app_server_thread_list_data(value) else {
+        return matches;
+    };
+    for thread in threads {
+        let thread_id = thread.get("id").and_then(Value::as_str);
+        let session_id = thread.get("sessionId").and_then(Value::as_str);
+        if thread_id == Some(requested_id) {
+            let exact_thread_id = thread_id.expect("checked above");
+            if session_id == Some(requested_id) {
+                matches.session_thread_ids.push(exact_thread_id.to_owned());
+                continue;
+            }
+            matches.exact_thread_id = Some(exact_thread_id.to_owned());
+            break;
+        }
+        if session_id == Some(requested_id) {
+            if let Some(thread_id) = thread_id {
+                matches.session_thread_ids.push(thread_id.to_owned());
+            }
+        }
+    }
+    matches
+}
+
+fn app_server_thread_identity_keys_from_response(value: &Value) -> Vec<String> {
+    app_server_thread_list_data(value)
+        .map(|threads| {
+            threads
+                .iter()
+                .filter_map(|thread| {
+                    thread
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .or_else(|| thread.get("sessionId").and_then(Value::as_str))
+                        .map(ToOwned::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn app_server_thread_list_data(value: &Value) -> Option<&Vec<Value>> {
+    value
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+}
+
+fn app_server_thread_list_next_cursor(value: &Value) -> Option<String> {
+    value
+        .get("result")
+        .and_then(|result| result.get("nextCursor"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn app_server_thread_timestamp(thread: &Value) -> Option<String> {
@@ -1249,11 +1677,12 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        HistorySession, SessionDraft, TitleSource, app_server_sessions_from_response,
-        app_server_thread_from_response, app_server_titles_from_response,
-        build_host_session_backfill, build_host_sessions_report, create_app_server_thread_at,
-        load_app_server_sessions, read_recent_lines, resolve_session, rollout_paths,
-        unix_seconds_to_iso,
+        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, HistorySession, SessionDraft, TitleSource,
+        app_server_sessions_from_response, app_server_thread_from_response,
+        app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
+        create_app_server_thread_at, load_app_server_sessions, read_recent_lines,
+        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
+        set_app_server_thread_archived_at, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
@@ -1262,7 +1691,7 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tungstenite::{Message, accept};
 
     #[test]
@@ -1270,6 +1699,7 @@ mod tests {
         let draft = SessionDraft {
             session_id: "session-1".to_owned(),
             metadata_title: Some("Metadata title".to_owned()),
+            app_server_present: true,
             cwd: Some("/tmp/project".to_owned()),
             updated_at: Some("2026-06-11T10:00:00.000Z".to_owned()),
         };
@@ -1286,6 +1716,7 @@ mod tests {
 
         assert_eq!(session.title, "Metadata title");
         assert_eq!(session.title_source, TitleSource::Metadata);
+        assert!(session.app_server_present);
     }
 
     #[test]
@@ -1293,6 +1724,7 @@ mod tests {
         let draft = SessionDraft {
             session_id: "session-1".to_owned(),
             metadata_title: None,
+            app_server_present: true,
             cwd: Some("/tmp/project".to_owned()),
             updated_at: None,
         };
@@ -1309,6 +1741,7 @@ mod tests {
 
         assert_eq!(session.title, "App title");
         assert_eq!(session.title_source, TitleSource::AppServer);
+        assert!(session.app_server_present);
     }
 
     #[test]
@@ -1362,6 +1795,66 @@ mod tests {
     }
 
     #[test]
+    fn app_server_inventory_uses_session_tree_id_over_thread_id() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "id": "thread-1",
+                        "sessionId": "session-tree-1",
+                        "name": "Thread title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                ]
+            }
+        });
+
+        let sessions = app_server_sessions_from_response(&response);
+
+        assert!(sessions.contains_key("session-tree-1"));
+        assert!(!sessions.contains_key("thread-1"));
+    }
+
+    #[test]
+    fn app_server_inventory_keeps_first_session_tree_row() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "id": "thread-new",
+                        "sessionId": "session-tree-1",
+                        "name": "New thread",
+                        "cwd": "/tmp/new-project",
+                        "updatedAt": 1781263443
+                    },
+                    {
+                        "id": "thread-old",
+                        "sessionId": "session-tree-1",
+                        "name": "Old thread",
+                        "cwd": "/tmp/old-project",
+                        "updatedAt": 1781263000
+                    }
+                ]
+            }
+        });
+
+        let sessions = app_server_sessions_from_response(&response);
+        let session = sessions.get("session-tree-1").expect("session");
+
+        assert_eq!(session.name.as_deref(), Some("New thread"));
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/new-project"));
+        assert_eq!(
+            session.updated_at.as_deref(),
+            Some("2026-06-12T11:24:03.000Z")
+        );
+    }
+
+    #[test]
     fn loads_app_server_sessions_after_initialization() {
         let (url, requests) = run_fake_app_server_with_requests(vec![json!({
             "jsonrpc": "2.0",
@@ -1391,6 +1884,18 @@ mod tests {
         assert_eq!(
             request.get("method").and_then(serde_json::Value::as_str),
             Some("thread/list")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            request
+                .pointer("/params/sortKey")
+                .and_then(serde_json::Value::as_str),
+            Some("updated_at")
         );
         assert_eq!(
             source_kinds
@@ -1489,6 +1994,873 @@ mod tests {
 
         assert_eq!(session.session_id, "thread-1");
         assert_eq!(session.title, "Requested title");
+    }
+
+    #[test]
+    fn archives_app_server_thread() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            app_server_thread_list_response(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {}
+            }),
+        ]);
+
+        assert!(set_app_server_thread_archived_at(&url, "thread-1", true, 1).expect("archive"));
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        assert_eq!(
+            list_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+
+        let request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/archive request");
+
+        assert_eq!(
+            request.get("method").and_then(serde_json::Value::as_str),
+            Some("thread/archive")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-1")
+        );
+    }
+
+    #[test]
+    fn archives_official_thread_id_without_session_id_as_exact_match() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-1"
+                        }
+                    ],
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {}
+            }),
+        ]);
+
+        assert!(set_app_server_thread_archived_at(&url, "thread-1", true, 1).expect("archive"));
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let archive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/archive request");
+
+        assert_eq!(
+            list_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            archive_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/archive")
+        );
+        assert_eq!(
+            archive_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-1")
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn archives_app_server_thread_by_resolving_legacy_session_id() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            app_server_thread_list_response(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {}
+            }),
+        ]);
+
+        assert!(
+            set_app_server_thread_archived_at(&url, "session-tree-1", true, 1).expect("archive")
+        );
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        let request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/archive request");
+
+        assert_eq!(
+            request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-1")
+        );
+    }
+
+    #[test]
+    fn archives_all_app_server_threads_in_a_session_tree() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-1",
+                            "sessionId": "session-tree-1"
+                        },
+                        {
+                            "id": "thread-2",
+                            "sessionId": "session-tree-1"
+                        },
+                        {
+                            "id": "thread-other",
+                            "sessionId": "session-tree-other"
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {}
+            }),
+        ]);
+
+        assert!(
+            set_app_server_thread_archived_at(&url, "session-tree-1", true, 1).expect("archive")
+        );
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let first_archive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first thread/archive request");
+        let second_archive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second thread/archive request");
+
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            first_archive_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(
+            second_archive_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-2")
+        );
+    }
+
+    #[test]
+    fn archives_session_tree_when_root_thread_id_matches_session_id() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "session-tree-1",
+                            "sessionId": "session-tree-1"
+                        },
+                        {
+                            "id": "thread-2",
+                            "sessionId": "session-tree-1"
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {}
+            }),
+        ]);
+
+        assert!(
+            set_app_server_thread_archived_at(&url, "session-tree-1", true, 1).expect("archive")
+        );
+        let _list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let first_archive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first thread/archive request");
+        let second_archive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second thread/archive request");
+
+        assert_eq!(
+            first_archive_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("session-tree-1")
+        );
+        assert_eq!(
+            second_archive_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-2")
+        );
+    }
+
+    #[test]
+    fn archive_sync_paginates_until_thread_is_found() {
+        let first_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-old-{index}") }))
+            .collect::<Vec<_>>();
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": first_page,
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-201",
+                            "sessionId": "session-tree-201"
+                        }
+                    ],
+                    "nextCursor": null
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {}
+            }),
+        ]);
+
+        assert!(
+            set_app_server_thread_archived_at(&url, "session-tree-201", true, 1).expect("archive")
+        );
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first thread/list request");
+        let second_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second thread/list request");
+        let archive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/archive request");
+
+        assert_eq!(
+            first_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            None
+        );
+        assert_eq!(
+            second_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+        assert_eq!(
+            first_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            second_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            archive_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/archive")
+        );
+        assert_eq!(
+            archive_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-201")
+        );
+    }
+
+    #[test]
+    fn archive_sync_errors_before_partial_session_tree_update_after_page_budget() {
+        let first_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| {
+                if index == 0 {
+                    json!({
+                        "id": "thread-1",
+                        "sessionId": "session-tree-1"
+                    })
+                } else {
+                    json!({ "id": format!("thread-old-{index}") })
+                }
+            })
+            .collect::<Vec<_>>();
+        let second_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-older-{index}") }))
+            .collect::<Vec<_>>();
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": first_page,
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": second_page,
+                    "nextCursor": "cursor-page-3"
+                }
+            }),
+        ]);
+
+        let error = set_app_server_thread_archived_at(&url, "session-tree-1", true, 1)
+            .expect_err("ambiguous archive sync should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded page budget while resolving a session tree")
+        );
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first thread/list request");
+        let second_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second thread/list request");
+
+        assert_eq!(
+            first_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            None
+        );
+        assert_eq!(
+            second_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn archive_sync_errors_when_unmatched_pages_exhaust_page_budget() {
+        let first_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-old-{index}") }))
+            .collect::<Vec<_>>();
+        let second_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-older-{index}") }))
+            .collect::<Vec<_>>();
+        let first_target_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-archived-old-{index}") }))
+            .collect::<Vec<_>>();
+        let second_target_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-archived-older-{index}") }))
+            .collect::<Vec<_>>();
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": first_page,
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": second_page,
+                    "nextCursor": "cursor-page-3"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "data": first_target_page,
+                    "nextCursor": "cursor-page-4"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "data": second_target_page,
+                    "nextCursor": "cursor-page-5"
+                }
+            }),
+        ]);
+
+        let error = set_app_server_thread_archived_at(&url, "session-tree-missing", true, 1)
+            .expect_err("unbounded archive sync should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded page budget before resolving thread state")
+        );
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first thread/list request");
+        let second_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second thread/list request");
+        let first_target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first target-state thread/list request");
+        let second_target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second target-state thread/list request");
+
+        assert_eq!(
+            first_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            None
+        );
+        assert_eq!(
+            second_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+        assert_eq!(
+            first_target_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            second_target_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-4")
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn archive_sync_checks_exact_target_state_after_source_page_budget_miss() {
+        let first_source_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-old-{index}") }))
+            .collect::<Vec<_>>();
+        let second_source_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-older-{index}") }))
+            .collect::<Vec<_>>();
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": first_source_page,
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": second_source_page,
+                    "nextCursor": "cursor-page-3"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-archived-1",
+                            "sessionId": "session-tree-archived"
+                        }
+                    ]
+                }
+            }),
+        ]);
+
+        assert!(
+            set_app_server_thread_archived_at(&url, "thread-archived-1", true, 1)
+                .expect("already archived")
+        );
+        let first_source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first source-state thread/list request");
+        let second_source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second source-state thread/list request");
+        let target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target-state thread/list request");
+
+        assert_eq!(
+            first_source_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            second_source_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+        assert_eq!(
+            target_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn archive_sync_errors_when_source_exhausts_before_target_session_tree_match() {
+        let first_source_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-old-{index}") }))
+            .collect::<Vec<_>>();
+        let second_source_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-older-{index}") }))
+            .collect::<Vec<_>>();
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": first_source_page,
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": second_source_page,
+                    "nextCursor": "cursor-page-3"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-archived-1",
+                            "sessionId": "session-tree-archived"
+                        }
+                    ]
+                }
+            }),
+        ]);
+
+        let error = set_app_server_thread_archived_at(&url, "session-tree-archived", true, 1)
+            .expect_err("ambiguous target session tree match should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded page budget before resolving session tree state")
+        );
+        let first_source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first source-state thread/list request");
+        let second_source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second source-state thread/list request");
+        let target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target-state thread/list request");
+
+        assert_eq!(
+            first_source_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            second_source_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+        assert_eq!(
+            target_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn archive_sync_noops_when_thread_is_not_in_app_server_list() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": []
+                }
+            }),
+        ]);
+
+        assert!(
+            !set_app_server_thread_archived_at(&url, "history-only-session", true, 1)
+                .expect("archive no-op")
+        );
+        let source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("source thread/list request");
+        let target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target thread/list request");
+
+        assert_eq!(
+            source_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            source_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            target_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn archive_sync_succeeds_when_thread_is_already_in_target_state() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-1",
+                            "sessionId": "session-tree-1",
+                            "name": "Thread title",
+                            "cwd": "/tmp/project",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+        ]);
+
+        assert!(set_app_server_thread_archived_at(&url, "thread-1", true, 1).expect("archive"));
+        let source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("source thread/list request");
+        let target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target thread/list request");
+
+        assert_eq!(
+            source_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            target_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn archive_sync_timeout_does_not_reset_after_deadline() {
+        let timeout = Duration::from_secs(5);
+
+        let expired = remaining_app_server_archive_timeout(
+            timeout,
+            Instant::now() - Duration::from_millis(1),
+        );
+        let soon = remaining_app_server_archive_timeout(
+            timeout,
+            Instant::now() + Duration::from_millis(50),
+        );
+
+        assert_eq!(expired, Duration::from_millis(1));
+        assert!(soon >= Duration::from_millis(1));
+        assert!(soon <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn unarchive_sync_succeeds_when_thread_is_already_in_target_state() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-1",
+                            "sessionId": "session-tree-1",
+                            "name": "Thread title",
+                            "cwd": "/tmp/project",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+        ]);
+
+        assert!(set_app_server_thread_archived_at(&url, "thread-1", false, 1).expect("unarchive"));
+        let source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("source thread/list request");
+        let target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target thread/list request");
+
+        assert_eq!(
+            source_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            target_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn unarchives_app_server_thread() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            app_server_thread_list_response(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-1",
+                        "sessionId": "session-tree-1",
+                        "name": "Thread title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        assert!(set_app_server_thread_archived_at(&url, "thread-1", false, 1).expect("unarchive"));
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/unarchive request");
+
+        assert_eq!(
+            request.get("method").and_then(serde_json::Value::as_str),
+            Some("thread/unarchive")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-1")
+        );
     }
 
     #[test]
@@ -1776,6 +3148,24 @@ mod tests {
 
     fn run_fake_app_server(responses: Vec<serde_json::Value>) -> String {
         run_fake_app_server_with_requests(responses).0
+    }
+
+    fn app_server_thread_list_response() -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "id": "thread-1",
+                        "sessionId": "session-tree-1",
+                        "name": "Thread title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                ]
+            }
+        })
     }
 
     fn test_config(codex_home: &std::path::Path) -> AgentConfig {

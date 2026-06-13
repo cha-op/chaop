@@ -8,6 +8,8 @@ import {
   type HostSessionsUpdatePayload,
   type LocalThreadCreateDispatch,
   type LocalThreadCreateResult,
+  type ThreadArchiveSyncDispatch,
+  type ThreadArchiveSyncResult,
   type ThreadEvent
 } from "@chaop/protocol";
 import {
@@ -20,6 +22,7 @@ import type { Env } from "./types.js";
 
 const THREAD_CREATE_TIMEOUT_MS = 15_000;
 const HOST_SESSION_BACKFILL_TIMEOUT_MS = 15_000;
+const THREAD_ARCHIVE_SYNC_TIMEOUT_MS = 20_000;
 
 type SocketAttachment = {
   socketType?: string;
@@ -41,6 +44,14 @@ export class WorkspaceDO implements DurableObject {
     {
       timer: ReturnType<typeof setTimeout>;
       resolve: (result: HostSessionBackfillResult) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private readonly pendingThreadArchiveSyncs = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      resolve: (result: ThreadArchiveSyncResult) => void;
       reject: (error: Error) => void;
     }
   >();
@@ -66,6 +77,10 @@ export class WorkspaceDO implements DurableObject {
 
     if (url.pathname === "/internal/backfill-host-session") {
       return this.backfillHostSession(request);
+    }
+
+    if (url.pathname === "/internal/sync-thread-archive") {
+      return this.syncThreadArchive(request);
     }
 
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -215,6 +230,19 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    if (message.kind === "thread.archive_sync_result" && isThreadArchiveSyncResult(message.payload)) {
+      this.resolveThreadArchiveSync(message.payload);
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            kind: "thread.archive_sync_result",
+            request_id: message.payload.request_id
+          })
+        )
+      );
+      return;
+    }
+
     ws.send(JSON.stringify(createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, { received: text.length })));
   }
 
@@ -328,6 +356,43 @@ export class WorkspaceDO implements DurableObject {
     }
   }
 
+  private async syncThreadArchive(request: Request): Promise<Response> {
+    const payload = await request.json().catch(() => ({})) as Partial<ThreadArchiveSyncDispatch> & {
+      connector_id?: unknown;
+    };
+    const connectorId = typeof payload.connector_id === "string" ? payload.connector_id : undefined;
+    if (!connectorId) {
+      return jsonResponse({ error: "Missing connector_id" }, 400);
+    }
+    if (!isThreadArchiveSyncDispatch(payload)) {
+      return jsonResponse({ error: "Invalid thread archive sync payload" }, 400);
+    }
+
+    const sockets = agentSocketsForConnector(this.ctx, connectorId);
+    const socket = sockets[0];
+    if (!socket) {
+      return jsonResponse({ error: "Connector is not connected" }, 404);
+    }
+
+    try {
+      const result = await this.waitForThreadArchiveSync(payload.request_id, () => {
+        socket.send(
+          JSON.stringify(
+            createEnvelope("thread.archive_sync", { type: "worker", id: "workspace-do-global" }, payload, {
+              target: { type: "connector", id: connectorId }
+            })
+          )
+        );
+      });
+      if (!result.ok) {
+        return jsonResponse({ error: result.error ?? "Connector could not sync the thread archive state" }, 502);
+      }
+      return jsonResponse({ ok: true, synced: result.synced !== false });
+    } catch (error) {
+      return jsonResponse({ error: error instanceof Error ? error.message : "Connector did not respond" }, 504);
+    }
+  }
+
   private async waitForLocalThreadCreate(
     requestId: string,
     send: () => void
@@ -385,6 +450,36 @@ export class WorkspaceDO implements DurableObject {
     }
     clearTimeout(pending.timer);
     this.pendingHostSessionBackfills.delete(result.request_id);
+    pending.resolve(result);
+  }
+
+  private async waitForThreadArchiveSync(
+    requestId: string,
+    send: () => void
+  ): Promise<ThreadArchiveSyncResult> {
+    return await new Promise<ThreadArchiveSyncResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingThreadArchiveSyncs.delete(requestId);
+        reject(new Error("Connector timed out while syncing the thread archive state"));
+      }, THREAD_ARCHIVE_SYNC_TIMEOUT_MS);
+      this.pendingThreadArchiveSyncs.set(requestId, { timer, resolve, reject });
+      try {
+        send();
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingThreadArchiveSyncs.delete(requestId);
+        reject(error instanceof Error ? error : new Error("Connector send failed"));
+      }
+    });
+  }
+
+  private resolveThreadArchiveSync(result: ThreadArchiveSyncResult): void {
+    const pending = this.pendingThreadArchiveSyncs.get(result.request_id);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingThreadArchiveSyncs.delete(result.request_id);
     pending.resolve(result);
   }
 
@@ -520,6 +615,29 @@ function isHostSessionBackfillResult(value: unknown): value is HostSessionBackfi
   );
 }
 
+function isThreadArchiveSyncDispatch(value: unknown): value is ThreadArchiveSyncDispatch {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    record.request_id.length > 0 &&
+    typeof record.session_id === "string" &&
+    record.session_id.length > 0 &&
+    typeof record.archived === "boolean"
+  );
+}
+
+function isThreadArchiveSyncResult(value: unknown): value is ThreadArchiveSyncResult {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    typeof record.ok === "boolean" &&
+    (record.synced === undefined || typeof record.synced === "boolean") &&
+    (record.error === undefined || typeof record.error === "string")
+  );
+}
+
 function isAgentBackfillEvent(value: unknown): boolean {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
@@ -563,6 +681,7 @@ function isAgentHostSession(value: unknown): boolean {
       record.title_source === "app_server" ||
       record.title_source === "history" ||
       record.title_source === "fallback") &&
+    (record.app_server_present === undefined || typeof record.app_server_present === "boolean") &&
     (record.cwd === undefined || typeof record.cwd === "string") &&
     typeof record.updated_at === "string"
   );

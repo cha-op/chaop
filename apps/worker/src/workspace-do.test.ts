@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { agentSocketsForConnector, hasPeerAgentSocket, hostSessionsMessage, threadEventMessage } from "./workspace-do.js";
+import { agentSocketsForConnector, hasPeerAgentSocket, hostSessionsMessage, threadEventMessage, WorkspaceDO } from "./workspace-do.js";
+import type { Env } from "./types.js";
 
 test("threadEventMessage wraps agent events for browser realtime consumers", () => {
   const message = threadEventMessage({
@@ -105,10 +106,77 @@ test("agentSocketsForConnector prefers the newest agent socket", () => {
   assert.deepEqual(agentSocketsForConnector(ctx, "connector-1"), [freshSocket, oldSocket, legacySocket]);
 });
 
+test("sync thread archive dispatches to the selected agent socket and resolves the result", async () => {
+  const sent: string[] = [];
+  const agentSocket = {
+    send(message: string) {
+      sent.push(message);
+    },
+    deserializeAttachment() {
+      return { socketType: "agent", connectorId: "connector-online", connectedAt: 300 };
+    }
+  } as unknown as WebSocket;
+  const ctx = {
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "agent:connector-online");
+      return [agentSocket];
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, {} as Env);
+
+  const responsePromise = workspace.fetch(new Request("https://workspace-do/internal/sync-thread-archive", {
+    method: "POST",
+    body: JSON.stringify({
+      connector_id: "connector-online",
+      request_id: "archive-1",
+      session_id: "session-1",
+      archived: true
+    })
+  }));
+
+  await waitFor(() => sent.length === 1);
+  assert.equal(sent.length, 1);
+  const dispatch = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { request_id?: string; session_id?: string; archived?: boolean };
+    target?: { type?: string; id?: string };
+  };
+  assert.equal(dispatch.kind, "thread.archive_sync");
+  assert.equal(dispatch.payload?.request_id, "archive-1");
+  assert.equal(dispatch.payload?.session_id, "session-1");
+  assert.equal(dispatch.payload?.archived, true);
+  assert.deepEqual(dispatch.target, { type: "connector", id: "connector-online" });
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "thread.archive_sync_result",
+    payload: { request_id: "archive-1", ok: true, synced: true }
+  }));
+
+  const response = await responsePromise;
+  const body = await response.json() as { ok?: boolean; synced?: boolean };
+  assert.equal(response.status, 200);
+  assert.deepEqual(body, { ok: true, synced: true });
+
+  assert.equal(sent.length, 2);
+  const ack = JSON.parse(sent[1] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; request_id?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, { kind: "thread.archive_sync_result", request_id: "archive-1" });
+});
+
 function socketWithAttachment(attachment: unknown): WebSocket {
   return {
     deserializeAttachment() {
       return attachment;
     }
   } as unknown as WebSocket;
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
 }

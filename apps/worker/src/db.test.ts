@@ -148,6 +148,7 @@ test("recordHostSessions preserves attached session workspace during inventory r
           session_id: "session-attached",
           title: "Attached session refresh",
           title_source: "app_server",
+          app_server_present: true,
           cwd: "/workspace/refreshed",
           updated_at: "2026-06-12T11:00:00.000Z"
         }
@@ -158,6 +159,76 @@ test("recordHostSessions preserves attached session workspace during inventory r
 
   assert.equal(db.workspaceOf("session-attached"), "workspace-api");
   assert.equal(db.titleOf("session-attached"), "Attached session refresh");
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+});
+
+test("recordHostSessions infers app-server presence for legacy app-server reports", async () => {
+  const db = hostSessionsInventoryDb({ workspaceId: "workspace-other" });
+
+  await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Legacy app-server title",
+          title_source: "app_server",
+          cwd: "/workspace/refreshed",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(db.titleOf("session-attached"), "Legacy app-server title");
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+});
+
+test("recordHostSessions keeps app-server presence independent from title source", async () => {
+  const db = hostSessionsInventoryDb({ workspaceId: "workspace-other" });
+
+  await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Metadata title from app-server inventory",
+          title_source: "metadata",
+          app_server_present: true,
+          cwd: "/workspace/refreshed",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(db.titleOf("session-attached"), "Metadata title from app-server inventory");
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+
+  await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "History title after archive",
+          title_source: "history",
+          cwd: "/workspace/refreshed",
+          updated_at: "2026-06-12T11:00:10.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(db.titleOf("session-attached"), "History title after archive");
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
 });
 
 test("recordHostSessionBackfillEvents imports events idempotently", async () => {
@@ -714,6 +785,7 @@ function duplicateConnectorRetirementDb() {
                       session_id: "session-1",
                       title: "Attached session",
                       title_source: "history",
+                      app_server_present: 1,
                       cwd: "/workspace/project",
                       attached_task_id: "task-old",
                       attached_thread_id: "thread-old",
@@ -804,6 +876,7 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
     session_id: string;
     title: string;
     title_source: string;
+    app_server_present: number;
     cwd: string | null;
     attached_task_id: string | null;
     attached_thread_id: string | null;
@@ -821,6 +894,7 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
         session_id: "session-attached",
         title: "Attached session",
         title_source: "history",
+        app_server_present: 0,
         cwd: "/workspace/attached",
         attached_task_id: "task-attached",
         attached_thread_id: "thread-attached",
@@ -838,6 +912,9 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
     },
     titleOf(sessionId: string) {
       return sessions.get(sessionId)?.title;
+    },
+    appServerPresentOf(sessionId: string) {
+      return sessions.get(sessionId)?.app_server_present;
     }
   };
 
@@ -879,6 +956,7 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
             sessionId: string,
             title: string,
             titleSource: string,
+            appServerPresent: number,
             cwd: string | null,
             discoveredAt: string,
             updatedAt: string
@@ -886,6 +964,7 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
             assert.equal(connectorId, "connector-online");
             assert.equal(hostname, "mac-studio.local");
             assert.equal(workspaceId, selectedWorkspaceId);
+            assert.ok(appServerPresent === 0 || appServerPresent === 1);
             assert.equal(discoveredAt, "2026-06-12T11:00:05.000Z");
             assert.match(
               sql,
@@ -905,6 +984,7 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
                   session_id: sessionId,
                   title,
                   title_source: titleSource,
+                  app_server_present: existing?.app_server_present || appServerPresent,
                   cwd,
                   attached_task_id: existing?.attached_task_id ?? null,
                   attached_thread_id: existing?.attached_thread_id ?? null,
@@ -976,6 +1056,9 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
     },
     titleOf(sessionId: string) {
       return counters.titleOf(sessionId);
+    },
+    appServerPresentOf(sessionId: string) {
+      return counters.appServerPresentOf(sessionId);
     }
   };
 
