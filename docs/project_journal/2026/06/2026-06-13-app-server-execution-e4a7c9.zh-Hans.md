@@ -73,6 +73,10 @@ superseded_by:
 - 第三轮 follow-up review 发现 auto-retarget 分支过宽，且 migration 会放松存量 targeted commands 的语义。现在 auto retarget 只允许当前 attachment 是 app-server Host Session 的情况；migration 会把已有非空 target connector 的 commands 回填为 `explicit`，从而保持升级前固定 target 的行为。
 - 后续 frozen-diff review 发现，如果 pending-command `SELECT` 与 lease `UPDATE` 之间选中的 Host Session 发生变化，command lease 仍可能 dispatch stale work。现在 lease update 会重新验证同一套 task-first Host Session target、connector target rules、online executable connector 状态和 app-server capability 后才会拿到 lease。
 - 后续 frozen-diff review 也发现 detach release 可能让 attached-inferred commands 停在 pending，直到出现无关触发。现在 detach 会在内部返回 replacement app-server connector ids，从公开 response 中剥离这份 metadata，并立即请求 Durable Object 向这些 connectors dispatch pending work。
+- Codex review-gate 发现 detach 生成的 command failure events 已持久化，但没有广播给 live browser sockets。现在 detach 会把这些 events 作为内部 metadata 返回，HTTP route 会从公开 response 中剥离它们，并通过专用 internal endpoint 让 Durable Object 广播。
+- Codex review-gate 也发现非 app-server attached-inferred commands 可能在所选 attachment 变化后仍被 insert。现在 command creation 会在 insert 前重新验证所有 attached-inferred Host Session targets；只有 app-server Codex commands 会额外持久化 lease-time app-server target。
+- Codex review-gate 发现 stale rejected final acknowledgement 可能停止后不再查询该 connector 的下一个 pending command。现在 Durable Object 会在 rejected final command event 后继续为同一个 connector 查询 pending work。
+- Offline frozen-diff review 发现已经绑定到 stored app-server session target 的 command，在任何 release/retarget flow 清空该 stored target 前，仍可能被 lease 到新的当前 attachment。现在 pending dispatch 要求 stored app-server lease target 为空，或等于选中的 Host Session session id，才允许 dispatch 或 lease update。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -115,6 +119,10 @@ superseded_by:
 - Migration tests 断言已有非空 command target 会回填成 `explicit` target-source 语义。
 - Worker DB tests 断言当 guarded lease update 在 attachment race 中失效时，pending-command dispatch 会跳过该 command。
 - Worker route 和 Durable Object tests 断言 detached attached-inferred command release 会立即 dispatch 到 replacement app-server connectors，同时公开 detach response 不暴露内部 metadata。
+- Worker route 和 Durable Object tests 断言 detach 生成的 failure events 会通过 internal DO endpoint 广播给 browser sockets，且公开 response 不泄露内部字段。
+- Worker route tests 断言 attached non-app-server command creation 在 insert 前 attachment 变化时会被拒绝。
+- Worker Durable Object tests 断言 rejected stale final command events 仍会为该 connector 查询 pending work。
+- Worker DB tests 断言当 stored app-server target 与当前 attachment 不同时，pending dispatch 会跳过该 command。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。

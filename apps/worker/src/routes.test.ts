@@ -737,6 +737,8 @@ test("host session attach skips backfill when the session is already attached", 
 
 test("host session detach clears the attached task and thread when D1 is bound", async () => {
   const db = hostSessionDetachDb();
+  let internalPath = "";
+  let broadcastedEventId = "";
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/detach", {
       method: "POST",
@@ -749,7 +751,20 @@ test("host session detach clears the attached task and thread when D1 is bound",
     }),
     {
       ...devEnv,
-      DB: db
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            const body = JSON.parse(String(init?.body ?? "{}")) as {
+              events?: Array<{ id?: string }>;
+            };
+            broadcastedEventId = body.events?.[0]?.id ?? "";
+            return new Response(JSON.stringify({ broadcasted: body.events?.length ?? 0 }));
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
     }
   );
   const body = (await response.json()) as {
@@ -758,6 +773,7 @@ test("host session detach clears the attached task and thread when D1 is bound",
       attached_task_id?: string;
       attached_thread_id?: string;
     };
+    failed_events?: unknown;
   };
 
   assert.equal(response.status, 200);
@@ -767,6 +783,9 @@ test("host session detach clears the attached task and thread when D1 is bound",
   assert.equal(db.commandFailures, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
+  assert.equal(body.failed_events, undefined);
+  assert.equal(internalPath, "/internal/broadcast-thread-events");
+  assert.match(broadcastedEventId, /^event-/);
 });
 
 test("host session detach refreshes connector activity after failing a leased command", async () => {
@@ -1408,6 +1427,37 @@ test("command creation rejects attached app-server commands when the attachment 
   });
 });
 
+test("command creation rejects attached non-app-server commands when the attachment changes before insert", async () => {
+  const envWithDetachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: false,
+        guardedCommandInsertChanges: 0
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached CLI session"
+      })
+    }),
+    envWithDetachedSession
+  );
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: "Attached host session changed before command creation"
+  });
+});
+
 test("command creation rejects explicit targets that do not own an attached host session", async () => {
   const envWithAttachedSession: Env = {
     ...devEnv,
@@ -1821,10 +1871,15 @@ function commandTargetDb(
             if (/WHERE EXISTS/.test(sql)) {
               const targetConnectorIdSource = args[8];
               const leaseTargetHostSessionId = args[9];
+              const appServerPresentGuard = args[24];
               assert.equal(targetConnectorId, "connector-attached");
               assert.equal(targetConnectorIdSource, "attached");
-              assert.equal(leaseTargetHostSessionId, "session-attached-thread");
-              assert.match(sql, /hs\.app_server_present = 1/);
+              assert.equal(
+                leaseTargetHostSessionId,
+                attachedThreadAppServerPresent ? "session-attached-thread" : null
+              );
+              assert.equal(appServerPresentGuard, attachedThreadAppServerPresent ? 1 : 0);
+              assert.match(sql, /COALESCE\(hs\.app_server_present, 0\) = \?/);
               assert.match(sql, /hs\.id = \(\s+SELECT hs2\.id/);
               assert.match(sql, /hs\.connector_id = \?/);
               assert.match(sql, /hs\.session_id = \?/);

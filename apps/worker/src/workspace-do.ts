@@ -82,6 +82,10 @@ export class WorkspaceDO implements DurableObject {
       return this.syncThreadArchive(request);
     }
 
+    if (url.pathname === "/internal/broadcast-thread-events") {
+      return this.broadcastThreadEvents(request);
+    }
+
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected WebSocket upgrade", { status: 426 });
     }
@@ -192,6 +196,8 @@ export class WorkspaceDO implements DurableObject {
         await this.sendPendingCommands(ws, connectorId);
       } else if (!result.accepted && result.dispatch_pending) {
         await this.sendPendingCommandsToAgents();
+      } else if (!result.accepted && finalCommandEvent) {
+        await this.sendPendingCommands(ws, connectorId);
       }
       return;
     }
@@ -242,6 +248,17 @@ export class WorkspaceDO implements DurableObject {
     for (const socket of this.ctx.getWebSockets("browser")) {
       socket.send(message);
     }
+  }
+
+  private async broadcastThreadEvents(request: Request): Promise<Response> {
+    const body = await request.json().catch(() => undefined) as { events?: unknown } | undefined;
+    const events = Array.isArray(body?.events) ? body.events.filter(isThreadEvent) : [];
+    for (const event of events) {
+      this.broadcastToBrowsers(threadEventMessage(event));
+    }
+    return new Response(JSON.stringify({ broadcasted: events.length }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
   }
 
   private async handleSocketGone(ws: WebSocket): Promise<void> {
@@ -573,6 +590,22 @@ function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
     (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
     (record.target_host_session_id === undefined || typeof record.target_host_session_id === "string") &&
     typeof record.summary === "string"
+  );
+}
+
+function isThreadEvent(value: unknown): value is ThreadEvent {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === "string" &&
+    typeof record.thread_id === "string" &&
+    (record.command_id === undefined || typeof record.command_id === "string") &&
+    typeof record.seq === "number" &&
+    Number.isFinite(record.seq) &&
+    isThreadEventKind(record.kind) &&
+    (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
+    typeof record.summary === "string" &&
+    typeof record.created_at === "string"
   );
 }
 

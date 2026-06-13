@@ -66,6 +66,52 @@ test("hostSessionsMessage wraps connector inventory updates for browser consumer
   assert.equal(envelope.payload?.host_sessions?.[0]?.title_source, "metadata");
 });
 
+test("internal broadcast thread events forwards valid events to browser sockets", async () => {
+  const sent: string[] = [];
+  const browserSocket = {
+    send(message: string) {
+      sent.push(message);
+    }
+  } as unknown as WebSocket;
+  const workspace = new WorkspaceDO({
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "browser");
+      return [browserSocket];
+    }
+  } as unknown as DurableObjectState, {} as Env);
+
+  const response = await workspace.fetch(new Request("https://workspace-do/internal/broadcast-thread-events", {
+    method: "POST",
+    body: JSON.stringify({
+      events: [
+        {
+          id: "event-1",
+          thread_id: "thread-1",
+          command_id: "command-1",
+          seq: 7,
+          kind: "command.failed",
+          priority: "P1",
+          summary: "Host session detached.",
+          created_at: "2026-06-13T10:00:00.000Z"
+        },
+        { id: "bad-event" }
+      ]
+    })
+  }));
+  const body = await response.json() as { broadcasted?: number };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.broadcasted, 1);
+  assert.equal(sent.length, 1);
+  const envelope = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { event?: { id?: string; summary?: string } };
+  };
+  assert.equal(envelope.kind, "thread.event");
+  assert.equal(envelope.payload?.event?.id, "event-1");
+  assert.equal(envelope.payload?.event?.summary, "Host session detached.");
+});
+
 test("hasPeerAgentSocket ignores the socket that is closing", () => {
   const closingSocket = {} as WebSocket;
   const peerSocket = {} as WebSocket;
@@ -201,6 +247,43 @@ test("agent event ack rejects stale command events", async () => {
   });
 });
 
+test("rejected stale final command events still poll pending work for the connector", async () => {
+  const sent: string[] = [];
+  const agentSocket = {
+    send(message: string) {
+      sent.push(message);
+    },
+    deserializeAttachment() {
+      return { socketType: "agent", connectorId: "connector-online", connectedAt: 300 };
+    }
+  } as unknown as WebSocket;
+  const db = staleFinalCommandEventDb();
+  const workspace = new WorkspaceDO({} as DurableObjectState, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "command.failed",
+      priority: "P1",
+      summary: "Finished after stale lease"
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, {
+    command_id: "command-1",
+    kind: "command.failed",
+    accepted: false
+  });
+  assert.equal(db.pendingDispatchQueries, 1);
+});
+
 test("rejected targeted app-server starts trigger pending dispatch to available agents", async () => {
   const staleSent: string[] = [];
   const replacementSent: string[] = [];
@@ -294,6 +377,66 @@ function staleCommandEventDb(): D1Database {
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     }
   } as D1Database;
+}
+
+function staleFinalCommandEventDb(): D1Database & { readonly pendingDispatchQueries: number } {
+  const counters = { pendingDispatchQueries: 0 };
+  return {
+    prepare(sql: string) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
+        return {
+          bind(commandId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                return {
+                  id: "command-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  task_id: "task-1",
+                  type: "codex",
+                  target_connector_id: null,
+                  target_connector_id_source: "auto",
+                  lease_owner_connector_id: "connector-online",
+                  state: "failed",
+                  lease_target_host_session_id: null
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
+        return {
+          bind(
+            now: string,
+            targetConnectorId: string,
+            autoAttachmentConnectorId: string,
+            hostSessionConnectorId: string,
+            executableConnectorId: string
+          ) {
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(targetConnectorId, "connector-online");
+            assert.equal(autoAttachmentConnectorId, "connector-online");
+            assert.equal(hostSessionConnectorId, "connector-online");
+            assert.equal(executableConnectorId, "connector-online");
+            return {
+              async all() {
+                counters.pendingDispatchQueries += 1;
+                return { results: [] };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get pendingDispatchQueries() {
+      return counters.pendingDispatchQueries;
+    }
+  } as D1Database & { readonly pendingDispatchQueries: number };
 }
 
 function rejectedTargetedStartDispatchDb(): D1Database & {
@@ -447,6 +590,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             selectedHostSessionIdForNullGuard: string | null,
             selectedHostSessionIdForPresentGuard: string | null,
             selectedHostSessionIdForMatchGuard: string | null,
+            targetHostSessionIdForStoredLeaseGuard: string | null,
             targetConnectorId: string,
             targetHostSessionIdForAutoTargetGuard: string | null,
             autoTargetConnectorId: string,
@@ -468,6 +612,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
             assert.equal(selectedHostSessionIdForNullGuard, "host-session-new");
             assert.equal(selectedHostSessionIdForPresentGuard, "host-session-new");
             assert.equal(selectedHostSessionIdForMatchGuard, "host-session-new");
+            assert.equal(targetHostSessionIdForStoredLeaseGuard, "host-session-new");
             assert.equal(targetConnectorId, "connector-replacement");
             assert.equal(targetHostSessionIdForAutoTargetGuard, "host-session-new");
             assert.equal(autoTargetConnectorId, "connector-replacement");

@@ -73,6 +73,10 @@ superseded_by:
 - Follow-up third review found the auto-retarget branch was too broad and the migration over-relaxed existing targeted commands. Auto retargeting now requires the current attachment to be an app-server Host Session, and the migration backfills existing non-null target connectors as `explicit` so upgrade keeps their previous fixed-target behaviour.
 - Follow-up frozen-diff review found command leasing could still dispatch stale work if the selected Host Session changed between the pending-command `SELECT` and lease `UPDATE`. The lease update now revalidates the same task-first Host Session target, connector target rules, online executable connector state, and app-server capability before taking the lease.
 - Follow-up frozen-diff review also found detach release could leave attached-inferred commands pending until an unrelated trigger. Detach now returns replacement app-server connector ids internally, strips that metadata from the public response, and immediately asks the Durable Object to dispatch pending work to those connectors.
+- Codex review-gate found that detach-generated command failure events were persisted but not broadcast to live browser sockets. Detach now returns those events as internal metadata, the HTTP route strips them from the public response, and the Durable Object broadcasts them through a dedicated internal endpoint.
+- Codex review-gate also found that non-app-server attached-inferred commands could be inserted after the selected attachment changed. Command creation now revalidates all attached-inferred Host Session targets before insert, while only app-server Codex commands persist a lease-time app-server target.
+- Codex review-gate found stale rejected final acknowledgements could stop without polling the connector's next pending command. The Durable Object now polls pending work for the same connector after rejected final command events.
+- Offline frozen-diff review found that a command already bound to a stored app-server session target could still be leased against a newer current attachment before any release/retarget flow cleared that stored target. Pending dispatch now requires stored app-server lease targets to be empty or match the selected Host Session session id before dispatch or lease update.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -115,6 +119,10 @@ superseded_by:
 - Migration tests assert existing non-null command targets are backfilled to `explicit` target-source semantics.
 - Worker DB tests assert pending-command dispatch skips work when the guarded lease update loses the attachment race.
 - Worker route and Durable Object tests assert detached attached-inferred command releases immediately dispatch to replacement app-server connectors while keeping the public detach response unchanged.
+- Worker route and Durable Object tests assert detach-generated failure events broadcast to browser sockets through the internal DO endpoint without leaking internal fields in the public response.
+- Worker route tests assert attached non-app-server command creation is rejected when the attachment changes before insert.
+- Worker Durable Object tests assert rejected stale final command events still poll pending work for that connector.
+- Worker DB tests assert pending dispatch skips commands whose stored app-server target differs from the current attachment.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server assistant-message delta accumulation respects the configured byte cap without splitting UTF-8 characters.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.

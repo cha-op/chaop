@@ -346,7 +346,7 @@ export async function detachHostSessionInDb(
   env: Env,
   sessionId: string,
   connectorId?: string
-): Promise<DetachHostSessionResponse & { released_connector_ids?: string[] }> {
+): Promise<DetachHostSessionResponse & { released_connector_ids?: string[]; failed_events?: ThreadEvent[] }> {
   if (!env.DB) {
     throw new Error("DB binding is required for host session detachment");
   }
@@ -369,7 +369,7 @@ export async function detachHostSessionInDb(
     .bind(now, hostSession.id)
     .run();
   const releasedConnectorIds = await releaseCommandsForDetachedAppServerHostSession(env, hostSession, now);
-  await failCommandsForDetachedAppServerHostSession(env, hostSession, now);
+  const failedEvents = await failCommandsForDetachedAppServerHostSession(env, hostSession, now);
 
   return {
     host_session: {
@@ -378,7 +378,8 @@ export async function detachHostSessionInDb(
       attached_thread_id: undefined,
       updated_at: now
     },
-    released_connector_ids: releasedConnectorIds
+    released_connector_ids: releasedConnectorIds,
+    failed_events: failedEvents
   };
 }
 
@@ -583,15 +584,15 @@ async function failCommandsForDetachedAppServerHostSession(
   env: Env,
   hostSession: HostSessionSummary,
   now: string
-): Promise<void> {
+): Promise<ThreadEvent[]> {
   if (hostSession.app_server_present !== true) {
-    return;
+    return [];
   }
 
   const taskId = hostSession.attached_task_id ?? null;
   const threadId = hostSession.attached_thread_id ?? null;
   if (!taskId && !threadId) {
-    return;
+    return [];
   }
 
   const commands = await allRows<CommandRow & { lease_owner_connector_id: string | null }>(
@@ -682,6 +683,7 @@ async function failCommandsForDetachedAppServerHostSession(
     )
   );
 
+  const failedEvents: ThreadEvent[] = [];
   for (const command of commands) {
     const result = await env.DB!.prepare(
       `UPDATE commands
@@ -790,7 +792,7 @@ async function failCommandsForDetachedAppServerHostSession(
     }
 
     if (command.thread_id) {
-      await appendEvent(env, {
+      const event = await appendEvent(env, {
         workspace_id: command.workspace_id,
         thread_id: command.thread_id,
         command_id: command.id,
@@ -798,8 +800,12 @@ async function failCommandsForDetachedAppServerHostSession(
         priority: "P1",
         summary: "Host session was detached before the command could run."
       });
+      if (event) {
+        failedEvents.push(event);
+      }
     }
   }
+  return failedEvents;
 }
 
 export async function findAttachedHostSessionForTaskInDb(
@@ -1074,6 +1080,13 @@ export async function createCommandInDb(
   const commandType = request.type ?? "placeholder";
   const scope = await resolveCommandScope(env, request);
   const attachedTarget = await findAttachedCommandTarget(env, scope);
+  const attachedTargetForInsert = attachedTarget
+    ? {
+      connectorId: attachedTarget.connector_id,
+      sessionId: attachedTarget.session_id,
+      appServerPresent: attachedTarget.app_server_present
+    }
+    : undefined;
   const appServerTargetHostSessionId =
     attachedTarget?.app_server_present === true && commandType === "codex" ? attachedTarget.session_id : null;
   const targetConnectorId =
@@ -1116,6 +1129,7 @@ export async function createCommandInDb(
 
   const inserted = await insertCommandInDb(env, user.id, command, {
     appServerTargetHostSessionId,
+    attachedTarget: targetConnectorIdSource === "attached" ? attachedTargetForInsert : undefined,
     targetConnectorIdSource
   });
   if (!inserted) {
@@ -1142,10 +1156,15 @@ async function insertCommandInDb(
   command: CommandSummary,
   options: {
     appServerTargetHostSessionId?: string | null;
+    attachedTarget?: {
+      connectorId: string;
+      sessionId: string;
+      appServerPresent: boolean;
+    } | undefined;
     targetConnectorIdSource: CommandTargetConnectorIdSource;
   }
 ): Promise<boolean> {
-  if (options.appServerTargetHostSessionId) {
+  if (options.attachedTarget) {
     if (!command.target_connector_id) {
       return false;
     }
@@ -1187,7 +1206,7 @@ async function insertCommandInDb(
          )
            AND hs.connector_id = ?
            AND hs.session_id = ?
-           AND hs.app_server_present = 1
+           AND COALESCE(hs.app_server_present, 0) = ?
        )`
     )
       .bind(
@@ -1214,7 +1233,8 @@ async function insertCommandInDb(
         command.task_id ?? null,
         command.task_id ?? null,
         command.target_connector_id,
-        options.appServerTargetHostSessionId
+        options.attachedTarget.sessionId,
+        options.attachedTarget.appServerPresent ? 1 : 0
       )
       .run();
     return Boolean((result.meta as { changes?: number } | undefined)?.changes);
@@ -1305,6 +1325,10 @@ export async function pendingCommandsForConnector(
            )
          )
          AND (hs.connector_id IS NULL OR hs.connector_id = ?)
+         AND (
+           cmd.lease_target_host_session_id IS NULL
+           OR hs.session_id = cmd.lease_target_host_session_id
+         )
          AND EXISTS (
            SELECT 1
            FROM workspace_connectors wc
@@ -1424,6 +1448,15 @@ export async function pendingCommandsForConnector(
            )
          )
          AND (
+           commands.lease_target_host_session_id IS NULL
+           OR EXISTS (
+             SELECT 1
+             FROM host_sessions hs_lease
+             WHERE hs_lease.id = ?
+               AND hs_lease.session_id = commands.lease_target_host_session_id
+           )
+         )
+         AND (
            target_connector_id = ?
            OR target_connector_id IS NULL
            OR (
@@ -1473,6 +1506,7 @@ export async function pendingCommandsForConnector(
         now,
         row.id,
         now,
+        row.target_host_session_row_id,
         row.target_host_session_row_id,
         row.target_host_session_row_id,
         row.target_host_session_row_id,

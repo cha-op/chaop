@@ -14,6 +14,7 @@ import {
   type RefreshHostSessionsResponse,
   type TaskArchiveResponse,
   type TaskArchiveSyncSummary,
+  type ThreadEvent,
   type ThreadEventsResponse
 } from "@chaop/protocol";
 import {
@@ -334,12 +335,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     try {
-      const { released_connector_ids: releasedConnectorIds, ...response } = await detachHostSessionInDb(
+      const {
+        released_connector_ids: releasedConnectorIds,
+        failed_events: failedEvents,
+        ...response
+      } = await detachHostSessionInDb(
         env,
         decodeURIComponent(detachHostSessionMatch[1] ?? ""),
         payload.value.connector_id
       );
-      await Promise.all((releasedConnectorIds ?? []).map((targetConnectorId) => dispatchPendingCommand(env, targetConnectorId)));
+      await Promise.all([
+        broadcastThreadEvents(env, failedEvents ?? []),
+        ...(releasedConnectorIds ?? []).map((targetConnectorId) => dispatchPendingCommand(env, targetConnectorId))
+      ]);
       return json(request, env, response, 200);
     } catch (error) {
       if (error instanceof NotFoundError) {
@@ -494,6 +502,17 @@ async function dispatchPendingCommand(env: Env, connectorId: string): Promise<vo
   await stub.fetch("https://workspace-do/internal/dispatch-pending", {
     method: "POST",
     body: JSON.stringify({ connector_id: connectorId })
+  });
+}
+
+async function broadcastThreadEvents(env: Env, events: ThreadEvent[]): Promise<void> {
+  if (!env.WORKSPACE_DO || events.length === 0) return;
+
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  await stub.fetch("https://workspace-do/internal/broadcast-thread-events", {
+    method: "POST",
+    body: JSON.stringify({ events })
   });
 }
 

@@ -426,6 +426,16 @@ test("pendingCommandsForConnector skips dispatch when the attachment lease guard
   assert.equal(db.connectorActivityUpdates, 0);
 });
 
+test("pendingCommandsForConnector skips dispatch when the stored app-server target differs from the current attachment", async () => {
+  const db = pendingCommandDispatchDb({ storedLeaseTargetHostSessionId: "session-old" });
+
+  const dispatches = await pendingCommandsForConnector({ DB: db } as Env, "connector-online");
+
+  assert.equal(dispatches.length, 0);
+  assert.equal(db.commandLeaseUpdates, 0);
+  assert.equal(db.connectorActivityUpdates, 0);
+});
+
 test("pendingCommandsForConnector does not downgrade expired app-server leases to codex_exec", async () => {
   const db = expiredAppServerLeaseDispatchDb();
 
@@ -1512,6 +1522,7 @@ function pendingCommandDispatchDb(options: {
   targetConnectorIdSource?: "explicit" | "attached" | "auto";
   targetHostSessionAppServerPresent?: 0 | 1;
   commandLeaseUpdateChanges?: 0 | 1;
+  storedLeaseTargetHostSessionId?: string | null;
 } = {}) {
   const connectorIdUnderTest = options.connectorId ?? "connector-online";
   const commandTargetConnectorId = options.commandTargetConnectorId ?? connectorIdUnderTest;
@@ -1538,6 +1549,7 @@ function pendingCommandDispatchDb(options: {
           /cmd\.target_connector_id_source = 'auto'\s+AND hs\.connector_id = \?\s+AND COALESCE\(hs\.app_server_present, 0\) = 1/
         );
         assert.match(sql, /hs\.connector_id IS NULL OR hs\.connector_id = \?/);
+        assert.match(sql, /cmd\.lease_target_host_session_id IS NULL\s+OR hs\.session_id = cmd\.lease_target_host_session_id/);
         assert.match(sql, /codex_app_server_exec/);
         assert.match(
           sql,
@@ -1563,6 +1575,12 @@ function pendingCommandDispatchDb(options: {
                   targetConnectorIdSource === "auto" &&
                   commandTargetConnectorId !== connectorIdUnderTest &&
                   targetHostSessionAppServerPresent !== 1
+                ) {
+                  return { results: [] };
+                }
+                if (
+                  options.storedLeaseTargetHostSessionId &&
+                  options.storedLeaseTargetHostSessionId !== "session-tree-1"
                 ) {
                   return { results: [] };
                 }
@@ -1598,6 +1616,8 @@ function pendingCommandDispatchDb(options: {
         assert.match(sql, /hs_task\.attached_task_id = commands\.task_id/);
         assert.match(sql, /hs_thread\.attached_thread_id = commands\.thread_id/);
         assert.match(sql, /target_connector_id_source = 'auto'\s+AND EXISTS \(\s+SELECT 1\s+FROM host_sessions hs_target/);
+        assert.match(sql, /commands\.lease_target_host_session_id IS NULL\s+OR EXISTS \(\s+SELECT 1\s+FROM host_sessions hs_lease/);
+        assert.match(sql, /hs_lease\.session_id = commands\.lease_target_host_session_id/);
         assert.match(sql, /LEFT JOIN host_sessions hs_guard ON hs_guard\.id = \?/);
         assert.match(sql, /hs_guard\.id IS NULL OR hs_guard\.connector_id = \?/);
         assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
@@ -1618,6 +1638,7 @@ function pendingCommandDispatchDb(options: {
             selectedHostSessionIdForNullGuard: string | null,
             selectedHostSessionIdForPresentGuard: string | null,
             selectedHostSessionIdForMatchGuard: string | null,
+            targetHostSessionIdForStoredLeaseGuard: string | null,
             targetConnectorId: string,
             targetHostSessionIdForAutoTargetGuard: string | null,
             autoTargetConnectorId: string,
@@ -1639,6 +1660,7 @@ function pendingCommandDispatchDb(options: {
             assert.equal(selectedHostSessionIdForNullGuard, "host-session-tree-1");
             assert.equal(selectedHostSessionIdForPresentGuard, "host-session-tree-1");
             assert.equal(selectedHostSessionIdForMatchGuard, "host-session-tree-1");
+            assert.equal(targetHostSessionIdForStoredLeaseGuard, "host-session-tree-1");
             assert.equal(targetConnectorId, connectorIdUnderTest);
             assert.equal(targetHostSessionIdForAutoTargetGuard, "host-session-tree-1");
             assert.equal(autoTargetConnectorId, connectorIdUnderTest);
