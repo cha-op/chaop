@@ -72,6 +72,28 @@ test("recordAgentEvent rejects app-server starts after the connector reattaches 
   assert.equal(db.eventInserts, 0);
 });
 
+test("recordAgentEvent accepts app-server starts for the current target session", async () => {
+  const db = appServerStartAfterDetachDb({
+    connector_id: "connector-online",
+    session_id: "session-old",
+    app_server_present: 1
+  });
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    target_host_session_id: "session-old",
+    kind: "command.started",
+    priority: "P1",
+    summary: "Starting"
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.event?.kind, "command.started");
+  assert.equal(db.commandUpdates, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+});
+
 test("recordAgentEvent accepts events from the active lease owner", async () => {
   const db = agentEventGuardDb({
     leaseOwnerConnectorId: "connector-online",
@@ -588,36 +610,54 @@ function appServerStartAfterDetachDb(currentTarget?: {
         };
       }
 
-      if (/SELECT hs\.connector_id, hs\.session_id, hs\.app_server_present/.test(sql) && /FROM host_sessions hs/.test(sql)) {
+      if (/UPDATE commands/.test(sql)) {
+        assert.match(sql, /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /hs\.session_id = \?/);
+        assert.match(sql, /hs2\.updated_at DESC,\s+hs2\.id DESC/);
         return {
           bind(
+            nextState: string,
+            connectorId: string,
+            updatedAt: string,
+            commandId: string,
+            ownerConnectorId: string,
             workspaceId: string,
             taskIdPresent: string | null,
             taskId: string | null,
             threadIdPresent: string | null,
-            threadId: string | null
+            threadId: string | null,
+            taskIdNullCheck: string | null,
+            taskIdForExists: string | null,
+            taskIdForOrder: string | null,
+            taskIdForOrderMatch: string | null,
+            targetConnectorId: string,
+            targetHostSessionId: string | null
           ) {
+            assert.equal(nextState, "running");
+            assert.equal(connectorId, "connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(ownerConnectorId, "connector-online");
             assert.equal(workspaceId, "workspace-api");
             assert.equal(taskIdPresent, "task-1");
             assert.equal(taskId, "task-1");
             assert.equal(threadIdPresent, "thread-1");
             assert.equal(threadId, "thread-1");
-            return {
-              async first() {
-                return currentTarget ?? null;
-              }
-            };
-          }
-        };
-      }
-
-      if (/UPDATE commands/.test(sql)) {
-        return {
-          bind() {
+            assert.equal(taskIdNullCheck, "task-1");
+            assert.equal(taskIdForExists, "task-1");
+            assert.equal(taskIdForOrder, "task-1");
+            assert.equal(taskIdForOrderMatch, "task-1");
+            assert.equal(targetConnectorId, "connector-online");
+            const changes =
+              currentTarget?.connector_id === targetConnectorId &&
+              currentTarget.session_id === targetHostSessionId &&
+              currentTarget.app_server_present === 1
+                ? 1
+                : 0;
             return {
               async run() {
-                counters.commandUpdates += 1;
-                return { meta: { changes: 1 } };
+                counters.commandUpdates += changes;
+                return { meta: { changes } };
               }
             };
           }
@@ -637,12 +677,69 @@ function appServerStartAfterDetachDb(currentTarget?: {
         };
       }
 
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 1 };
+              }
+            };
+          }
+        };
+      }
+
       if (/INSERT INTO events/.test(sql)) {
         return {
           bind() {
             return {
               async run() {
                 counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /last_seen_at/.test(sql)) {
+        return {
+          bind(lastSeenAt: string, updatedAt: string, connectorId: string) {
+            assert.match(lastSeenAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { active_count: 1 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /active_command_count/.test(sql)) {
+        return {
+          bind(activeCount: number, updatedAt: string, connectorId: string) {
+            assert.equal(activeCount, 1);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
                 return { success: true };
               }
             };

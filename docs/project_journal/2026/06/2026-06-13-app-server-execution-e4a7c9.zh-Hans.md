@@ -51,6 +51,7 @@ superseded_by:
 - Detached-command cleanup 也会覆盖 `target_connector_id IS NULL` 的 legacy 或 delayed app-server commands，同时保留 command leasing 可选择的任意当前 app-server Host Session replacement。
 - Independent PR review 发现还存在 create/detach 跨请求 race：command creation 可能先读到旧 app-server attachment，然后在 detach cleanup 扫描 commands 之后才 insert。现在 app-server Codex command creation 使用 guarded insert，只有按同一套 task-first/latest ordering 选出的当前 task/thread Host Session 仍解析到同一个 app-server target 时才会写入 command。
 - Independent PR review 发现 reattach-after-dispatch race：同一个 connector 可能先收到指向某个 app-server Host Session 的 command，随后又把另一个 Host Session attach 到同一 task/thread，最后才发送 `command.started`。现在 app-server `command.started` event 会带 `target_host_session_id`，Worker acknowledgement 只有在该 session 仍匹配当前 task/thread target 时才会接受 start。
+- 后续 independent review 发现 `command.started` Host Session identity check 与 command state update 之间仍有 TOCTOU window。现在 Worker 会把当前 Host Session target check 合并进同一条 guarded `UPDATE commands ... WHERE ... EXISTS (...)`，只有该 update 仍能解析到 event `target_host_session_id` 时才把 command 置为 `running`。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -63,6 +64,7 @@ superseded_by:
 - Worker Durable Object tests 断言 stale agent command events 会收到带 `accepted: false` 的 `server.ack`。
 - Worker DB tests 断言当前 Host Session attachment 消失后，app-server-only `command.started` events 会被拒绝。
 - Worker DB tests 断言同一个 connector 把另一个 Host Session reattach 到 command scope 后，app-server-only `command.started` events 会被拒绝。
+- Worker DB tests 断言 app-server-only `command.started` events 只有在 guarded command-state update 仍能把当前 target Host Session 解析到 event `target_host_session_id` 时才会被接受。
 - Worker route tests 断言当 attached Host Session 在 command insert 前变化时，app-server command creation 会返回 `409 Conflict`。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。

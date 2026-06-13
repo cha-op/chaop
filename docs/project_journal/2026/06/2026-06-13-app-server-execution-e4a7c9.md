@@ -51,6 +51,7 @@ superseded_by:
 - Detached-command cleanup also covers legacy or delayed app-server commands with `target_connector_id IS NULL`, while preserving replacement matching for any current app-server Host Session that command leasing could select.
 - Independent PR review found a remaining create/detach cross-request race where command creation could read an old app-server attachment, then insert after detach cleanup had already scanned commands. App-server Codex command creation now uses a guarded insert that only writes the command if the current task/thread Host Session selected by the same task-first/latest ordering still resolves to the same app-server target.
 - Independent PR review found a reattach-after-dispatch race: the same connector could receive a command for one app-server Host Session, then attach a different Host Session to the same task/thread before sending `command.started`. App-server `command.started` events now include `target_host_session_id`, and Worker acknowledgements reject starts unless that session still matches the current task/thread target.
+- Follow-up independent review found a remaining TOCTOU window between the `command.started` Host Session identity check and the command state update. Worker now folds the current Host Session target check into the same guarded `UPDATE commands ... WHERE ... EXISTS (...)` statement that moves the command to `running`.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -63,6 +64,7 @@ superseded_by:
 - Worker Durable Object tests assert stale agent command events receive `server.ack` with `accepted: false`.
 - Worker DB tests assert app-server-only `command.started` events are rejected after the current Host Session attachment is gone.
 - Worker DB tests assert app-server-only `command.started` events are rejected after the same connector reattaches a different Host Session to the command scope.
+- Worker DB tests assert app-server-only `command.started` events are accepted only when the guarded command-state update still resolves the current target Host Session to the event `target_host_session_id`.
 - Worker route tests assert app-server command creation returns `409 Conflict` when the attached Host Session changes before the command insert.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.

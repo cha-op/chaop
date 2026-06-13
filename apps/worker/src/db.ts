@@ -1049,23 +1049,21 @@ export async function recordAgentEvent(
   }
   if (command.lease_owner_connector_id !== connectorId) return { accepted: false };
   if (!isActiveCommandState(command.state)) return { accepted: false };
-  if (await shouldRejectStaleAppServerStart(env, connectorId, command, event)) {
-    return { accepted: false };
-  }
+  const requireCurrentAppServerStartTarget = await requiresCurrentAppServerStartTarget(
+    env,
+    connectorId,
+    command,
+    event
+  );
+  if (requireCurrentAppServerStartTarget && !event.target_host_session_id) return { accepted: false };
 
   const now = new Date().toISOString();
   const nextState = commandStateForEvent(event.kind);
 
   if (nextState) {
-    const result = await env.DB.prepare(
-      `UPDATE commands
-       SET state = ?, lease_owner_connector_id = ?, updated_at = ?
-       WHERE id = ?
-         AND lease_owner_connector_id = ?
-         AND state IN ('leased', 'running')`
-    )
-      .bind(nextState, connectorId, now, command.id, connectorId)
-      .run();
+    const result = await updateCommandStateForAgentEvent(env, connectorId, command, event, nextState, now, {
+      requireCurrentAppServerStartTarget
+    });
     if (!((result.meta as { changes?: number } | undefined)?.changes)) {
       return { accepted: false };
     }
@@ -1789,13 +1787,99 @@ function commandTargetHostSessionFromRow(row: PendingCommandRow): CommandTargetH
   };
 }
 
-async function shouldRejectStaleAppServerStart(
+async function updateCommandStateForAgentEvent(
   env: Env,
   connectorId: string,
   command: {
+    id: string;
     workspace_id: string;
     thread_id: string | null;
     task_id: string | null;
+    type: CommandSummary["type"];
+  },
+  event: AgentCommandEvent,
+  nextState: CommandSummary["state"],
+  now: string,
+  options: { requireCurrentAppServerStartTarget: boolean }
+): Promise<D1Result> {
+  if (options.requireCurrentAppServerStartTarget) {
+    const result = await env.DB!.prepare(
+      `UPDATE commands
+       SET state = ?, lease_owner_connector_id = ?, updated_at = ?
+       WHERE id = ?
+         AND lease_owner_connector_id = ?
+         AND state IN ('leased', 'running')
+         AND EXISTS (
+           SELECT 1
+           FROM host_sessions hs
+           WHERE hs.id = (
+             SELECT hs2.id
+             FROM host_sessions hs2
+             WHERE hs2.workspace_id = ?
+               AND (
+                 (? IS NOT NULL AND hs2.attached_task_id = ?)
+                 OR (
+                   ? IS NOT NULL
+                   AND hs2.attached_thread_id = ?
+                   AND (
+                     ? IS NULL
+                     OR NOT EXISTS (
+                       SELECT 1
+                       FROM host_sessions hst
+                       WHERE hst.workspace_id = hs2.workspace_id
+                         AND hst.attached_task_id = ?
+                     )
+                   )
+                 )
+               )
+             ORDER BY
+               CASE WHEN ? IS NOT NULL AND hs2.attached_task_id = ? THEN 0 ELSE 1 END,
+               hs2.updated_at DESC,
+               hs2.id DESC
+             LIMIT 1
+           )
+             AND hs.connector_id = ?
+             AND hs.session_id = ?
+             AND hs.app_server_present = 1
+         )`
+    )
+      .bind(
+        nextState,
+        connectorId,
+        now,
+        command.id,
+        connectorId,
+        command.workspace_id,
+        command.task_id ?? null,
+        command.task_id ?? null,
+        command.thread_id ?? null,
+        command.thread_id ?? null,
+        command.task_id ?? null,
+        command.task_id ?? null,
+        command.task_id ?? null,
+        command.task_id ?? null,
+        connectorId,
+        event.target_host_session_id ?? null
+      )
+      .run();
+    return result;
+  }
+
+  return env.DB!.prepare(
+    `UPDATE commands
+     SET state = ?, lease_owner_connector_id = ?, updated_at = ?
+     WHERE id = ?
+       AND lease_owner_connector_id = ?
+       AND state IN ('leased', 'running')`
+  )
+    .bind(nextState, connectorId, now, command.id, connectorId)
+    .run();
+}
+
+async function requiresCurrentAppServerStartTarget(
+  env: Env,
+  connectorId: string,
+  command: {
     type: CommandSummary["type"];
   },
   event: AgentCommandEvent
@@ -1803,20 +1887,7 @@ async function shouldRejectStaleAppServerStart(
   if (event.kind !== "command.started" || command.type !== "codex") {
     return false;
   }
-  if (!(await connectorRequiresAppServerStartValidation(env, connectorId))) {
-    return false;
-  }
-
-  const target = await findCurrentCommandHostSessionTarget(env, {
-    workspaceId: command.workspace_id,
-    threadId: command.thread_id ?? undefined,
-    taskId: command.task_id ?? undefined
-  });
-  return (
-    target?.connector_id !== connectorId ||
-    target.app_server_present !== true ||
-    target.session_id !== event.target_host_session_id
-  );
+  return await connectorRequiresAppServerStartValidation(env, connectorId);
 }
 
 async function connectorRequiresAppServerStartValidation(env: Env, connectorId: string): Promise<boolean> {
@@ -1840,58 +1911,6 @@ async function connectorRequiresAppServerStartValidation(env: Env, connectorId: 
   } catch {
     return false;
   }
-}
-
-async function findCurrentCommandHostSessionTarget(
-  env: Env,
-  scope: { workspaceId: string; threadId?: string | undefined; taskId?: string | undefined }
-): Promise<{ connector_id: string; session_id: string; app_server_present: boolean } | undefined> {
-  if (!scope.threadId && !scope.taskId) return undefined;
-
-  const row = await env.DB!.prepare(
-    `SELECT hs.connector_id, hs.session_id, hs.app_server_present
-     FROM host_sessions hs
-     WHERE hs.workspace_id = ?
-       AND (
-         (? IS NOT NULL AND hs.attached_task_id = ?)
-         OR (
-           ? IS NOT NULL
-           AND hs.attached_thread_id = ?
-           AND (
-             ? IS NULL
-             OR NOT EXISTS (
-               SELECT 1
-               FROM host_sessions hst
-               WHERE hst.workspace_id = hs.workspace_id
-                 AND hst.attached_task_id = ?
-             )
-           )
-         )
-       )
-     ORDER BY
-       CASE WHEN ? IS NOT NULL AND hs.attached_task_id = ? THEN 0 ELSE 1 END,
-       hs.updated_at DESC,
-       hs.id DESC
-     LIMIT 1`
-  )
-    .bind(
-      scope.workspaceId,
-      scope.taskId ?? null,
-      scope.taskId ?? null,
-      scope.threadId ?? null,
-      scope.threadId ?? null,
-      scope.taskId ?? null,
-      scope.taskId ?? null,
-      scope.taskId ?? null,
-      scope.taskId ?? null
-    )
-    .first<{ connector_id: string; session_id: string; app_server_present: number | boolean | null }>();
-  if (!row?.connector_id) return undefined;
-  return {
-    connector_id: row.connector_id,
-    session_id: row.session_id,
-    app_server_present: row.app_server_present === 1 || row.app_server_present === true
-  };
 }
 
 function hostSessionFromRow(row: HostSessionRow): HostSessionSummary {
