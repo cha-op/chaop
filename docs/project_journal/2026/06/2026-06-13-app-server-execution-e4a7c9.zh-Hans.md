@@ -88,6 +88,7 @@ superseded_by:
 - 最后一轮 follow-up reviews 在合并前又发现三个 inventory/release 边界：新建一个本机 app-server thread 时，单条新 session report 被当作完整 inventory snapshot；短暂 app-server list 失败无法和成功但为空的 app-server inventory 区分；多条 app-server command release 后可能漏掉某个 replacement connector dispatch。现在 Host Session report 会携带 `inventory_scope` 和 `app_server_inventory_ok`；Worker 只会在完整且成功的 snapshot 中清理 omitted app-server-only sessions，app-server inventory 失败时会保留已知 app-server presence，并在 release 后向 workspace 内所有 online executable app-server connectors fan out dispatch，让 command-level filters 决定真实接收者。
 - 对该修复的最后 review 发现 agent 在 `thread/list` 返回 error-like response、中途关闭，或还有后续分页时，仍可能把不完整 app-server inventory 标记为 full。现在 app-server inventory 会把 JSON-RPC errors、malformed responses 和 early close/reset 当作失败，会沿 `nextCursor` 一直翻页直到耗尽，并且在 inventory disabled 或 report 被 `max_sessions` 截断时把 Host Session report 标记为 incremental，因此 Worker omitted-session cleanup 只会基于完整证据运行。
 - 最终 rerun reviews 又发现两个完整性缺口：schema drift 的 app-server row 或 cursor 仍可能被接受为成功的 full inventory；Worker 会把旧版缺省 `inventory_scope` 或缺少 app-server inventory 证据的 full report 当成足以清理 omitted sessions 的证据，同时只清理 title 来自 app-server 的行。现在 agent 会拒绝缺少可执行 thread `id` 的 thread/list row、非字符串或空 cursor、重复 cursor；Worker 会把缺省 scope 当作 incremental，要求显式 `app_server_inventory_ok: true` 才能执行 omitted-session cleanup，并按当前 `app_server_present` 状态而不是 title source 清理 omitted sessions。
+- Offline frozen-diff review 发现 duplicate connector migration 仍可能让 pending explicit app-server command 停在已 retired 的 connector id 上。现在 Host Session migration 除了迁移 attached-inferred commands，也会把带有已迁移 `lease_target_host_session_id` 的 pending explicit Codex app-server commands 重新指向 replacement connector。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -139,6 +140,7 @@ superseded_by:
 - Migration tests 和本地 SQLite smoke check 覆盖 conservative legacy `target_connector_id_source` upgrade classification。
 - Worker DB 与 route tests 断言 app-server release paths 会把 replacement app-server `session_id` 写入 `lease_target_host_session_id`，而不是清空 app-server target。
 - Worker DB tests 断言 duplicate connector retirement 会把 pending attached-inferred commands 重新指向迁移后的 connector/session。
+- Worker DB tests 断言 duplicate connector retirement 会把带有已迁移 session target 的 pending explicit app-server commands 重新指向新 connector。
 - Worker DB tests 断言后续 inventory report 不再标记 session app-server present 时，会清掉 stale `app_server_present`。
 - Worker DB tests 断言只存在于 app-server 的 Host Sessions 如果从后续 inventory report 中消失，会从 app-server-present 状态 demote。
 - Worker DB tests 断言 incremental Host Session report 不会 demote 无关的 app-server-only sessions。

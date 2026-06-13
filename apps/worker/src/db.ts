@@ -2245,6 +2245,7 @@ async function migrateHostSessionsToConnector(
       )
       .run();
     await retargetAttachedCommandsForMigratedHostSession(env, row, fromConnectorId, toConnectorId, now);
+    await retargetExplicitAppServerCommandsForMigratedHostSession(env, row, fromConnectorId, toConnectorId, now);
   }
 
   await env.DB!.prepare(
@@ -2310,6 +2311,40 @@ async function retargetAttachedCommandsForMigratedHostSession(
       threadId,
       threadId
     )
+    .run();
+}
+
+async function retargetExplicitAppServerCommandsForMigratedHostSession(
+  env: Env,
+  row: HostSessionRow,
+  fromConnectorId: string,
+  toConnectorId: string,
+  now: string
+): Promise<void> {
+  if (!row.app_server_present) {
+    return;
+  }
+
+  await env.DB!.prepare(
+    `UPDATE commands
+     SET target_connector_id = ?,
+         updated_at = ?
+     WHERE workspace_id = ?
+       AND type = 'codex'
+       AND state = 'pending'
+       AND target_connector_id = ?
+       AND target_connector_id_source = 'explicit'
+       AND lease_target_host_session_id = ?
+       AND EXISTS (
+         SELECT 1
+         FROM host_sessions hs
+         WHERE hs.connector_id = ?
+           AND hs.session_id = ?
+           AND hs.workspace_id = commands.workspace_id
+           AND hs.app_server_present = 1
+       )`
+  )
+    .bind(toConnectorId, now, row.workspace_id, fromConnectorId, row.session_id, toConnectorId, row.session_id)
     .run();
 }
 

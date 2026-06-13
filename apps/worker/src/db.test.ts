@@ -367,6 +367,7 @@ test("ensureConnectorInventory retires duplicate connectors through disconnect c
   assert.equal(db.commandFailures, 1);
   assert.equal(db.migratedHostSessions, 1);
   assert.equal(db.retargetedAttachedCommands, 1);
+  assert.equal(db.retargetedExplicitAppServerCommands, 1);
   assert.equal(db.deletedOldHostSessions, 1);
   assert.equal(db.retiredConnectorTokens, 1);
 });
@@ -1457,6 +1458,7 @@ function duplicateConnectorRetirementDb() {
     eventInserts: 0,
     migratedHostSessions: 0,
     retargetedAttachedCommands: 0,
+    retargetedExplicitAppServerCommands: 0,
     deletedOldHostSessions: 0,
     retiredConnectorTokens: 0
   };
@@ -1639,6 +1641,38 @@ function duplicateConnectorRetirementDb() {
         };
       }
 
+      if (/UPDATE commands/.test(sql) && /target_connector_id_source = 'explicit'/.test(sql)) {
+        assert.match(sql, /type = 'codex'/);
+        assert.match(sql, /state = 'pending'/);
+        assert.match(sql, /lease_target_host_session_id = \?/);
+        assert.match(sql, /hs\.app_server_present = 1/);
+        return {
+          bind(
+            toConnectorId: string,
+            updatedAt: string,
+            workspaceId: string,
+            fromConnectorId: string,
+            sessionId: string,
+            targetConnectorId: string,
+            targetSessionId: string
+          ) {
+            assert.equal(toConnectorId, "connector-new");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(fromConnectorId, "connector-old");
+            assert.equal(sessionId, "session-1");
+            assert.equal(targetConnectorId, "connector-new");
+            assert.equal(targetSessionId, "session-1");
+            return {
+              async run() {
+                counters.retargetedExplicitAppServerCommands += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       if (/UPDATE commands/.test(sql) && /target_connector_id_source = 'attached'/.test(sql)) {
         assert.match(sql, /state = 'pending'/);
         assert.match(sql, /lease_target_host_session_id IS NULL OR lease_target_host_session_id = \?/);
@@ -1728,6 +1762,9 @@ function duplicateConnectorRetirementDb() {
     },
     get retargetedAttachedCommands() {
       return counters.retargetedAttachedCommands;
+    },
+    get retargetedExplicitAppServerCommands() {
+      return counters.retargetedExplicitAppServerCommands;
     },
     get deletedOldHostSessions() {
       return counters.deletedOldHostSessions;
