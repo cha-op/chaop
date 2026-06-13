@@ -365,6 +365,7 @@ test("ensureConnectorInventory retires duplicate connectors through disconnect c
 
   assert.equal(db.commandFailures, 1);
   assert.equal(db.migratedHostSessions, 1);
+  assert.equal(db.retargetedAttachedCommands, 1);
   assert.equal(db.deletedOldHostSessions, 1);
   assert.equal(db.retiredConnectorTokens, 1);
 });
@@ -1283,6 +1284,7 @@ function duplicateConnectorRetirementDb() {
     commandFailures: 0,
     eventInserts: 0,
     migratedHostSessions: 0,
+    retargetedAttachedCommands: 0,
     deletedOldHostSessions: 0,
     retiredConnectorTokens: 0
   };
@@ -1465,6 +1467,53 @@ function duplicateConnectorRetirementDb() {
         };
       }
 
+      if (/UPDATE commands/.test(sql) && /target_connector_id_source = 'attached'/.test(sql)) {
+        assert.match(sql, /state = 'pending'/);
+        assert.match(sql, /lease_target_host_session_id IS NULL OR lease_target_host_session_id = \?/);
+        assert.match(sql, /EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        return {
+          bind(
+            toConnectorId: string,
+            updatedAt: string,
+            workspaceId: string,
+            fromConnectorId: string,
+            sessionId: string,
+            taskIdPresent: string | null,
+            taskId: string | null,
+            threadIdPresent: string | null,
+            threadId: string | null,
+            targetConnectorId: string,
+            targetSessionId: string,
+            targetTaskIdPresent: string | null,
+            targetTaskId: string | null,
+            targetThreadIdPresent: string | null,
+            targetThreadId: string | null
+          ) {
+            assert.equal(toConnectorId, "connector-new");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(fromConnectorId, "connector-old");
+            assert.equal(sessionId, "session-1");
+            assert.equal(taskIdPresent, "task-old");
+            assert.equal(taskId, "task-old");
+            assert.equal(threadIdPresent, "thread-old");
+            assert.equal(threadId, "thread-old");
+            assert.equal(targetConnectorId, "connector-new");
+            assert.equal(targetSessionId, "session-1");
+            assert.equal(targetTaskIdPresent, "task-old");
+            assert.equal(targetTaskId, "task-old");
+            assert.equal(targetThreadIdPresent, "thread-old");
+            assert.equal(targetThreadId, "thread-old");
+            return {
+              async run() {
+                counters.retargetedAttachedCommands += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       if (/DELETE FROM host_sessions/.test(sql)) {
         return {
           bind(connectorId: string) {
@@ -1504,6 +1553,9 @@ function duplicateConnectorRetirementDb() {
     },
     get migratedHostSessions() {
       return counters.migratedHostSessions;
+    },
+    get retargetedAttachedCommands() {
+      return counters.retargetedAttachedCommands;
     },
     get deletedOldHostSessions() {
       return counters.deletedOldHostSessions;

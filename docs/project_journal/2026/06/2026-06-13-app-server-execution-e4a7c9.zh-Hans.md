@@ -81,6 +81,7 @@ superseded_by:
 - 同一轮 review 还发现 stale rejected `command.started` acknowledgement 可能生成最终 failure event，但不会查询该 connector 的下一个 pending command。现在 Durable Object 也会把 DB result 里返回的 final event 当作同 connector dispatch trigger。
 - 后续 independent review 发现 migration `0008` 无法区分旧版 auto-selected `target_connector_id` 和用户显式 target。最终 migration 现在会把所有历史非空 `target_connector_id` 都视为 `explicit`，保留本切片前已经存在的 fixed-target 行为，而不是根据当前 Host Sessions 猜测 attached-session 意图。
 - 同一轮 review 还发现，把 stale app-server lease release 给 replacement Host Session 时会清空已保存的 app-server target；如果 replacement 在下一次 lease 前消失，command 可能降级成普通 `codex_exec`。现在 detach cleanup 和 rejected-start release 都会把 replacement app-server `session_id` 写入 `lease_target_host_session_id`，所以 command 只能继续由该 app-server target 接手，或者被 detach cleanup 标记 failed。
+- 后续 frozen-diff review 发现 duplicate connector retirement 会把 attached Host Sessions 迁移到新 connector，但 pending attached-inferred commands 仍然指向已 retired 的旧 connector。现在 Host Session migration 会把迁移后 task/thread scope 下的 pending `attached` commands 重新指向新 connector，并用已迁移 connector/session 仍是当前 attachment 作为 guard。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -131,6 +132,7 @@ superseded_by:
 - Worker Durable Object tests 断言 rejected `command.started` event 生成 `command.failed` result 时，仍会为该 connector 查询 pending work。
 - Migration tests 和本地 SQLite smoke check 覆盖 conservative legacy `target_connector_id_source` upgrade classification。
 - Worker DB 与 route tests 断言 app-server release paths 会把 replacement app-server `session_id` 写入 `lease_target_host_session_id`，而不是清空 app-server target。
+- Worker DB tests 断言 duplicate connector retirement 会把 pending attached-inferred commands 重新指向迁移后的 connector/session。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。

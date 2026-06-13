@@ -2046,6 +2046,7 @@ async function migrateHostSessionsToConnector(
         now
       )
       .run();
+    await retargetAttachedCommandsForMigratedHostSession(env, row, fromConnectorId, toConnectorId, now);
   }
 
   await env.DB!.prepare(
@@ -2053,6 +2054,64 @@ async function migrateHostSessionsToConnector(
      WHERE connector_id = ?`
   )
     .bind(fromConnectorId)
+    .run();
+}
+
+async function retargetAttachedCommandsForMigratedHostSession(
+  env: Env,
+  row: HostSessionRow,
+  fromConnectorId: string,
+  toConnectorId: string,
+  now: string
+): Promise<void> {
+  const taskId = row.attached_task_id;
+  const threadId = row.attached_thread_id;
+  if (!taskId && !threadId) {
+    return;
+  }
+
+  await env.DB!.prepare(
+    `UPDATE commands
+     SET target_connector_id = ?,
+         updated_at = ?
+     WHERE workspace_id = ?
+       AND state = 'pending'
+       AND target_connector_id = ?
+       AND target_connector_id_source = 'attached'
+       AND (lease_target_host_session_id IS NULL OR lease_target_host_session_id = ?)
+       AND (
+         (? IS NOT NULL AND task_id = ?)
+         OR (? IS NOT NULL AND thread_id = ?)
+       )
+       AND EXISTS (
+         SELECT 1
+         FROM host_sessions hs
+         WHERE hs.connector_id = ?
+           AND hs.session_id = ?
+           AND hs.workspace_id = commands.workspace_id
+           AND (
+             (? IS NOT NULL AND hs.attached_task_id = ?)
+             OR (? IS NOT NULL AND hs.attached_thread_id = ?)
+           )
+       )`
+  )
+    .bind(
+      toConnectorId,
+      now,
+      row.workspace_id,
+      fromConnectorId,
+      row.session_id,
+      taskId,
+      taskId,
+      threadId,
+      threadId,
+      toConnectorId,
+      row.session_id,
+      taskId,
+      taskId,
+      threadId,
+      threadId
+    )
     .run();
 }
 
