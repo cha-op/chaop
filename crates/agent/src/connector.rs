@@ -3,6 +3,7 @@ use crate::executor::{codex_exec_result_events_with_cancel, codex_exec_started_e
 use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
 use crate::session_inventory::{
+    app_server_command_result_events_with_cancel, app_server_command_started_event,
     build_host_session_backfill, build_host_sessions_report, create_app_server_thread,
     set_app_server_thread_archived,
 };
@@ -41,6 +42,15 @@ struct Envelope {
 #[derive(Debug, Deserialize)]
 struct CommandDispatch {
     command: CommandPayload,
+    target_host_session: Option<CommandTargetHostSession>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommandTargetHostSession {
+    session_id: String,
+    #[serde(default)]
+    app_server_present: bool,
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +239,20 @@ fn handle_text_message(
     }
 
     let dispatch: CommandDispatch = serde_json::from_value(envelope.payload)?;
+    if requires_app_server_execution_mode(&dispatch)
+        && config.execution.mode != ExecutionMode::AppServer
+    {
+        dispatch_events(
+            socket,
+            &dispatch.command,
+            app_server_wrong_execution_mode_events(),
+            config,
+            last_host_sessions_message,
+            deferred_messages,
+        )?;
+        return Ok(true);
+    }
+
     if dispatch.command.command_type == CommandType::Codex
         && config.execution.mode == ExecutionMode::CodexExec
     {
@@ -243,6 +267,62 @@ fn handle_text_message(
         let events = wait_for_codex_exec_events(
             socket,
             config,
+            &dispatch.command.prompt,
+            last_host_sessions_message,
+            deferred_messages,
+        );
+        dispatch_events(
+            socket,
+            &dispatch.command,
+            events?,
+            config,
+            last_host_sessions_message,
+            deferred_messages,
+        )?;
+        return Ok(true);
+    }
+
+    if dispatch.command.command_type == CommandType::Codex
+        && config.execution.mode == ExecutionMode::AppServer
+    {
+        let Some(target_host_session) = dispatch.target_host_session.as_ref() else {
+            dispatch_events(
+                socket,
+                &dispatch.command,
+                app_server_missing_target_events(),
+                config,
+                last_host_sessions_message,
+                deferred_messages,
+            )?;
+            return Ok(true);
+        };
+        if !target_host_session.app_server_present {
+            dispatch_events(
+                socket,
+                &dispatch.command,
+                app_server_non_app_server_target_events(&target_host_session.session_id),
+                config,
+                last_host_sessions_message,
+                deferred_messages,
+            )?;
+            return Ok(true);
+        }
+        dispatch_events(
+            socket,
+            &dispatch.command,
+            vec![app_server_command_started_event(
+                &target_host_session.session_id,
+            )],
+            config,
+            last_host_sessions_message,
+            deferred_messages,
+        )?;
+        let events = wait_for_app_server_command_events(
+            socket,
+            config,
+            &target_host_session.session_id,
+            target_host_session.cwd.as_deref(),
+            &dispatch.command.id,
             &dispatch.command.prompt,
             last_host_sessions_message,
             deferred_messages,
@@ -451,6 +531,76 @@ fn wait_for_codex_exec_events(
     }
 }
 
+fn wait_for_app_server_command_events(
+    socket: &mut AgentSocket,
+    config: &AgentConfig,
+    session_id: &str,
+    cwd: Option<&str>,
+    command_id: &str,
+    prompt: &str,
+    last_host_sessions_message: &mut Option<String>,
+    deferred_messages: &mut VecDeque<String>,
+) -> Result<Vec<ConnectorEvent>, Box<dyn std::error::Error>> {
+    let worker_config = config.clone();
+    let session_id = session_id.to_owned();
+    let cwd = cwd.map(ToOwned::to_owned);
+    let command_id = command_id.to_owned();
+    let prompt = prompt.to_owned();
+    let (sender, receiver) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let mut worker = Some(thread::spawn(move || {
+        let events = app_server_command_result_events_with_cancel(
+            &worker_config,
+            &session_id,
+            cwd.as_deref(),
+            &command_id,
+            &prompt,
+            worker_cancel,
+        );
+        let _ = sender.send(events);
+    }));
+
+    set_socket_read_timeout(socket, Some(connector_read_tick()))?;
+    loop {
+        match receiver.try_recv() {
+            Ok(events) => {
+                join_codex_worker(worker.take())?;
+                set_socket_read_timeout(socket, Some(connector_read_tick()))?;
+                return Ok(events);
+            }
+            Err(TryRecvError::Disconnected) => {
+                join_codex_worker(worker.take())?;
+                return Err("app-server command worker stopped before returning events".into());
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                handle_background_text_message(
+                    socket,
+                    text.as_ref(),
+                    config,
+                    last_host_sessions_message,
+                    deferred_messages,
+                )?;
+            }
+            Ok(Message::Ping(payload)) => socket.send(Message::Pong(payload))?,
+            Ok(Message::Close(_)) => {
+                cancel_codex_worker(&cancel, worker.take())?;
+                return Err("connection closed while app-server command was running".into());
+            }
+            Ok(_) => {}
+            Err(error) if is_read_timeout(&error) => {}
+            Err(error) => {
+                cancel_codex_worker(&cancel, worker.take())?;
+                return Err(error.into());
+            }
+        }
+    }
+}
+
 fn cancel_codex_worker(
     cancel: &AtomicBool,
     worker: Option<thread::JoinHandle<()>>,
@@ -495,6 +645,14 @@ fn handle_background_text_message(
     Ok(())
 }
 
+fn requires_app_server_execution_mode(dispatch: &CommandDispatch) -> bool {
+    dispatch.command.command_type == CommandType::Codex
+        && dispatch
+            .target_host_session
+            .as_ref()
+            .is_some_and(|target| target.app_server_present)
+}
+
 fn command_events(command: &CommandPayload) -> Vec<ConnectorEvent> {
     match command.command_type {
         CommandType::Placeholder => placeholder_event_stream(&command.prompt),
@@ -512,6 +670,33 @@ fn command_events(command: &CommandPayload) -> Vec<ConnectorEvent> {
             },
         ],
     }
+}
+
+fn app_server_missing_target_events() -> Vec<ConnectorEvent> {
+    vec![ConnectorEvent {
+        kind: "command.failed".to_owned(),
+        priority: "P1".to_owned(),
+        summary: "Codex app-server execution requires an attached local app-server session."
+            .to_owned(),
+    }]
+}
+
+fn app_server_wrong_execution_mode_events() -> Vec<ConnectorEvent> {
+    vec![ConnectorEvent {
+        kind: "command.failed".to_owned(),
+        priority: "P1".to_owned(),
+        summary: "Attached app-server sessions require execution.mode = \"app_server\".".to_owned(),
+    }]
+}
+
+fn app_server_non_app_server_target_events(session_id: &str) -> Vec<ConnectorEvent> {
+    vec![ConnectorEvent {
+        kind: "command.failed".to_owned(),
+        priority: "P1".to_owned(),
+        summary: format!(
+            "Attached local session {session_id} is not available through Codex app-server."
+        ),
+    }]
 }
 
 fn dispatch_events(
@@ -671,8 +856,9 @@ fn set_socket_read_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        AckWaitAction, CommandPayload, CommandType, classify_ack_wait_text, command_events,
-        host_sessions_interval, is_read_timeout,
+        AckWaitAction, CommandDispatch, CommandPayload, CommandTargetHostSession, CommandType,
+        classify_ack_wait_text, command_events, host_sessions_interval, is_read_timeout,
+        requires_app_server_execution_mode,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use std::io::{self, ErrorKind};
@@ -720,6 +906,42 @@ mod tests {
             events.last().map(|event| event.summary.as_str()),
             Some("Codex exec is disabled in this connector config.")
         );
+    }
+
+    #[test]
+    fn app_server_targets_require_app_server_execution_mode() {
+        let dispatch = CommandDispatch {
+            command: CommandPayload {
+                id: "command-1".to_owned(),
+                command_type: CommandType::Codex,
+                prompt: "continue".to_owned(),
+            },
+            target_host_session: Some(CommandTargetHostSession {
+                session_id: "session-1".to_owned(),
+                app_server_present: true,
+                cwd: None,
+            }),
+        };
+
+        assert!(requires_app_server_execution_mode(&dispatch));
+    }
+
+    #[test]
+    fn non_app_server_targets_do_not_require_app_server_execution_mode() {
+        let dispatch = CommandDispatch {
+            command: CommandPayload {
+                id: "command-1".to_owned(),
+                command_type: CommandType::Codex,
+                prompt: "continue".to_owned(),
+            },
+            target_host_session: Some(CommandTargetHostSession {
+                session_id: "session-1".to_owned(),
+                app_server_present: false,
+                cwd: None,
+            }),
+        };
+
+        assert!(!requires_app_server_execution_mode(&dispatch));
     }
 
     #[test]

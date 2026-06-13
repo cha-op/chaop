@@ -4,7 +4,6 @@ import {
   type HostSessionBackfillDispatch,
   type HostSessionBackfillResult,
   type AgentHostSessionsReport,
-  type CommandDispatch,
   type HostSessionsUpdatePayload,
   type LocalThreadCreateDispatch,
   type LocalThreadCreateResult,
@@ -484,9 +483,9 @@ export class WorkspaceDO implements DurableObject {
   }
 
   private async sendPendingCommands(ws: WebSocket, connectorId: string): Promise<void> {
-    const commands = await pendingCommandsForConnector(this.env, connectorId);
-    for (const command of commands) {
-      const payload: CommandDispatch = { command };
+    const dispatches = await pendingCommandsForConnector(this.env, connectorId);
+    for (const payload of dispatches) {
+      const command = payload.command;
       ws.send(
         JSON.stringify(
           createEnvelope("command.dispatch", { type: "worker", id: "workspace-do-global" }, payload, {

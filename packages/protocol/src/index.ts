@@ -216,6 +216,12 @@ export type CommandSummary = {
   updated_at: string;
 };
 
+export type CommandTargetHostSession = {
+  session_id: string;
+  app_server_present: boolean;
+  cwd?: string | undefined;
+};
+
 export type ThreadEvent = {
   id: string;
   thread_id: string;
@@ -313,6 +319,7 @@ export type DetachHostSessionResponse = {
 
 export type CommandDispatch = {
   command: CommandSummary;
+  target_host_session?: CommandTargetHostSession | undefined;
 };
 
 export type AgentCommandEvent = {

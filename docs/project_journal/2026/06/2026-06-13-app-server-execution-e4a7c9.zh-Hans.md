@@ -1,0 +1,46 @@
+---
+id: 20260613-e4a7c9-zh-Hans
+title: App-server 执行切片
+status: completed
+created: 2026-06-13
+updated: 2026-06-13
+branch:
+pr:
+supersedes:
+  - 20260610-b7f2c1
+superseded_by:
+---
+
+[ [British English](2026-06-13-app-server-execution-e4a7c9.md) | 简体中文 ]
+
+# App-server 执行切片
+
+## 摘要
+- 本切片为 Chaop commands 增加真实 Codex app-server execution path。
+- 该路径通过私有 connector 配置显式开启：`execution.mode = "app_server"` 和 `session_inventory.app_server_url`。
+- CLI adapter 仍保留为 `execution.mode = "codex_exec"`，用于 fallback 和对照。
+
+## 决策
+- App-server command 只运行在已经 attach 到本机 app-server Host Session 的 Chaop thread 或 task 上。
+- 保持现有 `codex` command type 兼容；Worker 现在会在 `command.dispatch` 中带上已 attach 的本机 session target。
+- 执行前先把保存的 app-server `sessionId` 解析成当前 app-server `Thread.id`，再调用 `thread/resume` 和 `turn/start`。
+- 只从最终 app-server turn 返回简短 Chaop lifecycle events，不上传完整本机 transcript 或 artefact data。
+
+## 实现记录
+- Protocol 增加 `CommandTargetHostSession` 和可选 `CommandDispatch.target_host_session`。
+- Worker command lease 会关联已 attach 的 `host_sessions`，因此 Durable Object 可以把本机 session target dispatch 给 connector。
+- Command creation 现在会优先选择所选 thread/task 已 attach Host Session 的 owning connector，而不是 workspace 里任意最近在线的 connector。
+- 已 attach 的 app-server commands 要求 owning connector 声明 `codex_app_server_exec`；Worker creation/leasing 和 Rust connector 都会拒绝 fallback 到普通 `codex_exec`。
+- Connector config 增加 `execution.mode = "app_server"`；该模式下会声明 `codex_app_server_exec`，但不会同时声明只适用于 CLI 的 `codex_exec` capability。
+- Rust connector 会把 app-server command 放到后台 worker 中运行，主 control WebSocket 仍继续响应 ping、关闭和 background control messages。
+- App-server execution path 同时处理同步终态 `turn/start` response 和异步 `turn/completed` notification。
+- App-server `thread/resume` 和 `turn/start` 会使用已 attach session 的 cwd；只有当 attached cwd 缺失或不是绝对路径时，才 fallback 到 connector `workspace_root`。
+
+## 验证目标
+- Worker tests 覆盖 command dispatch 的 target host-session mapping。
+- Rust tests 覆盖 app-server session 解析、`thread/resume`、`turn/start`、终态 turn 处理和 completion notification。
+- 合并前跑完整 `pnpm test`、Rust workspace tests、build、journal validation 和 PR readiness review。
+
+## 后续事项
+- R2 artefact capture 仍留到后续切片。
+- Command lifecycle summary 之外的 budget aggregation 仍是后续工作。

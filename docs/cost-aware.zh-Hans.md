@@ -8,7 +8,7 @@
 
 | 服务面 | Chaop 为什么会用到 | 应设置的预算告警 |
 | --- | --- | --- |
-| OpenAI / Codex 用量 | 当 connector 配置 `execution.mode = "codex_exec"` 时，本机 connector 会执行 `codex exec`。这会消耗本机 Codex 登录账号对应的 Codex 额度，或者消耗 API/project budget，具体取决于本机 Codex 配置。 | 如果本机 Codex 走 API 计费，设置 OpenAI API 月度预算和邮件阈值。如果本机 Codex 走 ChatGPT/Codex 计划额度，关注 Codex usage 或 limit 页面。 |
+| OpenAI / Codex 用量 | 当 connector 配置 `execution.mode = "codex_exec"` 时，本机 connector 会执行 `codex exec`；当配置 `execution.mode = "app_server"` 时，它会通过本机 Codex app-server 启动 turn。两者都会消耗本机 Codex 登录账号对应的 Codex 额度，或者消耗 API/project budget，具体取决于本机 Codex 配置。 | 如果本机 Codex 走 API 计费，设置 OpenAI API 月度预算和邮件阈值。如果本机 Codex 走 ChatGPT/Codex 计划额度，关注 Codex usage 或 limit 页面。 |
 | Cloudflare Workers | `chaop-api` 承载浏览器 API、agent bootstrap、agent WebSocket upgrade 和 command dispatch。`chaop-web` 承载 GUI。 | 设置账号级 billing/usage notification，并为 Worker 设置 CPU limit。重点看 requests 和 CPU time。 |
 | Durable Objects | `WorkspaceDO` 负责协调浏览器和 connector 的实时 WebSocket。 | 关注 Durable Object requests、incoming WebSocket message 量和 duration。长连接如果没有 hibernation，可能产生 duration 成本。 |
 | D1 | D1 保存 users、connectors、workspaces、tasks、commands、token hashes 和 thread events。 | 关注 rows read、rows written 和 storage。最容易增长的是 event 写入量。 |
@@ -35,15 +35,17 @@
 ```toml
 [execution]
 mode = "codex_exec"
+# 或：
+mode = "app_server"
 ```
 
-当前 connector 只会把 lifecycle events、最终 assistant message 摘要和 token-usage 摘要发回 Cloudflare。它不会上传完整 Codex stdout/stderr、artefacts 或 token 级日志。
-Codex prompt 会通过 stdin 传入；每个 Codex command 都有 connector 配置里的 runtime timeout 和 stdout/stderr output cap。
+App-server execution 当前只会把 lifecycle events 和最终 assistant message 摘要发回 Cloudflare。CLI adapter 还会在 Codex JSONL 包含 token usage 时回传 token-usage 摘要。Connector 不会上传完整 Codex stdout/stderr、本机 transcripts、artefacts 或 token 级日志。
+`codex_exec` 会通过 stdin 传入 Codex prompt，`app_server` 会通过 `turn/start` 传入；每个 Codex command 都有 connector 配置里的 runtime timeout。
 
 ## 后续需要保留的成本控制
 
 - 每台 host 保持一个 Rust connector，本机多个逻辑 agent 都从它聚合。
-- `codex_exec` 继续按 connector 显式 opt-in。
+- `codex_exec` 和 `app_server` 继续按 connector 显式 opt-in。
 - 在明确 artefact upload policy 前，只回传短摘要。
 - 在增加 live stdout streaming 前，先做 server-side per-command event limits。
 - 启用 artefact upload 前，先做 R2 chunking 和 retention rules。

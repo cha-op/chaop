@@ -102,5 +102,5 @@ superseded_by:
 - Review follow-up 会避免在 source-state app-server scan 已触达分页预算时，把 target-state 里同一个 session tree 的其它 row 误判成 archive sync 已完成。Source 分页预算耗尽后，只有 exact `Thread.id` target match 仍可证明本机 app-server 状态已经同步。
 
 ## 下一步
-- 在 app-server protocol path 可以干净覆盖 create、resume、archive 和 event/history reads 之前，Codex CLI adapter 继续作为当前可用的 execution fallback。
+- App-server command execution 闭环记录在 `docs/project_journal/2026/06/2026-06-13-app-server-execution-e4a7c9.zh-Hans.md`。
 - R2 artefact capture 和 budget aggregation 排在这些核心控制闭环工作之后。

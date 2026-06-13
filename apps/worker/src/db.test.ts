@@ -6,6 +6,7 @@ import {
   ensureConnectorInventory,
   listThreadEventsInDb,
   markConnectorDisconnected,
+  pendingCommandsForConnector,
   recordAgentEvent,
   recordHostSessionBackfillEvents,
   recordHostSessions
@@ -103,6 +104,20 @@ test("ensureConnectorInventory retires duplicate connectors through disconnect c
   assert.equal(db.migratedHostSessions, 1);
   assert.equal(db.deletedOldHostSessions, 1);
   assert.equal(db.retiredConnectorTokens, 1);
+});
+
+test("pendingCommandsForConnector includes the attached host session target", async () => {
+  const db = pendingCommandDispatchDb();
+
+  const dispatches = await pendingCommandsForConnector({ DB: db } as Env, "connector-online");
+
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0]?.command.id, "command-1");
+  assert.equal(dispatches[0]?.target_host_session?.session_id, "session-tree-1");
+  assert.equal(dispatches[0]?.target_host_session?.app_server_present, true);
+  assert.equal(dispatches[0]?.target_host_session?.cwd, "/workspace/project");
+  assert.equal(db.commandLeaseUpdates, 1);
+  assert.equal(db.connectorActivityUpdates, 1);
 });
 
 test("recordHostSessions preserves stored sessions outside the latest top-N report", async () => {
@@ -863,6 +878,121 @@ function duplicateConnectorRetirementDb() {
     }
   };
 
+  return db as D1Database & typeof counters;
+}
+
+function pendingCommandDispatchDb() {
+  const counters = {
+    commandLeaseUpdates: 0,
+    connectorActivityUpdates: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
+        assert.match(sql, /hs\.session_id AS target_host_session_id/);
+        assert.match(sql, /hs\.connector_id IS NULL OR hs\.connector_id = \?/);
+        assert.match(sql, /codex_app_server_exec/);
+        assert.match(sql, /c\.capabilities_json LIKE/);
+        return {
+          bind(
+            now: string,
+            targetConnectorId: string,
+            hostSessionConnectorId: string,
+            executableConnectorId: string
+          ) {
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(targetConnectorId, "connector-online");
+            assert.equal(hostSessionConnectorId, "connector-online");
+            assert.equal(executableConnectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [
+                    {
+                      id: "command-1",
+                      workspace_id: "workspace-api",
+                      thread_id: "thread-1",
+                      task_id: "task-1",
+                      type: "codex",
+                      prompt: "Summarise this thread",
+                      state: "pending",
+                      target_connector_id: "connector-online",
+                      created_at: "2026-06-13T10:00:00.000Z",
+                      updated_at: "2026-06-13T10:00:00.000Z",
+                      target_host_session_id: "session-tree-1",
+                      target_host_session_app_server_present: 1,
+                      target_host_session_cwd: "/workspace/project"
+                    }
+                  ]
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'leased'/.test(sql)) {
+        return {
+          bind(
+            connectorId: string,
+            leaseUntil: string,
+            updatedAt: string,
+            commandId: string,
+            now: string
+          ) {
+            assert.equal(connectorId, "connector-online");
+            assert.match(leaseUntil, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                counters.commandLeaseUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { active_count: 1 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /active_command_count/.test(sql)) {
+        return {
+          bind(activeCount: number, updatedAt: string, connectorId: string) {
+            assert.equal(activeCount, 1);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                counters.connectorActivityUpdates += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandLeaseUpdates() {
+      return counters.commandLeaseUpdates;
+    },
+    get connectorActivityUpdates() {
+      return counters.connectorActivityUpdates;
+    }
+  };
   return db as D1Database & typeof counters;
 }
 

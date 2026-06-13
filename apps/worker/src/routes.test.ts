@@ -1164,6 +1164,121 @@ test("command creation preserves codex type for capable target connectors when D
   assert.equal(body.command.target_connector_id, "connector-online");
 });
 
+test("command creation targets the connector that owns an attached host session", async () => {
+  const envWithAttachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      { attachedThreadConnectorId: "connector-attached", attachedThreadAppServerPresent: true }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached session"
+      })
+    }),
+    envWithAttachedSession
+  );
+  const body = (await response.json()) as { command: { target_connector_id?: string; type: string } };
+
+  assert.equal(response.status, 202);
+  assert.equal(body.command.type, "codex");
+  assert.equal(body.command.target_connector_id, "connector-attached");
+});
+
+test("command creation accepts attached app-server commands without codex_exec capability", async () => {
+  const envWithAttachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        supportsCodex: false,
+        supportsAppServerExec: true
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached app-server session"
+      })
+    }),
+    envWithAttachedSession
+  );
+  const body = (await response.json()) as { command: { target_connector_id?: string; type: string } };
+
+  assert.equal(response.status, 202);
+  assert.equal(body.command.type, "codex");
+  assert.equal(body.command.target_connector_id, "connector-attached");
+});
+
+test("command creation rejects explicit targets that do not own an attached host session", async () => {
+  const envWithAttachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      { attachedThreadConnectorId: "connector-attached" }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors",
+        target_connector_id: "connector-online"
+      })
+    }),
+    envWithAttachedSession
+  );
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), {
+    error: "Target connector does not own the attached host session"
+  });
+});
+
+test("command creation rejects attached app-server commands when the owner lacks app-server execution", async () => {
+  const envWithAttachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        supportsAppServerExec: false
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached app-server session"
+      })
+    }),
+    envWithAttachedSession
+  );
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), { error: "Target connector not available" });
+});
+
 test("command creation rejects codex target connectors without codex_exec capability", async () => {
   const envWithPlaceholderConnector: Env = {
     ...devEnv,
@@ -1314,12 +1429,22 @@ function commandTargetDb(
     threadWorkspaceId?: string;
     taskWorkspaceId?: string;
     taskThreadId?: string;
+    attachedTaskConnectorId?: string;
+    attachedThreadConnectorId?: string;
+    attachedTaskAppServerPresent?: boolean;
+    attachedThreadAppServerPresent?: boolean;
+    supportsAppServerExec?: boolean;
   } = {}
 ): D1Database {
   const supportsCodex = options.supportsCodex ?? true;
+  const supportsAppServerExec = options.supportsAppServerExec ?? true;
   const threadWorkspaceId = options.threadWorkspaceId ?? "workspace-api";
   const taskWorkspaceId = options.taskWorkspaceId ?? "workspace-api";
   const taskThreadId = options.taskThreadId ?? "thread-orders-500";
+  const attachedTaskConnectorId = options.attachedTaskConnectorId;
+  const attachedThreadConnectorId = options.attachedThreadConnectorId;
+  const attachedTaskAppServerPresent = options.attachedTaskAppServerPresent ?? false;
+  const attachedThreadAppServerPresent = options.attachedThreadAppServerPresent ?? false;
   return {
     prepare(sql: string) {
       if (/INSERT INTO users/.test(sql)) {
@@ -1375,6 +1500,44 @@ function commandTargetDb(
         };
       }
 
+      if (/SELECT hs\.connector_id/.test(sql) && /hs\.attached_task_id = \?/.test(sql)) {
+        return {
+          bind(workspaceId: string, taskId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(taskId.startsWith("task-"), true);
+            return {
+              async first() {
+                return attachedTaskConnectorId
+                  ? {
+                    connector_id: attachedTaskConnectorId,
+                    app_server_present: attachedTaskAppServerPresent ? 1 : 0
+                  }
+                  : null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT hs\.connector_id/.test(sql) && /hs\.attached_thread_id = \?/.test(sql)) {
+        return {
+          bind(workspaceId: string, threadId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-orders-500");
+            return {
+              async first() {
+                return attachedThreadConnectorId
+                  ? {
+                    connector_id: attachedThreadConnectorId,
+                    app_server_present: attachedThreadAppServerPresent ? 1 : 0
+                  }
+                  : null;
+              }
+            };
+          }
+        };
+      }
+
       if (/SELECT c\.id/.test(sql) && /WHERE c\.id = \?/.test(sql)) {
         assert.match(sql, /workspace_connectors/);
         assert.match(sql, /wc\.workspace_id = \?/);
@@ -1382,16 +1545,38 @@ function commandTargetDb(
         assert.match(sql, /c\.status <> 'offline'/);
         assert.match(sql, /capabilities_json LIKE/);
         return {
-          bind(connectorId: string, workspaceId: string, commandType: string) {
+          bind(
+            connectorId: string,
+            workspaceId: string,
+            commandType: string,
+            requireAppServerExecForAppServer?: number,
+            requireAppServerExecForCodexExec?: number
+          ) {
             assert.equal(connectorId.startsWith("connector-"), true);
             assert.equal(workspaceId, "workspace-api");
             assert.equal(commandType === "placeholder" || commandType === "codex", true);
+            assert.equal(
+              requireAppServerExecForAppServer === undefined
+              || requireAppServerExecForAppServer === 0
+              || requireAppServerExecForAppServer === 1,
+              true
+            );
+            assert.equal(
+              requireAppServerExecForCodexExec === undefined
+              || requireAppServerExecForCodexExec === 0
+              || requireAppServerExecForCodexExec === 1,
+              true
+            );
+            assert.equal(requireAppServerExecForAppServer, requireAppServerExecForCodexExec);
             return {
               async first() {
+                if (commandType === "codex" && requireAppServerExecForAppServer === 1) {
+                  return row && supportsAppServerExec ? { id: connectorId } : null;
+                }
                 if (commandType === "codex" && !supportsCodex) {
                   return null;
                 }
-                return row;
+                return row ? { id: connectorId } : null;
               }
             };
           }

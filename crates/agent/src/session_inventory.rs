@@ -1,11 +1,16 @@
 use crate::config::AgentConfig;
+use crate::placeholder::ConnectorEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 use tungstenite::{
     Message, WebSocket, client::client, connect, handshake::HandshakeError, http::Uri,
@@ -1035,6 +1040,652 @@ pub fn set_app_server_thread_archived(
     )
 }
 
+pub fn app_server_command_started_event(session_id: &str) -> ConnectorEvent {
+    ConnectorEvent {
+        kind: "command.started".to_owned(),
+        priority: "P1".to_owned(),
+        summary: format!("Connector started Codex app-server turn for local thread {session_id}."),
+    }
+}
+
+pub fn app_server_command_result_events_with_cancel(
+    config: &AgentConfig,
+    session_id: &str,
+    cwd: Option<&str>,
+    command_id: &str,
+    prompt: &str,
+    cancel: Arc<AtomicBool>,
+) -> Vec<ConnectorEvent> {
+    match run_app_server_command(config, session_id, cwd, command_id, prompt, cancel) {
+        Ok(events) => events,
+        Err(AppServerCommandError::Cancelled) => vec![ConnectorEvent {
+            kind: "command.failed".to_owned(),
+            priority: "P1".to_owned(),
+            summary: "Codex app-server turn was cancelled because the connector connection closed."
+                .to_owned(),
+        }],
+        Err(AppServerCommandError::TimedOut(seconds)) => vec![ConnectorEvent {
+            kind: "command.failed".to_owned(),
+            priority: "P1".to_owned(),
+            summary: format!("Codex app-server turn timed out after {seconds} seconds."),
+        }],
+        Err(AppServerCommandError::Other(error)) => vec![ConnectorEvent {
+            kind: "command.failed".to_owned(),
+            priority: "P1".to_owned(),
+            summary: format!("Codex app-server turn could not start: {error}."),
+        }],
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AppServerCommandError {
+    Cancelled,
+    TimedOut(u64),
+    Other(String),
+}
+
+fn run_app_server_command(
+    config: &AgentConfig,
+    session_id: &str,
+    cwd: Option<&str>,
+    command_id: &str,
+    prompt: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<ConnectorEvent>, AppServerCommandError> {
+    let url = config
+        .session_inventory
+        .app_server_url
+        .as_deref()
+        .ok_or_else(|| {
+            AppServerCommandError::Other(
+                "session_inventory.app_server_url is required for app-server execution".to_owned(),
+            )
+        })?;
+    let timeout_seconds = config.execution.codex_timeout_seconds.max(1);
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let socket_timeout = app_server_command_socket_timeout(
+        config.session_inventory.app_server_timeout_seconds,
+        timeout_seconds,
+    );
+    let mut socket = connect_app_server(url, socket_timeout)
+        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+    initialize_app_server_connection_for_command(
+        &mut socket,
+        socket_timeout,
+        deadline,
+        timeout_seconds,
+        &cancel,
+    )?;
+
+    let cwd = app_server_command_cwd(config, cwd);
+    let mut request_id = 1;
+    let thread_id = resolve_app_server_thread_id_for_command(
+        &mut socket,
+        session_id,
+        &mut request_id,
+        socket_timeout,
+        deadline,
+        timeout_seconds,
+        &cancel,
+    )?
+    .ok_or_else(|| {
+        AppServerCommandError::Other(format!(
+            "active app-server thread {session_id} was not found"
+        ))
+    })?;
+    let resume_response = send_app_server_request_for_command(
+        &mut socket,
+        request_id,
+        "thread/resume",
+        serde_json::json!({
+            "threadId": thread_id,
+            "cwd": cwd.clone(),
+            "runtimeWorkspaceRoots": [cwd.clone()],
+            "excludeTurns": true
+        }),
+        socket_timeout,
+        deadline,
+        timeout_seconds,
+        &cancel,
+    )?;
+    request_id += 1;
+    let thread_id = response_thread_id(&resume_response).unwrap_or(thread_id);
+
+    let turn_response = send_app_server_request_for_command(
+        &mut socket,
+        request_id,
+        "turn/start",
+        serde_json::json!({
+            "threadId": thread_id,
+            "clientUserMessageId": command_id,
+            "input": [{
+                "type": "text",
+                "text": prompt,
+                "text_elements": []
+            }],
+            "cwd": cwd.clone(),
+            "runtimeWorkspaceRoots": [cwd]
+        }),
+        socket_timeout,
+        deadline,
+        timeout_seconds,
+        &cancel,
+    )?;
+    let Some(turn) = turn_response
+        .get("result")
+        .and_then(|result| result.get("turn"))
+    else {
+        return Err(AppServerCommandError::Other(
+            "app-server turn/start response did not include result.turn".to_owned(),
+        ));
+    };
+    let turn_id = turn
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppServerCommandError::Other(
+                "app-server turn/start response did not include turn.id".to_owned(),
+            )
+        })?
+        .to_owned();
+    if turn_is_terminal(turn) {
+        return Ok(app_server_command_events_from_turn(turn, None));
+    }
+    wait_for_app_server_turn_completion(
+        &mut socket,
+        &thread_id,
+        &turn_id,
+        socket_timeout,
+        deadline,
+        timeout_seconds,
+        &cancel,
+    )
+}
+
+fn initialize_app_server_connection_for_command(
+    socket: &mut AppServerSocket,
+    timeout: Duration,
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+) -> Result<(), AppServerCommandError> {
+    let _ = send_app_server_request_for_command(
+        socket,
+        0,
+        "initialize",
+        serde_json::json!({
+            "clientInfo": {
+                "name": "chaop-agent",
+                "title": "Chaop connector",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "requestAttestation": false
+            }
+        }),
+        timeout,
+        deadline,
+        timeout_seconds,
+        cancel,
+    )?;
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "initialized"
+            })
+            .to_string()
+            .into(),
+        ))
+        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+    Ok(())
+}
+
+fn send_app_server_request_for_command(
+    socket: &mut AppServerSocket,
+    id: i64,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+) -> Result<Value, AppServerCommandError> {
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            })
+            .to_string()
+            .into(),
+        ))
+        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+
+    loop {
+        ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
+        configure_socket_timeout(
+            socket,
+            remaining_app_server_command_timeout(timeout, deadline),
+        )
+        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                let value = serde_json::from_str::<Value>(text.as_ref())
+                    .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+                if value.get("id").and_then(Value::as_i64) != Some(id) {
+                    continue;
+                }
+                if let Some(error) = value.get("error") {
+                    return Err(AppServerCommandError::Other(
+                        app_server_error(method, error).to_string(),
+                    ));
+                }
+                return Ok(value);
+            }
+            Ok(Message::Close(_)) => {
+                return Err(AppServerCommandError::Other(format!(
+                    "app-server closed before {method} completed"
+                )));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut => {
+            }
+            Err(error) => return Err(AppServerCommandError::Other(error.to_string())),
+        }
+    }
+}
+
+fn resolve_app_server_thread_id_for_command(
+    socket: &mut AppServerSocket,
+    session_id: &str,
+    next_request_id: &mut i64,
+    timeout: Duration,
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+) -> Result<Option<String>, AppServerCommandError> {
+    let scan = find_app_server_thread_ids_in_pages_for_command(
+        socket,
+        session_id,
+        Some(false),
+        next_request_id,
+        timeout,
+        deadline,
+        timeout_seconds,
+        cancel,
+    )?;
+    match scan {
+        AppServerArchivePageScan::Complete(scan) => Ok(scan.thread_ids.into_iter().next()),
+        AppServerArchivePageScan::Exhausted { session_thread_ids }
+            if !session_thread_ids.is_empty() =>
+        {
+            Err(AppServerCommandError::Other(
+                "app-server execution exceeded page budget while resolving a session tree"
+                    .to_owned(),
+            ))
+        }
+        AppServerArchivePageScan::Exhausted { .. } => Err(AppServerCommandError::Other(
+            "app-server execution exceeded page budget before resolving thread state".to_owned(),
+        )),
+    }
+}
+
+fn find_app_server_thread_ids_in_pages_for_command(
+    socket: &mut AppServerSocket,
+    thread_id: &str,
+    archived_filter: Option<bool>,
+    next_request_id: &mut i64,
+    timeout: Duration,
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+) -> Result<AppServerArchivePageScan, AppServerCommandError> {
+    let mut seen_threads = HashSet::new();
+    let mut seen_match_thread_ids = HashSet::new();
+    let mut session_thread_ids = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    for _ in 0..APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE {
+        ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
+        let response = send_app_server_request_for_command(
+            socket,
+            *next_request_id,
+            "thread/list",
+            app_server_thread_list_params(
+                APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE,
+                cursor.as_deref(),
+                archived_filter,
+            ),
+            timeout,
+            deadline,
+            timeout_seconds,
+            cancel,
+        )?;
+        *next_request_id += 1;
+
+        let matches = app_server_archive_thread_ids_from_response(&response, thread_id);
+        if let Some(exact_thread_id) = matches.exact_thread_id {
+            return Ok(AppServerArchivePageScan::Complete(
+                AppServerArchiveCompletePageScan {
+                    thread_ids: vec![exact_thread_id],
+                    matched_exact_thread: true,
+                },
+            ));
+        }
+        for session_thread_id in matches.session_thread_ids {
+            if seen_match_thread_ids.insert(session_thread_id.clone()) {
+                session_thread_ids.push(session_thread_id);
+            }
+        }
+
+        let page_len = app_server_thread_list_data(&response)
+            .map(std::vec::Vec::len)
+            .unwrap_or(0);
+        let page_keys = app_server_thread_identity_keys_from_response(&response);
+        let new_key_count = page_keys
+            .into_iter()
+            .filter(|key| seen_threads.insert(key.to_owned()))
+            .count();
+        let next_cursor = app_server_thread_list_next_cursor(&response);
+        if next_cursor.is_none() || page_len == 0 || new_key_count == 0 {
+            return Ok(AppServerArchivePageScan::Complete(
+                AppServerArchiveCompletePageScan {
+                    thread_ids: session_thread_ids,
+                    matched_exact_thread: false,
+                },
+            ));
+        }
+        let next_cursor = next_cursor.expect("checked above");
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Ok(AppServerArchivePageScan::Complete(
+                AppServerArchiveCompletePageScan {
+                    thread_ids: session_thread_ids,
+                    matched_exact_thread: false,
+                },
+            ));
+        }
+        cursor = Some(next_cursor);
+    }
+    Ok(AppServerArchivePageScan::Exhausted { session_thread_ids })
+}
+
+fn wait_for_app_server_turn_completion(
+    socket: &mut AppServerSocket,
+    thread_id: &str,
+    turn_id: &str,
+    timeout: Duration,
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+) -> Result<Vec<ConnectorEvent>, AppServerCommandError> {
+    let mut output = AppServerTurnOutput::default();
+    loop {
+        ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
+        configure_socket_timeout(
+            socket,
+            remaining_app_server_command_timeout(timeout, deadline),
+        )
+        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                let value = serde_json::from_str::<Value>(text.as_ref())
+                    .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+                if let Some(events) =
+                    handle_app_server_turn_notification(&value, thread_id, turn_id, &mut output)?
+                {
+                    return Ok(events);
+                }
+            }
+            Ok(Message::Close(_)) => {
+                return Err(AppServerCommandError::Other(
+                    "app-server closed before turn completed".to_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut => {
+            }
+            Err(error) => return Err(AppServerCommandError::Other(error.to_string())),
+        }
+    }
+}
+
+fn handle_app_server_turn_notification(
+    value: &Value,
+    thread_id: &str,
+    turn_id: &str,
+    output: &mut AppServerTurnOutput,
+) -> Result<Option<Vec<ConnectorEvent>>, AppServerCommandError> {
+    let Some(method) = value.get("method").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let params = value.get("params").unwrap_or(&Value::Null);
+    match method {
+        "item/agentMessage/delta" if notification_matches(params, thread_id, turn_id) => {
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                output.agent_message.push_str(delta);
+            }
+        }
+        "item/commandExecution/outputDelta" if notification_matches(params, thread_id, turn_id) => {
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                output.command_output.push_str(delta);
+            }
+        }
+        "turn/completed" if turn_completed_notification_matches(params, thread_id, turn_id) => {
+            let turn = params.get("turn").ok_or_else(|| {
+                AppServerCommandError::Other(
+                    "app-server turn/completed notification did not include turn".to_owned(),
+                )
+            })?;
+            return Ok(Some(app_server_command_events_from_turn(
+                turn,
+                Some(output),
+            )));
+        }
+        "error" if notification_matches(params, thread_id, turn_id) => {
+            let will_retry = params
+                .get("willRetry")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !will_retry {
+                return Err(AppServerCommandError::Other(format!(
+                    "app-server reported a turn error: {}",
+                    app_server_turn_error_message(params.get("error"))
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+fn notification_matches(params: &Value, thread_id: &str, turn_id: &str) -> bool {
+    params.get("threadId").and_then(Value::as_str) == Some(thread_id)
+        && params.get("turnId").and_then(Value::as_str) == Some(turn_id)
+}
+
+fn turn_completed_notification_matches(params: &Value, thread_id: &str, turn_id: &str) -> bool {
+    params.get("threadId").and_then(Value::as_str) == Some(thread_id)
+        && params
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            == Some(turn_id)
+}
+
+fn app_server_command_events_from_turn(
+    turn: &Value,
+    fallback: Option<&AppServerTurnOutput>,
+) -> Vec<ConnectorEvent> {
+    let mut events = Vec::new();
+    let agent_message = last_agent_message_from_turn(turn).or_else(|| {
+        fallback.and_then(|output| compact_command_summary(&output.agent_message, 700))
+    });
+    if let Some(message) = agent_message {
+        events.push(ConnectorEvent {
+            kind: "command.output".to_owned(),
+            priority: "P2".to_owned(),
+            summary: format!("Codex: {message}"),
+        });
+    } else if turn_status(turn) == Some("completed") {
+        events.push(ConnectorEvent {
+            kind: "command.output".to_owned(),
+            priority: "P2".to_owned(),
+            summary: "Codex app-server turn completed without an assistant message.".to_owned(),
+        });
+    }
+
+    let command_output = command_output_from_turn(turn).or_else(|| {
+        fallback.and_then(|output| compact_command_summary(&output.command_output, 500))
+    });
+    if let Some(output) = command_output {
+        events.push(ConnectorEvent {
+            kind: "command.output".to_owned(),
+            priority: "P3".to_owned(),
+            summary: format!("Codex app-server command output: {output}"),
+        });
+    }
+
+    match turn_status(turn) {
+        Some("completed") => events.push(ConnectorEvent {
+            kind: "command.finished".to_owned(),
+            priority: "P1".to_owned(),
+            summary: "Codex app-server turn completed successfully.".to_owned(),
+        }),
+        Some("interrupted") => events.push(ConnectorEvent {
+            kind: "command.failed".to_owned(),
+            priority: "P1".to_owned(),
+            summary: "Codex app-server turn was interrupted.".to_owned(),
+        }),
+        Some("failed") => events.push(ConnectorEvent {
+            kind: "command.failed".to_owned(),
+            priority: "P1".to_owned(),
+            summary: format!(
+                "Codex app-server turn failed: {}",
+                app_server_turn_error_message(turn.get("error"))
+            ),
+        }),
+        _ => events.push(ConnectorEvent {
+            kind: "command.failed".to_owned(),
+            priority: "P1".to_owned(),
+            summary: "Codex app-server turn ended with an unknown status.".to_owned(),
+        }),
+    }
+    events
+}
+
+fn response_thread_id(value: &Value) -> Option<String> {
+    value
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn app_server_command_cwd(config: &AgentConfig, cwd: Option<&str>) -> String {
+    cwd.filter(|value| Path::new(value).is_absolute())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| config.workspace_root.to_string_lossy().into_owned())
+}
+
+fn turn_is_terminal(turn: &Value) -> bool {
+    matches!(
+        turn_status(turn),
+        Some("completed") | Some("failed") | Some("interrupted")
+    )
+}
+
+fn turn_status(turn: &Value) -> Option<&str> {
+    turn.get("status").and_then(Value::as_str)
+}
+
+fn last_agent_message_from_turn(turn: &Value) -> Option<String> {
+    turn.get("items")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter_map(|text| compact_command_summary(text, 700))
+        .last()
+}
+
+fn command_output_from_turn(turn: &Value) -> Option<String> {
+    turn.get("items")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("commandExecution"))
+        .filter_map(|item| item.get("aggregatedOutput").and_then(Value::as_str))
+        .filter_map(|text| compact_command_summary(text, 500))
+        .last()
+}
+
+fn app_server_turn_error_message(error: Option<&Value>) -> String {
+    error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .and_then(|message| compact_command_summary(message, 500))
+        .unwrap_or_else(|| "unknown error".to_owned())
+}
+
+fn compact_command_summary(value: &str, max_chars: usize) -> Option<String> {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    if compact.chars().count() <= max_chars {
+        return Some(compact);
+    }
+    let mut truncated = compact.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    Some(truncated)
+}
+
+#[derive(Default)]
+struct AppServerTurnOutput {
+    agent_message: String,
+    command_output: String,
+}
+
+fn ensure_app_server_command_budget(
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+) -> Result<(), AppServerCommandError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AppServerCommandError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(AppServerCommandError::TimedOut(timeout_seconds));
+    }
+    Ok(())
+}
+
+fn app_server_command_socket_timeout(
+    app_server_timeout_seconds: u64,
+    command_timeout_seconds: u64,
+) -> Duration {
+    Duration::from_secs(
+        app_server_timeout_seconds
+            .max(1)
+            .min(command_timeout_seconds)
+            .min(5),
+    )
+}
+
+fn remaining_app_server_command_timeout(timeout: Duration, deadline: Instant) -> Duration {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Duration::from_millis(1);
+    }
+    remaining.min(timeout).max(Duration::from_millis(1))
+}
+
 fn set_app_server_thread_archived_at(
     url: &str,
     thread_id: &str,
@@ -1678,18 +2329,22 @@ fn default_codex_home() -> PathBuf {
 mod tests {
     use super::{
         APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, HistorySession, SessionDraft, TitleSource,
-        app_server_sessions_from_response, app_server_thread_from_response,
-        app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
-        create_app_server_thread_at, load_app_server_sessions, read_recent_lines,
-        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
-        set_app_server_thread_archived_at, unix_seconds_to_iso,
+        app_server_command_result_events_with_cancel, app_server_sessions_from_response,
+        app_server_thread_from_response, app_server_titles_from_response,
+        build_host_session_backfill, build_host_sessions_report, create_app_server_thread_at,
+        load_app_server_sessions, read_recent_lines, remaining_app_server_archive_timeout,
+        resolve_session, rollout_paths, set_app_server_thread_archived_at, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc::{self, Receiver};
+    use std::sync::{
+        Arc,
+        atomic::AtomicBool,
+        mpsc::{self, Receiver},
+    };
     use std::thread;
     use std::time::{Duration, Instant};
     use tungstenite::{Message, accept};
@@ -3146,8 +3801,327 @@ mod tests {
         );
     }
 
+    #[test]
+    fn app_server_command_resumes_session_and_starts_turn() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-live-1",
+                            "sessionId": "session-tree-1",
+                            "name": "Live thread",
+                            "cwd": "/tmp/project",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "turns": []
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "turn": completed_turn("turn-1", "chaop-smoke")
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            Some("/tmp/attached-project"),
+            "command-1",
+            "Say exactly: chaop-smoke",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "command.output");
+        assert_eq!(events[0].summary, "Codex: chaop-smoke");
+        assert_eq!(events[1].kind, "command.finished");
+        assert_eq!(
+            events[1].summary,
+            "Codex app-server turn completed successfully."
+        );
+
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let turn_start_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("turn/start request");
+
+        assert_eq!(
+            list_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-live-1")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/attached-project")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-live-1")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/attached-project")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/clientUserMessageId")
+                .and_then(serde_json::Value::as_str),
+            Some("command-1")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/input/0/text")
+                .and_then(serde_json::Value::as_str),
+            Some("Say exactly: chaop-smoke")
+        );
+    }
+
+    #[test]
+    fn app_server_command_reports_failed_turn() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let url = run_fake_app_server(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-live-1",
+                            "sessionId": "session-tree-1",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "turns": []
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "turn": failed_turn("turn-1", "approval denied")
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            None,
+            "command-1",
+            "Run risky command",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "command.failed");
+        assert_eq!(
+            events[0].summary,
+            "Codex app-server turn failed: approval denied"
+        );
+    }
+
+    #[test]
+    fn app_server_command_waits_for_turn_completed_notification() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let url = run_fake_app_server(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-live-1",
+                            "sessionId": "session-tree-1",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "turns": []
+                    }
+                }
+            }),
+            json!([
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {
+                        "turn": in_progress_turn("turn-1")
+                    }
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-live-1",
+                        "turn": completed_turn("turn-1", "done after notification")
+                    }
+                }
+            ]),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            None,
+            "command-1",
+            "Wait for completion",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].summary, "Codex: done after notification");
+        assert_eq!(events[1].kind, "command.finished");
+    }
+
     fn run_fake_app_server(responses: Vec<serde_json::Value>) -> String {
         run_fake_app_server_with_requests(responses).0
+    }
+
+    fn completed_turn(turn_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "id": turn_id,
+            "items": [
+                {
+                    "type": "agentMessage",
+                    "id": "item-agent-1",
+                    "text": text,
+                    "phase": null,
+                    "memoryCitation": null
+                }
+            ],
+            "itemsView": "full",
+            "status": "completed",
+            "error": null,
+            "startedAt": 1781263443,
+            "completedAt": 1781263444,
+            "durationMs": 1000
+        })
+    }
+
+    fn failed_turn(turn_id: &str, message: &str) -> serde_json::Value {
+        json!({
+            "id": turn_id,
+            "items": [],
+            "itemsView": "full",
+            "status": "failed",
+            "error": {
+                "message": message,
+                "codexErrorInfo": "other",
+                "additionalDetails": null
+            },
+            "startedAt": 1781263443,
+            "completedAt": 1781263444,
+            "durationMs": 1000
+        })
+    }
+
+    fn in_progress_turn(turn_id: &str) -> serde_json::Value {
+        json!({
+            "id": turn_id,
+            "items": [],
+            "itemsView": "summary",
+            "status": "inProgress",
+            "error": null,
+            "startedAt": 1781263443,
+            "completedAt": null,
+            "durationMs": null
+        })
     }
 
     fn app_server_thread_list_response() -> serde_json::Value {
@@ -3251,9 +4225,17 @@ mod tests {
             for response in responses {
                 let request = read_fake_app_server_message(&mut socket);
                 let _ = requests_tx.send(request);
-                socket
-                    .send(Message::Text(response.to_string().into()))
-                    .expect("send app-server response");
+                if let Some(messages) = response.as_array() {
+                    for message in messages {
+                        socket
+                            .send(Message::Text(message.to_string().into()))
+                            .expect("send app-server response message");
+                    }
+                } else {
+                    socket
+                        .send(Message::Text(response.to_string().into()))
+                        .expect("send app-server response");
+                }
             }
         });
         (format!("ws://{address}"), requests_rx)

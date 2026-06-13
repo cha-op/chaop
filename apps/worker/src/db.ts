@@ -5,6 +5,8 @@ import type {
   AgentHostSessionsReport,
   AttachHostSessionResponse,
   BootstrapPayload,
+  CommandDispatch,
+  CommandTargetHostSession,
   CommandSummary,
   ConnectorSummary,
   CreateLocalThreadRequest,
@@ -637,15 +639,24 @@ export async function createCommandInDb(
 
   const commandType = request.type ?? "placeholder";
   const scope = await resolveCommandScope(env, request);
+  const attachedTarget = await findAttachedCommandTarget(env, scope);
   const targetConnectorId =
-    request.target_connector_id ?? (await chooseConnectorForWorkspace(env, scope.workspaceId, commandType));
+    request.target_connector_id
+    ?? attachedTarget?.connector_id
+    ?? (await chooseConnectorForWorkspace(env, scope.workspaceId, commandType));
 
   if (request.target_connector_id && !targetConnectorId) {
     throw new CommandTargetError("Target connector not available");
   }
 
+  if (attachedTarget && targetConnectorId !== attachedTarget.connector_id) {
+    throw new CommandTargetError("Target connector does not own the attached host session");
+  }
+
   if (targetConnectorId) {
-    await assertConnectorCanExecute(env, targetConnectorId, scope.workspaceId, commandType);
+    await assertConnectorCanExecute(env, targetConnectorId, scope.workspaceId, commandType, {
+      requireAppServerExec: attachedTarget?.app_server_present === true && commandType === "codex"
+    });
   }
 
   const now = new Date().toISOString();
@@ -700,19 +711,30 @@ export async function createCommandInDb(
 export async function pendingCommandsForConnector(
   env: Env,
   connectorId: string
-): Promise<CommandSummary[]> {
+): Promise<CommandDispatch[]> {
   if (!env.DB) return [];
 
   const now = new Date().toISOString();
-  const rows = await allRows<CommandRow>(
+  const rows = await allRows<PendingCommandRow>(
     env.DB.prepare(
-      `SELECT id, workspace_id, thread_id, task_id, type, prompt, state, target_connector_id, created_at, updated_at
+      `SELECT cmd.id, cmd.workspace_id, cmd.thread_id, cmd.task_id, cmd.type, cmd.prompt, cmd.state,
+              cmd.target_connector_id, cmd.created_at, cmd.updated_at,
+              hs.session_id AS target_host_session_id,
+              hs.app_server_present AS target_host_session_app_server_present,
+              hs.cwd AS target_host_session_cwd
        FROM commands cmd
+       LEFT JOIN host_sessions hs
+         ON hs.workspace_id = cmd.workspace_id
+        AND (
+          (cmd.task_id IS NOT NULL AND hs.attached_task_id = cmd.task_id)
+          OR (cmd.thread_id IS NOT NULL AND hs.attached_thread_id = cmd.thread_id)
+        )
        WHERE (
            cmd.state = 'pending'
            OR (cmd.state = 'leased' AND cmd.lease_until IS NOT NULL AND cmd.lease_until < ?)
          )
          AND (cmd.target_connector_id = ? OR cmd.target_connector_id IS NULL)
+         AND (hs.connector_id IS NULL OR hs.connector_id = ?)
          AND EXISTS (
            SELECT 1
            FROM workspace_connectors wc
@@ -721,15 +743,25 @@ export async function pendingCommandsForConnector(
              AND wc.connector_id = ?
              AND wc.can_execute = 1
              AND c.status <> 'offline'
-             AND (cmd.type <> 'codex' OR c.capabilities_json LIKE '%"codex_exec"%')
+             AND (
+               cmd.type <> 'codex'
+               OR (
+                 COALESCE(hs.app_server_present, 0) = 1
+                 AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
+               )
+               OR (
+                 COALESCE(hs.app_server_present, 0) <> 1
+                 AND c.capabilities_json LIKE '%"codex_exec"%'
+               )
+             )
          )
        ORDER BY created_at ASC
        LIMIT 1`
-    ).bind(now, connectorId, connectorId)
+    ).bind(now, connectorId, connectorId, connectorId)
   );
 
   const leaseUntil = new Date(Date.now() + 60_000).toISOString();
-  const leasedRows: CommandRow[] = [];
+  const leasedRows: PendingCommandRow[] = [];
 
   for (const row of rows) {
     const result = await env.DB.prepare(
@@ -752,7 +784,13 @@ export async function pendingCommandsForConnector(
     await updateConnectorActivity(env, connectorId);
   }
 
-  return leasedRows.map((row) => ({ ...commandFromRow(row), state: "leased" }));
+  return leasedRows.map((row) => {
+    const command = { ...commandFromRow(row), state: "leased" as const };
+    const targetHostSession = commandTargetHostSessionFromRow(row);
+    return targetHostSession
+      ? { command, target_host_session: targetHostSession }
+      : { command };
+  });
 }
 
 export async function recordAgentEvent(
@@ -1251,6 +1289,49 @@ async function chooseConnectorForWorkspace(
   return row?.id;
 }
 
+async function findAttachedCommandTarget(
+  env: Env,
+  scope: { workspaceId: string; threadId?: string | undefined; taskId?: string | undefined }
+): Promise<{ connector_id: string; app_server_present: boolean } | undefined> {
+  if (scope.taskId) {
+    const row = await env.DB!.prepare(
+      `SELECT hs.connector_id, hs.app_server_present
+       FROM host_sessions hs
+       WHERE hs.workspace_id = ? AND hs.attached_task_id = ?
+       ORDER BY hs.updated_at DESC
+       LIMIT 1`
+    )
+      .bind(scope.workspaceId, scope.taskId)
+      .first<{ connector_id: string; app_server_present: number | boolean | null }>();
+    if (row?.connector_id) {
+      return {
+        connector_id: row.connector_id,
+        app_server_present: row.app_server_present === 1 || row.app_server_present === true
+      };
+    }
+  }
+
+  if (scope.threadId) {
+    const row = await env.DB!.prepare(
+      `SELECT hs.connector_id, hs.app_server_present
+       FROM host_sessions hs
+       WHERE hs.workspace_id = ? AND hs.attached_thread_id = ?
+       ORDER BY hs.updated_at DESC
+       LIMIT 1`
+    )
+      .bind(scope.workspaceId, scope.threadId)
+      .first<{ connector_id: string; app_server_present: number | boolean | null }>();
+    if (row?.connector_id) {
+      return {
+        connector_id: row.connector_id,
+        app_server_present: row.app_server_present === 1 || row.app_server_present === true
+      };
+    }
+  }
+
+  return undefined;
+}
+
 async function findBestLocalThreadConnector(
   env: Env,
   workspaceId: string
@@ -1351,17 +1432,34 @@ async function assertConnectorCanExecute(
   env: Env,
   connectorId: string,
   workspaceId: string,
-  commandType: CommandSummary["type"]
+  commandType: CommandSummary["type"],
+  options: { requireAppServerExec?: boolean } = {}
 ): Promise<void> {
   const connector = await env.DB!.prepare(
     `SELECT c.id
      FROM connectors c
      INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
      WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
-       AND (? <> 'codex' OR c.capabilities_json LIKE '%"codex_exec"%')
+       AND (
+         ? <> 'codex'
+         OR (
+           ? = 1
+           AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
+         )
+         OR (
+           ? = 0
+           AND c.capabilities_json LIKE '%"codex_exec"%'
+         )
+       )
      LIMIT 1`
   )
-    .bind(connectorId, workspaceId, commandType)
+    .bind(
+      connectorId,
+      workspaceId,
+      commandType,
+      options.requireAppServerExec ? 1 : 0,
+      options.requireAppServerExec ? 1 : 0
+    )
     .first<{ id: string }>();
   if (!connector) {
     throw new CommandTargetError("Target connector not available");
@@ -1443,6 +1541,16 @@ function commandFromRow(row: CommandRow): CommandSummary {
     target_connector_id: row.target_connector_id ?? undefined,
     created_at: row.created_at,
     updated_at: row.updated_at
+  };
+}
+
+function commandTargetHostSessionFromRow(row: PendingCommandRow): CommandTargetHostSession | undefined {
+  if (!row.target_host_session_id) return undefined;
+  return {
+    session_id: row.target_host_session_id,
+    app_server_present:
+      row.target_host_session_app_server_present === 1 || row.target_host_session_app_server_present === true,
+    cwd: row.target_host_session_cwd ?? undefined
   };
 }
 
@@ -1580,6 +1688,12 @@ type CommandRow = Omit<CommandSummary, "thread_id" | "task_id" | "target_connect
   thread_id: string | null;
   task_id: string | null;
   target_connector_id: string | null;
+};
+
+type PendingCommandRow = CommandRow & {
+  target_host_session_id: string | null;
+  target_host_session_app_server_present: number | boolean | null;
+  target_host_session_cwd: string | null;
 };
 
 type ThreadEventRow = Omit<ThreadEvent, "command_id"> & {
