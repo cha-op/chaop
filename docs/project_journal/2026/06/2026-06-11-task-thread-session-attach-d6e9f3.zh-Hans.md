@@ -76,7 +76,8 @@ superseded_by:
 - Review follow-up 还会在普通 connector inventory refresh 期间保留已 attach host sessions 的 workspace 归属，避免新建成功后的 inventory report 又把 created session 移回 connector 默认 workspace。
 - Worker 的 D1 helper 会 upsert 创建出的 app-server session，并复用已有 attach 流程，所以新 session 会立即变成 task/thread 组合。
 - Task Board 和 Thread Command Centre 现在提供聚焦的 `New local thread` 表单；创建成功后会直接打开真实 thread。
-- 部署指南现在记录了本地 `codex app-server --experimental --listen ws://127.0.0.1:9876` 前提，以及私有 connector `app_server_url` 配置。
+- Review follow-up 让 app-server client 对齐已记录的协议：会在 `thread/list` 或 `thread/start` 前先发送 `initialize` 和 `initialized`，并接受没有 legacy `sessionId` 的官方 `Thread.id` 响应。
+- 部署指南现在记录了本地 `codex app-server --listen ws://127.0.0.1:9876` 前提，以及私有 connector `app_server_url` 配置。
 
 ## 下一步
 - 新建 thread 跑通后，再做旧 session history backfill，让 attach 的旧 sessions 可以显示有用的历史 output，同时默认不上传宽泛的本机 transcripts。

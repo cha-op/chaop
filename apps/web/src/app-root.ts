@@ -6,6 +6,7 @@ import {
   type BootstrapPayload,
   type CommandSummary,
   type ConnectorSummary,
+  type CreateLocalThreadResponse,
   type HostSessionsUpdatePayload,
   type HostSessionSummary,
   type TaskState,
@@ -667,20 +668,27 @@ export class ChaopApp extends LitElement {
     const title = this.newThreadTitle.trim() || "New Codex thread";
     this.newThreadState = "creating";
     this.actionError = undefined;
+    let response: CreateLocalThreadResponse;
     try {
-      const response = await createLocalThread({
+      response = await createLocalThread({
         workspace_id: workspace.id,
         title,
         connector_id: this.newThreadConnectorId || undefined
       });
-      this.mergeAttachedSession(response);
-      this.newThreadState = "idle";
-      this.newThreadTitle = "New Codex thread";
-      this.openThread(response.thread.id);
-      await this.load();
     } catch (error) {
       this.newThreadState = "failed";
       this.actionError = actionErrorMessage("Thread creation failed", error);
+      return;
+    }
+
+    this.mergeAttachedSession(response);
+    this.newThreadState = "idle";
+    this.newThreadTitle = "New Codex thread";
+    this.openThread(response.thread.id);
+    try {
+      await this.load();
+    } catch (error) {
+      this.actionError = actionErrorMessage("Thread refresh failed", error);
     }
   };
 

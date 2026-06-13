@@ -76,7 +76,8 @@ superseded_by:
 - Review follow-up preserves the workspace of already attached host sessions during ordinary connector inventory refreshes, so a post-create inventory report cannot move the created session back to the connector's default workspace.
 - Worker D1 helpers upsert the created app-server session and reuse the existing attach flow so the new session immediately becomes a task/thread pair.
 - Task Board and Thread Command Centre now expose a focused `New local thread` form; successful creation opens the real thread.
-- Deployment guidance now documents the local `codex app-server --experimental --listen ws://127.0.0.1:9876` prerequisite and the private connector `app_server_url` setting.
+- Review follow-up aligns the app-server client with the documented protocol by sending `initialize` and `initialized` before `thread/list` or `thread/start`, and by accepting official `Thread.id` responses without a legacy `sessionId`.
+- Deployment guidance now documents the local `codex app-server --listen ws://127.0.0.1:9876` prerequisite and the private connector `app_server_url` setting.
 
 ## Next Steps
 - After new-thread creation works, add old-session history backfill so attached sessions can show useful previous output without uploading broad local transcripts by default.

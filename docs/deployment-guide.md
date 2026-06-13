@@ -362,7 +362,7 @@ New local threads always start in the connector's configured `workspace_root`; t
 Start the local app-server with a private listener that only the connector host can reach:
 
 ```bash
-codex app-server --experimental --listen ws://127.0.0.1:9876
+codex app-server --listen ws://127.0.0.1:9876
 ```
 
 Then set the matching private connector config:
@@ -448,7 +448,7 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether `/connector/bootstrap` and `/ws/agent` are excluded from Browser Access.
 - If Codex exec returns `Codex executable not found`, set `execution.codex_command` to an absolute path that the connector process can execute, for example `/opt/homebrew/bin/codex` on this macOS deployment. This is separate from the attached session `cwd`.
 - If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
-- If New local thread fails with an app-server error, check that `codex app-server --experimental --listen ws://127.0.0.1:9876` is running, `session_inventory.app_server_url` matches it, and the connector was restarted after the config change.
+- If New local thread fails with an app-server error, check that `codex app-server --listen ws://127.0.0.1:9876` is running, `session_inventory.app_server_url` matches it, and the connector was restarted after the config change.
 - If Host Sessions is empty or stale, use the Host Sessions refresh button, wait up to `session_inventory.report_interval_seconds`, check that the connector was restarted after this slice, `session_inventory.enabled` is true, and the connector user can read `CODEX_HOME` or `~/.codex`.
 - If an attached historical Host Session shows only a few events, that is expected in the current slice: attachment imports session metadata and title only. Historical rollout/transcript backfill and full artefact capture are deferred.
 - If D1 migration fails, confirm the D1 database UUID is present in the Worker config.

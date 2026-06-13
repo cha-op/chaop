@@ -510,6 +510,7 @@ fn load_app_server_sessions(
 ) -> Result<HashMap<String, AppServerSession>, Box<dyn std::error::Error>> {
     let (mut socket, _) = connect(url)?;
     configure_socket_timeout(&mut socket, Duration::from_secs(timeout_seconds.max(1)))?;
+    initialize_app_server_connection(&mut socket)?;
     socket.send(Message::Text(
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -574,7 +575,7 @@ fn app_server_sessions_from_response(value: &Value) -> HashMap<String, AppServer
         return sessions;
     };
     for thread in data {
-        let Some(session_id) = thread.get("sessionId").and_then(Value::as_str) else {
+        let Some(session_id) = app_server_thread_session_id(thread) else {
             continue;
         };
         sessions.insert(
@@ -590,6 +591,13 @@ fn app_server_sessions_from_response(value: &Value) -> HashMap<String, AppServer
         );
     }
     sessions
+}
+
+fn app_server_thread_session_id(thread: &Value) -> Option<&str> {
+    thread
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .or_else(|| thread.get("id").and_then(Value::as_str))
 }
 
 #[cfg(test)]
@@ -626,6 +634,7 @@ fn create_app_server_thread_at(
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
     let (mut socket, _) = connect(url)?;
     configure_socket_timeout(&mut socket, Duration::from_secs(timeout_seconds.max(1)))?;
+    initialize_app_server_connection(&mut socket)?;
     let start_response = send_app_server_request(
         &mut socket,
         1,
@@ -666,6 +675,36 @@ fn create_app_server_thread_at(
         cwd: started.cwd,
         updated_at: started.updated_at,
     })
+}
+
+fn initialize_app_server_connection(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = send_app_server_request(
+        socket,
+        0,
+        "initialize",
+        serde_json::json!({
+            "clientInfo": {
+                "name": "chaop-agent",
+                "title": "Chaop connector",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "requestAttestation": false
+            }
+        }),
+    )?;
+    socket.send(Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized"
+        })
+        .to_string()
+        .into(),
+    ))?;
+    Ok(())
 }
 
 fn send_app_server_request(
@@ -725,10 +764,7 @@ fn app_server_thread_from_response(
         .get("id")
         .and_then(Value::as_str)
         .ok_or("app-server thread/start response did not include thread.id")?;
-    let session_id = thread
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .ok_or("app-server thread/start response did not include thread.sessionId")?;
+    let session_id = app_server_thread_session_id(thread).unwrap_or(id);
     Ok(AppServerThread {
         id: id.to_owned(),
         session_id: session_id.to_owned(),
@@ -839,14 +875,14 @@ mod tests {
     use super::{
         HistorySession, SessionDraft, TitleSource, app_server_sessions_from_response,
         app_server_thread_from_response, app_server_titles_from_response,
-        build_host_sessions_report, create_app_server_thread_at, read_recent_lines,
-        resolve_session, rollout_paths, unix_seconds_to_iso,
+        build_host_sessions_report, create_app_server_thread_at, load_app_server_sessions,
+        read_recent_lines, resolve_session, rollout_paths, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
     use tungstenite::{Message, accept};
 
@@ -903,8 +939,8 @@ mod tests {
             "id": 1,
             "result": {
                 "data": [
-                    { "sessionId": "session-1", "name": "App server title" },
-                    { "sessionId": "session-2", "name": null }
+                    { "id": "session-1", "name": "App server title" },
+                    { "id": "session-2", "name": null }
                 ]
             }
         });
@@ -926,7 +962,7 @@ mod tests {
             "result": {
                 "data": [
                     {
-                        "sessionId": "session-1",
+                        "id": "session-1",
                         "name": null,
                         "cwd": "/tmp/project",
                         "updatedAt": 1781263443
@@ -947,6 +983,34 @@ mod tests {
     }
 
     #[test]
+    fn loads_app_server_sessions_after_initialization() {
+        let url = run_fake_app_server(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "data": [
+                    {
+                        "id": "session-1",
+                        "name": "Server title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                ]
+            }
+        })]);
+
+        let sessions = load_app_server_sessions(&url, 20, 1).expect("sessions");
+        let session = sessions.get("session-1").expect("session");
+
+        assert_eq!(session.name.as_deref(), Some("Server title"));
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(
+            session.updated_at.as_deref(),
+            Some("2026-06-12T11:24:03.000Z")
+        );
+    }
+
+    #[test]
     fn parses_app_server_thread_start_response() {
         let response = json!({
             "jsonrpc": "2.0",
@@ -954,7 +1018,6 @@ mod tests {
             "result": {
                 "thread": {
                     "id": "thread-1",
-                    "sessionId": "session-1",
                     "name": "Created title",
                     "cwd": "/tmp/project",
                     "updatedAt": 1781263443
@@ -965,7 +1028,7 @@ mod tests {
         let thread = app_server_thread_from_response(&response).expect("thread");
 
         assert_eq!(thread.id, "thread-1");
-        assert_eq!(thread.session_id, "session-1");
+        assert_eq!(thread.session_id, "thread-1");
         assert_eq!(thread.name.as_deref(), Some("Created title"));
         assert_eq!(thread.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(thread.updated_at, "2026-06-12T11:24:03.000Z");
@@ -980,7 +1043,6 @@ mod tests {
                 "result": {
                     "thread": {
                         "id": "thread-1",
-                        "sessionId": "session-1",
                         "name": null,
                         "cwd": "/tmp/project",
                         "updatedAt": 1781263443
@@ -997,7 +1059,7 @@ mod tests {
         let session = create_app_server_thread_at(&url, Some("Requested title"), "/tmp/project", 1)
             .expect("created thread");
 
-        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.session_id, "thread-1");
         assert_eq!(session.title, "Requested title");
         assert_eq!(session.title_source, TitleSource::AppServer);
         assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
@@ -1012,7 +1074,6 @@ mod tests {
                 "result": {
                     "thread": {
                         "id": "thread-1",
-                        "sessionId": "session-1",
                         "name": "Server title",
                         "cwd": "/tmp/project",
                         "updatedAt": 1781263443
@@ -1029,7 +1090,7 @@ mod tests {
         let session = create_app_server_thread_at(&url, Some("Requested title"), "/tmp/project", 1)
             .expect("created thread despite name failure");
 
-        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.session_id, "thread-1");
         assert_eq!(session.title, "Requested title");
     }
 
@@ -1150,14 +1211,74 @@ mod tests {
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept fake app-server client");
             let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("id").and_then(serde_json::Value::as_i64),
+                Some(0)
+            );
+            assert_eq!(
+                initialize.get("method").and_then(serde_json::Value::as_str),
+                Some("initialize")
+            );
+            assert_eq!(
+                initialize
+                    .get("params")
+                    .and_then(|params| params.get("clientInfo"))
+                    .and_then(|info| info.get("name"))
+                    .and_then(serde_json::Value::as_str),
+                Some("chaop-agent")
+            );
+            assert_eq!(
+                initialize
+                    .get("params")
+                    .and_then(|params| params.get("capabilities"))
+                    .and_then(|capabilities| capabilities.get("experimentalApi"))
+                    .and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {
+                            "userAgent": "codex-test",
+                            "codexHome": "/tmp/codex",
+                            "platformFamily": "unix",
+                            "platformOs": "macos"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized
+                    .get("method")
+                    .and_then(serde_json::Value::as_str),
+                Some("initialized")
+            );
+            assert!(initialized.get("id").is_none());
+
             for response in responses {
-                let message = socket.read().expect("read app-server request");
-                assert!(matches!(message, Message::Text(_)));
+                let _request = read_fake_app_server_message(&mut socket);
                 socket
                     .send(Message::Text(response.to_string().into()))
                     .expect("send app-server response");
             }
         });
         format!("ws://{address}")
+    }
+
+    fn read_fake_app_server_message(
+        socket: &mut tungstenite::WebSocket<TcpStream>,
+    ) -> serde_json::Value {
+        let message = socket.read().expect("read app-server request");
+        let Message::Text(text) = message else {
+            panic!("expected text message");
+        };
+        serde_json::from_str(text.as_ref()).expect("valid app-server json")
     }
 }
