@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { BootstrapPayload, HostSessionSummary } from "@chaop/protocol";
+import type { BootstrapPayload, HostSessionSummary, TaskArchiveResponse } from "@chaop/protocol";
 import {
+  archiveSyncNotice,
+  archiveSyncWarning,
   historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
@@ -183,6 +185,78 @@ test("historyBackfillNotice handles empty and failed backfills", () => {
   assert.equal(historyBackfillNotice(undefined), undefined);
 });
 
+test("archiveSyncNotice summarises successful app-server sync", () => {
+  assert.equal(
+    archiveSyncNotice(
+      "Archive",
+      archiveResponse({
+        attempted: true,
+        connector_id: "connector-1",
+        session_id: "session-1",
+        archived: true
+      })
+    ),
+    "Archive completed. App-server sync completed."
+  );
+});
+
+test("archiveSyncNotice stays quiet for D1-only or failed sync paths", () => {
+  assert.equal(archiveSyncNotice("Archive", archiveResponse()), undefined);
+  assert.equal(
+    archiveSyncNotice(
+      "Archive",
+      archiveResponse({
+        attempted: false,
+        connector_id: "connector-1",
+        session_id: "session-1",
+        archived: true
+      })
+    ),
+    undefined
+  );
+  assert.equal(
+    archiveSyncNotice(
+      "Unarchive",
+      archiveResponse({
+        attempted: true,
+        connector_id: "connector-1",
+        session_id: "session-1",
+        archived: false,
+        error: "Connector is offline"
+      })
+    ),
+    undefined
+  );
+});
+
+test("archiveSyncWarning reports app-server sync failures", () => {
+  assert.equal(
+    archiveSyncWarning(
+      "Unarchive",
+      archiveResponse({
+        attempted: true,
+        connector_id: "connector-1",
+        session_id: "session-1",
+        archived: false,
+        error: "Connector is offline"
+      })
+    ),
+    "Unarchive completed, but app-server sync did not: Connector is offline"
+  );
+  assert.equal(
+    archiveSyncWarning(
+      "Archive",
+      archiveResponse({
+        attempted: true,
+        connector_id: "connector-1",
+        session_id: "session-1",
+        archived: true
+      })
+    ),
+    undefined
+  );
+});
+
 function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   return {
     user: {
@@ -263,6 +337,23 @@ function hostSession(sessionId: string): HostSessionSummary {
     title_source: "metadata",
     cwd: "/Users/you/Program/project",
     updated_at: "2026-06-12T10:00:00.000Z"
+  };
+}
+
+function archiveResponse(archive_sync?: TaskArchiveResponse["archive_sync"]): TaskArchiveResponse {
+  return {
+    task: {
+      id: "task-1",
+      workspace_id: "workspace-api",
+      thread_id: "thread-1",
+      title: "Task",
+      category_id: "category-1",
+      state: "idle",
+      realtime_mode: "realtime",
+      budget_state: "normal",
+      updated_at: "2026-06-12T10:00:00.000Z"
+    },
+    archive_sync
   };
 }
 

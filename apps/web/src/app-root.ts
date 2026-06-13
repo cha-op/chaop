@@ -9,7 +9,6 @@ import {
   type CreateLocalThreadResponse,
   type HostSessionsUpdatePayload,
   type HostSessionSummary,
-  type TaskArchiveResponse,
   type TaskState,
   type TaskSummary,
   type ThreadEvent,
@@ -29,6 +28,8 @@ import {
   unarchiveTask
 } from "./api.js";
 import {
+  archiveSyncNotice,
+  archiveSyncWarning,
   historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
@@ -727,6 +728,7 @@ export class ChaopApp extends LitElement {
   };
 
   private async toggleTaskArchive(task: TaskSummary): Promise<void> {
+    const action = task.archived_at ? "Unarchive" : "Archive";
     this.actionError = undefined;
     this.actionNotice = undefined;
     try {
@@ -734,10 +736,11 @@ export class ChaopApp extends LitElement {
         ? await unarchiveTask(task.id)
         : await archiveTask(task.id);
       this.mergeArchivedTask(response.task);
-      this.actionError = archiveSyncWarning(task.archived_at ? "Unarchive" : "Archive", response);
+      this.actionError = archiveSyncWarning(action, response);
+      this.actionNotice = archiveSyncNotice(action, response);
       await this.load();
     } catch (error) {
-      this.actionError = actionErrorMessage(task.archived_at ? "Unarchive failed" : "Archive failed", error);
+      this.actionError = actionErrorMessage(`${action} failed`, error);
     }
   }
 
@@ -1207,11 +1210,6 @@ function actionErrorMessage(prefix: string, error: unknown): string {
     return `${prefix}: ${error.message}`;
   }
   return prefix;
-}
-
-function archiveSyncWarning(action: "Archive" | "Unarchive", response: TaskArchiveResponse): string | undefined {
-  const error = response.archive_sync?.error;
-  return error ? `${action} completed, but app-server sync did not: ${error}` : undefined;
 }
 
 function cleanApiErrorMessage(message: string): string {
