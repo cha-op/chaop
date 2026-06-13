@@ -36,7 +36,7 @@ superseded_by:
 - App-server execution path 同时处理同步终态 `turn/start` response 和异步 `turn/completed` notification。
 - App-server `thread/resume` 和 `turn/start` 会使用已 attach session 的 cwd；只有当 attached cwd 缺失或不是绝对路径时，才 fallback 到 connector `workspace_root`。
 - Command session 解析会在 command timeout 预算内扫描 app-server `thread/list` 分页，不再复用 archive sync 的分页预算。
-- 已拿到 turn id 后，如果 connector 被取消或 command 超时，会 best-effort 发送 app-server `turn/interrupt`。
+- 如果 connector 被取消或 command 超时，且已经知道 turn id，或还能从 `turn/start` response 里恢复 turn id，会 best-effort 发送 app-server `turn/interrupt`。
 - App-server `commandExecution` output 默认不会转换成 Chaop command events。
 - PR readiness review 发现并修复了一个 dispatch 一致性问题：command creation 选择最新 attached Host Session，但 command lease 可能 join 到旧的重复 attachment row；现在 lease 使用同一套 task-first、latest-updated Host Session 选择规则。
 
@@ -44,6 +44,7 @@ superseded_by:
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
 - Worker tests 断言 command lease 只 join 最新的 task-first attached Host Session。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
+- Rust tests 覆盖 connector 还没读取 turn id 时的 `turn/start` 取消窗口。
 - 合并前跑完整 `pnpm test`、Rust workspace tests、build、journal validation 和 PR readiness review。
 
 ## 后续事项

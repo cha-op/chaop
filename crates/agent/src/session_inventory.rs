@@ -1077,7 +1077,7 @@ pub fn app_server_command_result_events_with_cancel(
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AppServerCommandError {
     Cancelled,
     TimedOut(u64),
@@ -1151,10 +1151,10 @@ fn run_app_server_command(
     request_id += 1;
     let thread_id = response_thread_id(&resume_response).unwrap_or(thread_id);
 
-    let turn_response = send_app_server_request_for_command(
+    let turn_response = send_app_server_turn_start_for_command(
         &mut socket,
-        request_id,
-        "turn/start",
+        &mut request_id,
+        &thread_id,
         serde_json::json!({
             "threadId": thread_id,
             "clientUserMessageId": command_id,
@@ -1171,7 +1171,6 @@ fn run_app_server_command(
         timeout_seconds,
         &cancel,
     )?;
-    request_id += 1;
     let Some(turn) = turn_response
         .get("result")
         .and_then(|result| result.get("turn"))
@@ -1292,6 +1291,97 @@ fn send_app_server_request_for_command(
                 return Err(AppServerCommandError::Other(format!(
                     "app-server closed before {method} completed"
                 )));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut => {
+            }
+            Err(error) => return Err(AppServerCommandError::Other(error.to_string())),
+        }
+    }
+}
+
+fn send_app_server_turn_start_for_command(
+    socket: &mut AppServerSocket,
+    next_request_id: &mut i64,
+    thread_id: &str,
+    params: Value,
+    timeout: Duration,
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+) -> Result<Value, AppServerCommandError> {
+    ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
+
+    let id = *next_request_id;
+    *next_request_id += 1;
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "turn/start",
+                "params": params
+            })
+            .to_string()
+            .into(),
+        ))
+        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+
+    let mut interruption = None::<AppServerCommandError>;
+    let mut interruption_deadline = None::<Instant>;
+    loop {
+        if interruption.is_none() {
+            interruption = app_server_command_interruption(deadline, timeout_seconds, cancel);
+            if interruption.is_some() {
+                interruption_deadline = Some(Instant::now() + timeout);
+            }
+        }
+        if let (Some(error), Some(deadline)) = (&interruption, interruption_deadline)
+            && Instant::now() >= deadline
+        {
+            return Err(error.clone());
+        }
+
+        let read_deadline = interruption_deadline.unwrap_or(deadline);
+        configure_socket_timeout(
+            socket,
+            remaining_app_server_command_timeout(timeout, read_deadline),
+        )
+        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                let value = serde_json::from_str::<Value>(text.as_ref())
+                    .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+                if value.get("id").and_then(Value::as_i64) != Some(id) {
+                    continue;
+                }
+                if let Some(error) = value.get("error") {
+                    if let Some(interruption) = interruption {
+                        return Err(interruption);
+                    }
+                    return Err(AppServerCommandError::Other(
+                        app_server_error("turn/start", error).to_string(),
+                    ));
+                }
+                if let Some(interruption) = interruption {
+                    if let Some(turn_id) = turn_id_from_start_response(&value) {
+                        send_app_server_turn_interrupt(
+                            socket,
+                            *next_request_id,
+                            thread_id,
+                            turn_id,
+                        );
+                        *next_request_id += 1;
+                    }
+                    return Err(interruption);
+                }
+                return Ok(value);
+            }
+            Ok(Message::Close(_)) => {
+                return Err(AppServerCommandError::Other(
+                    "app-server closed before turn/start completed".to_owned(),
+                ));
             }
             Ok(_) => {}
             Err(tungstenite::Error::Io(error))
@@ -1585,6 +1675,14 @@ fn response_thread_id(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn turn_id_from_start_response(value: &Value) -> Option<&str> {
+    value
+        .get("result")
+        .and_then(|result| result.get("turn"))
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+}
+
 fn app_server_command_cwd(config: &AgentConfig, cwd: Option<&str>) -> String {
     cwd.filter(|value| Path::new(value).is_absolute())
         .map(ToOwned::to_owned)
@@ -1643,13 +1741,24 @@ fn ensure_app_server_command_budget(
     timeout_seconds: u64,
     cancel: &AtomicBool,
 ) -> Result<(), AppServerCommandError> {
-    if cancel.load(Ordering::Relaxed) {
-        return Err(AppServerCommandError::Cancelled);
-    }
-    if Instant::now() >= deadline {
-        return Err(AppServerCommandError::TimedOut(timeout_seconds));
+    if let Some(error) = app_server_command_interruption(deadline, timeout_seconds, cancel) {
+        return Err(error);
     }
     Ok(())
+}
+
+fn app_server_command_interruption(
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+) -> Option<AppServerCommandError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Some(AppServerCommandError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Some(AppServerCommandError::TimedOut(timeout_seconds));
+    }
+    None
 }
 
 fn app_server_command_socket_timeout(
@@ -2328,8 +2437,8 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{
         Arc,
-        atomic::AtomicBool,
-        mpsc::{self, Receiver},
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
     };
     use std::thread;
     use std::time::{Duration, Instant};
@@ -4229,6 +4338,99 @@ mod tests {
     }
 
     #[test]
+    fn app_server_turn_start_interrupts_when_cancelled_before_turn_id_is_read() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, requests, release_turn_start) = run_fake_app_server_with_gated_turn_start();
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let command_cancel = Arc::clone(&cancel);
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                Some("/tmp/attached-project"),
+                "command-1",
+                "Continue carefully",
+                command_cancel,
+            )
+        });
+
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let turn_start_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("turn/start request");
+        assert_eq!(
+            list_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            resume_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert_eq!(
+            turn_start_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("turn/start")
+        );
+
+        cancel.store(true, Ordering::Relaxed);
+        release_turn_start
+            .send(())
+            .expect("release turn/start response");
+
+        let interrupt_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("turn/interrupt request");
+        assert_eq!(
+            interrupt_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("turn/interrupt")
+        );
+        assert_eq!(
+            interrupt_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-live-1")
+        );
+        assert_eq!(
+            interrupt_request
+                .pointer("/params/turnId")
+                .and_then(serde_json::Value::as_str),
+            Some("turn-race-1")
+        );
+
+        let events = handle.join().expect("command worker joins");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "command.failed");
+        assert_eq!(
+            events[0].summary,
+            "Codex app-server turn was cancelled because the connector connection closed."
+        );
+    }
+
+    #[test]
     fn app_server_command_omits_local_command_execution_output() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let url = run_fake_app_server(vec![
@@ -4487,6 +4689,116 @@ mod tests {
             }
         });
         (format!("ws://{address}"), requests_rx)
+    }
+
+    fn run_fake_app_server_with_gated_turn_start()
+    -> (String, Receiver<serde_json::Value>, Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+        let address = listener.local_addr().expect("fake app-server address");
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("id").and_then(serde_json::Value::as_i64),
+                Some(0)
+            );
+            assert_eq!(
+                initialize.get("method").and_then(serde_json::Value::as_str),
+                Some("initialize")
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {
+                            "userAgent": "codex-test",
+                            "codexHome": "/tmp/codex",
+                            "platformFamily": "unix",
+                            "platformOs": "macos"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized
+                    .get("method")
+                    .and_then(serde_json::Value::as_str),
+                Some("initialized")
+            );
+
+            let list_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(list_request);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "data": [
+                                {
+                                    "id": "thread-live-1",
+                                    "sessionId": "session-tree-1",
+                                    "updatedAt": 1781263443
+                                }
+                            ]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send thread/list response");
+
+            let resume_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(resume_request);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": "thread-live-1",
+                                "sessionId": "session-tree-1",
+                                "turns": []
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send thread/resume response");
+
+            let turn_start_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(turn_start_request);
+            release_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("release turn/start response");
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "result": {
+                            "turn": in_progress_turn("turn-race-1")
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send turn/start response");
+
+            let interrupt_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(interrupt_request);
+        });
+        (format!("ws://{address}"), requests_rx, release_tx)
     }
 
     fn run_fake_app_server_single_request() -> (String, Receiver<serde_json::Value>) {
