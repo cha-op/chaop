@@ -74,6 +74,7 @@ superseded_by:
 - Review follow-up 收紧了 cwd 边界：新建本机 thread 会从 connector 私有 `workspace_root` 启动，Browser 请求不能提供任意 cwd。App-server title 更新改为 best-effort，因此 `thread/start` 成功后即使 `thread/name/set` 失败，也仍会 attach 已创建的 thread。创建出的 host session 也会按请求 workspace upsert，避免多 workspace connector 把新 task/thread attach 到另一个 workspace。
 - Review follow-up 也会从 `thread/list` 读取 app-server-only inventory rows 的 `cwd` 和 `updatedAt`，避免 connector 在创建成功后的即时 refresh 又用空 cwd 或 epoch timestamp 覆盖刚 attach 好的 session。
 - Review follow-up 还会在普通 connector inventory refresh 期间保留已 attach host sessions 的 workspace 归属，避免新建成功后的 inventory report 又把 created session 移回 connector 默认 workspace。
+- Review follow-up 会为本机 thread RPC 选择同一 connector 的最新 WebSocket，降低 connector 重启期间命中过期 socket 而超时的概率，并确保测试 fixture 不包含本机 workspace 路径。
 - Worker 的 D1 helper 会 upsert 创建出的 app-server session，并复用已有 attach 流程，所以新 session 会立即变成 task/thread 组合。
 - Task Board 和 Thread Command Centre 现在提供聚焦的 `New local thread` 表单；创建成功后会直接打开真实 thread。
 - Review follow-up 让 app-server client 对齐已记录的协议：会在 `thread/list` 或 `thread/start` 前先发送 `initialize` 和 `initialized`，并接受没有 legacy `sessionId` 的官方 `Thread.id` 响应。

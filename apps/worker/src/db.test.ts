@@ -93,7 +93,7 @@ test("ensureConnectorInventory retires duplicate connectors through disconnect c
   await ensureConnectorInventory({ DB: db } as Env, "connector-new", {
     connector_name: "mac-studio",
     hostname: "mac-studio.local",
-    workspace_root: "/Users/joey/Program/Codex-workspace",
+    workspace_root: "/workspace/codex",
     capabilities: ["placeholder_commands"]
   });
 
@@ -115,7 +115,7 @@ test("recordHostSessions preserves stored sessions outside the latest top-N repo
           session_id: "session-new",
           title: "New session",
           title_source: "metadata",
-          cwd: "/Users/joey/Program/new",
+          cwd: "/workspace/new",
           updated_at: "2026-06-12T11:00:00.000Z"
         }
       ]
@@ -146,7 +146,7 @@ test("recordHostSessions preserves attached session workspace during inventory r
           session_id: "session-attached",
           title: "Attached session refresh",
           title_source: "app_server",
-          cwd: "/Users/joey/Program/refreshed",
+          cwd: "/workspace/refreshed",
           updated_at: "2026-06-12T11:00:00.000Z"
         }
       ]
@@ -633,7 +633,7 @@ function duplicateConnectorRetirementDb() {
                       session_id: "session-1",
                       title: "Attached session",
                       title_source: "history",
-                      cwd: "/Users/joey/Program/project",
+                      cwd: "/workspace/project",
                       attached_task_id: "task-old",
                       attached_thread_id: "thread-old",
                       updated_at: "2026-06-12T10:00:00.000Z"
@@ -740,7 +740,7 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
         session_id: "session-attached",
         title: "Attached session",
         title_source: "history",
-        cwd: "/Users/joey/Program/attached",
+        cwd: "/workspace/attached",
         attached_task_id: "task-attached",
         attached_thread_id: "thread-attached",
         updated_at: "2026-06-12T10:00:00.000Z"

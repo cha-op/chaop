@@ -213,7 +213,7 @@ test("local thread creation dispatches to an app-server capable connector and at
                   session_id: "session-created-1",
                   title: "Investigate retry loop",
                   title_source: "app_server",
-                  cwd: "/Users/joey/Program/Codex-workspace",
+                  cwd: "/workspace/codex",
                   updated_at: "2026-06-12T11:24:03.000Z"
                 }
               }),
@@ -393,7 +393,7 @@ test("agent bootstrap returns connector token", async () => {
       body: JSON.stringify({
         connector_name: "mac-studio",
         hostname: "mac-studio.local",
-        workspace_root: "/Users/joey/Program",
+        workspace_root: "/workspace",
         capabilities: ["placeholder"]
       })
     }),
@@ -415,7 +415,7 @@ test("agent bootstrap does not expose the old /api/agent/bootstrap path", async 
       body: JSON.stringify({
         connector_name: "mac-studio",
         hostname: "mac-studio.local",
-        workspace_root: "/Users/joey/Program",
+        workspace_root: "/workspace",
         capabilities: ["placeholder"]
       })
     }),
@@ -434,7 +434,7 @@ test("agent bootstrap returns local websocket URL in insecure local dev", async 
       body: JSON.stringify({
         connector_name: "mac-studio",
         hostname: "mac-studio.local",
-        workspace_root: "/Users/joey/Program",
+        workspace_root: "/workspace",
         capabilities: ["placeholder"]
       })
     }),
@@ -450,7 +450,7 @@ test("agent bootstrap returns stable connector ids for repeated names", async ()
   const body = JSON.stringify({
     connector_name: "mac-studio",
     hostname: "mac-studio.local",
-    workspace_root: "/Users/joey/Program",
+    workspace_root: "/workspace",
     capabilities: ["placeholder"]
   });
   const first = await handleRequest(
@@ -484,7 +484,7 @@ test("agent websocket accepts bootstrap-issued connector token before Durable Ob
       body: JSON.stringify({
         connector_name: "mac-studio",
         hostname: "mac-studio.local",
-        workspace_root: "/Users/joey/Program",
+        workspace_root: "/workspace",
         capabilities: ["placeholder"]
       })
     }),
@@ -1080,7 +1080,7 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
             assert.equal(sessionId, "session-created-1");
             assert.equal(title, "Investigate retry loop");
             assert.equal(titleSource, "app_server");
-            assert.equal(cwd, "/Users/joey/Program/Codex-workspace");
+            assert.equal(cwd, "/workspace/codex");
             assert.match(discoveredAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(updatedAt, "2026-06-12T11:24:03.000Z");
             return {
@@ -1290,7 +1290,7 @@ function hostSessionDetachDb(): D1Database {
     session_id: "session-1",
     title: "Attached session",
     title_source: "history",
-    cwd: "/Users/joey/Program/project",
+    cwd: "/workspace/project",
     updated_at: "2026-06-12T10:00:00.000Z",
     attached_task_id: "task-host-1",
     attached_thread_id: "thread-host-1"

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { hasPeerAgentSocket, hostSessionsMessage, threadEventMessage } from "./workspace-do.js";
+import { agentSocketsForConnector, hasPeerAgentSocket, hostSessionsMessage, threadEventMessage } from "./workspace-do.js";
 
 test("threadEventMessage wraps agent events for browser realtime consumers", () => {
   const message = threadEventMessage({
@@ -90,3 +90,25 @@ test("hasPeerAgentSocket returns false when the closing socket is the only agent
 
   assert.equal(hasPeerAgentSocket(ctx, "connector-1", closingSocket), false);
 });
+
+test("agentSocketsForConnector prefers the newest agent socket", () => {
+  const oldSocket = socketWithAttachment({ connectedAt: 100 });
+  const freshSocket = socketWithAttachment({ connectedAt: 300 });
+  const legacySocket = socketWithAttachment({});
+  const ctx = {
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "agent:connector-1");
+      return [oldSocket, legacySocket, freshSocket];
+    }
+  };
+
+  assert.deepEqual(agentSocketsForConnector(ctx, "connector-1"), [freshSocket, oldSocket, legacySocket]);
+});
+
+function socketWithAttachment(attachment: unknown): WebSocket {
+  return {
+    deserializeAttachment() {
+      return attachment;
+    }
+  } as unknown as WebSocket;
+}

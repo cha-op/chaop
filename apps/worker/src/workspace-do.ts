@@ -18,6 +18,12 @@ import type { Env } from "./types.js";
 
 const THREAD_CREATE_TIMEOUT_MS = 15_000;
 
+type SocketAttachment = {
+  socketType?: string;
+  connectorId?: string;
+  connectedAt?: number;
+};
+
 export class WorkspaceDO implements DurableObject {
   private readonly pendingThreadCreates = new Map<
     string,
@@ -59,7 +65,7 @@ export class WorkspaceDO implements DurableObject {
     const tags = connectorId ? [socketType, `${socketType}:${connectorId}`] : [socketType];
 
     this.ctx.acceptWebSocket(server, tags);
-    server.serializeAttachment({ socketType, connectorId });
+    server.serializeAttachment({ socketType, connectorId, connectedAt: Date.now() });
     server.send(
       JSON.stringify(
         createEnvelope("server.hello", { type: "worker", id: "workspace-do-global" }, { socket_type: socketType })
@@ -77,7 +83,7 @@ export class WorkspaceDO implements DurableObject {
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const text = typeof message === "string" ? message : new TextDecoder().decode(message);
-    const attachment = ws.deserializeAttachment() as { socketType?: string; connectorId?: string } | undefined;
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
     if (attachment?.socketType === "agent" && attachment.connectorId) {
       await this.handleAgentMessage(ws, attachment.connectorId, text);
       return;
@@ -231,7 +237,7 @@ export class WorkspaceDO implements DurableObject {
       return jsonResponse({ error: "Invalid local thread create payload" }, 400);
     }
 
-    const sockets = this.ctx.getWebSockets(`agent:${connectorId}`);
+    const sockets = agentSocketsForConnector(this.ctx, connectorId);
     const socket = sockets[0];
     if (!socket) {
       return jsonResponse({ error: "Connector is not connected" }, 404);
@@ -311,6 +317,20 @@ export function hasPeerAgentSocket(
   socket: WebSocket
 ): boolean {
   return ctx.getWebSockets(`agent:${connectorId}`).some((candidate) => candidate !== socket);
+}
+
+export function agentSocketsForConnector(
+  ctx: Pick<DurableObjectState, "getWebSockets">,
+  connectorId: string
+): WebSocket[] {
+  return [...ctx.getWebSockets(`agent:${connectorId}`)].sort(
+    (left, right) => socketConnectedAt(right) - socketConnectedAt(left)
+  );
+}
+
+function socketConnectedAt(socket: WebSocket): number {
+  const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+  return typeof attachment?.connectedAt === "number" ? attachment.connectedAt : 0;
 }
 
 export function threadEventMessage(event: ThreadEvent): string {
