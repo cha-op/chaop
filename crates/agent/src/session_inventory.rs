@@ -858,54 +858,30 @@ fn load_app_server_sessions(
     let timeout = Duration::from_secs(timeout_seconds.max(1));
     let mut socket = connect_app_server(url, timeout)?;
     initialize_app_server_connection(&mut socket)?;
-    let page_limit = limit.max(1);
     let session_limit = limit.max(1);
-    let mut request_id = 1;
-    let mut cursor: Option<String> = None;
-    let mut seen_cursors = HashSet::new();
-    let mut sessions = HashMap::new();
+    let page_limit = session_limit.saturating_add(1);
+    socket.send(Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "thread/list",
+            "params": app_server_thread_list_params(page_limit, None, Some(false))
+        })
+        .to_string()
+        .into(),
+    ))?;
 
-    loop {
-        socket.send(Message::Text(
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "thread/list",
-                "params": app_server_thread_list_params(page_limit, cursor.as_deref(), Some(false))
-            })
-            .to_string()
-            .into(),
-        ))?;
-
-        let value = read_app_server_inventory_page(&mut socket, request_id)?;
-        for (session_id, session) in app_server_sessions_from_response(&value) {
-            sessions.entry(session_id).or_insert(session);
-            if sessions.len() > session_limit {
-                return Ok(AppServerSessionInventory {
-                    sessions,
-                    truncated: true,
-                });
-            }
-        }
-        match app_server_thread_list_next_cursor(&value) {
-            Some(next_cursor) => {
-                if !seen_cursors.insert(next_cursor.clone()) {
-                    return Err(format!(
-                        "app-server thread/list returned repeated nextCursor {next_cursor}"
-                    )
-                    .into());
-                }
-                cursor = Some(next_cursor);
-            }
-            None => {
-                return Ok(AppServerSessionInventory {
-                    sessions,
-                    truncated: false,
-                });
-            }
-        }
-        request_id += 1;
-    }
+    let value = read_app_server_inventory_page(&mut socket, 1)?;
+    let sessions = app_server_sessions_from_response(&value);
+    let raw_thread_count = app_server_thread_list_data(&value)
+        .map(|threads| threads.len())
+        .unwrap_or_default();
+    let truncated =
+        raw_thread_count > session_limit || app_server_thread_list_next_cursor(&value).is_some();
+    Ok(AppServerSessionInventory {
+        sessions,
+        truncated,
+    })
 }
 
 fn read_app_server_inventory_page(
@@ -2836,6 +2812,12 @@ mod tests {
                             "name": "First page",
                             "cwd": "/tmp/page-1",
                             "updatedAt": 1781263443
+                        },
+                        {
+                            "id": "session-2",
+                            "name": "Second page",
+                            "cwd": "/tmp/page-2",
+                            "updatedAt": 1781267043
                         }
                     ],
                     "nextCursor": "cursor-page-2"
@@ -2844,21 +2826,6 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 2,
-                "result": {
-                    "data": [
-                        {
-                            "id": "session-2",
-                            "name": "Second page",
-                            "cwd": "/tmp/page-2",
-                            "updatedAt": 1781267043
-                        }
-                    ],
-                    "nextCursor": null
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
                 "result": {
                     "data": [
                         {
@@ -2877,10 +2844,7 @@ mod tests {
         let first_request = requests
             .recv_timeout(Duration::from_secs(1))
             .expect("first request");
-        let second_request = requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("second request");
-        let third_request = requests.recv_timeout(Duration::from_millis(100));
+        let second_request = requests.recv_timeout(Duration::from_millis(100));
 
         assert_eq!(inventory.sessions.len(), 2);
         assert!(inventory.truncated);
@@ -2900,12 +2864,12 @@ mod tests {
         );
         assert!(first_request.pointer("/params/cursor").is_none());
         assert_eq!(
-            second_request
-                .pointer("/params/cursor")
-                .and_then(serde_json::Value::as_str),
-            Some("cursor-page-2")
+            first_request
+                .pointer("/params/limit")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
         );
-        assert!(third_request.is_err());
+        assert!(second_request.is_err());
     }
 
     #[test]
@@ -3011,8 +2975,8 @@ mod tests {
     }
 
     #[test]
-    fn load_app_server_sessions_fails_on_repeated_next_cursor() {
-        let url = run_fake_app_server(vec![
+    fn load_app_server_sessions_marks_paginated_response_as_truncated() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -3041,12 +3005,73 @@ mod tests {
             }),
         ]);
 
-        let error = load_app_server_sessions(&url, 20, 1).expect_err("repeated cursor");
+        let inventory = load_app_server_sessions(&url, 20, 1).expect("sessions");
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first request");
+        let second_request = requests.recv_timeout(Duration::from_millis(100));
 
+        assert_eq!(inventory.sessions.len(), 1);
+        assert!(inventory.truncated);
+        assert!(first_request.pointer("/params/cursor").is_none());
+        assert!(second_request.is_err());
+    }
+
+    #[test]
+    fn load_app_server_sessions_does_not_follow_duplicate_session_pages() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-1",
+                            "sessionId": "session-tree-1",
+                            "name": "First thread"
+                        },
+                        {
+                            "id": "thread-2",
+                            "sessionId": "session-tree-1",
+                            "name": "Second thread"
+                        }
+                    ],
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-3",
+                            "sessionId": "session-tree-2",
+                            "name": "Should not be requested"
+                        }
+                    ],
+                    "nextCursor": null
+                }
+            }),
+        ]);
+
+        let inventory = load_app_server_sessions(&url, 20, 1).expect("sessions");
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first request");
+        let second_request = requests.recv_timeout(Duration::from_millis(100));
+
+        assert_eq!(inventory.sessions.len(), 1);
+        assert!(inventory.truncated);
         assert_eq!(
-            error.to_string(),
-            "app-server thread/list returned repeated nextCursor cursor-loop"
+            inventory
+                .sessions
+                .get("session-tree-1")
+                .and_then(|session| session.name.as_deref()),
+            Some("First thread")
         );
+        assert!(first_request.pointer("/params/cursor").is_none());
+        assert!(second_request.is_err());
     }
 
     #[test]
@@ -4156,6 +4181,11 @@ mod tests {
                             "id": "session-1",
                             "name": "First app-server thread",
                             "updatedAt": 1781263443
+                        },
+                        {
+                            "id": "session-2",
+                            "name": "Second app-server thread",
+                            "updatedAt": 1781267043
                         }
                     ],
                     "nextCursor": "cursor-page-2"
@@ -4164,20 +4194,6 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 2,
-                "result": {
-                    "data": [
-                        {
-                            "id": "session-2",
-                            "name": "Second app-server thread",
-                            "updatedAt": 1781267043
-                        }
-                    ],
-                    "nextCursor": "cursor-page-3"
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
                 "result": {
                     "data": [
                         {
@@ -4198,10 +4214,7 @@ mod tests {
         let first_request = requests
             .recv_timeout(Duration::from_secs(1))
             .expect("first request");
-        let second_request = requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("second request");
-        let third_request = requests.recv_timeout(Duration::from_millis(100));
+        let second_request = requests.recv_timeout(Duration::from_millis(100));
 
         assert_eq!(report.inventory_scope, InventoryScope::Incremental);
         assert_eq!(report.app_server_inventory_ok, Some(true));
@@ -4209,12 +4222,12 @@ mod tests {
         assert_eq!(report.sessions[0].session_id, "session-2");
         assert!(first_request.pointer("/params/cursor").is_none());
         assert_eq!(
-            second_request
-                .pointer("/params/cursor")
-                .and_then(serde_json::Value::as_str),
-            Some("cursor-page-2")
+            first_request
+                .pointer("/params/limit")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
         );
-        assert!(third_request.is_err());
+        assert!(second_request.is_err());
     }
 
     #[test]
