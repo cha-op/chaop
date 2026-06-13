@@ -736,6 +736,7 @@ test("host session attach skips backfill when the session is already attached", 
 });
 
 test("host session detach clears the attached task and thread when D1 is bound", async () => {
+  const db = hostSessionDetachDb();
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/detach", {
       method: "POST",
@@ -748,7 +749,7 @@ test("host session detach clears the attached task and thread when D1 is bound",
     }),
     {
       ...devEnv,
-      DB: hostSessionDetachDb()
+      DB: db
     }
   );
   const body = (await response.json()) as {
@@ -763,6 +764,9 @@ test("host session detach clears the attached task and thread when D1 is bound",
   assert.equal(body.host_session.session_id, "session-1");
   assert.equal(body.host_session.attached_task_id, undefined);
   assert.equal(body.host_session.attached_thread_id, undefined);
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
 });
 
 test("CORS preflight returns configured browser headers", async () => {
@@ -2421,7 +2425,16 @@ function hostSessionAttachBackfillDb(
   return db as D1Database & { readonly eventInserts: number };
 }
 
-function hostSessionDetachDb(): D1Database {
+function hostSessionDetachDb(): D1Database & {
+  readonly commandFailures: number;
+  readonly taskUpdates: number;
+  readonly eventInserts: number;
+} {
+  const counters = {
+    commandFailures: 0,
+    taskUpdates: 0,
+    eventInserts: 0
+  };
   const row = {
     id: "host-session-1",
     connector_id: "connector-online",
@@ -2430,6 +2443,7 @@ function hostSessionDetachDb(): D1Database {
     session_id: "session-1",
     title: "Attached session",
     title_source: "history",
+    app_server_present: 1,
     cwd: "/workspace/project",
     updated_at: "2026-06-12T10:00:00.000Z",
     attached_task_id: "task-host-1",
@@ -2454,6 +2468,133 @@ function hostSessionDetachDb(): D1Database {
         };
       }
 
+      if (/FROM commands cmd/.test(sql)) {
+        assert.match(sql, /cmd\.type = 'codex'/);
+        assert.match(sql, /cmd\.target_connector_id = \?/);
+        assert.match(sql, /cmd\.state = 'pending'/);
+        assert.match(sql, /NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /hs\.id <> \?/);
+        assert.match(sql, /hst\.id <> \?/);
+        return {
+          bind(
+            workspaceId: string,
+            connectorId: string,
+            now: string,
+            taskIdPresent: string | null,
+            taskId: string | null,
+            threadIdPresent: string | null,
+            threadId: string | null,
+            excludedHostSessionId: string,
+            excludedTaskHostSessionId: string
+          ) {
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(connectorId, "connector-online");
+            assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskIdPresent, "task-host-1");
+            assert.equal(taskId, "task-host-1");
+            assert.equal(threadIdPresent, "thread-host-1");
+            assert.equal(threadId, "thread-host-1");
+            assert.equal(excludedHostSessionId, "host-session-1");
+            assert.equal(excludedTaskHostSessionId, "host-session-1");
+            return {
+              async all() {
+                return {
+                  results: [
+                    {
+                      id: "command-detached",
+                      workspace_id: "workspace-api",
+                      thread_id: "thread-host-1",
+                      task_id: "task-host-1",
+                      type: "codex",
+                      prompt: "Continue this attached session",
+                      state: "pending",
+                      target_connector_id: "connector-online",
+                      created_at: "2026-06-12T10:01:00.000Z",
+                      updated_at: "2026-06-12T10:01:00.000Z"
+                    }
+                  ]
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /state = 'failed'/.test(sql)) {
+        return {
+          bind(updatedAt: string, commandId: string, now: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-detached");
+            assert.equal(now, updatedAt);
+            return {
+              async run() {
+                counters.commandFailures += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql) && /state = 'failed'/.test(sql)) {
+        return {
+          bind(updatedAt: string, taskId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId, "task-host-1");
+            return {
+              async run() {
+                counters.taskUpdates += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-host-1");
+            return {
+              async first() {
+                return { last_seq: 12 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind(
+            eventId: string,
+            workspaceId: string,
+            threadId: string,
+            commandId: string,
+            seq: number,
+            kind: string,
+            priority: string,
+            summary: string
+          ) {
+            assert.match(eventId, /^event-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-host-1");
+            assert.equal(commandId, "command-detached");
+            assert.equal(seq, 12);
+            assert.equal(kind, "command.failed");
+            assert.equal(priority, "P1");
+            assert.equal(summary, "Host session was detached before the command could run.");
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
       if (/UPDATE host_sessions/.test(sql) && /attached_task_id = NULL/.test(sql)) {
         return {
           bind(updatedAt: string, hostSessionId: string) {
@@ -2472,6 +2613,15 @@ function hostSessionDetachDb(): D1Database {
       }
 
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandFailures() {
+      return counters.commandFailures;
+    },
+    get taskUpdates() {
+      return counters.taskUpdates;
+    },
+    get eventInserts() {
+      return counters.eventInserts;
     }
-  } as unknown as D1Database;
+  } as unknown as D1Database & typeof counters;
 }

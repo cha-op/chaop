@@ -40,11 +40,13 @@ superseded_by:
 - App-server `commandExecution` output 默认不会转换成 Chaop command events。
 - PR readiness review 发现并修复了一个 dispatch 一致性问题：command creation 选择最新 attached Host Session，但 command lease 可能 join 到旧的重复 attachment row；现在 lease 使用同一套 task-first、latest-updated Host Session 选择规则。
 - PR readiness review 也让 command lease 与 command creation 在 task command 上保持一致：当 thread 已 attach 但 task attachment 缺失时，lease 会在确认不存在 task-attached Host Session 后 fallback 到 thread attachment。
+- Offline frozen-diff review 发现并修复了 pending command 与 detach 的 race；detaching 一个 app-server Host Session 时，如果 pending 或 expired-leased Codex command 已经找不到任何可替代 app-server attachment，会直接标记 failed，而不是永久停在 pending。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
 - Worker tests 断言 command lease 只 join 最新的 task-first attached Host Session。
 - Worker tests 断言 command lease 保留 task-first、thread-fallback 的 attachment selection SQL。
+- Worker route tests 覆盖 app-server Host Session detach 会让依赖该 attachment 的 pending Codex command 失败。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 覆盖 connector 还没读取 turn id 时的 `turn/start` 取消窗口。
 - 合并前跑完整 `pnpm test`、Rust workspace tests、build、journal validation 和 PR readiness review。

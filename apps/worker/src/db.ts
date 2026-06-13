@@ -350,6 +350,7 @@ export async function detachHostSessionInDb(
   }
 
   const now = new Date().toISOString();
+  await failCommandsForDetachedAppServerHostSession(env, hostSession, now);
   await env.DB.prepare(
     `UPDATE host_sessions
      SET attached_task_id = NULL, attached_thread_id = NULL, updated_at = ?
@@ -366,6 +367,114 @@ export async function detachHostSessionInDb(
       updated_at: now
     }
   };
+}
+
+async function failCommandsForDetachedAppServerHostSession(
+  env: Env,
+  hostSession: HostSessionSummary,
+  now: string
+): Promise<void> {
+  if (hostSession.app_server_present !== true) {
+    return;
+  }
+
+  const taskId = hostSession.attached_task_id ?? null;
+  const threadId = hostSession.attached_thread_id ?? null;
+  if (!taskId && !threadId) {
+    return;
+  }
+
+  const commands = await allRows<CommandRow>(
+    env.DB!.prepare(
+      `SELECT id, workspace_id, thread_id, task_id, type, prompt, state, target_connector_id, created_at, updated_at
+       FROM commands cmd
+       WHERE cmd.workspace_id = ?
+         AND cmd.type = 'codex'
+         AND cmd.target_connector_id = ?
+         AND (
+           cmd.state = 'pending'
+           OR (cmd.state = 'leased' AND cmd.lease_until IS NOT NULL AND cmd.lease_until < ?)
+         )
+         AND (
+           (? IS NOT NULL AND cmd.task_id = ?)
+           OR (? IS NOT NULL AND cmd.thread_id = ?)
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM host_sessions hs
+           WHERE hs.workspace_id = cmd.workspace_id
+             AND hs.id <> ?
+             AND hs.app_server_present = 1
+             AND (
+               (cmd.task_id IS NOT NULL AND hs.attached_task_id = cmd.task_id)
+               OR (
+                 cmd.thread_id IS NOT NULL
+                 AND hs.attached_thread_id = cmd.thread_id
+                 AND (
+                   cmd.task_id IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1
+                     FROM host_sessions hst
+                     WHERE hst.workspace_id = cmd.workspace_id
+                       AND hst.id <> ?
+                       AND hst.app_server_present = 1
+                       AND hst.attached_task_id = cmd.task_id
+                   )
+                 )
+               )
+             )
+         )
+       ORDER BY cmd.created_at ASC`
+    ).bind(
+      hostSession.workspace_id,
+      hostSession.connector_id,
+      now,
+      taskId,
+      taskId,
+      threadId,
+      threadId,
+      hostSession.id,
+      hostSession.id
+    )
+  );
+
+  for (const command of commands) {
+    const result = await env.DB!.prepare(
+      `UPDATE commands
+       SET state = 'failed', lease_owner_connector_id = NULL, lease_until = NULL, updated_at = ?
+       WHERE id = ?
+         AND (
+           state = 'pending'
+           OR (state = 'leased' AND lease_until IS NOT NULL AND lease_until < ?)
+         )`
+    )
+      .bind(now, command.id, now)
+      .run();
+    if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+      continue;
+    }
+
+    if (command.task_id) {
+      await env.DB!.prepare(
+        `UPDATE tasks
+         SET state = 'failed', updated_at = ?
+         WHERE id = ?`
+      )
+        .bind(now, command.task_id)
+        .run();
+    }
+
+    if (command.thread_id) {
+      await appendEvent(env, {
+        workspace_id: command.workspace_id,
+        thread_id: command.thread_id,
+        command_id: command.id,
+        kind: "command.failed",
+        priority: "P1",
+        summary: "Host session was detached before the command could run."
+      });
+    }
+  }
 }
 
 export async function findAttachedHostSessionForTaskInDb(
