@@ -1,4 +1,5 @@
 import type {
+  AgentBackfillEvent,
   AgentBootstrapRequest,
   AgentCommandEvent,
   AgentHostSessionsReport,
@@ -242,7 +243,7 @@ export async function attachHostSessionInDb(
   env: Env,
   sessionId: string,
   connectorId?: string
-): Promise<AttachHostSessionResponse> {
+): Promise<AttachHostSessionResponse & { attachment_created: boolean }> {
   if (!env.DB) {
     throw new Error("DB binding is required for host session attachment");
   }
@@ -258,7 +259,7 @@ export async function attachHostSessionInDb(
       loadThread(env, hostSession.attached_thread_id)
     ]);
     if (task && thread) {
-      return { host_session: hostSession, task, thread };
+      return { host_session: hostSession, task, thread, attachment_created: false };
     }
   }
 
@@ -318,7 +319,8 @@ export async function attachHostSessionInDb(
       updated_at: now
     },
     task,
-    thread
+    thread,
+    attachment_created: true
   };
 }
 
@@ -357,6 +359,115 @@ export async function detachHostSessionInDb(
       updated_at: now
     }
   };
+}
+
+export async function recordHostSessionBackfillEvents(
+  env: Env,
+  hostSession: HostSessionSummary,
+  events: AgentBackfillEvent[]
+): Promise<ThreadEvent[]> {
+  if (!env.DB || !hostSession.attached_thread_id) {
+    return [];
+  }
+
+  const thread = await loadThread(env, hostSession.attached_thread_id);
+  if (!thread) {
+    throw new NotFoundError("Attached thread not found");
+  }
+
+  const imported: ThreadEvent[] = [];
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]!;
+    const eventId = stableBackfillEventId(hostSession, event);
+    const existing = await env.DB.prepare(
+      "SELECT id FROM events WHERE id = ? LIMIT 1"
+    )
+      .bind(eventId)
+      .first<{ id: string }>();
+    if (existing) {
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    const createdAt = normaliseBackfillCreatedAt(event.created_at);
+    const sequence = await env.DB.prepare(
+      `UPDATE threads
+       SET last_seq = last_seq + 1, updated_at = ?
+       WHERE id = ?
+       RETURNING last_seq`
+    )
+      .bind(now, thread.id)
+      .first<{ last_seq: number }>();
+    if (!sequence) {
+      continue;
+    }
+
+    const summary = event.summary.split(/\s+/).join(" ").trim().slice(0, 600);
+    const stored: ThreadEvent = {
+      id: eventId,
+      thread_id: thread.id,
+      seq: sequence.last_seq,
+      kind: event.kind,
+      priority: event.priority,
+      summary,
+      created_at: createdAt
+    };
+
+    const insertResult = await env.DB.prepare(
+      `INSERT OR IGNORE INTO events (
+         id, workspace_id, thread_id, command_id, seq, kind, priority, summary, idempotency_key, created_at
+       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        stored.id,
+        thread.workspace_id,
+        stored.thread_id,
+        stored.seq,
+        stored.kind,
+        stored.priority,
+        stored.summary,
+        event.idempotency_key,
+        stored.created_at
+      )
+      .run();
+    if (insertResult.meta?.changes === 0) {
+      continue;
+    }
+    imported.push(stored);
+  }
+
+  return imported;
+}
+
+export async function listThreadEventsInDb(
+  env: Env,
+  threadId: string,
+  limit = 100
+): Promise<ThreadEvent[]> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for thread events");
+  }
+
+  const thread = await loadThread(env, threadId);
+  if (!thread) {
+    throw new NotFoundError("Thread not found");
+  }
+
+  const boundedLimit = Math.max(1, Math.min(limit, 200));
+  const rows = await allRows<ThreadEventRow>(
+    env.DB.prepare(
+      `SELECT id, thread_id, command_id, seq, kind, priority, summary, created_at
+       FROM events
+       WHERE thread_id = ?
+       ORDER BY seq DESC
+       LIMIT ?`
+    )
+      .bind(thread.id, boundedLimit)
+  );
+  return rows.reverse().map((row) => ({
+    ...row,
+    command_id: row.command_id ?? undefined
+  }));
 }
 
 export async function chooseConnectorForLocalThread(
@@ -401,7 +512,12 @@ export async function attachCreatedLocalThreadInDb(
   }
 
   await recordHostSessions(env, connectorId, { sessions: [session] }, new Date().toISOString(), { workspaceId });
-  return attachHostSessionInDb(env, session.session_id, connectorId);
+  const { attachment_created: _attachmentCreated, ...response } = await attachHostSessionInDb(
+    env,
+    session.session_id,
+    connectorId
+  );
+  return response;
 }
 
 export async function ensureConnectorInventory(
@@ -1352,6 +1468,33 @@ function hostSessionId(connectorId: string, sessionId: string): string {
 
 function stableScopedId(prefix: string, connectorId: string, sessionId: string): string {
   return `${prefix}-${slugPart(sessionId)}-${slugPart(connectorId).slice(-16)}`;
+}
+
+function stableBackfillEventId(
+  hostSession: HostSessionSummary,
+  event: AgentBackfillEvent
+): string {
+  const key = [
+    hostSession.connector_id,
+    hostSession.session_id,
+    hostSession.attached_thread_id,
+    event.idempotency_key
+  ].join("\0");
+  return `event-backfill-${slugPart(hostSession.session_id).slice(0, 24)}-${stableHash(key)}`;
+}
+
+function stableHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function normaliseBackfillCreatedAt(value: string): string {
+  const trimmed = value.trim();
+  return Number.isNaN(Date.parse(trimmed)) ? "1970-01-01T00:00:00.000Z" : trimmed;
 }
 
 function slugPart(value: string): string {

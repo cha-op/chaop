@@ -285,6 +285,8 @@ export type AttachHostSessionResponse = {
   host_session: HostSessionSummary;
   task: TaskSummary;
   thread: ThreadSummary;
+  events?: ThreadEvent[] | undefined;
+  backfill?: HostSessionBackfillSummary | undefined;
 };
 
 export type DetachHostSessionRequest = {
@@ -320,6 +322,39 @@ export type AgentHostSession = {
 
 export type AgentHostSessionsReport = {
   sessions: AgentHostSession[];
+};
+
+export type AgentBackfillEvent = {
+  kind: ThreadEvent["kind"];
+  priority: ThreadEvent["priority"];
+  summary: string;
+  idempotency_key: string;
+  created_at: string;
+};
+
+export type HostSessionBackfillDispatch = {
+  request_id: string;
+  session_id: string;
+  limit?: number | undefined;
+};
+
+export type HostSessionBackfillResult = {
+  request_id: string;
+  ok: boolean;
+  events?: AgentBackfillEvent[] | undefined;
+  truncated?: boolean | undefined;
+  error?: string | undefined;
+};
+
+export type HostSessionBackfillSummary = {
+  attempted: boolean;
+  imported_event_count: number;
+  truncated?: boolean | undefined;
+  error?: string | undefined;
+};
+
+export type ThreadEventsResponse = {
+  events: ThreadEvent[];
 };
 
 export type LocalThreadCreateDispatch = {

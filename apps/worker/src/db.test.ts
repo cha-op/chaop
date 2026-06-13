@@ -4,8 +4,10 @@ import {
   LocalThreadTargetError,
   chooseConnectorForLocalThread,
   ensureConnectorInventory,
+  listThreadEventsInDb,
   markConnectorDisconnected,
   recordAgentEvent,
+  recordHostSessionBackfillEvents,
   recordHostSessions
 } from "./db.js";
 import type { Env } from "./types.js";
@@ -156,6 +158,85 @@ test("recordHostSessions preserves attached session workspace during inventory r
 
   assert.equal(db.workspaceOf("session-attached"), "workspace-api");
   assert.equal(db.titleOf("session-attached"), "Attached session refresh");
+});
+
+test("recordHostSessionBackfillEvents imports events idempotently", async () => {
+  const db = hostSessionBackfillDb();
+  const hostSession = {
+    id: "host-session-1",
+    connector_id: "connector-online",
+    hostname: "mac-studio.local",
+    workspace_id: "workspace-api",
+    session_id: "session-1",
+    title: "Session",
+    title_source: "metadata" as const,
+    cwd: "/workspace/project",
+    updated_at: "2026-06-12T10:00:00.000Z",
+    attached_task_id: "task-1",
+    attached_thread_id: "thread-1"
+  };
+  const events = [
+    {
+      kind: "command.output" as const,
+      priority: "P3" as const,
+      summary: "2026-06-12 10:00 - User: Inspect failure",
+      idempotency_key: "rollout:session-1:1",
+      created_at: "2026-06-12T10:00:00.000Z"
+    }
+  ];
+
+  const first = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events);
+  const second = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events);
+
+  assert.equal(first.length, 1);
+  assert.equal(first[0]?.seq, 1);
+  assert.equal(second.length, 0);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.sequenceUpdates, 1);
+});
+
+test("recordHostSessionBackfillEvents does not return events ignored during insert", async () => {
+  const db = hostSessionBackfillDb({ ignoreInserts: true });
+  const hostSession = {
+    id: "host-session-1",
+    connector_id: "connector-online",
+    hostname: "mac-studio.local",
+    workspace_id: "workspace-api",
+    session_id: "session-1",
+    title: "Session",
+    title_source: "metadata" as const,
+    cwd: "/workspace/project",
+    updated_at: "2026-06-12T10:00:00.000Z",
+    attached_task_id: "task-1",
+    attached_thread_id: "thread-1"
+  };
+  const events = [
+    {
+      kind: "command.output" as const,
+      priority: "P3" as const,
+      summary: "2026-06-12 10:00 - User: Inspect failure",
+      idempotency_key: "rollout:session-1:1",
+      created_at: "2026-06-12T10:00:00.000Z"
+    }
+  ];
+
+  const imported = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events);
+
+  assert.equal(imported.length, 0);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.sequenceUpdates, 1);
+});
+
+test("listThreadEventsInDb returns a thread tail by seq independent of global event age", async () => {
+  const events = await listThreadEventsInDb({ DB: threadEventsDb() } as Env, "thread-1");
+
+  assert.deepEqual(
+    events.map((event) => [event.id, event.seq, event.created_at]),
+    [
+      ["event-backfill-old-1", 1, "2026-06-12T10:00:00.000Z"],
+      ["event-backfill-old-2", 2, "2026-06-12T10:01:00.000Z"]
+    ]
+  );
 });
 
 test("chooseConnectorForLocalThread selects app-server capable connectors", async () => {
@@ -899,6 +980,179 @@ function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
   };
 
   return db as D1Database & typeof counters;
+}
+
+function hostSessionBackfillDb(
+  options: { ignoreInserts?: boolean | undefined } = {}
+): D1Database & { readonly eventInserts: number; readonly sequenceUpdates: number } {
+  const inserted = new Set<string>();
+  const counters = {
+    eventInserts: 0,
+    sequenceUpdates: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/SELECT id, workspace_id, title, state, last_seq, updated_at, realtime_mode/.test(sql)) {
+        return {
+          bind(threadId: string) {
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return {
+                  id: "thread-1",
+                  workspace_id: "workspace-api",
+                  title: "Session",
+                  state: "idle",
+                  last_seq: 0,
+                  updated_at: "2026-06-12T10:00:00.000Z",
+                  realtime_mode: "realtime"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id FROM events WHERE id = \? LIMIT 1/.test(sql)) {
+        return {
+          bind(eventId: string) {
+            return {
+              async first() {
+                return inserted.has(eventId) ? { id: eventId } : null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                counters.sequenceUpdates += 1;
+                return { last_seq: counters.sequenceUpdates };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT OR IGNORE INTO events/.test(sql)) {
+        return {
+          bind(
+            eventId: string,
+            workspaceId: string,
+            threadId: string,
+            seq: number,
+            kind: string,
+            priority: string,
+            summary: string,
+            idempotencyKey: string,
+            createdAt: string
+          ) {
+            assert.match(eventId, /^event-backfill-session-1-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-1");
+            assert.equal(seq, 1);
+            assert.equal(kind, "command.output");
+            assert.equal(priority, "P3");
+            assert.equal(summary, "2026-06-12 10:00 - User: Inspect failure");
+            assert.equal(idempotencyKey, "rollout:session-1:1");
+            assert.equal(createdAt, "2026-06-12T10:00:00.000Z");
+            return {
+              async run() {
+                if (options.ignoreInserts) {
+                  return { success: true, meta: { changes: 0 } };
+                }
+                inserted.add(eventId);
+                counters.eventInserts += 1;
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get eventInserts() {
+      return counters.eventInserts;
+    },
+    get sequenceUpdates() {
+      return counters.sequenceUpdates;
+    }
+  };
+
+  return db as D1Database & { readonly eventInserts: number; readonly sequenceUpdates: number };
+}
+
+function threadEventsDb(): D1Database {
+  return {
+    prepare(sql: string) {
+      if (/SELECT id, workspace_id, title, state, last_seq, updated_at, realtime_mode/.test(sql)) {
+        return {
+          bind(threadId: string) {
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return {
+                  id: "thread-1",
+                  workspace_id: "workspace-api",
+                  title: "Attached history",
+                  state: "idle",
+                  last_seq: 2,
+                  updated_at: "2026-06-13T10:00:00.000Z",
+                  realtime_mode: "realtime"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM events/.test(sql) && /WHERE thread_id = \?/.test(sql) && /ORDER BY seq DESC/.test(sql)) {
+        return {
+          bind(threadId: string, limit: number) {
+            assert.equal(threadId, "thread-1");
+            assert.equal(limit, 100);
+            return {
+              async all() {
+                return {
+                  results: [
+                    {
+                      id: "event-backfill-old-2",
+                      thread_id: "thread-1",
+                      command_id: null,
+                      seq: 2,
+                      kind: "command.output",
+                      priority: "P3",
+                      summary: "Old backfill event 2",
+                      created_at: "2026-06-12T10:01:00.000Z"
+                    },
+                    {
+                      id: "event-backfill-old-1",
+                      thread_id: "thread-1",
+                      command_id: null,
+                      seq: 1,
+                      kind: "command.output",
+                      priority: "P3",
+                      summary: "Old backfill event 1",
+                      created_at: "2026-06-12T10:00:00.000Z"
+                    }
+                  ]
+                };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    }
+  } as unknown as D1Database;
 }
 
 function localThreadConnectorDb(row: { id: string } | null): D1Database {

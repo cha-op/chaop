@@ -118,8 +118,11 @@ impl AgentConfig {
             "placeholder_commands".to_owned(),
             "event_stream_summary".to_owned(),
             "local_spool_skeleton".to_owned(),
-            "host_session_inventory".to_owned(),
         ];
+        if self.session_inventory.enabled {
+            capabilities.push("host_session_inventory".to_owned());
+            capabilities.push("host_session_backfill_v2".to_owned());
+        }
         if self.execution.mode == ExecutionMode::CodexExec {
             capabilities.push("codex_exec".to_owned());
         }
@@ -255,7 +258,50 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
                 .capabilities
                 .contains(&"host_session_inventory".to_owned())
         );
+        assert!(
+            !request
+                .capabilities
+                .contains(&"host_session_backfill".to_owned())
+        );
+        assert!(
+            request
+                .capabilities
+                .contains(&"host_session_backfill_v2".to_owned())
+        );
         assert!(!request.capabilities.contains(&"codex_exec".to_owned()));
+    }
+
+    #[test]
+    fn omits_host_session_capabilities_when_inventory_is_disabled() {
+        let config = AgentConfig {
+            connector_name: "mac-studio".to_owned(),
+            control_url: "wss://api.example.com/ws/agent".to_owned(),
+            bootstrap_url: "https://api.example.com/connector/bootstrap".to_owned(),
+            workspace_root: "/Users/you/Program".into(),
+            token_file: "/Users/you/.chaop/connector.token".into(),
+            spool_db: "/Users/you/.chaop/connector-spool.sqlite".into(),
+            bootstrap: super::BootstrapConfig {
+                secret_file: "/Users/you/.chaop/bootstrap.secret".into(),
+            },
+            execution: super::ExecutionConfig::default(),
+            session_inventory: super::SessionInventoryConfig {
+                enabled: false,
+                ..super::SessionInventoryConfig::default()
+            },
+        };
+
+        let request = config.bootstrap_request("mac-studio.local");
+
+        assert!(
+            !request
+                .capabilities
+                .contains(&"host_session_inventory".to_owned())
+        );
+        assert!(
+            !request
+                .capabilities
+                .contains(&"host_session_backfill_v2".to_owned())
+        );
     }
 
     #[test]

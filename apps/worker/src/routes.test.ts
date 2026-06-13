@@ -246,6 +246,147 @@ test("local thread creation dispatches to an app-server capable connector and at
   assert.equal(db.syncWrites, 1);
 });
 
+test("host session attach imports bounded history backfill events", async () => {
+  let internalPath = "";
+  let dispatchBody: Record<string, unknown> | undefined;
+  const db = hostSessionAttachBackfillDb();
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            dispatchBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            return new Response(
+              JSON.stringify({
+                events: Array.from({ length: 31 }, (_, index) => ({
+                    kind: "command.output",
+                    priority: "P3",
+                    summary: `2026-06-12 10:${String(index).padStart(2, "0")} - User: Event ${index}`,
+                    idempotency_key: `rollout:session-1:${index}`,
+                    created_at: `2026-06-12T10:${String(index).padStart(2, "0")}:00.000Z`
+                })),
+                truncated: false
+              }),
+              { headers: { "content-type": "application/json; charset=utf-8" } }
+            );
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    events?: Array<{ summary: string }>;
+    backfill?: { attempted: boolean; imported_event_count: number; truncated?: boolean };
+    host_session: { attached_thread_id?: string };
+    thread: { last_seq: number };
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(internalPath, "/internal/backfill-host-session");
+  assert.equal(dispatchBody?.connector_id, "connector-online");
+  assert.equal(dispatchBody?.session_id, "session-1");
+  assert.equal(dispatchBody?.limit, 30);
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.thread.last_seq, 30);
+  assert.equal(body.events?.length, 30);
+  assert.equal(body.events?.[0]?.summary, "2026-06-12 10:01 - User: Event 1");
+  assert.deepEqual(body.backfill, {
+    attempted: true,
+    imported_event_count: 30,
+    truncated: true
+  });
+  assert.equal(db.eventInserts, 30);
+});
+
+test("host session attach skips backfill when connector lacks capability", async () => {
+  const db = hostSessionAttachBackfillDb({ supportsBackfill: false });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not receive backfill requests without connector capability");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    events?: unknown[];
+    backfill?: unknown;
+    host_session: { attached_thread_id?: string };
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.events, undefined);
+  assert.equal(body.backfill, undefined);
+  assert.equal(db.eventInserts, 0);
+});
+
+test("host session attach skips backfill when the session is already attached", async () => {
+  const db = hostSessionAttachBackfillDb({ alreadyAttached: true });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not receive backfill requests for existing attachments");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    events?: unknown[];
+    backfill?: unknown;
+    host_session: { attached_thread_id?: string };
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.events, undefined);
+  assert.equal(body.backfill, undefined);
+  assert.equal(db.eventInserts, 0);
+});
+
 test("host session detach clears the attached task and thread when D1 is bound", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/detach", {
@@ -1153,6 +1294,19 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
         };
       }
 
+      if (/SELECT capabilities_json/.test(sql) && /FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { capabilities_json: JSON.stringify(["host_session_backfill_v2"]) };
+              }
+            };
+          }
+        };
+      }
+
       if (/INSERT INTO threads/.test(sql)) {
         return {
           bind(threadId: string, workspaceId: string, title: string, createdAt: string, updatedAt: string) {
@@ -1279,6 +1433,269 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
   };
 
   return db as D1Database & { readonly userWrites: number; readonly syncWrites: number };
+}
+
+function hostSessionAttachBackfillDb(
+  options: { supportsBackfill?: boolean | undefined; alreadyAttached?: boolean | undefined } = {}
+): D1Database & { readonly eventInserts: number } {
+  const supportsBackfill = options.supportsBackfill ?? true;
+  const threadId = "thread-host-session-1-connector-online";
+  const taskId = "task-host-session-1-connector-online";
+  const session = {
+    id: "host-session-1",
+    connector_id: "connector-online",
+    hostname: "mac-studio.local",
+    workspace_id: "workspace-api",
+    session_id: "session-1",
+    title: "Existing session",
+    title_source: "metadata",
+    cwd: "/workspace/project",
+    attached_task_id: options.alreadyAttached ? taskId : null as string | null,
+    attached_thread_id: options.alreadyAttached ? threadId : null as string | null,
+    updated_at: "2026-06-12T10:00:00.000Z"
+  };
+  let threadRow: Record<string, unknown> | undefined = options.alreadyAttached
+    ? {
+      id: threadId,
+      workspace_id: "workspace-api",
+      title: "Existing session",
+      state: "idle",
+      realtime_mode: "realtime",
+      last_seq: 3,
+      updated_at: "2026-06-12T10:00:00.000Z"
+    }
+    : undefined;
+  let taskRow: Record<string, unknown> | undefined = options.alreadyAttached
+    ? {
+      id: taskId,
+      workspace_id: "workspace-api",
+      thread_id: threadId,
+      title: "Existing session",
+      category_id: "maintenance",
+      state: "idle",
+      connector_id: "connector-online",
+      assigned_agent: "chaop-agent",
+      realtime_mode: "realtime",
+      budget_state: "normal",
+      archived_at: null,
+      updated_at: "2026-06-12T10:00:00.000Z"
+    }
+    : undefined;
+  let eventInsertCount = 0;
+  let sequenceUpdates = 0;
+  const insertedEvents = new Set<string>();
+
+  const db = {
+    prepare(sql: string) {
+      if (/SELECT hs\.id, hs\.connector_id/.test(sql) && /FROM host_sessions hs/.test(sql)) {
+        return {
+          bind(sessionId: string, connectorId: string) {
+            assert.equal(sessionId, "session-1");
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return session;
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT capabilities_json/.test(sql) && /FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return {
+                  capabilities_json: JSON.stringify(supportsBackfill ? ["host_session_backfill_v2"] : [])
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO threads/.test(sql)) {
+        return {
+          bind(threadId: string, workspaceId: string, title: string, createdAt: string, updatedAt: string) {
+            assert.equal(threadId, "thread-host-session-1-connector-online");
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(title, "Existing session");
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                threadRow = {
+                  id: threadId,
+                  workspace_id: workspaceId,
+                  title,
+                  state: "idle",
+                  realtime_mode: "realtime",
+                  last_seq: 0,
+                  updated_at: updatedAt
+                };
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO tasks/.test(sql)) {
+        return {
+          bind(
+            taskId: string,
+            workspaceId: string,
+            threadId: string,
+            title: string,
+            connectorId: string,
+            createdAt: string,
+            updatedAt: string
+          ) {
+            assert.equal(taskId, "task-host-session-1-connector-online");
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-host-session-1-connector-online");
+            assert.equal(title, "Existing session");
+            assert.equal(connectorId, "connector-online");
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                taskRow = {
+                  id: taskId,
+                  workspace_id: workspaceId,
+                  thread_id: threadId,
+                  title,
+                  category_id: "maintenance",
+                  state: "idle",
+                  connector_id: connectorId,
+                  assigned_agent: "chaop-agent",
+                  realtime_mode: "realtime",
+                  budget_state: "normal",
+                  archived_at: null,
+                  updated_at: updatedAt
+                };
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE host_sessions/.test(sql) && /attached_task_id = \?/.test(sql)) {
+        return {
+          bind(taskId: string, threadId: string, updatedAt: string, hostSessionId: string) {
+            assert.equal(taskId, "task-host-session-1-connector-online");
+            assert.equal(threadId, "thread-host-session-1-connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(hostSessionId, "host-session-1");
+            return {
+              async run() {
+                session.attached_task_id = taskId;
+                session.attached_thread_id = threadId;
+                session.updated_at = updatedAt;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, workspace_id, thread_id, title, category_id/.test(sql) && /FROM tasks/.test(sql)) {
+        return {
+          bind(taskId: string) {
+            assert.equal(taskId, "task-host-session-1-connector-online");
+            return {
+              async first() {
+                return taskRow;
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, workspace_id, title, state, last_seq/.test(sql) && /FROM threads/.test(sql)) {
+        return {
+          bind(threadId: string) {
+            assert.equal(threadId, "thread-host-session-1-connector-online");
+            return {
+              async first() {
+                return threadRow;
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id FROM events WHERE id = \? LIMIT 1/.test(sql)) {
+        return {
+          bind(eventId: string) {
+            return {
+              async first() {
+                return insertedEvents.has(eventId) ? { id: eventId } : null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-host-session-1-connector-online");
+            return {
+              async first() {
+                sequenceUpdates += 1;
+                return { last_seq: sequenceUpdates };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT OR IGNORE INTO events/.test(sql)) {
+        return {
+          bind(
+            eventId: string,
+            workspaceId: string,
+            threadId: string,
+            seq: number,
+            kind: string,
+            priority: string,
+            summary: string,
+            idempotencyKey: string,
+            createdAt: string
+          ) {
+            assert.match(eventId, /^event-backfill-session-1-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-host-session-1-connector-online");
+            assert.ok(seq >= 1 && seq <= 30);
+            assert.equal(kind, "command.output");
+            assert.equal(priority, "P3");
+            assert.match(summary, /^2026-06-12 10:\d{2} - User: Event \d+$/);
+            assert.match(idempotencyKey, /^rollout:session-1:\d+$/);
+            assert.match(createdAt, /^2026-06-12T10:\d{2}:00\.000Z$/);
+            return {
+              async run() {
+                insertedEvents.add(eventId);
+                eventInsertCount += 1;
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get eventInserts() {
+      return eventInsertCount;
+    }
+  };
+
+  return db as D1Database & { readonly eventInserts: number };
 }
 
 function hostSessionDetachDb(): D1Database {

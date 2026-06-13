@@ -353,7 +353,9 @@ extra_args = ["--skip-git-repo-check"]
 Prompt 会通过 stdin 传给 Codex，不放在命令行参数里。除非有明确运维理由，不要放宽 timeout 和 output cap。
 由 `launchctl` 或其他 service manager 启动的常驻 connector，请使用绝对 `codex_command` 路径。这类进程不一定继承交互式 shell 的 `PATH`；如果找不到 executable，Codex exec 会在使用 workspace `cwd` 之前就失败。
 
-Session inventory 默认开启。Connector 会从 `CODEX_HOME` 或 `~/.codex` 读取本机 Codex metadata，上报 session id、title、cwd、更新时间和 title 来源，不上传 rollout transcripts。Title 解析优先使用 metadata 或 rollout 里的标题，其次使用可选 app-server `Thread.name`，再其次使用本地 history 里的近期 prompt，最后 fallback 到 cwd 和 session id。
+Session inventory 默认开启。Connector 会从 `CODEX_HOME` 或 `~/.codex` 读取本机 Codex metadata，上报 session id、title、cwd、更新时间和 title 来源；普通 inventory report 不会上传 rollout transcripts。Title 解析优先使用 metadata 或 rollout 里的标题，其次使用可选 app-server `Thread.name`，再其次使用本地 history 里的近期 prompt，最后 fallback 到 cwd 和 session id。设置 `session_inventory.enabled = false` 会同时禁用 Host Session inventory 和 Host Session history backfill capability。
+
+当用户明确 attach 某个 Host Session 时，Worker 会向该 session 所属 connector 请求这个单一 session 的有界 history backfill。Connector 会读取匹配的本机 rollout，跳过注入的 developer/context records、reasoning records 和 tool output records，只返回简短的 user、assistant 和 tool call 摘要。如果找不到 rollout，则 fallback 到该 session 在 `history.jsonl` 里的近期 prompt。导入的 events 会保留本机原始事件时间，所以旧 history backfill 不会在全局 recent-event feed 里挤掉更新的 control-plane events。Backfill 失败不会阻止 attachment；Browser 仍会显示已 attach thread，并单独显示 backfill warning。
 
 当 Chaop 需要创建新的本机 Codex app-server thread，或需要使用 app-server title 时，设置 `session_inventory.app_server_url`。只有配置了这个 URL 的 connector 才会声明 `app_server_threads` capability；如果没有在线 connector 声明这个 capability，Worker 会拒绝新建本机 thread 请求。`app_server_timeout_seconds` 应保持较短，避免 app-server 停止时阻塞 connector 启动或 thread 创建。
 
@@ -450,6 +452,6 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - 如果 connector 已连接但一直收不到 command，检查 connector bootstrap 是否已经写入 workspace membership，command 是否 target 到可执行 connector，以及已部署 Worker 是否绑定 `WorkspaceDO`。
 - 如果 New local thread 返回 app-server 错误，检查 `codex app-server --listen ws://127.0.0.1:9876` 是否正在运行、`session_inventory.app_server_url` 是否匹配，以及修改配置后是否已经重启 connector。
 - 如果 Host Sessions 页面为空或过期，先使用 Host Sessions refresh 按钮，再等待最多 `session_inventory.report_interval_seconds`，并检查 connector 是否已经在本切片后重启、`session_inventory.enabled` 是否为 true，以及运行 connector 的用户是否可以读取 `CODEX_HOME` 或 `~/.codex`。
-- 如果 attach 之后的历史 Host Session 只显示少量 events，这是当前切片的预期边界：attachment 只导入 session metadata 和 title。历史 rollout/transcript backfill 和完整 artefact capture 留到后续切片。
+- 如果 attach 之后的历史 Host Session 仍只显示少量 events，检查 connector 运行用户是否可以读取匹配的 `~/.codex/sessions/**/rollout-*.jsonl` 文件。Backfill 会刻意限制为“单个明确 attach 的 session 的短摘要”；完整 transcript 和 artefact capture 仍留到后续切片。
 - 如果 D1 migration 失败，确认 D1 database UUID 已写入 Worker 配置。
 - 如果 R2 写入失败，确认 bucket 已创建，并且 Worker binding 名称与实现一致。

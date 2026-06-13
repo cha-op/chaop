@@ -2,7 +2,9 @@ use crate::config::{AgentConfig, ExecutionMode};
 use crate::executor::{codex_exec_result_events_with_cancel, codex_exec_started_event};
 use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
-use crate::session_inventory::{build_host_sessions_report, create_app_server_thread};
+use crate::session_inventory::{
+    build_host_session_backfill, build_host_sessions_report, create_app_server_thread,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -44,6 +46,13 @@ struct CommandDispatch {
 struct ThreadCreateDispatch {
     request_id: String,
     title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostSessionBackfillDispatch {
+    request_id: String,
+    session_id: String,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +204,12 @@ fn handle_text_message(
         return Ok(false);
     }
 
+    if envelope.kind == "host_session.backfill" {
+        let dispatch: HostSessionBackfillDispatch = serde_json::from_value(envelope.payload)?;
+        handle_host_session_backfill(socket, &dispatch, config)?;
+        return Ok(false);
+    }
+
     if envelope.kind != "command.dispatch" {
         return Ok(false);
     }
@@ -266,6 +281,45 @@ fn handle_thread_create(
             socket.send(Message::Text(
                 json!({
                     "kind": "thread.create_result",
+                    "payload": {
+                        "request_id": dispatch.request_id,
+                        "ok": false,
+                        "error": error.to_string()
+                    }
+                })
+                .to_string()
+                .into(),
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_host_session_backfill(
+    socket: &mut AgentSocket,
+    dispatch: &HostSessionBackfillDispatch,
+    config: &AgentConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match build_host_session_backfill(config, &dispatch.session_id, dispatch.limit.unwrap_or(30)) {
+        Ok(backfill) => {
+            socket.send(Message::Text(
+                json!({
+                    "kind": "host_session.backfill_result",
+                    "payload": {
+                        "request_id": dispatch.request_id,
+                        "ok": true,
+                        "events": backfill.events,
+                        "truncated": backfill.truncated
+                    }
+                })
+                .to_string()
+                .into(),
+            ))?;
+        }
+        Err(error) => {
+            socket.send(Message::Text(
+                json!({
+                    "kind": "host_session.backfill_result",
                     "payload": {
                         "request_id": dispatch.request_id,
                         "ok": false,
@@ -375,6 +429,9 @@ fn handle_background_text_message(
     } else if envelope.kind == "thread.create" {
         let dispatch: ThreadCreateDispatch = serde_json::from_value(envelope.payload)?;
         handle_thread_create(socket, &dispatch, config, last_host_sessions_message)?;
+    } else if envelope.kind == "host_session.backfill" {
+        let dispatch: HostSessionBackfillDispatch = serde_json::from_value(envelope.payload)?;
+        handle_host_session_backfill(socket, &dispatch, config)?;
     } else {
         deferred_messages.push_back(text.to_owned());
     }
