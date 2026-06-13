@@ -566,6 +566,7 @@ function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
       record.kind === "command.finished" ||
       record.kind === "command.failed") &&
     (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
+    (record.target_host_session_id === undefined || typeof record.target_host_session_id === "string") &&
     typeof record.summary === "string"
   );
 }

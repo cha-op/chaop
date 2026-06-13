@@ -1812,7 +1812,11 @@ async function shouldRejectStaleAppServerStart(
     threadId: command.thread_id ?? undefined,
     taskId: command.task_id ?? undefined
   });
-  return target?.connector_id !== connectorId || target.app_server_present !== true;
+  return (
+    target?.connector_id !== connectorId ||
+    target.app_server_present !== true ||
+    target.session_id !== event.target_host_session_id
+  );
 }
 
 async function connectorRequiresAppServerStartValidation(env: Env, connectorId: string): Promise<boolean> {
@@ -1841,11 +1845,11 @@ async function connectorRequiresAppServerStartValidation(env: Env, connectorId: 
 async function findCurrentCommandHostSessionTarget(
   env: Env,
   scope: { workspaceId: string; threadId?: string | undefined; taskId?: string | undefined }
-): Promise<{ connector_id: string; app_server_present: boolean } | undefined> {
+): Promise<{ connector_id: string; session_id: string; app_server_present: boolean } | undefined> {
   if (!scope.threadId && !scope.taskId) return undefined;
 
   const row = await env.DB!.prepare(
-    `SELECT hs.connector_id, hs.app_server_present
+    `SELECT hs.connector_id, hs.session_id, hs.app_server_present
      FROM host_sessions hs
      WHERE hs.workspace_id = ?
        AND (
@@ -1881,10 +1885,11 @@ async function findCurrentCommandHostSessionTarget(
       scope.taskId ?? null,
       scope.taskId ?? null
     )
-    .first<{ connector_id: string; app_server_present: number | boolean | null }>();
+    .first<{ connector_id: string; session_id: string; app_server_present: number | boolean | null }>();
   if (!row?.connector_id) return undefined;
   return {
     connector_id: row.connector_id,
+    session_id: row.session_id,
     app_server_present: row.app_server_present === 1 || row.app_server_present === true
   };
 }

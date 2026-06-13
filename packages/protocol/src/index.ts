@@ -324,6 +324,7 @@ export type CommandDispatch = {
 
 export type AgentCommandEvent = {
   command_id: string;
+  target_host_session_id?: string | undefined;
   kind:
     | "command.started"
     | "command.output"

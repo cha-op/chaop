@@ -8,7 +8,7 @@ use crate::session_inventory::{
     set_app_server_thread_archived,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::ErrorKind;
@@ -309,12 +309,13 @@ fn handle_text_message(
             )?;
             return Ok(true);
         }
-        if !dispatch_events(
+        if !dispatch_events_for_target_host_session(
             socket,
             &dispatch.command,
             vec![app_server_command_started_event(
                 &target_host_session.session_id,
             )],
+            Some(&target_host_session.session_id),
             config,
             last_host_sessions_message,
             deferred_messages,
@@ -711,22 +712,34 @@ fn dispatch_events(
     last_host_sessions_message: &mut Option<String>,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    dispatch_events_for_target_host_session(
+        socket,
+        command,
+        events,
+        None,
+        config,
+        last_host_sessions_message,
+        deferred_messages,
+    )
+}
+
+fn dispatch_events_for_target_host_session(
+    socket: &mut AgentSocket,
+    command: &CommandPayload,
+    events: Vec<ConnectorEvent>,
+    target_host_session_id: Option<&str>,
+    config: &AgentConfig,
+    last_host_sessions_message: &mut Option<String>,
+    deferred_messages: &mut VecDeque<String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     for event in events {
         if event.kind == "command.accepted" {
             continue;
         }
         socket.send(Message::Text(
-            json!({
-                "kind": "agent.event",
-                "payload": {
-                    "command_id": command.id,
-                    "kind": event.kind,
-                    "priority": event.priority,
-                    "summary": event.summary
-                }
-            })
-            .to_string()
-            .into(),
+            agent_event_message(command, &event, target_host_session_id)
+                .to_string()
+                .into(),
         ))?;
         if !wait_for_ack(
             socket,
@@ -740,6 +753,34 @@ fn dispatch_events(
         }
     }
     Ok(true)
+}
+
+fn agent_event_message(
+    command: &CommandPayload,
+    event: &ConnectorEvent,
+    target_host_session_id: Option<&str>,
+) -> Value {
+    match target_host_session_id.filter(|_| event.kind == "command.started") {
+        Some(session_id) => json!({
+            "kind": "agent.event",
+            "payload": {
+                "command_id": command.id,
+                "target_host_session_id": session_id,
+                "kind": event.kind,
+                "priority": event.priority,
+                "summary": event.summary
+            }
+        }),
+        None => json!({
+            "kind": "agent.event",
+            "payload": {
+                "command_id": command.id,
+                "kind": event.kind,
+                "priority": event.priority,
+                "summary": event.summary
+            }
+        }),
+    }
 }
 
 fn configure_socket(socket: &mut AgentSocket) -> std::io::Result<()> {
@@ -868,10 +909,11 @@ fn set_socket_read_timeout(
 mod tests {
     use super::{
         AckWaitAction, CommandDispatch, CommandPayload, CommandTargetHostSession, CommandType,
-        classify_ack_wait_text, command_events, host_sessions_interval, is_read_timeout,
-        requires_app_server_execution_mode,
+        agent_event_message, classify_ack_wait_text, command_events, host_sessions_interval,
+        is_read_timeout, requires_app_server_execution_mode,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
+    use crate::placeholder::ConnectorEvent;
     use std::io::{self, ErrorKind};
     use std::time::Duration;
     use tungstenite::Error as WebSocketError;
@@ -917,6 +959,52 @@ mod tests {
             events.last().map(|event| event.summary.as_str()),
             Some("Codex exec is disabled in this connector config.")
         );
+    }
+
+    #[test]
+    fn app_server_started_event_payload_identifies_target_host_session() {
+        let command = CommandPayload {
+            id: "command-1".to_owned(),
+            command_type: CommandType::Codex,
+            prompt: "continue".to_owned(),
+        };
+        let event = ConnectorEvent {
+            kind: "command.started".to_owned(),
+            priority: "P1".to_owned(),
+            summary: "Connector started Codex app-server turn for local thread session-1."
+                .to_owned(),
+        };
+
+        let message = agent_event_message(&command, &event, Some("session-1"));
+
+        assert_eq!(
+            message.pointer("/kind").and_then(|value| value.as_str()),
+            Some("agent.event")
+        );
+        assert_eq!(
+            message
+                .pointer("/payload/target_host_session_id")
+                .and_then(|value| value.as_str()),
+            Some("session-1")
+        );
+    }
+
+    #[test]
+    fn non_started_event_payload_omits_target_host_session() {
+        let command = CommandPayload {
+            id: "command-1".to_owned(),
+            command_type: CommandType::Codex,
+            prompt: "continue".to_owned(),
+        };
+        let event = ConnectorEvent {
+            kind: "command.output".to_owned(),
+            priority: "P2".to_owned(),
+            summary: "Progress".to_owned(),
+        };
+
+        let message = agent_event_message(&command, &event, Some("session-1"));
+
+        assert!(message.pointer("/payload/target_host_session_id").is_none());
     }
 
     #[test]

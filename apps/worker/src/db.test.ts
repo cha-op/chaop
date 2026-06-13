@@ -37,6 +37,29 @@ test("recordAgentEvent rejects app-server starts after the attachment is detache
 
   const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
     command_id: "command-1",
+    target_host_session_id: "session-old",
+    kind: "command.started",
+    priority: "P1",
+    summary: "Starting"
+  });
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.event, undefined);
+  assert.equal(db.commandUpdates, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
+test("recordAgentEvent rejects app-server starts after the connector reattaches a different session", async () => {
+  const db = appServerStartAfterDetachDb({
+    connector_id: "connector-online",
+    session_id: "session-new",
+    app_server_present: 1
+  });
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    target_host_session_id: "session-old",
     kind: "command.started",
     priority: "P1",
     summary: "Starting"
@@ -518,7 +541,11 @@ function agentEventGuardDb(command: {
   return db as D1Database & typeof counters;
 }
 
-function appServerStartAfterDetachDb() {
+function appServerStartAfterDetachDb(currentTarget?: {
+  connector_id: string;
+  session_id: string;
+  app_server_present: number;
+}) {
   const counters = {
     commandUpdates: 0,
     taskUpdates: 0,
@@ -561,7 +588,7 @@ function appServerStartAfterDetachDb() {
         };
       }
 
-      if (/SELECT hs\.connector_id, hs\.app_server_present/.test(sql) && /FROM host_sessions hs/.test(sql)) {
+      if (/SELECT hs\.connector_id, hs\.session_id, hs\.app_server_present/.test(sql) && /FROM host_sessions hs/.test(sql)) {
         return {
           bind(
             workspaceId: string,
@@ -577,7 +604,7 @@ function appServerStartAfterDetachDb() {
             assert.equal(threadId, "thread-1");
             return {
               async first() {
-                return null;
+                return currentTarget ?? null;
               }
             };
           }

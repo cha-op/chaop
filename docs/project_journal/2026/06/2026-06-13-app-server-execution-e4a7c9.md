@@ -50,6 +50,7 @@ superseded_by:
 - Independent PR review found the stale `command.started` race could still win after cleanup selected a leased command. App-server-only connector starts now revalidate the current task/thread Host Session target before accepting `command.started`.
 - Detached-command cleanup also covers legacy or delayed app-server commands with `target_connector_id IS NULL`, while preserving replacement matching for any current app-server Host Session that command leasing could select.
 - Independent PR review found a remaining create/detach cross-request race where command creation could read an old app-server attachment, then insert after detach cleanup had already scanned commands. App-server Codex command creation now uses a guarded insert that only writes the command if the current task/thread Host Session selected by the same task-first/latest ordering still resolves to the same app-server target.
+- Independent PR review found a reattach-after-dispatch race: the same connector could receive a command for one app-server Host Session, then attach a different Host Session to the same task/thread before sending `command.started`. App-server `command.started` events now include `target_host_session_id`, and Worker acknowledgements reject starts unless that session still matches the current task/thread target.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -61,10 +62,12 @@ superseded_by:
 - Worker route tests assert Host Session detach clears the attachment before command cleanup queries run.
 - Worker Durable Object tests assert stale agent command events receive `server.ack` with `accepted: false`.
 - Worker DB tests assert app-server-only `command.started` events are rejected after the current Host Session attachment is gone.
+- Worker DB tests assert app-server-only `command.started` events are rejected after the same connector reattaches a different Host Session to the command scope.
 - Worker route tests assert app-server command creation returns `409 Conflict` when the attached Host Session changes before the command insert.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.
 - Rust tests assert rejected command-event acknowledgements are recognised instead of treated as successful acks.
+- Rust tests assert app-server `command.started` event payloads identify the target Host Session, without leaking that field onto non-started events.
 - Rust tests cover the `turn/start` cancellation window before the connector has read the turn id.
 - Full `pnpm test`, Rust workspace tests, build, journal validation, and PR readiness review before merge.
 
