@@ -134,6 +134,30 @@ test("recordHostSessions preserves stored sessions outside the latest top-N repo
   });
 });
 
+test("recordHostSessions preserves attached session workspace during inventory refresh", async () => {
+  const db = hostSessionsInventoryDb({ workspaceId: "workspace-other" });
+
+  await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Attached session refresh",
+          title_source: "app_server",
+          cwd: "/Users/joey/Program/refreshed",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(db.workspaceOf("session-attached"), "workspace-api");
+  assert.equal(db.titleOf("session-attached"), "Attached session refresh");
+});
+
 test("chooseConnectorForLocalThread selects app-server capable connectors", async () => {
   const connectorId = await chooseConnectorForLocalThread(
     { DB: localThreadConnectorDb({ id: "connector-online" }) } as Env,
@@ -689,7 +713,8 @@ function duplicateConnectorRetirementDb() {
   return db as D1Database & typeof counters;
 }
 
-function hostSessionsInventoryDb() {
+function hostSessionsInventoryDb(options: { workspaceId?: string } = {}) {
+  const selectedWorkspaceId = options.workspaceId ?? "workspace-api";
   type StoredHostSession = {
     id: string;
     connector_id: string;
@@ -726,6 +751,12 @@ function hostSessionsInventoryDb() {
     sync: undefined as { connectorId: string; reported: number; stored: number } | undefined,
     hasSession(sessionId: string) {
       return sessions.has(sessionId);
+    },
+    workspaceOf(sessionId: string) {
+      return sessions.get(sessionId)?.workspace_id;
+    },
+    titleOf(sessionId: string) {
+      return sessions.get(sessionId)?.title;
     }
   };
 
@@ -750,7 +781,7 @@ function hostSessionsInventoryDb() {
             assert.equal(connectorId, "connector-online");
             return {
               async first() {
-                return { workspace_id: "workspace-api" };
+                return { workspace_id: selectedWorkspaceId };
               }
             };
           }
@@ -773,21 +804,29 @@ function hostSessionsInventoryDb() {
           ) {
             assert.equal(connectorId, "connector-online");
             assert.equal(hostname, "mac-studio.local");
-            assert.equal(workspaceId, "workspace-api");
+            assert.equal(workspaceId, selectedWorkspaceId);
             assert.equal(discoveredAt, "2026-06-12T11:00:05.000Z");
+            assert.match(
+              sql,
+              /CASE\s+WHEN host_sessions\.attached_task_id IS NOT NULL OR host_sessions\.attached_thread_id IS NOT NULL/
+            );
             return {
               async run() {
+                const existing = sessions.get(sessionId);
                 sessions.set(sessionId, {
                   id,
                   connector_id: connectorId,
                   hostname,
-                  workspace_id: workspaceId,
+                  workspace_id:
+                    existing?.attached_task_id || existing?.attached_thread_id
+                      ? existing.workspace_id
+                      : workspaceId,
                   session_id: sessionId,
                   title,
                   title_source: titleSource,
                   cwd,
-                  attached_task_id: null,
-                  attached_thread_id: null,
+                  attached_task_id: existing?.attached_task_id ?? null,
+                  attached_thread_id: existing?.attached_thread_id ?? null,
                   updated_at: updatedAt
                 });
                 return { success: true };
@@ -850,6 +889,12 @@ function hostSessionsInventoryDb() {
     },
     hasSession(sessionId: string) {
       return counters.hasSession(sessionId);
+    },
+    workspaceOf(sessionId: string) {
+      return counters.workspaceOf(sessionId);
+    },
+    titleOf(sessionId: string) {
+      return counters.titleOf(sessionId);
     }
   };
 

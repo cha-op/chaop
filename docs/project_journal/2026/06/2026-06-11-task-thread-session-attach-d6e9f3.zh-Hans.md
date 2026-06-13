@@ -73,6 +73,7 @@ superseded_by:
 - Rust connector 现在会使用 `session_inventory.app_server_url` 调用 app-server `thread/start`，再用 `thread/name/set` 写入请求的 title，并把创建出的 session 作为轻量 host-session metadata 回传。
 - Review follow-up 收紧了 cwd 边界：新建本机 thread 会从 connector 私有 `workspace_root` 启动，Browser 请求不能提供任意 cwd。App-server title 更新改为 best-effort，因此 `thread/start` 成功后即使 `thread/name/set` 失败，也仍会 attach 已创建的 thread。创建出的 host session 也会按请求 workspace upsert，避免多 workspace connector 把新 task/thread attach 到另一个 workspace。
 - Review follow-up 也会从 `thread/list` 读取 app-server-only inventory rows 的 `cwd` 和 `updatedAt`，避免 connector 在创建成功后的即时 refresh 又用空 cwd 或 epoch timestamp 覆盖刚 attach 好的 session。
+- Review follow-up 还会在普通 connector inventory refresh 期间保留已 attach host sessions 的 workspace 归属，避免新建成功后的 inventory report 又把 created session 移回 connector 默认 workspace。
 - Worker 的 D1 helper 会 upsert 创建出的 app-server session，并复用已有 attach 流程，所以新 session 会立即变成 task/thread 组合。
 - Task Board 和 Thread Command Centre 现在提供聚焦的 `New local thread` 表单；创建成功后会直接打开真实 thread。
 - 部署指南现在记录了本地 `codex app-server --experimental --listen ws://127.0.0.1:9876` 前提，以及私有 connector `app_server_url` 配置。

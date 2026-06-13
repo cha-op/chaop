@@ -127,7 +127,11 @@ export async function recordHostSessions(
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(connector_id, session_id) DO UPDATE SET
          hostname = excluded.hostname,
-         workspace_id = excluded.workspace_id,
+         workspace_id = CASE
+           WHEN host_sessions.attached_task_id IS NOT NULL OR host_sessions.attached_thread_id IS NOT NULL
+           THEN host_sessions.workspace_id
+           ELSE excluded.workspace_id
+         END,
          title = excluded.title,
          title_source = excluded.title_source,
          cwd = excluded.cwd,
