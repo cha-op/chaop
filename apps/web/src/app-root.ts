@@ -23,6 +23,7 @@ import {
   createLocalThread,
   detachHostSession,
   loadBootstrap,
+  loadThreadEvents,
   refreshHostSessions,
   unarchiveTask
 } from "./api.js";
@@ -186,6 +187,9 @@ export class ChaopApp extends LitElement {
       this.data = mergeBootstrapPayload(this.data, incoming);
       this.loadError = undefined;
       this.ensureSelectedThread();
+      await this.loadSelectedThreadEvents().catch((error) => {
+        this.actionError = actionErrorMessage("Thread events refresh failed", error);
+      });
     } catch (error) {
       this.loadError = error instanceof Error ? error.message : "Bootstrap request failed";
     }
@@ -195,6 +199,9 @@ export class ChaopApp extends LitElement {
     this.view = viewFromHash();
     this.selectedThreadId = threadIdFromHash();
     this.ensureSelectedThread();
+    void this.loadSelectedThreadEvents().catch((error) => {
+      this.actionError = actionErrorMessage("Thread events refresh failed", error);
+    });
   };
 
   private navItem(view: View, label: string) {
@@ -719,6 +726,9 @@ export class ChaopApp extends LitElement {
     try {
       const response = await attachHostSession(session.session_id, { connector_id: session.connector_id });
       this.mergeAttachedSession(response);
+      if (response.backfill?.error) {
+        this.actionError = `Attached, but history backfill failed: ${response.backfill.error}`;
+      }
       this.openThread(response.thread.id);
     } catch (error) {
       this.actionError = actionErrorMessage("Attach failed", error);
@@ -769,6 +779,12 @@ export class ChaopApp extends LitElement {
       threads: [
         response.thread,
         ...this.data.threads.filter((item) => item.id !== response.thread.id)
+      ],
+      events: [
+        ...(response.events ?? []),
+        ...this.data.events.filter(
+          (item) => !(response.events ?? []).some((event) => event.id === item.id)
+        )
       ]
     };
   }
@@ -807,6 +823,9 @@ export class ChaopApp extends LitElement {
   private openThread(threadId: string): void {
     this.selectedThreadId = threadId;
     window.location.hash = `thread-centre?thread=${encodeURIComponent(threadId)}`;
+    void this.loadSelectedThreadEvents().catch((error) => {
+      this.actionError = actionErrorMessage("Thread events refresh failed", error);
+    });
   }
 
   private selectedThread(): ThreadSummary | undefined {
@@ -868,6 +887,29 @@ export class ChaopApp extends LitElement {
         if (left.seq !== right.seq) return right.seq - left.seq;
         return right.created_at.localeCompare(left.created_at);
       });
+  }
+
+  private async loadSelectedThreadEvents(): Promise<void> {
+    if (!this.data) return;
+    const thread = this.selectedThread();
+    if (!thread) return;
+    const response = await loadThreadEvents(thread.id);
+    this.mergeThreadEvents(response.events);
+    if (this.actionError?.startsWith("Thread events refresh failed:")) {
+      this.actionError = undefined;
+    }
+  }
+
+  private mergeThreadEvents(incoming: ThreadEvent[]): void {
+    if (!this.data || incoming.length === 0) return;
+    const incomingIds = new Set(incoming.map((event) => event.id));
+    this.data = {
+      ...this.data,
+      events: [
+        ...incoming,
+        ...this.data.events.filter((event) => !incomingIds.has(event.id))
+      ]
+    };
   }
 
   private commandModeButton(type: CommandSummary["type"], label: string) {

@@ -1,6 +1,8 @@
 import {
   createEnvelope,
   type AgentCommandEvent,
+  type HostSessionBackfillDispatch,
+  type HostSessionBackfillResult,
   type AgentHostSessionsReport,
   type CommandDispatch,
   type HostSessionsUpdatePayload,
@@ -17,6 +19,7 @@ import {
 import type { Env } from "./types.js";
 
 const THREAD_CREATE_TIMEOUT_MS = 15_000;
+const HOST_SESSION_BACKFILL_TIMEOUT_MS = 15_000;
 
 type SocketAttachment = {
   socketType?: string;
@@ -30,6 +33,14 @@ export class WorkspaceDO implements DurableObject {
     {
       timer: ReturnType<typeof setTimeout>;
       resolve: (result: LocalThreadCreateResult) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private readonly pendingHostSessionBackfills = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      resolve: (result: HostSessionBackfillResult) => void;
       reject: (error: Error) => void;
     }
   >();
@@ -51,6 +62,10 @@ export class WorkspaceDO implements DurableObject {
 
     if (url.pathname === "/internal/create-local-thread") {
       return this.createLocalThread(request);
+    }
+
+    if (url.pathname === "/internal/backfill-host-session") {
+      return this.backfillHostSession(request);
     }
 
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -187,6 +202,19 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    if (message.kind === "host_session.backfill_result" && isHostSessionBackfillResult(message.payload)) {
+      this.resolveHostSessionBackfill(message.payload);
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            kind: "host_session.backfill_result",
+            request_id: message.payload.request_id
+          })
+        )
+      );
+      return;
+    }
+
     ws.send(JSON.stringify(createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, { received: text.length })));
   }
 
@@ -263,6 +291,43 @@ export class WorkspaceDO implements DurableObject {
     }
   }
 
+  private async backfillHostSession(request: Request): Promise<Response> {
+    const payload = await request.json().catch(() => ({})) as Partial<HostSessionBackfillDispatch> & {
+      connector_id?: unknown;
+    };
+    const connectorId = typeof payload.connector_id === "string" ? payload.connector_id : undefined;
+    if (!connectorId) {
+      return jsonResponse({ error: "Missing connector_id" }, 400);
+    }
+    if (!isHostSessionBackfillDispatch(payload)) {
+      return jsonResponse({ error: "Invalid host session backfill payload" }, 400);
+    }
+
+    const sockets = agentSocketsForConnector(this.ctx, connectorId);
+    const socket = sockets[0];
+    if (!socket) {
+      return jsonResponse({ error: "Connector is not connected" }, 404);
+    }
+
+    try {
+      const result = await this.waitForHostSessionBackfill(payload.request_id, () => {
+        socket.send(
+          JSON.stringify(
+            createEnvelope("host_session.backfill", { type: "worker", id: "workspace-do-global" }, payload, {
+              target: { type: "connector", id: connectorId }
+            })
+          )
+        );
+      });
+      if (!result.ok) {
+        return jsonResponse({ error: result.error ?? "Connector could not backfill the host session" }, 502);
+      }
+      return jsonResponse({ events: result.events ?? [], truncated: result.truncated === true });
+    } catch (error) {
+      return jsonResponse({ error: error instanceof Error ? error.message : "Connector did not respond" }, 504);
+    }
+  }
+
   private async waitForLocalThreadCreate(
     requestId: string,
     send: () => void
@@ -290,6 +355,36 @@ export class WorkspaceDO implements DurableObject {
     }
     clearTimeout(pending.timer);
     this.pendingThreadCreates.delete(result.request_id);
+    pending.resolve(result);
+  }
+
+  private async waitForHostSessionBackfill(
+    requestId: string,
+    send: () => void
+  ): Promise<HostSessionBackfillResult> {
+    return await new Promise<HostSessionBackfillResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingHostSessionBackfills.delete(requestId);
+        reject(new Error("Connector timed out while backfilling the host session"));
+      }, HOST_SESSION_BACKFILL_TIMEOUT_MS);
+      this.pendingHostSessionBackfills.set(requestId, { timer, resolve, reject });
+      try {
+        send();
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingHostSessionBackfills.delete(requestId);
+        reject(error instanceof Error ? error : new Error("Connector send failed"));
+      }
+    });
+  }
+
+  private resolveHostSessionBackfill(result: HostSessionBackfillResult): void {
+    const pending = this.pendingHostSessionBackfills.get(result.request_id);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingHostSessionBackfills.delete(result.request_id);
     pending.resolve(result);
   }
 
@@ -398,6 +493,57 @@ function isLocalThreadCreateResult(value: unknown): value is LocalThreadCreateRe
     typeof record.ok === "boolean" &&
     (record.error === undefined || typeof record.error === "string") &&
     (record.session === undefined || isAgentHostSession(record.session))
+  );
+}
+
+function isHostSessionBackfillDispatch(value: unknown): value is HostSessionBackfillDispatch {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    record.request_id.length > 0 &&
+    typeof record.session_id === "string" &&
+    record.session_id.length > 0 &&
+    (record.limit === undefined || (typeof record.limit === "number" && Number.isFinite(record.limit)))
+  );
+}
+
+function isHostSessionBackfillResult(value: unknown): value is HostSessionBackfillResult {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    typeof record.ok === "boolean" &&
+    (record.error === undefined || typeof record.error === "string") &&
+    (record.truncated === undefined || typeof record.truncated === "boolean") &&
+    (record.events === undefined || (Array.isArray(record.events) && record.events.every(isAgentBackfillEvent)))
+  );
+}
+
+function isAgentBackfillEvent(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    isThreadEventKind(record.kind) &&
+    (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
+    typeof record.summary === "string" &&
+    record.summary.trim().length > 0 &&
+    typeof record.idempotency_key === "string" &&
+    record.idempotency_key.trim().length > 0 &&
+    typeof record.created_at === "string" &&
+    record.created_at.trim().length > 0
+  );
+}
+
+function isThreadEventKind(value: unknown): boolean {
+  return (
+    value === "command.accepted" ||
+    value === "command.started" ||
+    value === "command.output" ||
+    value === "command.finished" ||
+    value === "command.failed" ||
+    value === "approval.requested" ||
+    value === "notice.throttled"
   );
 }
 

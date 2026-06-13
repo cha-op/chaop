@@ -84,8 +84,14 @@ superseded_by:
 - Review follow-up 会在 bootstrap 中暴露 connector capabilities，并把 `New local thread` 的 connector 选项过滤到 `app_server_threads`，让手动选择与后端 eligibility check 保持一致。
 - 部署指南现在记录了本地 `codex app-server --listen ws://127.0.0.1:9876` 前提，以及私有 connector `app_server_url` 配置。
 
+## 2026-06-13 Session History Backfill
+- 历史 Host Session attach 现在会先创建 task/thread attachment，然后向对应 connector 请求这个单一 session 的有界 history backfill。
+- `WorkspaceDO` 现在通过已有 agent WebSocket 支持 `host_session.backfill` / `host_session.backfill_result` RPC，会为选中的 connector 使用最新 socket，并设置有界 timeout。
+- Rust connector 只读取被请求的本机 Codex session。它优先读取匹配的 rollout 文件，跳过注入的 developer/context records、reasoning records 和 tool output records，只返回简短的 user、assistant 和 tool call 摘要；如果找不到 rollout，则 fallback 到该 session 在 `history.jsonl` 里的近期 prompt。
+- Worker 会把返回的摘要作为幂等的 `command.output` thread events 写入，event id 使用确定性的 backfill id，因此重复 attach/backfill 不会重复导入历史。Backfill events 会保留本机原始时间戳，并且要求 connector 声明 `host_session_backfill_v2` capability；该 capability 只会在 session inventory 开启时声明。
+- Browser 会立即合并 attach response 中导入的 backfill events；如果 backfill 失败，会保留已成功 attachment，并单独显示 warning。Thread Centre 也会通过 thread-scoped events API 重新读取当前 thread 的 event tail，所以旧 backfill history 即使比全局 recent-event feed 更旧，刷新后仍然可见。
+
 ## 下一步
-- 新建 thread 跑通后，再做旧 session history backfill，让 attach 的旧 sessions 可以显示有用的历史 output，同时默认不上传宽泛的本机 transcripts。
 - History backfill 之后，再通过 connector 把 Chaop archive/unarchive 同步到本机 Codex app-server archive 状态。本机 history 文件保持只读。
 - 在 app-server protocol path 可以干净覆盖 create、resume、archive 和 event/history reads 之前，Codex CLI adapter 继续作为当前可用的 execution fallback。
 - R2 artefact capture 和 budget aggregation 排在这些核心控制闭环工作之后。

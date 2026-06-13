@@ -1,5 +1,6 @@
 import {
   createEnvelope,
+  type AgentBackfillEvent,
   type AgentHostSession,
   type AttachHostSessionRequest,
   type AgentBootstrapRequest,
@@ -8,8 +9,10 @@ import {
   type CreateCommandResponse,
   type CreateLocalThreadRequest,
   type DetachHostSessionRequest,
+  type HostSessionSummary,
   type LocalThreadCreateResult,
-  type RefreshHostSessionsResponse
+  type RefreshHostSessionsResponse,
+  type ThreadEventsResponse
 } from "@chaop/protocol";
 import {
   authenticateAgentBootstrap,
@@ -28,11 +31,15 @@ import {
   createCommandInDb,
   detachHostSessionInDb,
   ensureConnectorInventory,
+  listThreadEventsInDb,
   loadBootstrapFromDb,
+  recordHostSessionBackfillEvents,
   unarchiveTaskInDb
 } from "./db.js";
 import { budget, sampleBootstrap } from "./sample-data.js";
 import type { Env } from "./types.js";
+
+const HOST_SESSION_BACKFILL_EVENT_LIMIT = 30;
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -225,6 +232,27 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return json(request, env, response, 202);
   }
 
+  const threadEventsMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/events$/);
+  if (request.method === "GET" && threadEventsMatch) {
+    const originCheck = validateBrowserOrigin(request, env);
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+
+    try {
+      const response: ThreadEventsResponse = {
+        events: await listThreadEventsInDb(env, decodeURIComponent(threadEventsMatch[1] ?? ""))
+      };
+      return json(request, env, response, 200);
+    } catch (error) {
+      if (error instanceof NotFoundError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      throw error;
+    }
+  }
+
   const attachHostSessionMatch = url.pathname.match(/^\/api\/host-sessions\/([^/]+)\/attach$/);
   if (request.method === "POST" && attachHostSessionMatch) {
     const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
@@ -242,11 +270,31 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     try {
-      const response = await attachHostSessionInDb(
+      const attachment = await attachHostSessionInDb(
         env,
         decodeURIComponent(attachHostSessionMatch[1] ?? ""),
         payload.value.connector_id
       );
+      const { attachment_created: attachmentCreated, ...response } = attachment;
+      const backfill = attachmentCreated
+        ? await requestAndRecordHostSessionBackfill(env, response.host_session)
+        : undefined;
+      if (backfill) {
+        response.events = backfill.events;
+        if (backfill.events.length > 0) {
+          const latestSeq = Math.max(response.thread.last_seq, ...backfill.events.map((event) => event.seq));
+          response.thread = {
+            ...response.thread,
+            last_seq: latestSeq
+          };
+        }
+        response.backfill = {
+          attempted: true,
+          imported_event_count: backfill.events.length,
+          truncated: backfill.truncated,
+          error: backfill.error
+        };
+      }
       return json(request, env, response, 201);
     } catch (error) {
       if (error instanceof NotFoundError) {
@@ -488,6 +536,92 @@ async function requestLocalThreadCreate(
   return body.session;
 }
 
+async function requestAndRecordHostSessionBackfill(
+  env: Env,
+  hostSession: HostSessionSummary
+): Promise<{
+  events: Awaited<ReturnType<typeof recordHostSessionBackfillEvents>>;
+  truncated?: boolean | undefined;
+  error?: string | undefined;
+} | undefined> {
+  if (!env.DB || !env.WORKSPACE_DO || !hostSession.connector_id || !hostSession.attached_thread_id) {
+    return undefined;
+  }
+  if (!(await connectorSupportsHostSessionBackfill(env, hostSession.connector_id))) {
+    return undefined;
+  }
+
+  try {
+    const result = await requestHostSessionBackfill(env, hostSession.connector_id, hostSession.session_id);
+    const events = await recordHostSessionBackfillEvents(env, hostSession, result.events ?? []);
+    return { events, truncated: result.truncated };
+  } catch (error) {
+    return {
+      events: [],
+      error: error instanceof Error ? error.message : "Host session history backfill failed"
+    };
+  }
+}
+
+async function connectorSupportsHostSessionBackfill(env: Env, connectorId: string): Promise<boolean> {
+  if (!env.DB) return false;
+  const row = await env.DB.prepare(
+    `SELECT capabilities_json
+     FROM connectors
+     WHERE id = ? AND status <> 'offline'
+     LIMIT 1`
+  )
+    .bind(connectorId)
+    .first<{ capabilities_json: string | null }>();
+  if (!row?.capabilities_json) return false;
+  try {
+    const capabilities = JSON.parse(row.capabilities_json) as unknown;
+    return Array.isArray(capabilities) && capabilities.includes("host_session_backfill_v2");
+  } catch {
+    return false;
+  }
+}
+
+async function requestHostSessionBackfill(
+  env: Env,
+  connectorId: string,
+  sessionId: string
+): Promise<{ events: AgentBackfillEvent[]; truncated?: boolean }> {
+  if (!env.WORKSPACE_DO) {
+    throw new ConnectorRpcError("Workspace Durable Object binding is unavailable", 503);
+  }
+
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  const response = await stub.fetch("https://workspace-do/internal/backfill-host-session", {
+    method: "POST",
+    body: JSON.stringify({
+      connector_id: connectorId,
+      request_id: `host-session-backfill-${cryptoRandomId().slice(0, 16)}`,
+      session_id: sessionId,
+      limit: HOST_SESSION_BACKFILL_EVENT_LIMIT
+    })
+  });
+  const body = await response.json().catch(() => ({})) as {
+    events?: unknown;
+    truncated?: unknown;
+    error?: unknown;
+  };
+
+  if (!response.ok) {
+    const message = typeof body.error === "string" ? body.error : "Connector could not backfill the host session";
+    throw new ConnectorRpcError(message, response.status);
+  }
+  if (body.events !== undefined && !Array.isArray(body.events)) {
+    throw new ConnectorRpcError("Connector returned an invalid host session backfill response", 502);
+  }
+  const events = (body.events ?? []).filter(isAgentBackfillEvent);
+  return {
+    events: events.slice(-HOST_SESSION_BACKFILL_EVENT_LIMIT),
+    truncated: body.truncated === true || events.length > HOST_SESSION_BACKFILL_EVENT_LIMIT
+  };
+}
+
 async function readJson(
   request: Request
 ): Promise<{ ok: true; value: unknown } | { ok: false; message: string }> {
@@ -579,6 +713,29 @@ function isAgentHostSession(value: unknown): value is AgentHostSession {
       value.title_source === "fallback") &&
     optionalString(value.cwd) &&
     isNonEmptyString(value.updated_at)
+  );
+}
+
+function isAgentBackfillEvent(value: unknown): value is AgentBackfillEvent {
+  if (!isRecord(value)) return false;
+  return (
+    isThreadEventKind(value.kind) &&
+    (value.priority === "P0" || value.priority === "P1" || value.priority === "P2" || value.priority === "P3") &&
+    isNonEmptyString(value.summary) &&
+    isNonEmptyString(value.idempotency_key) &&
+    isNonEmptyString(value.created_at)
+  );
+}
+
+function isThreadEventKind(value: unknown): boolean {
+  return (
+    value === "command.accepted" ||
+    value === "command.started" ||
+    value === "command.output" ||
+    value === "command.finished" ||
+    value === "command.failed" ||
+    value === "approval.requested" ||
+    value === "notice.throttled"
   );
 }
 

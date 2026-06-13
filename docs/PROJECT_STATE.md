@@ -10,6 +10,7 @@
 - Tasks now have one required primary thread, and local Codex sessions can be attached as task/thread pairs from Host Sessions.
 - The Rust connector defaults to placeholder execution and can opt in to local Codex CLI execution with private `execution.mode = "codex_exec"` configuration.
 - The Rust connector reports lightweight local Codex session inventory, can optionally use app-server `Thread.name` values for title enrichment, and can create new local app-server threads when `session_inventory.app_server_url` is configured.
+- Attached Host Sessions now request a bounded single-session history backfill from the connector, importing short rollout/history summaries without broad transcript upload.
 - Active workstream state lives in `docs/project_journal/2026/06/2026-06-11-task-thread-session-attach-d6e9f3.md`.
 
 ## Recovery Pointers
@@ -21,5 +22,5 @@
 - Local journal index: optional generated `docs/project_journal/INDEX.md`; do not commit it.
 
 ## Global Blockers
-- Codex app-server execution, historical session backfill, archive synchronisation, and R2 artefact capture are still deferred to later slices.
+- Codex app-server execution, archive synchronisation, and R2 artefact capture are still deferred to later slices.
 - Deployment-instance values must stay outside this repository; keep tracked docs generic and store instance values in an ignored local file or private deployment repository/subrepo.

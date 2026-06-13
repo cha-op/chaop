@@ -9,7 +9,8 @@ import type {
   DetachHostSessionRequest,
   DetachHostSessionResponse,
   RefreshHostSessionsResponse,
-  TaskSummary
+  TaskSummary,
+  ThreadEventsResponse
 } from "@chaop/protocol";
 import { fallbackBootstrap } from "./sample-data.js";
 
@@ -87,6 +88,26 @@ export async function detachHostSession(
 
 export async function refreshHostSessions(): Promise<RefreshHostSessionsResponse> {
   return postJson("/api/host-sessions/refresh", {});
+}
+
+export async function loadThreadEvents(threadId: string): Promise<ThreadEventsResponse> {
+  try {
+    const response = await fetch(apiUrl(`/api/threads/${encodeURIComponent(threadId)}/events`), {
+      credentials: "include",
+      headers: devHeaders()
+    });
+
+    if (!response.ok) {
+      throw await responseError(response, "Thread events failed");
+    }
+
+    return (await response.json()) as ThreadEventsResponse;
+  } catch (error) {
+    if (import.meta.env.DEV) {
+      return { events: [] };
+    }
+    throw error;
+  }
 }
 
 export function browserSocketUrl(): string {

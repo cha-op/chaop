@@ -31,6 +31,21 @@ pub struct AgentHostSession {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentBackfillEvent {
+    pub kind: String,
+    pub priority: String,
+    pub summary: String,
+    pub idempotency_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSessionBackfill {
+    pub events: Vec<AgentBackfillEvent>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TitleSource {
@@ -144,6 +159,38 @@ pub fn build_host_sessions_report(
     sessions.truncate(config.session_inventory.max_sessions);
 
     Ok(AgentHostSessionsReport { sessions })
+}
+
+pub fn build_host_session_backfill(
+    config: &AgentConfig,
+    session_id: &str,
+    limit: usize,
+) -> Result<HostSessionBackfill, Box<dyn std::error::Error>> {
+    if !config.session_inventory.enabled {
+        return Err("session inventory is disabled".into());
+    }
+
+    let codex_home = config
+        .session_inventory
+        .codex_home
+        .clone()
+        .unwrap_or_else(default_codex_home);
+    let limit = limit.clamp(1, 80);
+
+    if let Some(path) = find_rollout_path(
+        &codex_home,
+        session_id,
+        config.session_inventory.max_sessions,
+    )? {
+        return read_rollout_backfill(&path, session_id, limit);
+    }
+
+    Ok(read_history_backfill(
+        &codex_home,
+        session_id,
+        limit,
+        config.session_inventory.max_sessions,
+    )?)
 }
 
 fn read_session_index(
@@ -283,12 +330,270 @@ fn read_rollout_metadata(
     Ok(())
 }
 
+fn find_rollout_path(
+    codex_home: &Path,
+    session_id: &str,
+    max_sessions: usize,
+) -> std::io::Result<Option<PathBuf>> {
+    let sessions_dir = codex_home.join("sessions");
+    if !sessions_dir.exists() {
+        return Ok(None);
+    }
+
+    for path in rollout_paths(&sessions_dir, rollout_scan_limit(max_sessions).max(1_000))? {
+        if rollout_path_has_session_id(&path, session_id)? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn rollout_path_has_session_id(path: &Path, session_id: &str) -> std::io::Result<bool> {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(80) {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        if value
+            .get("payload")
+            .and_then(|payload| payload.get("id"))
+            .and_then(Value::as_str)
+            == Some(session_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_rollout_backfill(
+    path: &Path,
+    session_id: &str,
+    limit: usize,
+) -> Result<HostSessionBackfill, Box<dyn std::error::Error>> {
+    let mut events = Vec::<AgentBackfillEvent>::new();
+    let scan_limit = rollout_backfill_line_scan_limit(limit);
+    let lines = read_recent_lines(path, scan_limit)?;
+    let reached_scan_limit = lines.len() == scan_limit;
+
+    for line in lines {
+        let record_hash = stable_hash(&line);
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(event) = backfill_event_from_rollout_record(session_id, &value, &record_hash)
+        else {
+            continue;
+        };
+        events.push(event);
+    }
+
+    let truncated = events.len() > limit || reached_scan_limit;
+    if events.len() > limit {
+        let drain_count = events.len() - limit;
+        events.drain(0..drain_count);
+    }
+
+    Ok(HostSessionBackfill { events, truncated })
+}
+
+fn read_history_backfill(
+    codex_home: &Path,
+    session_id: &str,
+    limit: usize,
+    max_sessions: usize,
+) -> std::io::Result<HostSessionBackfill> {
+    let path = codex_home.join("history.jsonl");
+    if !path.exists() {
+        return Ok(HostSessionBackfill {
+            events: Vec::new(),
+            truncated: false,
+        });
+    }
+
+    let mut events = Vec::new();
+    for line in read_recent_lines(&path, metadata_scan_limit(max_sessions))? {
+        let Ok(entry) = serde_json::from_str::<HistoryLine>(&line) else {
+            continue;
+        };
+        if entry.session_id != session_id {
+            continue;
+        }
+        let Some(text) = compact_event_text(entry.text.as_deref()) else {
+            continue;
+        };
+        let created_at = entry.ts.and_then(unix_seconds_to_iso);
+        let timestamp = created_at.as_deref().unwrap_or("unknown time");
+        events.push(AgentBackfillEvent {
+            kind: "command.output".to_owned(),
+            priority: "P3".to_owned(),
+            summary: format!("{} - User: {text}", compact_timestamp(timestamp)),
+            idempotency_key: format!("history:{session_id}:{timestamp}:{}", stable_hash(&text)),
+            created_at: created_at.unwrap_or_else(unknown_backfill_created_at),
+        });
+    }
+    let truncated = events.len() > limit;
+    if truncated {
+        let drain_count = events.len() - limit;
+        events.drain(0..drain_count);
+    }
+    Ok(HostSessionBackfill { events, truncated })
+}
+
+fn backfill_event_from_rollout_record(
+    session_id: &str,
+    value: &Value,
+    record_hash: &str,
+) -> Option<AgentBackfillEvent> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+
+    let created_at = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let timestamp = created_at.as_deref().unwrap_or("unknown time");
+    let item = value.get("payload")?;
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    let summary = match item_type {
+        "message" => {
+            let role = item.get("role").and_then(Value::as_str)?;
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let text = message_text(item, role)?;
+            let label = if role == "user" { "User" } else { "Assistant" };
+            format!("{} - {label}: {text}", compact_timestamp(timestamp))
+        }
+        "function_call" => {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+            format!("{} - Tool call: {name}", compact_timestamp(timestamp))
+        }
+        _ => return None,
+    };
+
+    let idempotency_key = format!(
+        "rollout:{session_id}:{timestamp}:{item_type}:{}",
+        record_hash
+    );
+
+    Some(AgentBackfillEvent {
+        kind: "command.output".to_owned(),
+        priority: "P3".to_owned(),
+        summary,
+        idempotency_key,
+        created_at: created_at.unwrap_or_else(unknown_backfill_created_at),
+    })
+}
+
+fn unknown_backfill_created_at() -> String {
+    "1970-01-01T00:00:00.000Z".to_owned()
+}
+
+fn message_text(item: &Value, role: &str) -> Option<String> {
+    let content = item.get("content").and_then(Value::as_array)?;
+    let mut parts = Vec::new();
+    for part in content {
+        let text = part
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| part.get("input").and_then(Value::as_str));
+        let text = match (role, text) {
+            ("user", Some(value)) => strip_injected_context_prefix(value),
+            (_, Some(value)) => Some(value.trim()),
+            (_, None) => None,
+        };
+        if let Some(text) = text.and_then(|value| compact_event_text(Some(value))) {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn compact_event_text(value: Option<&str>) -> Option<String> {
+    let compact = value?.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    let mut text = compact.chars().take(260).collect::<String>();
+    if compact.chars().count() > 260 {
+        text.push_str("...");
+    }
+    Some(text)
+}
+
+fn looks_like_injected_context(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<permissions instructions>")
+        || trimmed.starts_with("<apps_instructions>")
+        || trimmed.starts_with("<skills_instructions>")
+        || trimmed.starts_with("<plugins_instructions>")
+        || trimmed.starts_with("<developer")
+}
+
+fn strip_injected_context_prefix(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if !looks_like_injected_context(trimmed) {
+        return Some(trimmed);
+    }
+
+    let mut latest_end = None::<usize>;
+    for marker in [
+        "</INSTRUCTIONS>",
+        "</environment_context>",
+        "</permissions instructions>",
+        "</collaboration_mode>",
+        "</apps_instructions>",
+        "</skills_instructions>",
+        "</plugins_instructions>",
+        "</developer>",
+    ] {
+        if let Some(index) = trimmed.rfind(marker) {
+            latest_end =
+                Some(latest_end.map_or(index + marker.len(), |end| end.max(index + marker.len())));
+        }
+    }
+
+    let remainder = trimmed.get(latest_end?..)?.trim();
+    if remainder.is_empty() {
+        None
+    } else {
+        Some(remainder)
+    }
+}
+
+fn compact_timestamp(timestamp: &str) -> String {
+    timestamp
+        .strip_suffix('Z')
+        .unwrap_or(timestamp)
+        .replace('T', " ")
+        .chars()
+        .take(16)
+        .collect()
+}
+
 fn rollout_scan_limit(max_sessions: usize) -> usize {
     max_sessions.saturating_mul(3).clamp(50, 500)
 }
 
 fn metadata_scan_limit(max_sessions: usize) -> usize {
     max_sessions.saturating_mul(5).clamp(50, 1000)
+}
+
+fn rollout_backfill_line_scan_limit(event_limit: usize) -> usize {
+    event_limit.saturating_mul(20).clamp(200, 2_000)
 }
 
 fn read_recent_lines(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
@@ -923,6 +1228,15 @@ fn max_string(first: Option<String>, second: Option<String>) -> Option<String> {
     }
 }
 
+fn stable_hash(value: &str) -> String {
+    let mut hash = 0x811c9dc5_u32;
+    for byte in value.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    format!("{hash:08x}")
+}
+
 fn default_codex_home() -> PathBuf {
     if let Ok(value) = std::env::var("CODEX_HOME") {
         return value.into();
@@ -937,8 +1251,9 @@ mod tests {
     use super::{
         HistorySession, SessionDraft, TitleSource, app_server_sessions_from_response,
         app_server_thread_from_response, app_server_titles_from_response,
-        build_host_sessions_report, create_app_server_thread_at, load_app_server_sessions,
-        read_recent_lines, resolve_session, rollout_paths, unix_seconds_to_iso,
+        build_host_session_backfill, build_host_sessions_report, create_app_server_thread_at,
+        load_app_server_sessions, read_recent_lines, resolve_session, rollout_paths,
+        unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
@@ -1287,8 +1602,200 @@ mod tests {
         assert_eq!(report.sessions[2].title, "Metadata index title");
     }
 
+    #[test]
+    fn backfills_bounded_rollout_history_for_one_session() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        fs::create_dir_all(codex_home.join("sessions/2026/06/13")).expect("sessions dir");
+        fs::write(
+            codex_home.join("sessions/2026/06/13/rollout-session-1.jsonl"),
+            r##"{"timestamp":"2026-06-13T03:00:00.000Z","type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project"}}
+{"timestamp":"2026-06-13T03:01:00.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"developer instructions"}]}}
+{"timestamp":"2026-06-13T03:02:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/project"}]}}
+{"timestamp":"2026-06-13T03:03:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Run the integration check"}]}}
+{"timestamp":"2026-06-13T03:04:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will inspect the failing path."}]}}
+{"timestamp":"2026-06-13T03:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{}"}}
+{"timestamp":"2026-06-13T03:06:00.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"test passed\nextra line"}}
+"##,
+        )
+        .expect("rollout");
+
+        let config = test_config(codex_home);
+        let backfill = build_host_session_backfill(&config, "session-1", 10).expect("backfill");
+
+        assert_eq!(backfill.truncated, false);
+        assert_eq!(backfill.events.len(), 3);
+        assert_eq!(
+            backfill.events[0].summary,
+            "2026-06-13 03:03 - User: Run the integration check"
+        );
+        assert_eq!(backfill.events[0].created_at, "2026-06-13T03:03:00.000Z");
+        assert_eq!(
+            backfill.events[1].summary,
+            "2026-06-13 03:04 - Assistant: I will inspect the failing path."
+        );
+        assert_eq!(backfill.events[1].created_at, "2026-06-13T03:04:00.000Z");
+        assert_eq!(
+            backfill.events[2].summary,
+            "2026-06-13 03:05 - Tool call: exec_command"
+        );
+        assert_eq!(backfill.events[2].created_at, "2026-06-13T03:05:00.000Z");
+    }
+
+    #[test]
+    fn backfills_history_prompt_when_rollout_is_missing() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        fs::write(
+            codex_home.join("history.jsonl"),
+            r#"{"session_id":"session-1","text":"History prompt","ts":1781263443}"#,
+        )
+        .expect("history");
+
+        let config = test_config(codex_home);
+        let backfill = build_host_session_backfill(&config, "session-1", 10).expect("backfill");
+
+        assert_eq!(backfill.events.len(), 1);
+        assert_eq!(
+            backfill.events[0].summary,
+            "2026-06-12 11:24 - User: History prompt"
+        );
+        assert_eq!(backfill.events[0].kind, "command.output");
+        assert_eq!(backfill.events[0].priority, "P3");
+        assert_eq!(backfill.events[0].created_at, "2026-06-12T11:24:03.000Z");
+    }
+
+    #[test]
+    fn rollout_backfill_preserves_prompt_after_injected_context() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        fs::create_dir_all(codex_home.join("sessions/2026/06/13")).expect("sessions dir");
+        fs::write(
+            codex_home.join("sessions/2026/06/13/rollout-session-1.jsonl"),
+            r##"{"timestamp":"2026-06-13T03:00:00.000Z","type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project"}}
+{"timestamp":"2026-06-13T03:01:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nKeep docs bilingual.\n</INSTRUCTIONS>\n<environment_context>\n  <cwd>/tmp/project</cwd>\n</environment_context>\n\nImplement the parser"}]}}"##,
+        )
+        .expect("rollout");
+
+        let config = test_config(codex_home);
+        let backfill = build_host_session_backfill(&config, "session-1", 10).expect("backfill");
+
+        assert_eq!(backfill.events.len(), 1);
+        assert_eq!(
+            backfill.events[0].summary,
+            "2026-06-13 03:01 - User: Implement the parser"
+        );
+    }
+
+    #[test]
+    fn history_backfill_uses_inventory_scan_horizon() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let mut lines = vec![
+            r#"{"session_id":"session-1","text":"Visible older prompt","ts":1781263443}"#
+                .to_owned(),
+        ];
+        lines.extend((0..199).map(|index| {
+            let filler_id = index + 1_000;
+            format!(
+                r#"{{"session_id":"session-{filler_id}","text":"Filler prompt {index}","ts":1781263444}}"#
+            )
+        }));
+        fs::write(codex_home.join("history.jsonl"), lines.join("\n")).expect("history");
+
+        let mut config = test_config(codex_home);
+        config.session_inventory.max_sessions = 100;
+        let backfill = build_host_session_backfill(&config, "session-1", 30).expect("backfill");
+
+        assert_eq!(backfill.events.len(), 1);
+        assert_eq!(
+            backfill.events[0].summary,
+            "2026-06-12 11:24 - User: Visible older prompt"
+        );
+    }
+
+    #[test]
+    fn backfill_is_disabled_when_session_inventory_is_disabled() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        fs::write(
+            codex_home.join("history.jsonl"),
+            r#"{"session_id":"session-1","text":"History prompt","ts":1781263443}"#,
+        )
+        .expect("history");
+
+        let mut config = test_config(codex_home);
+        config.session_inventory.enabled = false;
+
+        let error = build_host_session_backfill(&config, "session-1", 10).expect_err("disabled");
+
+        assert_eq!(error.to_string(), "session inventory is disabled");
+    }
+
+    #[test]
+    fn backfill_does_not_match_rollout_filename_by_session_prefix() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        fs::create_dir_all(codex_home.join("sessions/2026/06/13")).expect("sessions dir");
+        fs::write(
+            codex_home.join("sessions/2026/06/13/rollout-session-10.jsonl"),
+            r#"{"timestamp":"2026-06-13T03:00:00.000Z","type":"session_meta","payload":{"id":"session-10","cwd":"/tmp/project"}}
+{"timestamp":"2026-06-13T03:01:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Wrong session"}]}}"#,
+        )
+        .expect("rollout");
+
+        let config = test_config(codex_home);
+        let backfill = build_host_session_backfill(&config, "session-1", 10).expect("backfill");
+
+        assert!(backfill.events.is_empty());
+    }
+
+    #[test]
+    fn rollout_backfill_idempotency_keys_use_raw_record_identity() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        fs::create_dir_all(codex_home.join("sessions/2026/06/13")).expect("sessions dir");
+        fs::write(
+            codex_home.join("sessions/2026/06/13/rollout-session-1.jsonl"),
+            r#"{"timestamp":"2026-06-13T03:00:00.000Z","type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project"}}
+{"timestamp":"2026-06-13T03:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{}"}}
+{"timestamp":"2026-06-13T03:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-2","arguments":"{}"}}"#,
+        )
+        .expect("rollout");
+
+        let config = test_config(codex_home);
+        let backfill = build_host_session_backfill(&config, "session-1", 10).expect("backfill");
+
+        assert_eq!(backfill.events.len(), 2);
+        assert_eq!(backfill.events[0].summary, backfill.events[1].summary);
+        assert_ne!(
+            backfill.events[0].idempotency_key,
+            backfill.events[1].idempotency_key
+        );
+    }
+
     fn run_fake_app_server(responses: Vec<serde_json::Value>) -> String {
         run_fake_app_server_with_requests(responses).0
+    }
+
+    fn test_config(codex_home: &std::path::Path) -> AgentConfig {
+        AgentConfig {
+            connector_name: "mac-studio".to_owned(),
+            control_url: "wss://api.example.com/ws/agent".to_owned(),
+            bootstrap_url: "https://api.example.com/connector/bootstrap".to_owned(),
+            workspace_root: "/tmp/project".into(),
+            token_file: "/tmp/token".into(),
+            spool_db: "/tmp/spool.sqlite".into(),
+            bootstrap: BootstrapConfig {
+                secret_file: "/tmp/bootstrap.secret".into(),
+            },
+            execution: ExecutionConfig::default(),
+            session_inventory: SessionInventoryConfig {
+                codex_home: Some(codex_home.into()),
+                app_server_url: None,
+                ..SessionInventoryConfig::default()
+            },
+        }
     }
 
     fn run_fake_app_server_with_requests(

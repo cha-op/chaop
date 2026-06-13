@@ -84,8 +84,14 @@ superseded_by:
 - Review follow-up exposes connector capabilities in bootstrap and filters `New local thread` connector choices to `app_server_threads`, so manual selection matches the backend eligibility check.
 - Deployment guidance now documents the local `codex app-server --listen ws://127.0.0.1:9876` prerequisite and the private connector `app_server_url` setting.
 
+## 2026-06-13 Session History Backfill
+- Historical Host Session attach now requests a bounded single-session history backfill from the matched connector after the task/thread attachment is created.
+- `WorkspaceDO` now supports `host_session.backfill` / `host_session.backfill_result` RPC over the existing agent WebSocket, using the newest socket for the selected connector and a bounded timeout.
+- The Rust connector reads only the requested local Codex session. It prefers the matching rollout file, skips injected developer/context records, reasoning records, and tool output records, and returns short user, assistant, and tool-call summaries. If no rollout is found, it falls back to the session's recent `history.jsonl` prompt.
+- Worker stores returned summaries as idempotent `command.output` thread events with deterministic backfill event ids, so repeated attach/backfill attempts do not duplicate history. Backfill events preserve their original local timestamps and require the `host_session_backfill_v2` capability, which is only advertised when session inventory is enabled.
+- Browser attach responses now merge imported backfill events immediately and show a warning if backfill fails while preserving the successful attachment. Thread Centre also reloads the selected thread's event tail through a thread-scoped events API, so old backfilled history remains visible after refresh even when it is older than the global recent-event feed.
+
 ## Next Steps
-- After new-thread creation works, add old-session history backfill so attached sessions can show useful previous output without uploading broad local transcripts by default.
 - After history backfill, sync Chaop archive/unarchive to the local Codex app-server archive state through the connector. Keep local history files read-only.
 - Keep the Codex CLI adapter as the current working execution fallback until the app-server protocol path can cover create, resume, archive, and event/history reads cleanly.
 - Keep R2 artefact capture and budget aggregation behind this core control-loop closure work.
