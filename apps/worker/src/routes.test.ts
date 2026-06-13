@@ -1661,7 +1661,9 @@ function commandTargetDb(
             if (/WHERE EXISTS/.test(sql)) {
               assert.equal(targetConnectorId, "connector-attached");
               assert.match(sql, /hs\.app_server_present = 1/);
+              assert.match(sql, /hs\.id = \(\s+SELECT hs2\.id/);
               assert.match(sql, /hs\.connector_id = \?/);
+              assert.match(sql, /ORDER BY\s+CASE WHEN \? IS NOT NULL AND hs2\.attached_task_id = \?/);
               assert.match(sql, /OR NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hst/);
             }
             return {

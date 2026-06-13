@@ -829,25 +829,34 @@ async function insertCommandInDb(
        WHERE EXISTS (
          SELECT 1
          FROM host_sessions hs
-         WHERE hs.workspace_id = ?
-           AND hs.connector_id = ?
-           AND hs.app_server_present = 1
-           AND (
-             (? IS NOT NULL AND hs.attached_task_id = ?)
-             OR (
-               ? IS NOT NULL
-               AND hs.attached_thread_id = ?
-               AND (
-                 ? IS NULL
-                 OR NOT EXISTS (
-                   SELECT 1
-                   FROM host_sessions hst
-                   WHERE hst.workspace_id = hs.workspace_id
-                     AND hst.attached_task_id = ?
+         WHERE hs.id = (
+           SELECT hs2.id
+           FROM host_sessions hs2
+           WHERE hs2.workspace_id = ?
+             AND (
+               (? IS NOT NULL AND hs2.attached_task_id = ?)
+               OR (
+                 ? IS NOT NULL
+                 AND hs2.attached_thread_id = ?
+                 AND (
+                   ? IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1
+                     FROM host_sessions hst
+                     WHERE hst.workspace_id = hs2.workspace_id
+                       AND hst.attached_task_id = ?
+                   )
                  )
                )
              )
-           )
+           ORDER BY
+             CASE WHEN ? IS NOT NULL AND hs2.attached_task_id = ? THEN 0 ELSE 1 END,
+             hs2.updated_at DESC,
+             hs2.id DESC
+           LIMIT 1
+         )
+           AND hs.connector_id = ?
+           AND hs.app_server_present = 1
        )`
     )
       .bind(
@@ -863,13 +872,15 @@ async function insertCommandInDb(
         command.created_at,
         command.updated_at,
         command.workspace_id,
-        command.target_connector_id,
         command.task_id ?? null,
         command.task_id ?? null,
         command.thread_id ?? null,
         command.thread_id ?? null,
         command.task_id ?? null,
-        command.task_id ?? null
+        command.task_id ?? null,
+        command.task_id ?? null,
+        command.task_id ?? null,
+        command.target_connector_id
       )
       .run();
     return Boolean((result.meta as { changes?: number } | undefined)?.changes);

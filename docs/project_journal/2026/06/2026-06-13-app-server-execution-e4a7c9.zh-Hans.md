@@ -49,7 +49,7 @@ superseded_by:
 - Independent PR review 发现 detach ordering race；detach 现在会先清空 Host Session attachment，再按照保存的旧 attachment 失败依赖它的 commands，所以并发 command creation 不会再选中正在 detach 的 session。
 - Independent PR review 发现 stale `command.started` race 仍可能在 cleanup 选中 leased command 后抢先成功。现在 app-server-only connector 的 start 会在接受 `command.started` 前重新验证当前 task/thread Host Session target。
 - Detached-command cleanup 也会覆盖 `target_connector_id IS NULL` 的 legacy 或 delayed app-server commands，同时保留 command leasing 可选择的任意当前 app-server Host Session replacement。
-- Independent PR review 发现还存在 create/detach 跨请求 race：command creation 可能先读到旧 app-server attachment，然后在 detach cleanup 扫描 commands 之后才 insert。现在 app-server Codex command creation 使用 guarded insert，只有当前 task/thread Host Session 仍解析到同一个 app-server target 时才会写入 command。
+- Independent PR review 发现还存在 create/detach 跨请求 race：command creation 可能先读到旧 app-server attachment，然后在 detach cleanup 扫描 commands 之后才 insert。现在 app-server Codex command creation 使用 guarded insert，只有按同一套 task-first/latest ordering 选出的当前 task/thread Host Session 仍解析到同一个 app-server target 时才会写入 command。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
