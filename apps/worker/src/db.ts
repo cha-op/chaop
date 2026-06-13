@@ -490,21 +490,43 @@ async function failCommandsForDetachedAppServerHostSession(
       `UPDATE commands
        SET state = 'failed', lease_owner_connector_id = NULL, lease_until = NULL, updated_at = ?
        WHERE id = ?
-         AND state IN ('pending', 'leased')
+         AND workspace_id = ?
+         AND type = 'codex'
+         AND (target_connector_id = ? OR target_connector_id IS NULL)
+         AND (
+           (
+             state = 'pending'
+             AND lease_target_host_session_id = ?
+           )
+           OR (
+             state = 'leased'
+             AND (
+               lease_target_host_session_id = ?
+               OR (
+                 lease_target_host_session_id IS NULL
+                 AND lease_owner_connector_id = ?
+               )
+             )
+           )
+         )
+         AND (
+           (? IS NOT NULL AND task_id = ?)
+           OR (? IS NOT NULL AND thread_id = ?)
+         )
          AND NOT EXISTS (
            SELECT 1
            FROM host_sessions hs
            INNER JOIN connectors c ON c.id = hs.connector_id
            INNER JOIN workspace_connectors wc
-             ON wc.workspace_id = ?
+             ON wc.workspace_id = commands.workspace_id
             AND wc.connector_id = hs.connector_id
            WHERE hs.id = COALESCE(
              (
                SELECT hs_task.id
                FROM host_sessions hs_task
-               WHERE hs_task.workspace_id = ?
-                 AND ? IS NOT NULL
-                 AND hs_task.attached_task_id = ?
+               WHERE hs_task.workspace_id = commands.workspace_id
+                 AND commands.task_id IS NOT NULL
+                 AND hs_task.attached_task_id = commands.task_id
                  AND hs_task.id <> ?
                ORDER BY hs_task.updated_at DESC, hs_task.id DESC
                LIMIT 1
@@ -512,18 +534,18 @@ async function failCommandsForDetachedAppServerHostSession(
              (
                SELECT hs_thread.id
                FROM host_sessions hs_thread
-               WHERE hs_thread.workspace_id = ?
-                 AND ? IS NOT NULL
-                 AND hs_thread.attached_thread_id = ?
+               WHERE hs_thread.workspace_id = commands.workspace_id
+                 AND commands.thread_id IS NOT NULL
+                 AND hs_thread.attached_thread_id = commands.thread_id
                  AND hs_thread.id <> ?
                  AND (
-                   ? IS NULL
+                   commands.task_id IS NULL
                    OR NOT EXISTS (
                      SELECT 1
                      FROM host_sessions hst
-                     WHERE hst.workspace_id = ?
+                     WHERE hst.workspace_id = commands.workspace_id
                        AND hst.id <> ?
-                       AND hst.attached_task_id = ?
+                       AND hst.attached_task_id = commands.task_id
                    )
                  )
                ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
@@ -534,27 +556,24 @@ async function failCommandsForDetachedAppServerHostSession(
              AND wc.can_execute = 1
              AND c.status <> 'offline'
              AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
-             AND (? IS NULL OR hs.connector_id = ?)
+             AND (commands.target_connector_id IS NULL OR hs.connector_id = commands.target_connector_id)
          )`
     )
       .bind(
         now,
         command.id,
-        command.workspace_id,
-        command.workspace_id,
-        command.task_id,
-        command.task_id,
+        hostSession.workspace_id,
+        hostSession.connector_id,
         hostSession.id,
-        command.workspace_id,
-        command.thread_id,
-        command.thread_id,
         hostSession.id,
-        command.task_id,
-        command.workspace_id,
+        hostSession.connector_id,
+        taskId,
+        taskId,
+        threadId,
+        threadId,
         hostSession.id,
-        command.task_id,
-        command.target_connector_id,
-        command.target_connector_id
+        hostSession.id,
+        hostSession.id
       )
       .run();
     if (!((result.meta as { changes?: number } | undefined)?.changes)) {
@@ -1241,6 +1260,7 @@ async function releaseRejectedAppServerStartLease(
   const result = await env.DB!.prepare(
     `UPDATE commands
      SET state = 'pending',
+         target_connector_id = NULL,
          lease_owner_connector_id = NULL,
          lease_until = NULL,
          lease_target_host_session_id = NULL,

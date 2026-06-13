@@ -715,6 +715,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
       }
 
       if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
+        assert.match(sql, /target_connector_id = NULL/);
         assert.match(sql, /lease_owner_connector_id = NULL/);
         assert.match(sql, /lease_until = NULL/);
         assert.match(sql, /lease_target_host_session_id = NULL/);

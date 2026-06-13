@@ -341,6 +341,7 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
       }
 
       if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
+        assert.match(sql, /target_connector_id = NULL/);
         assert.match(sql, /lease_target_host_session_id = \?/);
         return {
           bind(updatedAt: string, commandId: string, connectorId: string, targetHostSessionId: string) {
