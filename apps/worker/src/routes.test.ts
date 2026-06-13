@@ -2435,6 +2435,7 @@ function hostSessionDetachDb(): D1Database & {
     taskUpdates: 0,
     eventInserts: 0
   };
+  let attachmentCleared = false;
   const row = {
     id: "host-session-1",
     connector_id: "connector-online",
@@ -2469,6 +2470,7 @@ function hostSessionDetachDb(): D1Database & {
       }
 
       if (/FROM commands cmd/.test(sql)) {
+        assert.equal(attachmentCleared, true);
         assert.match(sql, /cmd\.type = 'codex'/);
         assert.match(sql, /cmd\.target_connector_id = \?/);
         assert.match(sql, /cmd\.state = 'pending'/);
@@ -2602,6 +2604,7 @@ function hostSessionDetachDb(): D1Database & {
           bind(updatedAt: string, hostSessionId: string) {
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(hostSessionId, "host-session-1");
+            attachmentCleared = true;
             row.updated_at = updatedAt;
             row.attached_task_id = null as unknown as string;
             row.attached_thread_id = null as unknown as string;

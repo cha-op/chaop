@@ -46,6 +46,7 @@ superseded_by:
 - Final independent review found and fixed the lease-before-dispatch detach window; detaching an app-server Host Session now fails both pending and leased-but-not-running Codex commands that depend on that attachment.
 - Final frozen-diff review found a remaining detach/dispatch acknowledgement race; Worker command-event acknowledgements now include `accepted`, and the Rust connector aborts local execution when `command.started` is rejected as stale.
 - Detached-command replacement matching now keeps the outer replacement scoped to the command target connector while using the same connector-agnostic task-first existence check as command leasing, so cross-connector task attachments cannot incorrectly enable a thread fallback.
+- Independent PR review found a detach ordering race; detach now clears the Host Session attachment before failing commands that depended on the saved old attachment, so concurrent command creation cannot target a session that is already being detached.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -54,6 +55,7 @@ superseded_by:
 - Worker route tests cover app-server Host Session detach failing pending attachment-dependent Codex commands.
 - Worker route tests assert detached-command replacement matching is scoped to the command target connector.
 - Worker route tests assert detached-command cleanup covers leased commands immediately instead of waiting for lease expiry.
+- Worker route tests assert Host Session detach clears the attachment before command cleanup queries run.
 - Worker Durable Object tests assert stale agent command events receive `server.ack` with `accepted: false`.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.
 - Rust tests assert app-server command session resolution stops paging once the target session is found.

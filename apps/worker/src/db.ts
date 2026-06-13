@@ -355,7 +355,6 @@ export async function detachHostSessionInDb(
   }
 
   const now = new Date().toISOString();
-  await failCommandsForDetachedAppServerHostSession(env, hostSession, now);
   await env.DB.prepare(
     `UPDATE host_sessions
      SET attached_task_id = NULL, attached_thread_id = NULL, updated_at = ?
@@ -363,6 +362,7 @@ export async function detachHostSessionInDb(
   )
     .bind(now, hostSession.id)
     .run();
+  await failCommandsForDetachedAppServerHostSession(env, hostSession, now);
 
   return {
     host_session: {
