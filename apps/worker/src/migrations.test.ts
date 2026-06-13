@@ -20,6 +20,27 @@ test("host session app-server presence is added only by forward migration", asyn
   );
 });
 
+test("command lease target host session is added by forward migration", async () => {
+  const migration = await readMigration("0007_command_lease_target_host_session.sql");
+
+  assert.match(migration, /ALTER TABLE commands ADD COLUMN lease_target_host_session_id TEXT/);
+});
+
+test("command target connector source is added by forward migration", async () => {
+  const migration = await readMigration("0008_command_target_connector_source.sql");
+
+  assert.match(
+    migration,
+    /ALTER TABLE commands ADD COLUMN target_connector_id_source TEXT NOT NULL DEFAULT 'auto'/
+  );
+  assert.match(
+    migration,
+    /SET target_connector_id_source = 'explicit'\s+WHERE target_connector_id IS NOT NULL/
+  );
+  assert.doesNotMatch(migration, /target_connector_id_source = 'attached'/);
+  assert.doesNotMatch(migration, /lease_target_host_session_id =/);
+});
+
 async function readMigration(fileName: string): Promise<string> {
   return await readFile(new URL(fileName, migrationsDir), "utf8");
 }

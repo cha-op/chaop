@@ -736,6 +736,9 @@ test("host session attach skips backfill when the session is already attached", 
 });
 
 test("host session detach clears the attached task and thread when D1 is bound", async () => {
+  const db = hostSessionDetachDb();
+  let internalPath = "";
+  let broadcastedEventId = "";
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/detach", {
       method: "POST",
@@ -748,7 +751,20 @@ test("host session detach clears the attached task and thread when D1 is bound",
     }),
     {
       ...devEnv,
-      DB: hostSessionDetachDb()
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            const body = JSON.parse(String(init?.body ?? "{}")) as {
+              events?: Array<{ id?: string }>;
+            };
+            broadcastedEventId = body.events?.[0]?.id ?? "";
+            return new Response(JSON.stringify({ broadcasted: body.events?.length ?? 0 }));
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
     }
   );
   const body = (await response.json()) as {
@@ -757,12 +773,167 @@ test("host session detach clears the attached task and thread when D1 is bound",
       attached_task_id?: string;
       attached_thread_id?: string;
     };
+    failed_events?: unknown;
   };
 
   assert.equal(response.status, 200);
   assert.equal(body.host_session.session_id, "session-1");
   assert.equal(body.host_session.attached_task_id, undefined);
   assert.equal(body.host_session.attached_thread_id, undefined);
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(body.failed_events, undefined);
+  assert.equal(internalPath, "/internal/broadcast-thread-events");
+  assert.match(broadcastedEventId, /^event-/);
+});
+
+test("host session detach refreshes connector activity after failing a leased command", async () => {
+  const db = hostSessionDetachDb({ detachedCommandState: "leased" });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.connectorActivityUpdates, 1);
+});
+
+test("host session detach dispatches app-server capable connectors after releasing attached-inferred commands", async () => {
+  const db = hostSessionDetachDb({
+    releaseDetachedCommands: true,
+    returnDetachedCommands: false
+  });
+  let internalPath = "";
+  const dispatchedConnectorIds: string[] = [];
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            const body = JSON.parse(String(init?.body ?? "{}")) as { connector_id?: string };
+            dispatchedConnectorIds.push(body.connector_id ?? "");
+            return new Response("{}");
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as Record<string, unknown>;
+
+  assert.equal(response.status, 200);
+  assert.equal(body.released_connector_ids, undefined);
+  assert.equal(db.commandReleases, 1);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.connectorActivityUpdates, 1);
+  assert.equal(internalPath, "/internal/dispatch-pending");
+  assert.deepEqual(dispatchedConnectorIds, ["connector-online", "connector-replacement"]);
+});
+
+test("host session detach does not release same-session leases owned by a replacement connector", async () => {
+  const db = hostSessionDetachDb({
+    detachedCommandState: "leased",
+    detachedLeaseOwnedByReplacement: true,
+    returnDetachedCommands: false
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(db.commandReleases, 0);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.connectorActivityUpdates, 0);
+});
+
+test("host session detach keeps nullable-target leases owned by another connector", async () => {
+  const db = hostSessionDetachDb({ returnDetachedCommands: false });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
+test("host session detach skips side effects when guarded command failure loses the race", async () => {
+  const db = hostSessionDetachDb({ detachedCommandFailureChanges: 0 });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.connectorActivityUpdates, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
 });
 
 test("CORS preflight returns configured browser headers", async () => {
@@ -1164,6 +1335,220 @@ test("command creation preserves codex type for capable target connectors when D
   assert.equal(body.command.target_connector_id, "connector-online");
 });
 
+test("command creation targets the connector that owns an attached host session", async () => {
+  const envWithAttachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      { attachedThreadConnectorId: "connector-attached", attachedThreadAppServerPresent: true }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached session"
+      })
+    }),
+    envWithAttachedSession
+  );
+  const body = (await response.json()) as { command: { target_connector_id?: string; type: string } };
+
+  assert.equal(response.status, 202);
+  assert.equal(body.command.type, "codex");
+  assert.equal(body.command.target_connector_id, "connector-attached");
+});
+
+test("command creation accepts attached app-server commands without codex_exec capability", async () => {
+  const envWithAttachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        supportsCodex: false,
+        supportsAppServerExec: true
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached app-server session"
+      })
+    }),
+    envWithAttachedSession
+  );
+  const body = (await response.json()) as { command: { target_connector_id?: string; type: string } };
+
+  assert.equal(response.status, 202);
+  assert.equal(body.command.type, "codex");
+  assert.equal(body.command.target_connector_id, "connector-attached");
+});
+
+test("command creation rejects attached app-server commands when the attachment changes before insert", async () => {
+  const envWithDetachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        supportsCodex: false,
+        supportsAppServerExec: true,
+        guardedCommandInsertChanges: 0
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached app-server session"
+      })
+    }),
+    envWithDetachedSession
+  );
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: "Attached host session changed before command creation"
+  });
+});
+
+test("command creation rejects attached non-app-server commands when the attachment changes before insert", async () => {
+  const envWithDetachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: false,
+        guardedCommandInsertChanges: 0
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached CLI session"
+      })
+    }),
+    envWithDetachedSession
+  );
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: "Attached host session changed before command creation"
+  });
+});
+
+test("command creation rejects explicit attached targets when the attachment changes before insert", async () => {
+  const envWithDetachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        supportsCodex: false,
+        supportsAppServerExec: true,
+        guardedCommandInsertChanges: 0,
+        expectedTargetConnectorIdSource: "explicit"
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        target_connector_id: "connector-attached",
+        type: "codex",
+        prompt: "Continue the explicit attached app-server session"
+      })
+    }),
+    envWithDetachedSession
+  );
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: "Attached host session changed before command creation"
+  });
+});
+
+test("command creation rejects explicit targets that do not own an attached host session", async () => {
+  const envWithAttachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      { attachedThreadConnectorId: "connector-attached" }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors",
+        target_connector_id: "connector-online"
+      })
+    }),
+    envWithAttachedSession
+  );
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), {
+    error: "Target connector does not own the attached host session"
+  });
+});
+
+test("command creation rejects attached app-server commands when the owner lacks app-server execution", async () => {
+  const envWithAttachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        supportsAppServerExec: false
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        prompt: "Continue the attached app-server session"
+      })
+    }),
+    envWithAttachedSession
+  );
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), { error: "Target connector not available" });
+});
+
 test("command creation rejects codex target connectors without codex_exec capability", async () => {
   const envWithPlaceholderConnector: Env = {
     ...devEnv,
@@ -1314,12 +1699,24 @@ function commandTargetDb(
     threadWorkspaceId?: string;
     taskWorkspaceId?: string;
     taskThreadId?: string;
+    attachedTaskConnectorId?: string;
+    attachedThreadConnectorId?: string;
+    attachedTaskAppServerPresent?: boolean;
+    attachedThreadAppServerPresent?: boolean;
+    supportsAppServerExec?: boolean;
+    guardedCommandInsertChanges?: number;
+    expectedTargetConnectorIdSource?: "explicit" | "attached" | "auto";
   } = {}
 ): D1Database {
   const supportsCodex = options.supportsCodex ?? true;
+  const supportsAppServerExec = options.supportsAppServerExec ?? true;
   const threadWorkspaceId = options.threadWorkspaceId ?? "workspace-api";
   const taskWorkspaceId = options.taskWorkspaceId ?? "workspace-api";
   const taskThreadId = options.taskThreadId ?? "thread-orders-500";
+  const attachedTaskConnectorId = options.attachedTaskConnectorId;
+  const attachedThreadConnectorId = options.attachedThreadConnectorId;
+  const attachedTaskAppServerPresent = options.attachedTaskAppServerPresent ?? false;
+  const attachedThreadAppServerPresent = options.attachedThreadAppServerPresent ?? false;
   return {
     prepare(sql: string) {
       if (/INSERT INTO users/.test(sql)) {
@@ -1375,6 +1772,46 @@ function commandTargetDb(
         };
       }
 
+      if (/SELECT hs\.connector_id/.test(sql) && /hs\.attached_task_id = \?/.test(sql)) {
+        return {
+          bind(workspaceId: string, taskId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(taskId.startsWith("task-"), true);
+            return {
+              async first() {
+                return attachedTaskConnectorId
+                  ? {
+                    connector_id: attachedTaskConnectorId,
+                    session_id: "session-attached-task",
+                    app_server_present: attachedTaskAppServerPresent ? 1 : 0
+                  }
+                  : null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT hs\.connector_id/.test(sql) && /hs\.attached_thread_id = \?/.test(sql)) {
+        return {
+          bind(workspaceId: string, threadId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-orders-500");
+            return {
+              async first() {
+                return attachedThreadConnectorId
+                  ? {
+                    connector_id: attachedThreadConnectorId,
+                    session_id: "session-attached-thread",
+                    app_server_present: attachedThreadAppServerPresent ? 1 : 0
+                  }
+                  : null;
+              }
+            };
+          }
+        };
+      }
+
       if (/SELECT c\.id/.test(sql) && /WHERE c\.id = \?/.test(sql)) {
         assert.match(sql, /workspace_connectors/);
         assert.match(sql, /wc\.workspace_id = \?/);
@@ -1382,16 +1819,38 @@ function commandTargetDb(
         assert.match(sql, /c\.status <> 'offline'/);
         assert.match(sql, /capabilities_json LIKE/);
         return {
-          bind(connectorId: string, workspaceId: string, commandType: string) {
+          bind(
+            connectorId: string,
+            workspaceId: string,
+            commandType: string,
+            requireAppServerExecForAppServer?: number,
+            requireAppServerExecForCodexExec?: number
+          ) {
             assert.equal(connectorId.startsWith("connector-"), true);
             assert.equal(workspaceId, "workspace-api");
             assert.equal(commandType === "placeholder" || commandType === "codex", true);
+            assert.equal(
+              requireAppServerExecForAppServer === undefined
+              || requireAppServerExecForAppServer === 0
+              || requireAppServerExecForAppServer === 1,
+              true
+            );
+            assert.equal(
+              requireAppServerExecForCodexExec === undefined
+              || requireAppServerExecForCodexExec === 0
+              || requireAppServerExecForCodexExec === 1,
+              true
+            );
+            assert.equal(requireAppServerExecForAppServer, requireAppServerExecForCodexExec);
             return {
               async first() {
+                if (commandType === "codex" && requireAppServerExecForAppServer === 1) {
+                  return row && supportsAppServerExec ? { id: connectorId } : null;
+                }
                 if (commandType === "codex" && !supportsCodex) {
                   return null;
                 }
-                return row;
+                return row ? { id: connectorId } : null;
               }
             };
           }
@@ -1416,7 +1875,63 @@ function commandTargetDb(
         };
       }
 
-      if (/INSERT INTO commands/.test(sql) || /INSERT INTO events/.test(sql)) {
+      if (/INSERT INTO commands/.test(sql)) {
+        return {
+          bind(...args: unknown[]) {
+            const [
+              commandId,
+              workspaceId,
+              threadId,
+              taskId,
+              commandType,
+              prompt,
+              state,
+              targetConnectorId
+            ] = args as [
+              string,
+              string,
+              string | null,
+              string | null,
+              string,
+              string,
+              string,
+              string | null
+            ];
+            assert.match(commandId, /^command-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-orders-500");
+            assert.equal(taskId, null);
+            assert.equal(commandType === "placeholder" || commandType === "codex", true);
+            assert.equal(typeof prompt, "string");
+            assert.equal(state, "pending");
+            if (/WHERE EXISTS/.test(sql)) {
+              const targetConnectorIdSource = args[8];
+              const leaseTargetHostSessionId = args[9];
+              const appServerPresentGuard = args[24];
+              assert.equal(targetConnectorId, "connector-attached");
+              assert.equal(targetConnectorIdSource, options.expectedTargetConnectorIdSource ?? "attached");
+              assert.equal(
+                leaseTargetHostSessionId,
+                attachedThreadAppServerPresent ? "session-attached-thread" : null
+              );
+              assert.equal(appServerPresentGuard, attachedThreadAppServerPresent ? 1 : 0);
+              assert.match(sql, /COALESCE\(hs\.app_server_present, 0\) = \?/);
+              assert.match(sql, /hs\.id = \(\s+SELECT hs2\.id/);
+              assert.match(sql, /hs\.connector_id = \?/);
+              assert.match(sql, /hs\.session_id = \?/);
+              assert.match(sql, /ORDER BY\s+CASE WHEN \? IS NOT NULL AND hs2\.attached_task_id = \?/);
+              assert.match(sql, /OR NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hst/);
+            }
+            return {
+              async run() {
+                return { meta: { changes: options.guardedCommandInsertChanges ?? 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
         return {
           bind() {
             return {
@@ -1591,6 +2106,26 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
                   updated_at: updatedAt
                 });
                 return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/hs\.app_server_present = 1/.test(sql) && /hs\.title_source = 'app_server'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [...sessions.values()].filter(
+                    (session) =>
+                      session.connector_id === connectorId &&
+                      session.app_server_present === 1 &&
+                      session.title_source === "app_server"
+                  )
+                };
               }
             };
           }
@@ -2236,7 +2771,27 @@ function hostSessionAttachBackfillDb(
   return db as D1Database & { readonly eventInserts: number };
 }
 
-function hostSessionDetachDb(): D1Database {
+function hostSessionDetachDb(options: {
+  returnDetachedCommands?: boolean;
+  detachedCommandState?: "pending" | "leased";
+  detachedCommandFailureChanges?: number;
+  releaseDetachedCommands?: boolean;
+  detachedLeaseOwnedByReplacement?: boolean;
+} = {}): D1Database & {
+  readonly commandReleases: number;
+  readonly commandFailures: number;
+  readonly connectorActivityUpdates: number;
+  readonly taskUpdates: number;
+  readonly eventInserts: number;
+} {
+  const counters = {
+    commandReleases: 0,
+    commandFailures: 0,
+    connectorActivityUpdates: 0,
+    taskUpdates: 0,
+    eventInserts: 0
+  };
+  let attachmentCleared = false;
   const row = {
     id: "host-session-1",
     connector_id: "connector-online",
@@ -2245,6 +2800,7 @@ function hostSessionDetachDb(): D1Database {
     session_id: "session-1",
     title: "Attached session",
     title_source: "history",
+    app_server_present: 1,
     cwd: "/workspace/project",
     updated_at: "2026-06-12T10:00:00.000Z",
     attached_task_id: "task-host-1",
@@ -2269,11 +2825,343 @@ function hostSessionDetachDb(): D1Database {
         };
       }
 
+      if (/FROM commands cmd/.test(sql)) {
+        assert.equal(attachmentCleared, true);
+        assert.match(sql, /cmd\.type = 'codex'/);
+        assert.match(sql, /cmd\.target_connector_id = \?/);
+        assert.match(sql, /cmd\.target_connector_id IS NULL/);
+        assert.match(sql, /cmd\.state = 'pending'/);
+        assert.match(sql, /cmd\.state = 'leased'/);
+        assert.match(sql, /cmd\.lease_target_host_session_id = \?/);
+        assert.match(sql, /cmd\.lease_owner_connector_id = \?/);
+        assert.match(sql, /cmd\.state = 'leased'\s+AND cmd\.lease_owner_connector_id = \?\s+AND \(\s+cmd\.lease_target_host_session_id = \?/);
+        assert.match(sql, /cmd\.state = 'pending'\s+AND cmd\.lease_target_host_session_id = \?/);
+        assert.doesNotMatch(sql, /cmd\.lease_until IS NOT NULL/);
+        assert.match(sql, /NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
+        assert.match(sql, /INNER JOIN workspace_connectors wc/);
+        assert.match(sql, /wc\.can_execute = 1/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
+        assert.match(sql, /WHERE hs\.id = COALESCE\(/);
+        assert.match(sql, /hs_task\.id <> \?/);
+        assert.match(sql, /hs_thread\.id <> \?/);
+        assert.doesNotMatch(sql, /CASE\s+WHEN cmd\.task_id IS NOT NULL/);
+        assert.match(sql, /ORDER BY hs_task\.updated_at DESC,\s+hs_task\.id DESC/);
+        assert.match(sql, /ORDER BY hs_thread\.updated_at DESC,\s+hs_thread\.id DESC/);
+        assert.match(sql, /LIMIT 1/);
+        assert.match(sql, /cmd\.target_connector_id IS NULL OR hs\.connector_id = cmd\.target_connector_id/);
+        assert.match(sql, /hst\.id <> \?/);
+        assert.doesNotMatch(sql, /hst\.connector_id = cmd\.target_connector_id/);
+        assert.doesNotMatch(sql, /hst\.app_server_present = 1/);
+        assert.doesNotMatch(sql, /hs\.attached_task_id = cmd\.task_id/);
+        return {
+          bind(
+            workspaceId: string,
+            connectorId: string,
+            pendingLeaseTargetHostSessionId: string,
+            legacyLeaseOwnerConnectorId: string,
+            leasedLeaseTargetHostSessionId: string,
+            taskIdPresent: string | null,
+            taskId: string | null,
+            threadIdPresent: string | null,
+            threadId: string | null,
+            excludedHostSessionId: string,
+            excludedTaskHostSessionId: string
+          ) {
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(connectorId, "connector-online");
+            assert.equal(pendingLeaseTargetHostSessionId, "session-1");
+            assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
+            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
+            assert.equal(taskIdPresent, "task-host-1");
+            assert.equal(taskId, "task-host-1");
+            assert.equal(threadIdPresent, "thread-host-1");
+            assert.equal(threadId, "thread-host-1");
+            assert.equal(excludedHostSessionId, "host-session-1");
+            assert.equal(excludedTaskHostSessionId, "host-session-1");
+            return {
+              async all() {
+                const commandWasReleased = counters.commandReleases > 0;
+                return {
+                  results: options.returnDetachedCommands === false || commandWasReleased || options.detachedLeaseOwnedByReplacement ? [] : [
+                    {
+                      id: "command-detached",
+                      workspace_id: "workspace-api",
+                      thread_id: "thread-host-1",
+                      task_id: "task-host-1",
+                      type: "codex",
+                      prompt: "Continue this attached session",
+                      state: options.detachedCommandState ?? "pending",
+                      target_connector_id: "connector-online",
+                      lease_owner_connector_id: "connector-online",
+                      created_at: "2026-06-12T10:01:00.000Z",
+                      updated_at: "2026-06-12T10:01:00.000Z"
+                    }
+                  ]
+                };
+              }
+            };
+            }
+          };
+        }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
+        assert.match(sql, /target_connector_id = CASE WHEN target_connector_id_source = 'attached' THEN NULL ELSE target_connector_id END/);
+        assert.match(sql, /target_connector_id_source = CASE WHEN target_connector_id_source = 'attached' THEN 'auto' ELSE target_connector_id_source END/);
+        assert.match(sql, /lease_owner_connector_id = NULL/);
+        assert.match(sql, /lease_until = NULL/);
+        assert.match(sql, /lease_target_host_session_id = \(\s+SELECT hs\.session_id/);
+        assert.match(sql, /state = 'pending'\s+AND lease_target_host_session_id = \?/);
+        assert.match(sql, /state = 'leased'/);
+        assert.match(sql, /lease_owner_connector_id = \?/);
+        assert.match(sql, /state = 'leased'\s+AND lease_owner_connector_id = \?\s+AND \(\s+lease_target_host_session_id = \?/);
+        assert.match(sql, /AND EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /hs_task\.connector_id <> \? OR hs_task\.session_id <> \?/);
+        assert.match(sql, /hs_thread\.connector_id <> \? OR hs_thread\.session_id <> \?/);
+        assert.match(sql, /hst\.connector_id <> \? OR hst\.session_id <> \?/);
+        assert.match(sql, /commands\.target_connector_id_source = 'attached'/);
+        assert.match(sql, /commands\.target_connector_id IS NULL/);
+        assert.match(sql, /hs\.connector_id = commands\.target_connector_id/);
+        return {
+          bind(
+            replacementTaskConnectorId: string,
+            replacementTaskSessionId: string,
+            replacementThreadConnectorId: string,
+            replacementThreadSessionId: string,
+            replacementFallbackConnectorId: string,
+            replacementFallbackSessionId: string,
+            updatedAt: string,
+            workspaceId: string,
+            connectorId: string,
+            pendingLeaseTargetHostSessionId: string,
+            legacyLeaseOwnerConnectorId: string,
+            leasedLeaseTargetHostSessionId: string,
+            taskIdPresent: string | null,
+            taskId: string | null,
+            threadIdPresent: string | null,
+            threadId: string | null,
+            excludedTaskConnectorId: string,
+            excludedTaskSessionId: string,
+            excludedThreadConnectorId: string,
+            excludedThreadSessionId: string,
+            excludedFallbackConnectorId: string,
+            excludedFallbackSessionId: string
+          ) {
+            assert.equal(replacementTaskConnectorId, "connector-online");
+            assert.equal(replacementTaskSessionId, "session-1");
+            assert.equal(replacementThreadConnectorId, "connector-online");
+            assert.equal(replacementThreadSessionId, "session-1");
+            assert.equal(replacementFallbackConnectorId, "connector-online");
+            assert.equal(replacementFallbackSessionId, "session-1");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(connectorId, "connector-online");
+            assert.equal(pendingLeaseTargetHostSessionId, "session-1");
+            assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
+            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
+            assert.equal(taskIdPresent, "task-host-1");
+            assert.equal(taskId, "task-host-1");
+            assert.equal(threadIdPresent, "thread-host-1");
+            assert.equal(threadId, "thread-host-1");
+            assert.equal(excludedTaskConnectorId, "connector-online");
+            assert.equal(excludedTaskSessionId, "session-1");
+            assert.equal(excludedThreadConnectorId, "connector-online");
+            assert.equal(excludedThreadSessionId, "session-1");
+            assert.equal(excludedFallbackConnectorId, "connector-online");
+            assert.equal(excludedFallbackSessionId, "session-1");
+            return {
+              async run() {
+                const changes =
+                  options.releaseDetachedCommands && counters.commandReleases === 0 && !options.detachedLeaseOwnedByReplacement
+                    ? 1
+                    : 0;
+                counters.commandReleases += changes;
+                return { meta: { changes } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT DISTINCT c\.id AS connector_id/.test(sql)) {
+        assert.match(sql, /FROM connectors c/);
+        assert.match(sql, /INNER JOIN workspace_connectors wc/);
+        assert.match(sql, /wc\.workspace_id = \?/);
+        assert.match(sql, /wc\.can_execute = 1/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
+        return {
+          bind(workspaceId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            return {
+              async all() {
+                return {
+                  results: options.releaseDetachedCommands && !options.detachedLeaseOwnedByReplacement
+                    ? [{ connector_id: "connector-online" }, { connector_id: "connector-replacement" }]
+                    : []
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /state = 'failed'/.test(sql)) {
+        assert.match(sql, /workspace_id = \?/);
+        assert.match(sql, /type = 'codex'/);
+        assert.match(sql, /target_connector_id = \? OR target_connector_id IS NULL/);
+        assert.match(sql, /state = 'pending'\s+AND lease_target_host_session_id = \?/);
+        assert.match(sql, /state = 'leased'/);
+        assert.match(sql, /lease_owner_connector_id = \?/);
+        assert.match(sql, /state = 'leased'\s+AND lease_owner_connector_id = \?\s+AND \(\s+lease_target_host_session_id = \?/);
+        assert.match(sql, /AND NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
+        assert.match(sql, /WHERE hs\.id = COALESCE\(/);
+        assert.match(sql, /wc\.workspace_id = commands\.workspace_id/);
+        assert.match(sql, /commands\.task_id IS NOT NULL/);
+        assert.match(sql, /hs_task\.attached_task_id = commands\.task_id/);
+        assert.match(sql, /commands\.thread_id IS NOT NULL/);
+        assert.match(sql, /hs_thread\.attached_thread_id = commands\.thread_id/);
+        assert.match(sql, /commands\.task_id IS NULL/);
+        assert.match(sql, /hst\.workspace_id = commands\.workspace_id/);
+        assert.match(sql, /hst\.attached_task_id = commands\.task_id/);
+        assert.match(sql, /commands\.target_connector_id IS NULL OR hs\.connector_id = commands\.target_connector_id/);
+        return {
+          bind(
+            updatedAt: string,
+            commandId: string,
+            workspaceId: string,
+            connectorId: string,
+            pendingLeaseTargetHostSessionId: string,
+            legacyLeaseOwnerConnectorId: string,
+            leasedLeaseTargetHostSessionId: string,
+            taskIdPresent: string | null,
+            taskId: string | null,
+            threadIdPresent: string | null,
+            threadId: string | null,
+            excludedTaskHostSessionId: string,
+            excludedThreadHostSessionId: string,
+            excludedFallbackHostSessionId: string
+          ) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-detached");
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(connectorId, "connector-online");
+            assert.equal(pendingLeaseTargetHostSessionId, "session-1");
+            assert.equal(legacyLeaseOwnerConnectorId, "connector-online");
+            assert.equal(leasedLeaseTargetHostSessionId, "session-1");
+            assert.equal(taskIdPresent, "task-host-1");
+            assert.equal(taskId, "task-host-1");
+            assert.equal(threadIdPresent, "thread-host-1");
+            assert.equal(threadId, "thread-host-1");
+            assert.equal(excludedTaskHostSessionId, "host-session-1");
+            assert.equal(excludedThreadHostSessionId, "host-session-1");
+            assert.equal(excludedFallbackHostSessionId, "host-session-1");
+            return {
+              async run() {
+                const changes = options.detachedCommandFailureChanges ?? 1;
+                counters.commandFailures += changes;
+                return { meta: { changes } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { active_count: 0 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /active_command_count/.test(sql)) {
+        return {
+          bind(activeCount: number, updatedAt: string, connectorId: string) {
+            assert.equal(activeCount, 0);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                counters.connectorActivityUpdates += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks/.test(sql) && /state = 'failed'/.test(sql)) {
+        return {
+          bind(updatedAt: string, taskId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId, "task-host-1");
+            return {
+              async run() {
+                counters.taskUpdates += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-host-1");
+            return {
+              async first() {
+                return { last_seq: 12 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind(
+            eventId: string,
+            workspaceId: string,
+            threadId: string,
+            commandId: string,
+            seq: number,
+            kind: string,
+            priority: string,
+            summary: string
+          ) {
+            assert.match(eventId, /^event-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-host-1");
+            assert.equal(commandId, "command-detached");
+            assert.equal(seq, 12);
+            assert.equal(kind, "command.failed");
+            assert.equal(priority, "P1");
+            assert.equal(summary, "Host session was detached before the command could run.");
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
       if (/UPDATE host_sessions/.test(sql) && /attached_task_id = NULL/.test(sql)) {
         return {
           bind(updatedAt: string, hostSessionId: string) {
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(hostSessionId, "host-session-1");
+            attachmentCleared = true;
             row.updated_at = updatedAt;
             row.attached_task_id = null as unknown as string;
             row.attached_thread_id = null as unknown as string;
@@ -2287,6 +3175,21 @@ function hostSessionDetachDb(): D1Database {
       }
 
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandReleases() {
+      return counters.commandReleases;
+    },
+    get commandFailures() {
+      return counters.commandFailures;
+    },
+    get connectorActivityUpdates() {
+      return counters.connectorActivityUpdates;
+    },
+    get taskUpdates() {
+      return counters.taskUpdates;
+    },
+    get eventInserts() {
+      return counters.eventInserts;
     }
-  } as unknown as D1Database;
+  } as unknown as D1Database & typeof counters;
 }

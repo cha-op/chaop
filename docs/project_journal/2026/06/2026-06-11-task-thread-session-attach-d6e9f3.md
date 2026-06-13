@@ -102,5 +102,5 @@ superseded_by:
 - Review follow-up prevents a false archive-sync success when the source-state app-server scan hits the page budget and the target-state scan only finds another row in the same session tree. Exact `Thread.id` target matches can still confirm an already-synced state after a source page-budget miss.
 
 ## Next Steps
-- Keep the Codex CLI adapter as the current working execution fallback until the app-server protocol path can cover create, resume, archive, and event/history reads cleanly.
+- Use `docs/project_journal/2026/06/2026-06-13-app-server-execution-e4a7c9.md` for the app-server command execution closure.
 - Keep R2 artefact capture and budget aggregation behind this core control-loop closure work.

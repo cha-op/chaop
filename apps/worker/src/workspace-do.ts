@@ -4,7 +4,6 @@ import {
   type HostSessionBackfillDispatch,
   type HostSessionBackfillResult,
   type AgentHostSessionsReport,
-  type CommandDispatch,
   type HostSessionsUpdatePayload,
   type LocalThreadCreateDispatch,
   type LocalThreadCreateResult,
@@ -13,6 +12,7 @@ import {
   type ThreadEvent
 } from "@chaop/protocol";
 import {
+  failStaleExplicitAppServerCommandTargets,
   markConnectorDisconnected,
   pendingCommandsForConnector,
   recordAgentEvent,
@@ -83,6 +83,10 @@ export class WorkspaceDO implements DurableObject {
       return this.syncThreadArchive(request);
     }
 
+    if (url.pathname === "/internal/broadcast-thread-events") {
+      return this.broadcastThreadEvents(request);
+    }
+
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected WebSocket upgrade", { status: 426 });
     }
@@ -136,19 +140,7 @@ export class WorkspaceDO implements DurableObject {
 
   private async dispatchPending(request: Request): Promise<Response> {
     const payload = await request.json().catch(() => ({})) as { connector_id?: string };
-    if (payload.connector_id) {
-      const sockets = this.ctx.getWebSockets(`agent:${payload.connector_id}`);
-      await Promise.all(sockets.map((socket) => this.sendPendingCommands(socket, payload.connector_id!)));
-      return new Response(JSON.stringify({ dispatched_to: sockets.length }), {
-        headers: { "content-type": "application/json; charset=utf-8" }
-      });
-    }
-
-    const sockets = this.ctx.getWebSockets("agent");
-    await Promise.all(sockets.map((socket) => {
-      const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
-      return attachment?.connectorId ? this.sendPendingCommands(socket, attachment.connectorId) : undefined;
-    }));
+    const sockets = await this.sendPendingCommandsToAgents(payload.connector_id);
     return new Response(JSON.stringify({ dispatched_to: sockets.length }), {
       headers: { "content-type": "application/json; charset=utf-8" }
     });
@@ -182,23 +174,38 @@ export class WorkspaceDO implements DurableObject {
         connector_id: connectorId,
         synced_at: result.synced_at
       }));
+      for (const event of result.failed_events) {
+        this.broadcastToBrowsers(threadEventMessage(event));
+      }
+      for (const releasedConnectorId of result.released_connector_ids) {
+        await this.sendPendingCommandsToAgents(releasedConnectorId);
+      }
       return;
     }
 
     if (message.kind === "agent.event" && isAgentCommandEvent(message.payload)) {
-      const event = await recordAgentEvent(this.env, connectorId, message.payload);
+      const result = await recordAgentEvent(this.env, connectorId, message.payload);
       ws.send(
         JSON.stringify(
           createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
             command_id: message.payload.command_id,
-            kind: message.payload.kind
+            kind: message.payload.kind,
+            accepted: result.accepted
           })
         )
       );
-      if (event) {
-        this.broadcastToBrowsers(threadEventMessage(event));
+      if (result.event) {
+        this.broadcastToBrowsers(threadEventMessage(result.event));
       }
-      if (message.payload.kind === "command.finished" || message.payload.kind === "command.failed") {
+      const finalCommandEvent =
+        message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
+      const resultFinalCommandEvent =
+        result.event?.kind === "command.finished" || result.event?.kind === "command.failed";
+      if (result.accepted && (finalCommandEvent || resultFinalCommandEvent)) {
+        await this.sendPendingCommands(ws, connectorId);
+      } else if (!result.accepted && result.dispatch_pending) {
+        await this.sendPendingCommandsToAgents();
+      } else if (!result.accepted && (finalCommandEvent || resultFinalCommandEvent)) {
         await this.sendPendingCommands(ws, connectorId);
       }
       return;
@@ -250,6 +257,17 @@ export class WorkspaceDO implements DurableObject {
     for (const socket of this.ctx.getWebSockets("browser")) {
       socket.send(message);
     }
+  }
+
+  private async broadcastThreadEvents(request: Request): Promise<Response> {
+    const body = await request.json().catch(() => undefined) as { events?: unknown } | undefined;
+    const events = Array.isArray(body?.events) ? body.events.filter(isThreadEvent) : [];
+    for (const event of events) {
+      this.broadcastToBrowsers(threadEventMessage(event));
+    }
+    return new Response(JSON.stringify({ broadcasted: events.length }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
   }
 
   private async handleSocketGone(ws: WebSocket): Promise<void> {
@@ -483,10 +501,20 @@ export class WorkspaceDO implements DurableObject {
     pending.resolve(result);
   }
 
-  private async sendPendingCommands(ws: WebSocket, connectorId: string): Promise<void> {
-    const commands = await pendingCommandsForConnector(this.env, connectorId);
-    for (const command of commands) {
-      const payload: CommandDispatch = { command };
+  private async sendPendingCommands(
+    ws: WebSocket,
+    connectorId: string,
+    options: { skipStaleExplicitCleanup?: boolean } = {}
+  ): Promise<void> {
+    if (!options.skipStaleExplicitCleanup) {
+      const failedEvents = await failStaleExplicitAppServerCommandTargets(this.env, connectorId);
+      for (const event of failedEvents) {
+        this.broadcastToBrowsers(threadEventMessage(event));
+      }
+    }
+    const dispatches = await pendingCommandsForConnector(this.env, connectorId);
+    for (const payload of dispatches) {
+      const command = payload.command;
       ws.send(
         JSON.stringify(
           createEnvelope("command.dispatch", { type: "worker", id: "workspace-do-global" }, payload, {
@@ -498,6 +526,27 @@ export class WorkspaceDO implements DurableObject {
         )
       );
     }
+  }
+
+  private async sendPendingCommandsToAgents(connectorId?: string): Promise<WebSocket[]> {
+    if (connectorId) {
+      const failedEvents = await failStaleExplicitAppServerCommandTargets(this.env, connectorId);
+      for (const event of failedEvents) {
+        this.broadcastToBrowsers(threadEventMessage(event));
+      }
+      const sockets = this.ctx.getWebSockets(`agent:${connectorId}`);
+      await Promise.all(
+        sockets.map((socket) => this.sendPendingCommands(socket, connectorId, { skipStaleExplicitCleanup: true }))
+      );
+      return sockets;
+    }
+
+    const sockets = this.ctx.getWebSockets("agent");
+    await Promise.all(sockets.map((socket) => {
+      const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
+      return attachment?.connectorId ? this.sendPendingCommands(socket, attachment.connectorId) : undefined;
+    }));
+    return sockets;
   }
 }
 
@@ -564,7 +613,24 @@ function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
       record.kind === "command.finished" ||
       record.kind === "command.failed") &&
     (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
+    (record.target_host_session_id === undefined || typeof record.target_host_session_id === "string") &&
     typeof record.summary === "string"
+  );
+}
+
+function isThreadEvent(value: unknown): value is ThreadEvent {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === "string" &&
+    typeof record.thread_id === "string" &&
+    (record.command_id === undefined || typeof record.command_id === "string") &&
+    typeof record.seq === "number" &&
+    Number.isFinite(record.seq) &&
+    isThreadEventKind(record.kind) &&
+    (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
+    typeof record.summary === "string" &&
+    typeof record.created_at === "string"
   );
 }
 
@@ -667,8 +733,15 @@ function isThreadEventKind(value: unknown): boolean {
 
 function isAgentHostSessionsReport(value: unknown): value is AgentHostSessionsReport {
   if (typeof value !== "object" || value === null) return false;
-  const sessions = (value as { sessions?: unknown }).sessions;
-  return Array.isArray(sessions) && sessions.every(isAgentHostSession);
+  const record = value as { sessions?: unknown; inventory_scope?: unknown; app_server_inventory_ok?: unknown };
+  return (
+    Array.isArray(record.sessions) &&
+    record.sessions.every(isAgentHostSession) &&
+    (record.inventory_scope === undefined ||
+      record.inventory_scope === "full" ||
+      record.inventory_scope === "incremental") &&
+    (record.app_server_inventory_ok === undefined || typeof record.app_server_inventory_ok === "boolean")
+  );
 }
 
 function isAgentHostSession(value: unknown): boolean {

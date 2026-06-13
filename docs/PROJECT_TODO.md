@@ -13,4 +13,4 @@
 - [done] Add an explicit "new Codex thread" flow that can create a local Codex/app-server thread from Chaop instead of only attaching existing local sessions.
 - [done] Add old-session history backfill for attached Host Sessions without uploading broad local transcripts by default.
 - [done] Sync Chaop archive/unarchive actions to local Codex app-server archive state through the connector, while keeping local history files read-only.
-- [pending] Replace the Codex CLI adapter with real Codex app-server protocol execution.
+- [done] Add real Codex app-server protocol execution for Chaop threads attached to local app-server Host Sessions.

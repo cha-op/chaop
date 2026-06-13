@@ -216,6 +216,12 @@ export type CommandSummary = {
   updated_at: string;
 };
 
+export type CommandTargetHostSession = {
+  session_id: string;
+  app_server_present: boolean;
+  cwd?: string | undefined;
+};
+
 export type ThreadEvent = {
   id: string;
   thread_id: string;
@@ -313,10 +319,12 @@ export type DetachHostSessionResponse = {
 
 export type CommandDispatch = {
   command: CommandSummary;
+  target_host_session?: CommandTargetHostSession | undefined;
 };
 
 export type AgentCommandEvent = {
   command_id: string;
+  target_host_session_id?: string | undefined;
   kind:
     | "command.started"
     | "command.output"
@@ -335,8 +343,12 @@ export type AgentHostSession = {
   updated_at: string;
 };
 
+export type HostSessionInventoryScope = "full" | "incremental";
+
 export type AgentHostSessionsReport = {
   sessions: AgentHostSession[];
+  inventory_scope?: HostSessionInventoryScope | undefined;
+  app_server_inventory_ok?: boolean | undefined;
 };
 
 export type AgentBackfillEvent = {

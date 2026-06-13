@@ -8,7 +8,7 @@ This document lists the places where Chaop can incur cost and the alerts to set 
 
 | Surface | Why Chaop uses it | Budget alert to set |
 | --- | --- | --- |
-| OpenAI / Codex usage | A connector with `execution.mode = "codex_exec"` runs `codex exec` locally. That consumes the signed-in Codex allowance or API/project budget, depending on local Codex configuration. | Set a monthly OpenAI API budget and email threshold if the local Codex client is API-backed. Also watch the Codex usage or limit page for ChatGPT-backed local clients. |
+| OpenAI / Codex usage | A connector with `execution.mode = "codex_exec"` runs `codex exec` locally. A connector with `execution.mode = "app_server"` starts turns through the local Codex app-server. Both consume the signed-in Codex allowance or API/project budget, depending on local Codex configuration. | Set a monthly OpenAI API budget and email threshold if the local Codex client is API-backed. Also watch the Codex usage or limit page for ChatGPT-backed local clients. |
 | Cloudflare Workers | `chaop-api` serves browser API routes, agent bootstrap, agent WebSocket upgrade, and command dispatch. `chaop-web` serves the GUI. | Set account billing notifications and a Worker CPU limit. Watch requests and CPU time. |
 | Durable Objects | `WorkspaceDO` coordinates live browser and connector WebSockets. | Watch Durable Object requests, incoming WebSocket message volume, and duration. Long-lived sockets can create duration charges unless hibernation is used. |
 | D1 | D1 stores users, connectors, workspaces, tasks, commands, token hashes, and thread events. | Watch rows read, rows written, and storage. The cost-sensitive path is event volume. |
@@ -37,13 +37,20 @@ The main repository defaults to placeholder execution. Real Codex execution is o
 mode = "codex_exec"
 ```
 
-The connector currently sends only lifecycle events, the final assistant message summary, and a token-usage summary back to Cloudflare. It does not upload full Codex stdout/stderr, artefacts, or per-token logs.
-Codex prompts are passed over stdin, and connector config keeps a runtime timeout plus stdout/stderr output cap for each Codex command.
+or:
+
+```toml
+[execution]
+mode = "app_server"
+```
+
+The connector currently sends only lifecycle events and the final assistant message summary back to Cloudflare for app-server execution. It does not upload app-server `commandExecution` output by default. The CLI adapter also sends a token-usage summary when Codex JSONL includes one. It does not upload full Codex stdout/stderr, local transcripts, artefacts, or per-token logs.
+Codex prompts are passed over stdin for `codex_exec` and through `turn/start` for `app_server`; connector config keeps a runtime timeout for each Codex command.
 
 ## Cost Controls To Keep
 
 - Keep one Rust connector per host and aggregate local logical agents behind it.
-- Keep `codex_exec` opt-in per connector.
+- Keep `codex_exec` and `app_server` opt-in per connector.
 - Keep command output summaries short until an explicit artefact upload policy exists.
 - Add server-side per-command event limits before adding live stdout streaming.
 - Add R2 chunking and retention rules before enabling artefact upload.
