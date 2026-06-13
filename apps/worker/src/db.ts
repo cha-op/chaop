@@ -405,7 +405,42 @@ async function releaseCommandsForDetachedAppServerHostSession(
          target_connector_id_source = CASE WHEN target_connector_id_source = 'attached' THEN 'auto' ELSE target_connector_id_source END,
          lease_owner_connector_id = NULL,
          lease_until = NULL,
-         lease_target_host_session_id = NULL,
+         lease_target_host_session_id = (
+           SELECT hs.session_id
+           FROM host_sessions hs
+           WHERE hs.id = COALESCE(
+             (
+               SELECT hs_task.id
+               FROM host_sessions hs_task
+               WHERE hs_task.workspace_id = commands.workspace_id
+                 AND commands.task_id IS NOT NULL
+                 AND hs_task.attached_task_id = commands.task_id
+                 AND (hs_task.connector_id <> ? OR hs_task.session_id <> ?)
+               ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+               LIMIT 1
+             ),
+             (
+               SELECT hs_thread.id
+               FROM host_sessions hs_thread
+               WHERE hs_thread.workspace_id = commands.workspace_id
+                 AND commands.thread_id IS NOT NULL
+                 AND hs_thread.attached_thread_id = commands.thread_id
+                 AND (hs_thread.connector_id <> ? OR hs_thread.session_id <> ?)
+                 AND (
+                   commands.task_id IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1
+                     FROM host_sessions hst
+                     WHERE hst.workspace_id = commands.workspace_id
+                       AND hst.attached_task_id = commands.task_id
+                       AND (hst.connector_id <> ? OR hst.session_id <> ?)
+                   )
+                 )
+               ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+               LIMIT 1
+             )
+           )
+         ),
          updated_at = ?
      WHERE workspace_id = ?
        AND type = 'codex'
@@ -476,9 +511,15 @@ async function releaseCommandsForDetachedAppServerHostSession(
              OR commands.target_connector_id IS NULL
              OR hs.connector_id = commands.target_connector_id
            )
-       )`
-  )
+      )`
+    )
     .bind(
+      hostSession.connector_id,
+      hostSession.session_id,
+      hostSession.connector_id,
+      hostSession.session_id,
+      hostSession.connector_id,
+      hostSession.session_id,
       now,
       hostSession.workspace_id,
       hostSession.connector_id,
@@ -1676,7 +1717,39 @@ async function releaseRejectedAppServerStartLease(
          target_connector_id_source = CASE WHEN ? THEN 'auto' ELSE target_connector_id_source END,
          lease_owner_connector_id = NULL,
          lease_until = NULL,
-         lease_target_host_session_id = NULL,
+         lease_target_host_session_id = (
+           SELECT hs.session_id
+           FROM host_sessions hs
+           WHERE hs.id = COALESCE(
+             (
+               SELECT hs_task.id
+               FROM host_sessions hs_task
+               WHERE hs_task.workspace_id = commands.workspace_id
+                 AND commands.task_id IS NOT NULL
+                 AND hs_task.attached_task_id = commands.task_id
+               ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+               LIMIT 1
+             ),
+             (
+               SELECT hs_thread.id
+               FROM host_sessions hs_thread
+               WHERE hs_thread.workspace_id = commands.workspace_id
+                 AND commands.thread_id IS NOT NULL
+                 AND hs_thread.attached_thread_id = commands.thread_id
+                 AND (
+                   commands.task_id IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1
+                     FROM host_sessions hst
+                     WHERE hst.workspace_id = commands.workspace_id
+                       AND hst.attached_task_id = commands.task_id
+                   )
+                 )
+               ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+               LIMIT 1
+             )
+           )
+         ),
          updated_at = ?
      WHERE id = ?
        AND lease_owner_connector_id = ?

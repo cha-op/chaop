@@ -2891,7 +2891,7 @@ function hostSessionDetachDb(options: {
         assert.match(sql, /target_connector_id_source = CASE WHEN target_connector_id_source = 'attached' THEN 'auto' ELSE target_connector_id_source END/);
         assert.match(sql, /lease_owner_connector_id = NULL/);
         assert.match(sql, /lease_until = NULL/);
-        assert.match(sql, /lease_target_host_session_id = NULL/);
+        assert.match(sql, /lease_target_host_session_id = \(\s+SELECT hs\.session_id/);
         assert.match(sql, /state = 'pending'\s+AND lease_target_host_session_id = \?/);
         assert.match(sql, /state = 'leased'/);
         assert.match(sql, /lease_owner_connector_id = \?/);
@@ -2905,6 +2905,12 @@ function hostSessionDetachDb(options: {
         assert.match(sql, /hs\.connector_id = commands\.target_connector_id/);
         return {
           bind(
+            replacementTaskConnectorId: string,
+            replacementTaskSessionId: string,
+            replacementThreadConnectorId: string,
+            replacementThreadSessionId: string,
+            replacementFallbackConnectorId: string,
+            replacementFallbackSessionId: string,
             updatedAt: string,
             workspaceId: string,
             connectorId: string,
@@ -2922,6 +2928,12 @@ function hostSessionDetachDb(options: {
             excludedFallbackConnectorId: string,
             excludedFallbackSessionId: string
           ) {
+            assert.equal(replacementTaskConnectorId, "connector-online");
+            assert.equal(replacementTaskSessionId, "session-1");
+            assert.equal(replacementThreadConnectorId, "connector-online");
+            assert.equal(replacementThreadSessionId, "session-1");
+            assert.equal(replacementFallbackConnectorId, "connector-online");
+            assert.equal(replacementFallbackSessionId, "session-1");
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(workspaceId, "workspace-api");
             assert.equal(connectorId, "connector-online");

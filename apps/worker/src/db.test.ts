@@ -888,7 +888,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
         assert.match(sql, /target_connector_id_source = CASE WHEN \? THEN 'auto' ELSE target_connector_id_source END/);
         assert.match(sql, /lease_owner_connector_id = NULL/);
         assert.match(sql, /lease_until = NULL/);
-        assert.match(sql, /lease_target_host_session_id = NULL/);
+        assert.match(sql, /lease_target_host_session_id = \(\s+SELECT hs\.session_id/);
         assert.match(sql, /state = 'leased'/);
         assert.match(sql, /lease_target_host_session_id IS NOT NULL/);
         assert.match(sql, /lease_target_host_session_id = \?/);

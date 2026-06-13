@@ -79,7 +79,8 @@ superseded_by:
 - Offline frozen-diff review 发现已经绑定到 stored app-server session target 的 command，在任何 release/retarget flow 清空该 stored target 前，仍可能被 lease 到新的当前 attachment。现在 pending dispatch 要求 stored app-server lease target 为空，或等于选中的 Host Session session id，才允许 dispatch 或 lease update。
 - 后续 frozen-diff review 发现 explicit target commands 仍可能依赖已读取的 attached Host Session，但没有走 guarded insert path。现在只要 command creation 读取了 attachment，insert 前都会重新验证该 attachment，同时保留 `explicit` target-source 语义。
 - 同一轮 review 还发现 stale rejected `command.started` acknowledgement 可能生成最终 failure event，但不会查询该 connector 的下一个 pending command。现在 Durable Object 也会把 DB result 里返回的 final event 当作同 connector dispatch trigger。
-- 后续 independent review 发现 migration `0008` 无法区分旧版 auto-selected `target_connector_id` 和用户显式 target。现在 migration 会让 attachment 不匹配的旧 target 保持默认 `auto`，把匹配当前 attachment 的 target 标成 `attached`，只有没有 attached Host Session 的旧 target 才保留为 `explicit`。
+- 后续 independent review 发现 migration `0008` 无法区分旧版 auto-selected `target_connector_id` 和用户显式 target。最终 migration 现在会把所有历史非空 `target_connector_id` 都视为 `explicit`，保留本切片前已经存在的 fixed-target 行为，而不是根据当前 Host Sessions 猜测 attached-session 意图。
+- 同一轮 review 还发现，把 stale app-server lease release 给 replacement Host Session 时会清空已保存的 app-server target；如果 replacement 在下一次 lease 前消失，command 可能降级成普通 `codex_exec`。现在 detach cleanup 和 rejected-start release 都会把 replacement app-server `session_id` 写入 `lease_target_host_session_id`，所以 command 只能继续由该 app-server target 接手，或者被 detach cleanup 标记 failed。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -128,7 +129,8 @@ superseded_by:
 - Worker DB tests 断言当 stored app-server target 与当前 attachment 不同时，pending dispatch 会跳过该 command。
 - Worker route tests 断言 explicit attached command target 在 insert 前 attachment 变化时会被拒绝。
 - Worker Durable Object tests 断言 rejected `command.started` event 生成 `command.failed` result 时，仍会为该 connector 查询 pending work。
-- Migration tests 和本地 SQLite smoke check 覆盖 refined legacy `target_connector_id_source` upgrade classification。
+- Migration tests 和本地 SQLite smoke check 覆盖 conservative legacy `target_connector_id_source` upgrade classification。
+- Worker DB 与 route tests 断言 app-server release paths 会把 replacement app-server `session_id` 写入 `lease_target_host_session_id`，而不是清空 app-server target。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
 - Rust tests 断言 app-server assistant-message delta 本地累计会遵守配置的 byte cap，且不会截断出非法 UTF-8。
 - Rust tests 断言 app-server command session resolution 找到目标 session 后会停止翻页。
