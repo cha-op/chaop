@@ -651,6 +651,35 @@ test("recordHostSessions preserves app-server presence when app-server inventory
   assert.equal(db.demotedSessions, 0);
 });
 
+test("recordHostSessions preserves app-server presence without explicit app-server inventory evidence", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "app_server"
+  });
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Metadata title from legacy connector",
+          title_source: "metadata",
+          cwd: "/workspace/attached",
+          updated_at: "2026-06-12T11:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 1);
+  assert.equal(db.titleOf("session-attached"), "Metadata title from legacy connector");
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
+});
+
 test("recordHostSessions preserves attached session workspace during inventory refresh", async () => {
   const db = hostSessionsInventoryDb({ workspaceId: "workspace-other" });
 
@@ -729,11 +758,13 @@ test("recordHostSessions tracks current app-server presence independent from tit
     { DB: db } as Env,
     "connector-online",
     {
+      app_server_inventory_ok: true,
       sessions: [
         {
           session_id: "session-attached",
           title: "History title after archive",
           title_source: "history",
+          app_server_present: false,
           cwd: "/workspace/refreshed",
           updated_at: "2026-06-12T11:00:10.000Z"
         }

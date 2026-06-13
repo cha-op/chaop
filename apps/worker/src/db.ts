@@ -139,15 +139,16 @@ export async function recordHostSessions(
     inventoryScope === "full" &&
     report.app_server_inventory_ok === true &&
     reportedSessions.length === report.sessions.length;
-  const preserveAppServerPresence = report.app_server_inventory_ok === false;
+  const canUseAppServerAbsence = report.app_server_inventory_ok === true;
 
   for (const session of reportedSessions) {
     const id = hostSessionId(connectorId, session.session_id);
     const previous = await findHostSession(env, session.session_id, connectorId);
+    const reportedAppServerPresent = agentHostSessionAppServerPresent(session);
     const appServerPresent =
-      preserveAppServerPresence && previous?.app_server_present === true
+      !reportedAppServerPresent && !canUseAppServerAbsence && previous?.app_server_present === true
         ? 1
-        : agentHostSessionAppServerPresent(session) ? 1 : 0;
+        : reportedAppServerPresent ? 1 : 0;
     await env.DB.prepare(
       `INSERT INTO host_sessions (
          id, connector_id, hostname, workspace_id, session_id, title, title_source, app_server_present,

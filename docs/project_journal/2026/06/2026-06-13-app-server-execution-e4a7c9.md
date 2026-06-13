@@ -89,6 +89,7 @@ superseded_by:
 - Final review of that fix found the agent still marked incomplete app-server inventories as full when `thread/list` returned an error-like response, closed mid-list, or had more pages. App-server inventory now treats JSON-RPC errors, malformed responses, and early close/reset as failures, follows `nextCursor` until exhausted, and marks disabled or `max_sessions`-truncated Host Session reports as incremental so Worker omitted-session cleanup only runs on complete evidence.
 - Final rerun reviews found two more completeness gaps: schema-drift app-server rows or cursors could still be accepted as a successful full inventory, and Worker treated missing legacy `inventory_scope` or missing app-server inventory evidence as enough to clear omitted sessions whose title came from app-server. The agent now rejects thread/list rows without an executable thread `id`, non-string or empty cursors, and repeated cursors; Worker treats missing scope as incremental, requires explicit `app_server_inventory_ok: true` for omitted-session cleanup, and clears omitted sessions by current `app_server_present` state rather than title source.
 - Offline frozen-diff review found duplicate connector migration could still strand pending explicit app-server commands on the retired connector id. Host Session migration now retargets pending explicit Codex app-server commands with the migrated `lease_target_host_session_id` to the replacement connector, alongside attached-inferred commands.
+- Independent review found same-session reports could still demote a known app-server Host Session when the report lacked explicit app-server inventory evidence. Worker now requires `app_server_inventory_ok: true` before using a reported app-server absence to clear existing app-server presence, while still allowing successful app-server inventory to reflect real archive/unarchive state.
 
 ## Validation Targets
 - Worker tests for command dispatch target host-session mapping.
@@ -148,6 +149,7 @@ superseded_by:
 - Worker DB tests assert legacy reports without `inventory_scope` do not trigger omitted-session cleanup.
 - Worker DB tests assert full reports without explicit app-server inventory evidence do not trigger omitted-session cleanup.
 - Worker DB tests assert omitted app-server cleanup is keyed by `app_server_present`, not title source.
+- Worker DB tests assert reported sessions without explicit app-server inventory evidence preserve existing app-server presence, while reliable app-server inventory can still clear presence after archive.
 - Worker DB tests assert stale explicit app-server command targets fail before dispatch instead of remaining pending.
 - Worker Durable Object tests assert stale-target cleanup remains compatible with rejected-event dispatch polling.
 - Rust tests for app-server session resolution, deep page scanning, `thread/resume`, `turn/start`, terminal turn handling, completion notifications, cancellation interrupts, and command-output omission.

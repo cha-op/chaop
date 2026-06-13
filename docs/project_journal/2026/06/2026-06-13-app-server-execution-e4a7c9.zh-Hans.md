@@ -89,6 +89,7 @@ superseded_by:
 - 对该修复的最后 review 发现 agent 在 `thread/list` 返回 error-like response、中途关闭，或还有后续分页时，仍可能把不完整 app-server inventory 标记为 full。现在 app-server inventory 会把 JSON-RPC errors、malformed responses 和 early close/reset 当作失败，会沿 `nextCursor` 一直翻页直到耗尽，并且在 inventory disabled 或 report 被 `max_sessions` 截断时把 Host Session report 标记为 incremental，因此 Worker omitted-session cleanup 只会基于完整证据运行。
 - 最终 rerun reviews 又发现两个完整性缺口：schema drift 的 app-server row 或 cursor 仍可能被接受为成功的 full inventory；Worker 会把旧版缺省 `inventory_scope` 或缺少 app-server inventory 证据的 full report 当成足以清理 omitted sessions 的证据，同时只清理 title 来自 app-server 的行。现在 agent 会拒绝缺少可执行 thread `id` 的 thread/list row、非字符串或空 cursor、重复 cursor；Worker 会把缺省 scope 当作 incremental，要求显式 `app_server_inventory_ok: true` 才能执行 omitted-session cleanup，并按当前 `app_server_present` 状态而不是 title source 清理 omitted sessions。
 - Offline frozen-diff review 发现 duplicate connector migration 仍可能让 pending explicit app-server command 停在已 retired 的 connector id 上。现在 Host Session migration 除了迁移 attached-inferred commands，也会把带有已迁移 `lease_target_host_session_id` 的 pending explicit Codex app-server commands 重新指向 replacement connector。
+- Independent review 发现同一个 session 的 report 如果缺少明确 app-server inventory 证据，仍可能把已知 app-server Host Session demote。现在 Worker 必须看到 `app_server_inventory_ok: true`，才会用 report 里的 app-server absence 清掉已有 app-server presence；成功的 app-server inventory 仍可以反映真实 archive/unarchive 状态。
 
 ## 验证目标
 - Worker tests 覆盖 command dispatch 的 target host-session mapping。
@@ -148,6 +149,7 @@ superseded_by:
 - Worker DB tests 断言旧版缺少 `inventory_scope` 的 report 不会触发 omitted-session cleanup。
 - Worker DB tests 断言缺少明确 app-server inventory 证据的 full report 不会触发 omitted-session cleanup。
 - Worker DB tests 断言 omitted app-server cleanup 基于 `app_server_present`，而不是 title source。
+- Worker DB tests 断言缺少明确 app-server inventory 证据的 reported session 会保留已有 app-server presence，同时可靠 app-server inventory 仍可在 archive 后清掉 presence。
 - Worker DB tests 断言 stale explicit app-server command target 会在 dispatch 前失败，而不是一直 pending。
 - Worker Durable Object tests 断言 stale-target cleanup 与 rejected-event dispatch polling 兼容。
 - Rust tests 覆盖 app-server session 解析、深分页扫描、`thread/resume`、`turn/start`、终态 turn 处理、completion notification、取消 interrupt 和 command output 省略。
