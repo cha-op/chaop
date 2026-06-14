@@ -51,7 +51,7 @@ Codex prompts are passed over stdin for `codex_exec` and through `turn/start` fo
 
 - Keep one Rust connector per host and aggregate local logical agents behind it.
 - Keep `app_server` opt-in per connector, and keep `codex_exec` as a private fallback hidden from the Browser by default.
-- Managed app-server health checks are local connector probes. The connector refreshes remote capabilities only when `agent.ready` changes; the durable AppServerInstance state model, debounce, batching, and rate limits are planned for the next lifecycle slice.
+- Managed app-server health checks are local connector probes. The connector now reports AppServerInstance state through a dedicated channel, with duplicate healthy reports filtered by Durable Object in-memory dedupe and unchanged summaries protected by a 15 minute D1 debounce. State edges and active turn count changes still persist promptly.
 - Keep command output summaries short until an explicit artefact upload policy exists.
 - Add server-side per-command event limits before adding live stdout streaming.
 - Add R2 chunking and retention rules before enabling artefact upload.

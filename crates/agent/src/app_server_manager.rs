@@ -12,6 +12,7 @@ use tungstenite::http::Uri;
 
 const APP_SERVER_SPAWN_ATTEMPTS: usize = 3;
 const APP_SERVER_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(20);
+const APP_SERVER_EXTERNAL_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct AppServerManager {
@@ -19,7 +20,13 @@ pub struct AppServerManager {
     listen_url: Option<String>,
     child: Option<Child>,
     last_start_failure: Option<Instant>,
+    last_external_probe: Option<Instant>,
     shutdown_requested: fn() -> bool,
+    state: AppServerInstanceState,
+    generation: u64,
+    active_turn_count: u32,
+    status_summary: Option<String>,
+    last_error: Option<String>,
 }
 
 impl AppServerManager {
@@ -34,7 +41,13 @@ impl AppServerManager {
             listen_url,
             child: None,
             last_start_failure: None,
+            last_external_probe: None,
             shutdown_requested,
+            state: AppServerInstanceState::Stopped,
+            generation: 0,
+            active_turn_count: 0,
+            status_summary: None,
+            last_error: None,
         }
     }
 
@@ -71,6 +84,64 @@ impl AppServerManager {
         runtime
     }
 
+    pub fn instance_snapshot(&mut self, config: &AgentConfig) -> Option<AppServerInstanceSnapshot> {
+        if !self.enabled && config.session_inventory.app_server_url.is_none() {
+            return None;
+        }
+        if !self.enabled {
+            self.refresh_external_state(config);
+        }
+        Some(AppServerInstanceSnapshot {
+            instance_key: "default".to_owned(),
+            scope: "connector".to_owned(),
+            endpoint_type: if self.enabled { "managed" } else { "external" }.to_owned(),
+            state: self.state.as_str().to_owned(),
+            active_turn_count: self.active_turn_count,
+            generation: self.generation,
+            status_summary: self.status_summary.clone().or_else(|| {
+                Some(if self.enabled {
+                    "Managed app-server state is available.".to_owned()
+                } else {
+                    "External app-server endpoint is configured.".to_owned()
+                })
+            }),
+            last_error: self.last_error.clone(),
+        })
+    }
+
+    pub fn begin_turn(&mut self) {
+        self.active_turn_count = self.active_turn_count.saturating_add(1);
+    }
+
+    pub fn finish_turn(&mut self) {
+        self.active_turn_count = self.active_turn_count.saturating_sub(1);
+    }
+
+    fn refresh_external_state(&mut self, config: &AgentConfig) {
+        let Some(url) = config.session_inventory.app_server_url.as_deref() else {
+            return;
+        };
+        let now = Instant::now();
+        if self.last_external_probe.is_some_and(|last_probe| {
+            now.saturating_duration_since(last_probe) < APP_SERVER_EXTERNAL_PROBE_INTERVAL
+        }) {
+            return;
+        }
+        self.last_external_probe = Some(now);
+        match app_server_health_check(url, config.session_inventory.app_server_timeout_seconds) {
+            Ok(()) => self.set_state(
+                AppServerInstanceState::Healthy,
+                "External app-server is healthy.",
+                None,
+            ),
+            Err(error) => self.set_state(
+                AppServerInstanceState::Degraded,
+                "External app-server health check failed.",
+                Some(&error.to_string()),
+            ),
+        }
+    }
+
     fn probe_ready(&self, config: &AgentConfig) -> Option<String> {
         let Some(listen_url) = self.validated_listen_url() else {
             return None;
@@ -90,6 +161,11 @@ impl AppServerManager {
 
     fn ensure_ready(&mut self, config: &AgentConfig) -> Option<String> {
         let Some(listen_url) = self.validated_listen_url() else {
+            self.set_state(
+                AppServerInstanceState::Degraded,
+                "Managed app-server listen URL is missing or not loopback.",
+                Some("Invalid managed app-server listen URL."),
+            );
             return None;
         };
 
@@ -100,16 +176,36 @@ impl AppServerManager {
         )
         .is_ok()
         {
+            self.set_state(
+                AppServerInstanceState::Healthy,
+                "Managed app-server is healthy.",
+                None,
+            );
             return Some(listen_url);
         }
 
         if !self.can_attempt_start(config) {
+            self.set_state(
+                AppServerInstanceState::Degraded,
+                "Managed app-server restart backoff is active.",
+                Some("Health check failed while restart backoff is active."),
+            );
             return None;
         }
         if (self.shutdown_requested)() {
+            self.set_state(
+                AppServerInstanceState::Stopped,
+                "Connector shutdown requested before managed app-server start.",
+                None,
+            );
             return None;
         }
         if self.child.is_some() {
+            self.set_state(
+                AppServerInstanceState::Restarting,
+                "Restarting unhealthy managed app-server.",
+                None,
+            );
             self.stop_child("restarting unhealthy managed app-server");
         }
 
@@ -117,40 +213,76 @@ impl AppServerManager {
             Ok(child) => {
                 self.child = Some(child);
                 if self.wait_until_ready(config, &listen_url) {
+                    self.set_state(
+                        AppServerInstanceState::Healthy,
+                        "Managed app-server is healthy.",
+                        None,
+                    );
                     Some(listen_url)
                 } else {
                     self.stop_child(
                         "managed app-server did not become healthy before startup timeout",
                     );
                     self.record_start_failure();
+                    self.set_state(
+                        AppServerInstanceState::Degraded,
+                        "Managed app-server did not become healthy before startup timeout.",
+                        Some("Startup health check timed out."),
+                    );
                     None
                 }
             }
             Err(error) => {
                 eprintln!("failed to start managed app-server: {error}");
                 self.record_start_failure();
+                self.set_state(
+                    AppServerInstanceState::Degraded,
+                    "Failed to start managed app-server.",
+                    Some(&error.to_string()),
+                );
                 None
             }
         }
+    }
+
+    fn set_state(
+        &mut self,
+        state: AppServerInstanceState,
+        summary: &str,
+        last_error: Option<&str>,
+    ) {
+        if self.state != state {
+            self.generation = self.generation.saturating_add(1);
+        }
+        self.state = state;
+        self.status_summary = Some(summary.to_owned());
+        self.last_error = last_error.map(str::to_owned);
     }
 
     fn clear_exited_child(&mut self) {
         let Some(child) = self.child.as_mut() else {
             return;
         };
-        let should_cleanup = match child.try_wait() {
+        let cleanup_reason = match child.try_wait() {
             Ok(Some(status)) => {
                 eprintln!("managed app-server exited with status {status}");
-                true
+                Some((
+                    "Managed app-server exited unexpectedly.",
+                    format!("Process exited with status {status}."),
+                ))
             }
-            Ok(None) => false,
+            Ok(None) => None,
             Err(error) => {
                 eprintln!("failed to inspect managed app-server status: {error}");
-                true
+                Some((
+                    "Failed to inspect managed app-server status.",
+                    error.to_string(),
+                ))
             }
         };
 
-        if should_cleanup {
+        if let Some((summary, error)) = cleanup_reason {
+            self.set_state(AppServerInstanceState::Degraded, summary, Some(&error));
             self.stop_child("managed app-server exited; cleaning up process group");
             self.record_start_failure();
         }
@@ -275,6 +407,37 @@ impl AppServerManager {
             thread::sleep(Duration::from_millis(100));
         }
         false
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppServerInstanceSnapshot {
+    pub instance_key: String,
+    pub scope: String,
+    pub endpoint_type: String,
+    pub state: String,
+    pub active_turn_count: u32,
+    pub generation: u64,
+    pub status_summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppServerInstanceState {
+    Healthy,
+    Degraded,
+    Restarting,
+    Stopped,
+}
+
+impl AppServerInstanceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Restarting => "restarting",
+            Self::Stopped => "stopped",
+        }
     }
 }
 
@@ -416,6 +579,23 @@ mod tests {
     }
 
     #[test]
+    fn external_instance_snapshot_reports_unreachable_endpoint_as_degraded() {
+        let mut config = config_with_managed(false);
+        config.session_inventory.app_server_url = Some("not-a-url".to_owned());
+        let mut manager = AppServerManager::new(&config);
+
+        let snapshot = manager.instance_snapshot(&config).expect("snapshot");
+
+        assert_eq!(snapshot.endpoint_type, "external");
+        assert_eq!(snapshot.state, "degraded");
+        assert_eq!(
+            snapshot.status_summary.as_deref(),
+            Some("External app-server health check failed.")
+        );
+        assert!(snapshot.last_error.is_some());
+    }
+
+    #[test]
     fn managed_runtime_config_rejects_non_loopback_listen_url_without_spawning() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let marker = tempdir.path().join("spawned");
@@ -517,11 +697,12 @@ mod tests {
             .spawn_app_server(&config, "ws://127.0.0.1:65530")
             .expect("spawn app-server");
 
-        let recorded = wait_for_file_content(&marker);
+        let expected = codex_home.to_string_lossy().into_owned();
+        let recorded = wait_for_file_content_matching(&marker, |content| content == expected);
         child.kill().expect("kill child");
         child.wait().expect("wait child");
 
-        assert_eq!(recorded, codex_home.to_string_lossy());
+        assert_eq!(recorded, expected);
     }
 
     #[test]
@@ -548,7 +729,8 @@ mod tests {
             .spawn_app_server(&config, "ws://127.0.0.1:65530")
             .expect("spawn app-server");
 
-        let recorded = wait_for_file_content(&marker);
+        let recorded =
+            wait_for_file_content_matching(&marker, |content| content.lines().count() >= 9);
         child.kill().expect("kill child");
         child.wait().expect("wait child");
 
@@ -861,6 +1043,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("timed out waiting for content in {}", path.display());
+    }
+
+    fn wait_for_file_content_matching(
+        path: &std::path::Path,
+        predicate: impl Fn(&str) -> bool,
+    ) -> String {
+        for _ in 0..250 {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if predicate(&content) {
+                    return content;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!(
+            "timed out waiting for matching content in {}",
+            path.display()
+        );
     }
 
     #[cfg(unix)]

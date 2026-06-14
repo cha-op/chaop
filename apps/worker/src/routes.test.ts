@@ -1893,6 +1893,11 @@ function readOnlyBootstrapDb(): D1Database {
         assert.match(sql, /c\.status <> 'offline'/);
         assert.match(sql, /hs\.attached_task_id IS NOT NULL OR hs\.attached_thread_id IS NOT NULL/);
       }
+      if (/FROM app_server_instances/.test(sql)) {
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = asi\.connector_id/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.capabilities_json LIKE '%"app_server_instance_state"%'/);
+      }
       return {
         bind() {
           return this;

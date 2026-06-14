@@ -1,9 +1,11 @@
 import {
   createEnvelope,
+  type AgentAppServerInstancesReport,
   type AgentCommandEvent,
   type HostSessionBackfillDispatch,
   type HostSessionBackfillResult,
   type AgentHostSessionsReport,
+  type AppServerInstancesUpdatePayload,
   type ConnectorsUpdatePayload,
   type HostSessionsUpdatePayload,
   type LocalThreadCreateDispatch,
@@ -16,11 +18,13 @@ import {
   cleanupStaleExplicitAppServerCommandTargets,
   failActiveCommandsForConnector,
   getConnectorSummary,
+  markAppServerInstancesStoppedForConnector,
   markConnectorDegraded,
   markConnectorOffline,
   markConnectorOnline,
   pendingCommandsForConnector,
   recordAgentEvent,
+  recordAppServerInstances,
   recordHostSessions,
   releaseLeasedCommandsForConnector,
   updateConnectorCapabilities
@@ -30,6 +34,7 @@ import type { Env } from "./types.js";
 const THREAD_CREATE_TIMEOUT_MS = 15_000;
 const HOST_SESSION_BACKFILL_TIMEOUT_MS = 15_000;
 const THREAD_ARCHIVE_SYNC_TIMEOUT_MS = 20_000;
+const APP_SERVER_REPORT_CACHE_MS = 60_000;
 
 type SocketAttachment = {
   socketType?: string;
@@ -63,6 +68,13 @@ export class WorkspaceDO implements DurableObject {
       timer: ReturnType<typeof setTimeout>;
       resolve: (result: ThreadArchiveSyncResult) => void;
       reject: (error: Error) => void;
+    }
+  >();
+  private readonly appServerReportCache = new Map<
+    string,
+    {
+      fingerprint: string;
+      acceptedAt: number;
     }
   >();
 
@@ -227,6 +239,47 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    if (message.kind === "agent.app_server_instances") {
+      if (!isAgentAppServerInstancesReport(message.payload)) {
+        ws.send(
+          JSON.stringify(
+            createEnvelope("server.error", { type: "worker", id: "workspace-do-global" }, {
+              error: "Invalid agent.app_server_instances payload"
+            })
+          )
+        );
+        return;
+      }
+      const reportFingerprint = cacheableAppServerReportFingerprint(message.payload);
+      const deduped = this.shouldSkipDuplicateAppServerReport(connectorId, reportFingerprint);
+      const result = deduped
+        ? { app_server_instances: [], synced_at: new Date().toISOString(), snapshot: message.payload.snapshot === true }
+        : await recordAppServerInstances(this.env, connectorId, message.payload);
+      if (!deduped) {
+        this.rememberAppServerReport(connectorId, reportFingerprint);
+      }
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            kind: "agent.app_server_instances",
+            count: result.app_server_instances.length,
+            synced_at: result.synced_at,
+            deduped,
+            report_id: message.payload.report_id
+          })
+        )
+      );
+      if (result.app_server_instances.length > 0 || result.snapshot) {
+        this.broadcastToBrowsers(appServerInstancesMessage({
+          app_server_instances: result.app_server_instances,
+          connector_id: connectorId,
+          synced_at: result.synced_at,
+          snapshot: result.snapshot
+        }));
+      }
+      return;
+    }
+
     if (message.kind === "agent.event" && isAgentCommandEvent(message.payload)) {
       const result = await recordAgentEvent(this.env, connectorId, message.payload);
       ws.send(
@@ -323,6 +376,28 @@ export class WorkspaceDO implements DurableObject {
     }));
   }
 
+  private shouldSkipDuplicateAppServerReport(
+    connectorId: string,
+    fingerprint: string | undefined
+  ): boolean {
+    if (!fingerprint) return false;
+    const cached = this.appServerReportCache.get(connectorId);
+    const now = Date.now();
+    return Boolean(
+      cached &&
+      cached.fingerprint === fingerprint &&
+      now - cached.acceptedAt < APP_SERVER_REPORT_CACHE_MS
+    );
+  }
+
+  private rememberAppServerReport(connectorId: string, fingerprint: string | undefined): void {
+    if (!fingerprint) {
+      this.appServerReportCache.delete(connectorId);
+      return;
+    }
+    this.appServerReportCache.set(connectorId, { fingerprint, acceptedAt: Date.now() });
+  }
+
   private async broadcastThreadEvents(request: Request): Promise<Response> {
     const body = await request.json().catch(() => undefined) as { events?: unknown } | undefined;
     const events = Array.isArray(body?.events) ? body.events.filter(isThreadEvent) : [];
@@ -351,6 +426,18 @@ export class WorkspaceDO implements DurableObject {
       );
       for (const event of events) {
         this.broadcastToBrowsers(threadEventMessage(event));
+      }
+      if (!hasReadyPeer) {
+        const stoppedAt = new Date().toISOString();
+        this.appServerReportCache.delete(attachment.connectorId);
+        const stoppedInstances = await markAppServerInstancesStoppedForConnector(this.env, attachment.connectorId, stoppedAt);
+        if (stoppedInstances.length > 0) {
+          this.broadcastToBrowsers(appServerInstancesMessage({
+            app_server_instances: stoppedInstances,
+            connector_id: attachment.connectorId,
+            synced_at: stoppedAt
+          }));
+        }
       }
       if (!hasReadyPeer && hasAuthenticatedPeer) {
         await markConnectorDegraded(this.env, attachment.connectorId);
@@ -869,6 +956,12 @@ export function connectorsMessage(payload: ConnectorsUpdatePayload): string {
   );
 }
 
+export function appServerInstancesMessage(payload: AppServerInstancesUpdatePayload): string {
+  return JSON.stringify(
+    createEnvelope("app_server_instances.updated", { type: "worker", id: "workspace-do-global" }, payload)
+  );
+}
+
 function parseMessage(text: string): { kind?: string; payload?: unknown } | undefined {
   try {
     const value = JSON.parse(text) as unknown;
@@ -885,6 +978,65 @@ function isAgentReadyPayload(value: unknown): value is { capabilities: string[] 
     Array.isArray(record.capabilities) &&
     record.capabilities.every((capability) => typeof capability === "string")
   );
+}
+
+function isAgentAppServerInstancesReport(value: unknown): value is AgentAppServerInstancesReport {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  if (record.report_id !== undefined && !isBoundedString(record.report_id, 128)) return false;
+  if (record.snapshot !== undefined && typeof record.snapshot !== "boolean") return false;
+  if (!Array.isArray(record.instances) || record.instances.length > 16) return false;
+  return record.instances.every(isAgentAppServerInstance);
+}
+
+function isAgentAppServerInstance(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    isBoundedString(record.instance_key, 128) &&
+    (record.scope === "connector" || record.scope === "workspace" || record.scope === "thread") &&
+    (record.endpoint_type === "managed" || record.endpoint_type === "external") &&
+    (
+      record.state === "healthy" ||
+      record.state === "degraded" ||
+      record.state === "draining" ||
+      record.state === "restarting" ||
+      record.state === "stopped"
+    ) &&
+    (record.active_turn_count === undefined || isNonNegativeInteger(record.active_turn_count, 1_000_000)) &&
+    (record.generation === undefined || isNonNegativeInteger(record.generation, 1_000_000_000)) &&
+    (record.status_summary === undefined || isBoundedString(record.status_summary, 512)) &&
+    (record.last_error === undefined || isBoundedString(record.last_error, 512)) &&
+    (
+      record.reason === undefined ||
+      record.reason === "edge" ||
+      record.reason === "summary" ||
+      record.reason === "shutdown"
+    )
+  );
+}
+
+function cacheableAppServerReportFingerprint(report: AgentAppServerInstancesReport): string | undefined {
+  if (report.snapshot === true || report.instances.length === 0) return undefined;
+  if (report.instances.some((instance) => instance.state !== "healthy")) return undefined;
+  return JSON.stringify(report.instances.map((instance) => ({
+    instance_key: instance.instance_key,
+    scope: instance.scope,
+    endpoint_type: instance.endpoint_type,
+    state: instance.state,
+    active_turn_count: instance.active_turn_count ?? 0,
+    generation: instance.generation ?? 0,
+    status_summary: instance.status_summary ?? "",
+    last_error: instance.last_error ?? ""
+  })));
+}
+
+function isBoundedString(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maxLength;
+}
+
+function isNonNegativeInteger(value: unknown, maxValue: number): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= maxValue;
 }
 
 function jsonResponse(payload: unknown, status = 200): Response {

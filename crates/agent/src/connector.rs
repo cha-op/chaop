@@ -29,6 +29,8 @@ type AgentSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<Tc
 const CONNECTOR_READ_TICK_SECONDS: u64 = 5;
 const CONNECTOR_RECONNECT_BACKOFF_SECONDS: u64 = 2;
 const AGENT_READY_RETRY_SECONDS: u64 = 10;
+const APP_SERVER_INSTANCE_SUMMARY_SECONDS: u64 = 5 * 60;
+const APP_SERVER_INSTANCE_TEXT_LIMIT: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -54,6 +56,19 @@ struct HostSessionsSendState {
     last_sent: Option<String>,
     last_sent_at: Option<Instant>,
     last_acked: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AppServerInstancesSendState {
+    last_sent: Option<String>,
+    last_sent_id: Option<String>,
+    last_sent_key: Option<String>,
+    last_sent_snapshot: bool,
+    last_sent_at: Option<Instant>,
+    last_acked: Option<String>,
+    last_acked_id: Option<String>,
+    last_acked_key: Option<String>,
+    next_report_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,10 +169,19 @@ fn run_connected_session(
     let mut runtime_config = app_server.runtime_config(config);
     let mut agent_ready_state = AgentReadyState::default();
     let mut host_sessions_state = HostSessionsSendState::default();
+    let mut app_server_instances_state = AppServerInstancesSendState::default();
     let mut deferred_messages = VecDeque::<String>::new();
     if send_agent_ready(&mut socket, &runtime_config, &mut agent_ready_state, true)?
         .should_send_host_sessions()
     {
+        send_app_server_instances(
+            &mut socket,
+            config,
+            app_server,
+            &mut app_server_instances_state,
+            true,
+            true,
+        )?;
         send_host_sessions(&mut socket, &runtime_config, &mut host_sessions_state, true)?;
     }
     let mut next_host_sessions_at = Instant::now() + host_sessions_interval(&runtime_config);
@@ -185,6 +209,14 @@ fn run_connected_session(
                     )?
                     .should_send_host_sessions()
                     {
+                        send_app_server_instances(
+                            &mut socket,
+                            config,
+                            app_server,
+                            &mut app_server_instances_state,
+                            true,
+                            true,
+                        )?;
                         send_host_sessions(
                             &mut socket,
                             &runtime_config,
@@ -194,6 +226,14 @@ fn run_connected_session(
                         next_host_sessions_at =
                             Instant::now() + host_sessions_interval(&runtime_config);
                     } else if Instant::now() >= next_host_sessions_at {
+                        send_app_server_instances(
+                            &mut socket,
+                            config,
+                            app_server,
+                            &mut app_server_instances_state,
+                            false,
+                            false,
+                        )?;
                         send_host_sessions(
                             &mut socket,
                             &runtime_config,
@@ -202,6 +242,15 @@ fn run_connected_session(
                         )?;
                         next_host_sessions_at =
                             Instant::now() + host_sessions_interval(&runtime_config);
+                    } else {
+                        send_app_server_instances(
+                            &mut socket,
+                            config,
+                            app_server,
+                            &mut app_server_instances_state,
+                            false,
+                            false,
+                        )?;
                     }
                     continue;
                 }
@@ -217,6 +266,12 @@ fn run_connected_session(
                 if apply_agent_ready_ack_text(text.as_ref(), &mut agent_ready_state)? {
                     continue;
                 }
+                if apply_app_server_instances_ack_text(
+                    text.as_ref(),
+                    &mut app_server_instances_state,
+                )? {
+                    continue;
+                }
                 if apply_host_sessions_ack_text(text.as_ref(), &mut host_sessions_state)? {
                     continue;
                 }
@@ -224,6 +279,14 @@ fn run_connected_session(
                 if send_agent_ready(&mut socket, &runtime_config, &mut agent_ready_state, false)?
                     .should_send_host_sessions()
                 {
+                    send_app_server_instances(
+                        &mut socket,
+                        config,
+                        app_server,
+                        &mut app_server_instances_state,
+                        true,
+                        true,
+                    )?;
                     send_host_sessions(
                         &mut socket,
                         &runtime_config,
@@ -237,6 +300,8 @@ fn run_connected_session(
                     &mut socket,
                     text.as_ref(),
                     &runtime_config,
+                    app_server,
+                    &mut app_server_instances_state,
                     &mut agent_ready_state,
                     &mut host_sessions_state,
                     &mut deferred_messages,
@@ -375,6 +440,175 @@ fn acknowledge_host_sessions(state: &mut HostSessionsSendState) {
     state.last_acked = Some(message);
 }
 
+fn send_app_server_instances(
+    socket: &mut AgentSocket,
+    config: &AgentConfig,
+    app_server: &mut AppServerManager,
+    state: &mut AppServerInstancesSendState,
+    force: bool,
+    snapshot: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut message) = app_server_instances_message(config, app_server, snapshot) else {
+        return Ok(());
+    };
+    let key = app_server_instances_message_key(&message)?;
+    let mut send_snapshot = snapshot;
+    if !snapshot && state.has_unacked_snapshot_for_key(&key) {
+        message = app_server_instances_message_with_snapshot(&message, true)?;
+        send_snapshot = true;
+    }
+    let now = Instant::now();
+    if !should_send_app_server_instances(&key, state, force, now) {
+        return Ok(());
+    }
+    let report_id = state.next_report_id();
+    let outbound_message = app_server_instances_message_with_report_id(&message, &report_id)?;
+    socket.send(Message::Text(outbound_message.into()))?;
+    state.last_sent = Some(message);
+    state.last_sent_id = Some(report_id);
+    state.last_sent_key = Some(key);
+    state.last_sent_snapshot = send_snapshot;
+    state.last_sent_at = Some(now);
+    state.last_acked = None;
+    state.last_acked_id = None;
+    state.last_acked_key = None;
+    Ok(())
+}
+
+fn should_send_app_server_instances(
+    key: &str,
+    state: &AppServerInstancesSendState,
+    force: bool,
+    now: Instant,
+) -> bool {
+    if force {
+        return true;
+    }
+    if state.last_acked_key.as_deref() == Some(key) {
+        return state.last_sent_at.map_or(true, |sent_at| {
+            now.saturating_duration_since(sent_at) >= app_server_instance_summary_interval()
+        });
+    }
+    if state.last_sent_key.as_deref() == Some(key)
+        && state.last_sent_at.is_some_and(|sent_at| {
+            now.saturating_duration_since(sent_at) < agent_ready_retry_interval()
+        })
+    {
+        return false;
+    }
+    true
+}
+
+impl AppServerInstancesSendState {
+    fn next_report_id(&mut self) -> String {
+        self.next_report_id = self.next_report_id.saturating_add(1);
+        format!("app-server-report-{}", self.next_report_id)
+    }
+
+    fn has_unacked_snapshot_for_key(&self, key: &str) -> bool {
+        self.last_sent_snapshot
+            && self.last_sent_key.as_deref() == Some(key)
+            && self.last_sent_id.is_some()
+            && self.last_acked_id != self.last_sent_id
+    }
+}
+
+fn acknowledge_app_server_instances(
+    state: &mut AppServerInstancesSendState,
+    report_id: Option<&str>,
+) {
+    if let Some(report_id) = report_id {
+        if state.last_sent_id.as_deref() != Some(report_id) {
+            return;
+        }
+    }
+    let Some(message) = state.last_sent.clone() else {
+        return;
+    };
+    state.last_acked = Some(message);
+    state.last_acked_id = state.last_sent_id.clone();
+    state.last_acked_key = state.last_sent_key.clone();
+}
+
+fn app_server_instances_message(
+    config: &AgentConfig,
+    app_server: &mut AppServerManager,
+    snapshot: bool,
+) -> Option<String> {
+    let instances = match app_server.instance_snapshot(config) {
+        Some(instance) => {
+            let mut instance_payload = json!({
+                "instance_key": instance.instance_key,
+                "scope": instance.scope,
+                "endpoint_type": instance.endpoint_type,
+                "state": instance.state,
+                "active_turn_count": instance.active_turn_count,
+                "generation": instance.generation
+            });
+            if let Some(status_summary) = instance.status_summary {
+                instance_payload["status_summary"] =
+                    json!(bounded_app_server_instance_text(&status_summary));
+            }
+            if let Some(last_error) = instance.last_error {
+                instance_payload["last_error"] =
+                    json!(bounded_app_server_instance_text(&last_error));
+            }
+            vec![instance_payload]
+        }
+        None if snapshot => Vec::new(),
+        None => return None,
+    };
+    Some(
+        json!({
+            "kind": "agent.app_server_instances",
+            "payload": {
+                "snapshot": snapshot,
+                "instances": instances
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn app_server_instances_message_with_report_id(
+    message: &str,
+    report_id: &str,
+) -> Result<String, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(message)?;
+    value["payload"]["report_id"] = json!(report_id);
+    Ok(value.to_string())
+}
+
+fn app_server_instances_message_with_snapshot(
+    message: &str,
+    snapshot: bool,
+) -> Result<String, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(message)?;
+    value["payload"]["snapshot"] = json!(snapshot);
+    Ok(value.to_string())
+}
+
+fn app_server_instances_message_key(message: &str) -> Result<String, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(message)?;
+    if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+        payload.remove("report_id");
+        payload.remove("snapshot");
+    }
+    Ok(value.to_string())
+}
+
+fn bounded_app_server_instance_text(value: &str) -> String {
+    if value.chars().count() <= APP_SERVER_INSTANCE_TEXT_LIMIT {
+        return value.to_owned();
+    }
+    let mut truncated = value
+        .chars()
+        .take(APP_SERVER_INSTANCE_TEXT_LIMIT.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
 fn host_sessions_message(config: &AgentConfig) -> String {
     let report = build_host_sessions_report(config).unwrap_or_else(|error| {
         eprintln!("chaop-agent: host session inventory failed: {error}");
@@ -399,10 +633,34 @@ fn fallback_host_sessions_report(config: &AgentConfig) -> AgentHostSessionsRepor
     }
 }
 
+fn app_server_instances_ack_message(envelope: &Envelope) -> Option<Option<&str>> {
+    if envelope.kind != "server.ack" {
+        return None;
+    }
+    if envelope.payload.get("kind").and_then(Value::as_str) != Some("agent.app_server_instances") {
+        return None;
+    }
+    Some(envelope.payload.get("report_id").and_then(Value::as_str))
+}
+
+fn apply_app_server_instances_ack_text(
+    text: &str,
+    state: &mut AppServerInstancesSendState,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let envelope: Envelope = serde_json::from_str(text)?;
+    if let Some(report_id) = app_server_instances_ack_message(&envelope) {
+        acknowledge_app_server_instances(state, report_id);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn handle_text_message(
     socket: &mut AgentSocket,
     text: &str,
     config: &AgentConfig,
+    app_server: &mut AppServerManager,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     agent_ready_state: &mut AgentReadyState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
@@ -415,6 +673,11 @@ fn handle_text_message(
 
     if let Some(message) = agent_ready_ack_message(&envelope) {
         acknowledge_agent_ready(agent_ready_state, message);
+        return Ok(false);
+    }
+
+    if let Some(report_id) = app_server_instances_ack_message(&envelope) {
+        acknowledge_app_server_instances(app_server_instances_state, report_id);
         return Ok(false);
     }
 
@@ -454,6 +717,7 @@ fn handle_text_message(
             &dispatch.command,
             app_server_wrong_execution_mode_events(),
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )?;
@@ -468,6 +732,7 @@ fn handle_text_message(
             &dispatch.command,
             vec![codex_exec_started_event(&config.workspace_root)],
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )? {
@@ -477,6 +742,7 @@ fn handle_text_message(
             socket,
             config,
             &dispatch.command.prompt,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         );
@@ -485,6 +751,7 @@ fn handle_text_message(
             &dispatch.command,
             events?,
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )?;
@@ -500,6 +767,7 @@ fn handle_text_message(
                 &dispatch.command,
                 app_server_missing_target_events(),
                 config,
+                app_server_instances_state,
                 host_sessions_state,
                 deferred_messages,
             )?;
@@ -511,6 +779,7 @@ fn handle_text_message(
                 &dispatch.command,
                 app_server_non_app_server_target_events(&target_host_session.session_id),
                 config,
+                app_server_instances_state,
                 host_sessions_state,
                 deferred_messages,
             )?;
@@ -524,10 +793,23 @@ fn handle_text_message(
             )],
             Some(&target_host_session.session_id),
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )? {
             return Ok(true);
+        }
+        app_server.begin_turn();
+        if let Err(error) = send_app_server_instances(
+            socket,
+            config,
+            app_server,
+            app_server_instances_state,
+            true,
+            false,
+        ) {
+            app_server.finish_turn();
+            return Err(error);
         }
         let events = wait_for_app_server_command_events(
             socket,
@@ -536,14 +818,25 @@ fn handle_text_message(
             target_host_session.cwd.as_deref(),
             &dispatch.command.id,
             &dispatch.command.prompt,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         );
+        app_server.finish_turn();
+        send_app_server_instances(
+            socket,
+            config,
+            app_server,
+            app_server_instances_state,
+            true,
+            false,
+        )?;
         dispatch_events(
             socket,
             &dispatch.command,
             events?,
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )?;
@@ -555,6 +848,7 @@ fn handle_text_message(
         &dispatch.command,
         command_events(&dispatch.command),
         config,
+        app_server_instances_state,
         host_sessions_state,
         deferred_messages,
     )?;
@@ -741,6 +1035,7 @@ fn wait_for_codex_exec_events(
     socket: &mut AgentSocket,
     config: &AgentConfig,
     prompt: &str,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<Vec<ConnectorEvent>, Box<dyn std::error::Error>> {
@@ -785,6 +1080,7 @@ fn wait_for_codex_exec_events(
                     socket,
                     text.as_ref(),
                     config,
+                    app_server_instances_state,
                     host_sessions_state,
                     deferred_messages,
                 )?;
@@ -811,6 +1107,7 @@ fn wait_for_app_server_command_events(
     cwd: Option<&str>,
     command_id: &str,
     prompt: &str,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<Vec<ConnectorEvent>, Box<dyn std::error::Error>> {
@@ -859,6 +1156,7 @@ fn wait_for_app_server_command_events(
                     socket,
                     text.as_ref(),
                     config,
+                    app_server_instances_state,
                     host_sessions_state,
                     deferred_messages,
                 )?;
@@ -901,14 +1199,18 @@ fn handle_background_text_message(
     socket: &mut AgentSocket,
     text: &str,
     config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
     if envelope.kind == "host_sessions.refresh" {
         send_host_sessions(socket, config, host_sessions_state, true)?;
-    } else if host_sessions_ack_message(&envelope) {
-        acknowledge_host_sessions(host_sessions_state);
+    } else if handle_background_ack_message(
+        &envelope,
+        app_server_instances_state,
+        host_sessions_state,
+    ) {
     } else if envelope.kind == "thread.create" {
         let dispatch: ThreadCreateDispatch = serde_json::from_value(envelope.payload)?;
         handle_thread_create(socket, &dispatch, config, host_sessions_state)?;
@@ -922,6 +1224,22 @@ fn handle_background_text_message(
         deferred_messages.push_back(text.to_owned());
     }
     Ok(())
+}
+
+fn handle_background_ack_message(
+    envelope: &Envelope,
+    app_server_instances_state: &mut AppServerInstancesSendState,
+    host_sessions_state: &mut HostSessionsSendState,
+) -> bool {
+    if let Some(report_id) = app_server_instances_ack_message(envelope) {
+        acknowledge_app_server_instances(app_server_instances_state, report_id);
+        return true;
+    }
+    if host_sessions_ack_message(envelope) {
+        acknowledge_host_sessions(host_sessions_state);
+        return true;
+    }
+    false
 }
 
 fn requires_app_server_execution_mode(dispatch: &CommandDispatch) -> bool {
@@ -983,6 +1301,7 @@ fn dispatch_events(
     command: &CommandPayload,
     events: Vec<ConnectorEvent>,
     config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -992,6 +1311,7 @@ fn dispatch_events(
         events,
         None,
         config,
+        app_server_instances_state,
         host_sessions_state,
         deferred_messages,
     )
@@ -1003,6 +1323,7 @@ fn dispatch_events_for_target_host_session(
     events: Vec<ConnectorEvent>,
     target_host_session_id: Option<&str>,
     config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1020,6 +1341,7 @@ fn dispatch_events_for_target_host_session(
             &command.id,
             &event.kind,
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )? {
@@ -1085,6 +1407,10 @@ fn agent_ready_retry_interval() -> Duration {
     Duration::from_secs(AGENT_READY_RETRY_SECONDS)
 }
 
+fn app_server_instance_summary_interval() -> Duration {
+    Duration::from_secs(APP_SERVER_INSTANCE_SUMMARY_SECONDS)
+}
+
 fn host_sessions_retry_interval() -> Duration {
     agent_ready_retry_interval()
 }
@@ -1110,6 +1436,7 @@ fn wait_for_ack(
     command_id: &str,
     event_kind: &str,
     config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1133,6 +1460,7 @@ fn wait_for_ack(
                         socket,
                         text.as_ref(),
                         config,
+                        app_server_instances_state,
                         host_sessions_state,
                         deferred_messages,
                     )?,
@@ -1202,14 +1530,21 @@ fn set_socket_read_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        AckWaitAction, AgentReadyState, CommandDispatch, CommandPayload, CommandTargetHostSession,
-        CommandType, HostSessionsSendState, acknowledge_agent_ready, acknowledge_host_sessions,
+        AckWaitAction, AgentReadyState, AppServerInstancesSendState, CommandDispatch,
+        CommandPayload, CommandTargetHostSession, CommandType, Envelope, HostSessionsSendState,
+        acknowledge_agent_ready, acknowledge_app_server_instances, acknowledge_host_sessions,
         agent_event_message, agent_ready_ack_message, agent_ready_message,
-        agent_ready_retry_interval, apply_agent_ready_ack_text, apply_host_sessions_ack_text,
-        classify_ack_wait_text, command_events, host_sessions_ack_message, host_sessions_interval,
+        agent_ready_retry_interval, app_server_instance_summary_interval,
+        app_server_instances_message, app_server_instances_message_key,
+        app_server_instances_message_with_report_id, apply_agent_ready_ack_text,
+        apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
+        bounded_app_server_instance_text, classify_ack_wait_text, command_events,
+        handle_background_ack_message, host_sessions_ack_message, host_sessions_interval,
         host_sessions_message, host_sessions_retry_interval, is_read_timeout,
-        requires_app_server_execution_mode, should_send_agent_ready, should_send_host_sessions,
+        requires_app_server_execution_mode, should_send_agent_ready,
+        should_send_app_server_instances, should_send_host_sessions,
     };
+    use crate::app_server_manager::AppServerManager;
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use crate::placeholder::ConnectorEvent;
     use serde_json::Value;
@@ -1521,6 +1856,314 @@ mod tests {
             false,
             now + Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn acknowledged_app_server_instances_wait_for_summary_interval() {
+        let message =
+            r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let now = Instant::now();
+        let mut state = AppServerInstancesSendState {
+            last_sent: Some(message.clone()),
+            last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(message.clone()),
+            last_sent_snapshot: false,
+            last_sent_at: Some(now),
+            last_acked: None,
+            last_acked_id: None,
+            last_acked_key: None,
+            next_report_id: 1,
+        };
+        acknowledge_app_server_instances(&mut state, Some("report-1"));
+
+        assert!(!should_send_app_server_instances(
+            &message,
+            &state,
+            false,
+            now + (app_server_instance_summary_interval() - Duration::from_secs(1))
+        ));
+        assert!(should_send_app_server_instances(
+            &message,
+            &state,
+            false,
+            now + app_server_instance_summary_interval()
+        ));
+    }
+
+    #[test]
+    fn unacknowledged_app_server_instances_retry_after_ready_interval() {
+        let message = r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#;
+        let now = Instant::now();
+        let state = AppServerInstancesSendState {
+            last_sent: Some(message.to_owned()),
+            last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(message.to_owned()),
+            last_sent_snapshot: false,
+            last_sent_at: Some(now),
+            last_acked: None,
+            last_acked_id: None,
+            last_acked_key: None,
+            next_report_id: 1,
+        };
+
+        assert!(!should_send_app_server_instances(
+            message,
+            &state,
+            false,
+            now + (agent_ready_retry_interval() - Duration::from_secs(1))
+        ));
+        assert!(should_send_app_server_instances(
+            message,
+            &state,
+            false,
+            now + agent_ready_retry_interval()
+        ));
+    }
+
+    #[test]
+    fn app_server_instances_ack_text_updates_send_state() {
+        let message =
+            r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let mut state = AppServerInstancesSendState {
+            last_sent: Some(message.clone()),
+            last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(message.clone()),
+            last_sent_snapshot: false,
+            last_sent_at: Some(Instant::now()),
+            last_acked: None,
+            last_acked_id: None,
+            last_acked_key: None,
+            next_report_id: 1,
+        };
+
+        let applied = apply_app_server_instances_ack_text(
+            r#"{"kind":"server.ack","payload":{"kind":"agent.app_server_instances","report_id":"report-1"}}"#,
+            &mut state,
+        )
+        .expect("ack");
+
+        assert!(applied);
+        assert_eq!(state.last_acked.as_deref(), Some(message.as_str()));
+        assert_eq!(state.last_acked_id.as_deref(), Some("report-1"));
+        assert_eq!(state.last_acked_key.as_deref(), Some(message.as_str()));
+    }
+
+    #[test]
+    fn app_server_instances_ack_text_ignores_stale_report_ids() {
+        let message =
+            r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let mut state = AppServerInstancesSendState {
+            last_sent: Some(message.clone()),
+            last_sent_id: Some("report-current".to_owned()),
+            last_sent_key: Some(message),
+            last_sent_snapshot: false,
+            last_sent_at: Some(Instant::now()),
+            last_acked: None,
+            last_acked_id: None,
+            last_acked_key: None,
+            next_report_id: 2,
+        };
+
+        let applied = apply_app_server_instances_ack_text(
+            r#"{"kind":"server.ack","payload":{"kind":"agent.app_server_instances","report_id":"report-old"}}"#,
+            &mut state,
+        )
+        .expect("ack");
+
+        assert!(applied);
+        assert!(state.last_acked.is_none());
+        assert!(state.last_acked_id.is_none());
+    }
+
+    #[test]
+    fn app_server_instances_ack_text_accepts_legacy_ack_without_report_id() {
+        let message =
+            r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let mut state = AppServerInstancesSendState {
+            last_sent: Some(message.clone()),
+            last_sent_id: Some("report-current".to_owned()),
+            last_sent_key: Some(message.clone()),
+            last_sent_snapshot: false,
+            last_sent_at: Some(Instant::now()),
+            last_acked: None,
+            last_acked_id: None,
+            last_acked_key: None,
+            next_report_id: 2,
+        };
+
+        let applied = apply_app_server_instances_ack_text(
+            r#"{"kind":"server.ack","payload":{"kind":"agent.app_server_instances"}}"#,
+            &mut state,
+        )
+        .expect("ack");
+
+        assert!(applied);
+        assert_eq!(state.last_acked.as_deref(), Some(message.as_str()));
+        assert_eq!(state.last_acked_id.as_deref(), Some("report-current"));
+        assert_eq!(state.last_acked_key.as_deref(), Some(message.as_str()));
+    }
+
+    #[test]
+    fn app_server_instances_message_can_carry_report_id_without_changing_semantic_message() {
+        let mut config = test_config();
+        config.session_inventory.managed_app_server.enabled = true;
+        config.session_inventory.managed_app_server.listen_url =
+            Some("ws://127.0.0.1:65530".to_owned());
+        let mut manager = AppServerManager::new(&config);
+
+        let semantic_message =
+            app_server_instances_message(&config, &mut manager, true).expect("message");
+        let outbound = app_server_instances_message_with_report_id(&semantic_message, "report-1")
+            .expect("outbound");
+        let semantic_value: Value = serde_json::from_str(&semantic_message).expect("semantic json");
+        let outbound_value: Value = serde_json::from_str(&outbound).expect("outbound json");
+
+        assert!(semantic_value.pointer("/payload/report_id").is_none());
+        assert_eq!(
+            outbound_value
+                .pointer("/payload/report_id")
+                .and_then(Value::as_str),
+            Some("report-1")
+        );
+        assert_eq!(
+            semantic_value.pointer("/payload/instances"),
+            outbound_value.pointer("/payload/instances")
+        );
+    }
+
+    #[test]
+    fn app_server_instances_message_key_ignores_snapshot_and_report_id() {
+        let snapshot = r#"{"kind":"agent.app_server_instances","payload":{"report_id":"report-1","snapshot":true,"instances":[{"instance_key":"default"}]}}"#;
+        let incremental = r#"{"kind":"agent.app_server_instances","payload":{"snapshot":false,"instances":[{"instance_key":"default"}]}}"#;
+
+        assert_eq!(
+            app_server_instances_message_key(snapshot).expect("snapshot key"),
+            app_server_instances_message_key(incremental).expect("incremental key")
+        );
+    }
+
+    #[test]
+    fn unacknowledged_app_server_instances_snapshot_is_tracked_for_snapshot_retry() {
+        let key = r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let state = AppServerInstancesSendState {
+            last_sent: Some(key.clone()),
+            last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(key.clone()),
+            last_sent_snapshot: true,
+            last_sent_at: Some(Instant::now()),
+            last_acked: None,
+            last_acked_id: None,
+            last_acked_key: None,
+            next_report_id: 1,
+        };
+
+        assert!(state.has_unacked_snapshot_for_key(&key));
+    }
+
+    #[test]
+    fn background_app_server_instances_ack_is_consumed_without_defer() {
+        let message =
+            r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let text = r#"{"kind":"server.ack","payload":{"kind":"agent.app_server_instances","report_id":"report-1"}}"#;
+        let envelope: Envelope = serde_json::from_str(text).expect("envelope");
+        let mut app_server_instances_state = AppServerInstancesSendState {
+            last_sent: Some(message.clone()),
+            last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(message.clone()),
+            last_sent_snapshot: false,
+            last_sent_at: Some(Instant::now()),
+            last_acked: None,
+            last_acked_id: None,
+            last_acked_key: None,
+            next_report_id: 1,
+        };
+        let mut host_sessions_state = HostSessionsSendState::default();
+
+        assert_eq!(
+            classify_ack_wait_text(text, "command-1", "command.started").expect("classify"),
+            AckWaitAction::Defer
+        );
+        assert!(handle_background_ack_message(
+            &envelope,
+            &mut app_server_instances_state,
+            &mut host_sessions_state
+        ));
+        assert_eq!(
+            app_server_instances_state.last_acked.as_deref(),
+            Some(message.as_str())
+        );
+        assert_eq!(
+            app_server_instances_state.last_acked_id.as_deref(),
+            Some("report-1")
+        );
+        assert_eq!(
+            app_server_instances_state.last_acked_key.as_deref(),
+            Some(message.as_str())
+        );
+    }
+
+    #[test]
+    fn app_server_instances_message_reports_active_turn_count() {
+        let mut config = test_config();
+        config.session_inventory.managed_app_server.enabled = true;
+        config.session_inventory.managed_app_server.listen_url =
+            Some("ws://127.0.0.1:65530".to_owned());
+        let mut manager = AppServerManager::new(&config);
+        manager.begin_turn();
+
+        let message = app_server_instances_message(&config, &mut manager, true).expect("message");
+        let value: Value = serde_json::from_str(&message).expect("json");
+
+        assert_eq!(
+            value.pointer("/kind").and_then(Value::as_str),
+            Some("agent.app_server_instances")
+        );
+        assert_eq!(
+            value
+                .pointer("/payload/instances/0/active_turn_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            value.pointer("/payload/snapshot").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(value.pointer("/payload/instances/0/last_error").is_none());
+    }
+
+    #[test]
+    fn app_server_instance_text_is_bounded_for_worker_validation() {
+        assert_eq!(bounded_app_server_instance_text("short"), "short");
+
+        let bounded = bounded_app_server_instance_text(&"x".repeat(600));
+
+        assert_eq!(bounded.chars().count(), 512);
+        assert!(bounded.ends_with("..."));
+    }
+
+    #[test]
+    fn app_server_instances_message_sends_empty_snapshot_when_reporting_disabled() {
+        let config = test_config();
+        let mut manager = AppServerManager::new(&config);
+
+        let snapshot_message =
+            app_server_instances_message(&config, &mut manager, true).expect("message");
+        let snapshot_value: Value = serde_json::from_str(&snapshot_message).expect("json");
+
+        assert_eq!(
+            snapshot_value
+                .pointer("/payload/snapshot")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot_value
+                .pointer("/payload/instances")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert!(app_server_instances_message(&config, &mut manager, false).is_none());
     }
 
     #[test]

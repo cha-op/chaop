@@ -1,4 +1,5 @@
 import type {
+  AppServerInstanceSummary,
   BootstrapPayload,
   BudgetSummary,
   ConnectorSummary,
@@ -178,6 +179,23 @@ export const hostSessionSyncs: HostSessionSyncSummary[] = [
   }
 ];
 
+export const appServerInstances: AppServerInstanceSummary[] = [
+  {
+    id: "app-server-sample-managed",
+    connector_id: "connector-mac-studio",
+    instance_key: "default",
+    scope: "connector",
+    endpoint_type: "managed",
+    state: "healthy",
+    active_turn_count: 1,
+    generation: 1,
+    status_summary: "Managed app-server is accepting turns.",
+    last_seen_at: "2026-06-09T21:58:05.000Z",
+    state_changed_at: "2026-06-09T21:57:50.000Z",
+    updated_at: "2026-06-09T21:58:05.000Z"
+  }
+];
+
 export const budget: BudgetSummary = {
   state: "conservative",
   daily_used_pct: 75,
@@ -224,6 +242,7 @@ export function sampleBootstrap(email = "operator@example.com"): BootstrapPayloa
     tasks,
     host_sessions: hostSessions,
     host_session_syncs: hostSessionSyncs,
+    app_server_instances: appServerInstances,
     task_categories: taskCategories,
     running_commands: [],
     events,

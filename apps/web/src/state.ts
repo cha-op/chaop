@@ -1,4 +1,5 @@
 import type {
+  AppServerInstanceSummary,
   BootstrapPayload,
   CommandSummary,
   CreateCommandRequest,
@@ -18,9 +19,15 @@ export function mergeBootstrapPayload(
   current: BootstrapPayload | undefined,
   incoming: BootstrapPayload
 ): BootstrapPayload {
-  if (!current) return incoming;
+  if (!current) {
+    return {
+      ...incoming,
+      app_server_instances: appServerInstancesOrEmpty(incoming)
+    };
+  }
 
   const hostSessionSyncs = mergeHostSessionSyncs(incoming.host_session_syncs, current.host_session_syncs);
+  const incomingAppServerInstances = maybeAppServerInstances(incoming);
   return {
     ...incoming,
     connectors: mergeBootstrapConnectors(current.connectors, incoming.connectors),
@@ -29,8 +36,20 @@ export function mergeBootstrapPayload(
     running_commands: mergeById(incoming.running_commands, current.running_commands, newerByUpdatedAt),
     events: mergeById(incoming.events, current.events, newerByCreatedAt),
     host_sessions: mergeHostSessions(incoming.host_sessions, current.host_sessions),
-    host_session_syncs: hostSessionSyncs
+    host_session_syncs: hostSessionSyncs,
+    app_server_instances: incomingAppServerInstances
+      ? mergeBootstrapAppServerInstances(appServerInstancesOrEmpty(current), incomingAppServerInstances)
+      : appServerInstancesOrEmpty(current)
   };
+}
+
+function maybeAppServerInstances(payload: BootstrapPayload): AppServerInstanceSummary[] | undefined {
+  const value = (payload as { app_server_instances?: unknown }).app_server_instances;
+  return Array.isArray(value) ? value as AppServerInstanceSummary[] : undefined;
+}
+
+function appServerInstancesOrEmpty(payload: BootstrapPayload): AppServerInstanceSummary[] {
+  return maybeAppServerInstances(payload) ?? [];
 }
 
 function mergeBootstrapConnectors(
@@ -44,6 +63,17 @@ function mergeBootstrapConnectors(
   });
 }
 
+function mergeBootstrapAppServerInstances(
+  current: AppServerInstanceSummary[],
+  incoming: AppServerInstanceSummary[]
+): AppServerInstanceSummary[] {
+  const currentById = new Map(current.map((item) => [item.id, item]));
+  return incoming.map((item) => {
+    const currentItem = currentById.get(item.id);
+    return currentItem ? newerAppServerInstance(item, currentItem) : item;
+  });
+}
+
 export function mergeConnectorSummaries(
   current: ConnectorSummary[],
   incoming: ConnectorSummary[]
@@ -54,6 +84,28 @@ export function mergeConnectorSummaries(
     ...current.map((item) => {
       const incomingItem = incomingById.get(item.id);
       return incomingItem ? newerConnector(incomingItem, item) : item;
+    }),
+    ...incoming.filter((item) => !knownIds.has(item.id))
+  ];
+}
+
+export function mergeAppServerInstances(
+  current: AppServerInstanceSummary[],
+  incoming: AppServerInstanceSummary[],
+  options: { snapshotConnectorId?: string | undefined } = {}
+): AppServerInstanceSummary[] {
+  const incomingById = new Map(incoming.map((item) => [item.id, item]));
+  const retainedCurrent = current.filter(
+    (item) =>
+      options.snapshotConnectorId === undefined ||
+      item.connector_id !== options.snapshotConnectorId ||
+      incomingById.has(item.id)
+  );
+  const knownIds = new Set(retainedCurrent.map((item) => item.id));
+  return [
+    ...retainedCurrent.map((item) => {
+      const incomingItem = incomingById.get(item.id);
+      return incomingItem ? newerAppServerInstance(incomingItem, item) : item;
     }),
     ...incoming.filter((item) => !knownIds.has(item.id))
   ];
@@ -258,6 +310,13 @@ function newerConnector(incoming: ConnectorSummary, current: ConnectorSummary): 
   if (incomingTime && currentTime && currentTime < incomingTime) return incoming;
   if (incomingTime && currentTime && currentTime > incomingTime) return current;
   return incoming;
+}
+
+function newerAppServerInstance(
+  incoming: AppServerInstanceSummary,
+  current: AppServerInstanceSummary
+): AppServerInstanceSummary {
+  return current.updated_at > incoming.updated_at ? current : incoming;
 }
 
 function connectorTimestamp(connector: ConnectorSummary): string | undefined {

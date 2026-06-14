@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   agentSocketsForConnector,
+  appServerInstancesMessage,
   connectorsMessage,
   hasPeerAgentSocket,
   hasReadyPeerAgentSocket,
@@ -100,6 +101,236 @@ test("connectorsMessage wraps connector capability updates for browser consumers
   assert.equal(envelope.payload?.connectors?.[0]?.id, "connector-1");
   assert.deepEqual(envelope.payload?.connectors?.[0]?.capabilities, ["codex_app_server_exec"]);
   assert.equal(envelope.payload?.synced_at, "2026-06-13T10:01:00.000Z");
+});
+
+test("appServerInstancesMessage wraps app-server instance updates for browser consumers", () => {
+  const message = appServerInstancesMessage({
+    connector_id: "connector-1",
+    synced_at: "2026-06-14T10:00:00.000Z",
+    app_server_instances: [
+      {
+        id: "app-server-1",
+        connector_id: "connector-1",
+        instance_key: "default",
+        scope: "connector",
+        endpoint_type: "managed",
+        state: "healthy",
+        active_turn_count: 1,
+        generation: 1,
+        last_seen_at: "2026-06-14T10:00:00.000Z",
+        state_changed_at: "2026-06-14T10:00:00.000Z",
+        updated_at: "2026-06-14T10:00:00.000Z"
+      }
+    ]
+  });
+  const envelope = JSON.parse(message) as {
+    kind?: string;
+    payload?: { app_server_instances?: Array<{ state?: string }>; connector_id?: string };
+  };
+
+  assert.equal(envelope.kind, "app_server_instances.updated");
+  assert.equal(envelope.payload?.connector_id, "connector-1");
+  assert.equal(envelope.payload?.app_server_instances?.[0]?.state, "healthy");
+});
+
+test("agent app-server instance report is acked and broadcast", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      return [];
+    }
+  } as unknown as DurableObjectState;
+  const db = appServerInstanceDoDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      report_id: "report-1",
+      instances: [appServerInstancePayload("healthy")]
+    }
+  }));
+
+  assert.equal(db.writes, 1);
+  assert.equal(agentSent.length, 1);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as {
+    payload?: { kind?: string; count?: number; deduped?: boolean; report_id?: string };
+  };
+  assert.equal(ack.payload?.kind, "agent.app_server_instances");
+  assert.equal(ack.payload?.count, 1);
+  assert.equal(ack.payload?.deduped, false);
+  assert.equal(ack.payload?.report_id, "report-1");
+  assert.equal(browserSent.length, 1);
+  const update = JSON.parse(browserSent[0] ?? "{}") as { kind?: string; payload?: { app_server_instances?: Array<{ state?: string }> } };
+  assert.equal(update.kind, "app_server_instances.updated");
+  assert.equal(update.payload?.app_server_instances?.[0]?.state, "healthy");
+});
+
+test("empty app-server instance snapshot is acked and broadcast", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      return [];
+    }
+  } as unknown as DurableObjectState;
+  const db = appServerInstanceDoDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      snapshot: true,
+      instances: []
+    }
+  }));
+
+  assert.equal(db.writes, 0);
+  assert.equal(agentSent.length, 1);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as { payload?: { count?: number; deduped?: boolean } };
+  assert.equal(ack.payload?.count, 0);
+  assert.equal(ack.payload?.deduped, false);
+  assert.equal(browserSent.length, 1);
+  const update = JSON.parse(browserSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { app_server_instances?: unknown[]; connector_id?: string; snapshot?: boolean };
+  };
+  assert.equal(update.kind, "app_server_instances.updated");
+  assert.equal(update.payload?.connector_id, "connector-online");
+  assert.equal(update.payload?.snapshot, true);
+  assert.deepEqual(update.payload?.app_server_instances, []);
+});
+
+test("duplicate healthy app-server report is acked without D1 write", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      return [];
+    }
+  } as unknown as DurableObjectState;
+  const db = appServerInstanceDoDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+  const message = JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      instances: [appServerInstancePayload("healthy")]
+    }
+  });
+
+  await workspace.webSocketMessage(agentSocket, message);
+  await workspace.webSocketMessage(agentSocket, message);
+
+  assert.equal(db.writes, 1);
+  assert.equal(browserSent.length, 1);
+  const secondAck = JSON.parse(agentSent[1] ?? "{}") as { payload?: { count?: number; deduped?: boolean } };
+  assert.equal(secondAck.payload?.count, 0);
+  assert.equal(secondAck.payload?.deduped, true);
+});
+
+test("duplicate app-server report cache does not slide on skipped reports", async () => {
+  const originalDateNow = Date.now;
+  let now = 1_000;
+  Date.now = () => now;
+  try {
+    const agentSent: string[] = [];
+    const agentSocket = mutableSocketWithAttachment({
+      socketType: "agent",
+      connectorId: "connector-online",
+      agentReady: true
+    }, agentSent);
+    const ctx = {
+      getWebSockets() {
+        return [];
+      }
+    } as unknown as DurableObjectState;
+    const db = appServerInstanceDoDb();
+    const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+    const message = JSON.stringify({
+      kind: "agent.app_server_instances",
+      payload: {
+        instances: [appServerInstancePayload("healthy")]
+      }
+    });
+
+    await workspace.webSocketMessage(agentSocket, message);
+    now += 30_000;
+    await workspace.webSocketMessage(agentSocket, message);
+    now += 31_000;
+    await workspace.webSocketMessage(agentSocket, message);
+
+    const secondAck = JSON.parse(agentSent[1] ?? "{}") as { payload?: { deduped?: boolean } };
+    const thirdAck = JSON.parse(agentSent[2] ?? "{}") as { payload?: { deduped?: boolean } };
+    assert.equal(secondAck.payload?.deduped, true);
+    assert.equal(thirdAck.payload?.deduped, false);
+  } finally {
+    Date.now = originalDateNow;
+  }
+});
+
+test("app-server edge report bypasses duplicate healthy cache", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      return [];
+    }
+  } as unknown as DurableObjectState;
+  const db = appServerInstanceDoDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: { instances: [appServerInstancePayload("healthy")] }
+  }));
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: { instances: [appServerInstancePayload("healthy")] }
+  }));
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: { instances: [appServerInstancePayload("degraded", { last_error: "Health failed" })] }
+  }));
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: { instances: [appServerInstancePayload("healthy")] }
+  }));
+
+  assert.equal(db.writes, 3);
+  assert.equal(browserSent.length, 3);
+  const edgeUpdate = JSON.parse(browserSent[1] ?? "{}") as { payload?: { app_server_instances?: Array<{ state?: string }> } };
+  assert.equal(edgeUpdate.payload?.app_server_instances?.[0]?.state, "degraded");
+  const recoveryUpdate = JSON.parse(browserSent[2] ?? "{}") as { payload?: { app_server_instances?: Array<{ state?: string }> } };
+  assert.equal(recoveryUpdate.payload?.app_server_instances?.[0]?.state, "healthy");
 });
 
 test("internal broadcast thread events forwards valid events to browser sockets", async () => {
@@ -230,12 +461,13 @@ test("hasReadyPeerAgentSocket counts only ready peers", () => {
 });
 
 test("closing ready socket with handshaking peer fails active commands without marking offline", async () => {
+  const agentSent: string[] = [];
   const browserSent: string[] = [];
-  const closingSocket = socketWithAttachment({
+  const closingSocket = mutableSocketWithAttachment({
     socketType: "agent",
     connectorId: "connector-online",
     agentReady: true
-  });
+  }, agentSent);
   const handshakingPeer = socketWithAttachment({
     socketType: "agent",
     connectorId: "connector-online"
@@ -253,6 +485,16 @@ test("closing ready socket with handshaking peer fails active commands without m
   const db = socketGoneDb();
   const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
 
+  await workspace.webSocketMessage(closingSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      instances: [appServerInstancePayload("healthy")]
+    }
+  }));
+  assert.equal(db.appServerInstanceWrites, 1);
+  agentSent.length = 0;
+  browserSent.length = 0;
+
   await workspace.webSocketClose(closingSocket);
 
   assert.equal(db.commandFailures, 1);
@@ -261,7 +503,8 @@ test("closing ready socket with handshaking peer fails active commands without m
   assert.equal(db.activityUpdates, 1);
   assert.equal(db.connectorDegradedUpdates, 1);
   assert.equal(db.connectorOfflineUpdates, 0);
-  assert.equal(browserSent.length, 2);
+  assert.equal(db.appServerInstanceWrites, 2);
+  assert.equal(browserSent.length, 3);
   const envelope = JSON.parse(browserSent[0] ?? "{}") as {
     kind?: string;
     payload?: { event?: { kind?: string; summary?: string } };
@@ -269,7 +512,14 @@ test("closing ready socket with handshaking peer fails active commands without m
   assert.equal(envelope.kind, "thread.event");
   assert.equal(envelope.payload?.event?.kind, "command.failed");
   assert.equal(envelope.payload?.event?.summary, "Connector disconnected before the command completed.");
-  const connectorUpdate = JSON.parse(browserSent[1] ?? "{}") as {
+  const appServerUpdate = JSON.parse(browserSent[1] ?? "{}") as {
+    kind?: string;
+    payload?: { app_server_instances?: Array<{ state?: string; active_turn_count?: number }> };
+  };
+  assert.equal(appServerUpdate.kind, "app_server_instances.updated");
+  assert.equal(appServerUpdate.payload?.app_server_instances?.[0]?.state, "stopped");
+  assert.equal(appServerUpdate.payload?.app_server_instances?.[0]?.active_turn_count, 0);
+  const connectorUpdate = JSON.parse(browserSent[2] ?? "{}") as {
     kind?: string;
     payload?: { connectors?: Array<{ id?: string; status?: string; capabilities?: string[]; updated_at?: string }> };
   };
@@ -382,6 +632,51 @@ test("closing the last authenticated socket broadcasts the offline connector sta
   assert.equal(connectorUpdate.kind, "connectors.updated");
   assert.equal(connectorUpdate.payload?.connectors?.[0]?.id, "connector-online");
   assert.equal(connectorUpdate.payload?.connectors?.[0]?.status, "offline");
+});
+
+test("closing the last authenticated socket clears app-server duplicate cache", async () => {
+  const browserSent: string[] = [];
+  const agentSent: string[] = [];
+  const firstAgentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const reconnectedAgentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  let agentSockets = [firstAgentSocket];
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return agentSockets;
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = socketGoneDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+  const message = JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      instances: [appServerInstancePayload("healthy")]
+    }
+  });
+
+  await workspace.webSocketMessage(firstAgentSocket, message);
+  assert.equal(db.appServerInstanceWrites, 1);
+  await workspace.webSocketClose(firstAgentSocket);
+  assert.equal(db.appServerInstanceWrites, 2);
+  agentSockets = [reconnectedAgentSocket];
+  await workspace.webSocketMessage(reconnectedAgentSocket, message);
+
+  assert.equal(db.appServerInstanceWrites, 3);
+  const reconnectAck = JSON.parse(agentSent[1] ?? "{}") as { payload?: { deduped?: boolean } };
+  assert.equal(reconnectAck.payload?.deduped, false);
 });
 
 test("agentSocketsForConnector prefers the newest ready agent socket", () => {
@@ -1695,17 +1990,95 @@ function socketGoneDb(): D1Database & {
   readonly activityUpdates: number;
   readonly connectorDegradedUpdates: number;
   readonly connectorOfflineUpdates: number;
+  readonly appServerInstanceWrites: number;
 } {
+  const appServerRows = new Map<string, AppServerInstanceDoRow>();
   const counters = {
     commandFailures: 0,
     taskUpdates: 0,
     eventInserts: 0,
     activityUpdates: 0,
     connectorDegradedUpdates: 0,
-    connectorOfflineUpdates: 0
+    connectorOfflineUpdates: 0,
+    appServerInstanceWrites: 0
   };
   return {
     prepare(sql: string) {
+      if (/SELECT id\s+FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { id: connectorId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+        return {
+          bind(connectorId: string, instanceKey: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return appServerRows.get(`${connectorId}:${instanceKey}`) ?? null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO app_server_instances/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            connectorId: string,
+            instanceKey: string,
+            scope: AppServerInstanceDoRow["scope"],
+            endpointType: AppServerInstanceDoRow["endpoint_type"],
+            state: AppServerInstanceDoRow["state"],
+            activeTurnCount: number,
+            generation: number,
+            statusSummary: string | null,
+            lastError: string | null,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            createdAt: string,
+            updatedAt: string
+          ) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                counters.appServerInstanceWrites += 1;
+                appServerRows.set(`${connectorId}:${instanceKey}`, {
+                  id,
+                  connector_id: connectorId,
+                  instance_key: instanceKey,
+                  scope,
+                  endpoint_type: endpointType,
+                  state,
+                  active_turn_count: activeTurnCount,
+                  generation,
+                  status_summary: statusSummary,
+                  last_error: lastError,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  created_at: appServerRows.get(`${connectorId}:${instanceKey}`)?.created_at ?? createdAt,
+                  updated_at: updatedAt
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
         return {
           bind(connectorId: string) {
@@ -1770,6 +2143,58 @@ function socketGoneDb(): D1Database & {
                     }
                   ]
                 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM app_server_instances/.test(sql) && /state <> 'stopped'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [...appServerRows.values()].filter(
+                    (row) => row.connector_id === connectorId && row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE app_server_instances/.test(sql) && /SET state = 'stopped'/.test(sql)) {
+        return {
+          bind(
+            statusSummary: string,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            updatedAt: string,
+            id: string
+          ) {
+            return {
+              async run() {
+                const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
+                assert.ok(row);
+                counters.appServerInstanceWrites += 1;
+                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                  ...row,
+                  state: "stopped",
+                  active_turn_count: 0,
+                  status_summary: statusSummary,
+                  last_error: null,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  updated_at: updatedAt
+                });
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -1946,6 +2371,9 @@ function socketGoneDb(): D1Database & {
     },
     get connectorOfflineUpdates() {
       return counters.connectorOfflineUpdates;
+    },
+    get appServerInstanceWrites() {
+      return counters.appServerInstanceWrites;
     }
   } as D1Database & typeof counters;
 }
@@ -1963,6 +2391,143 @@ function mutableSocketWithAttachment(initialAttachment: unknown, sent: string[])
       attachment = nextAttachment;
     }
   } as unknown as WebSocket;
+}
+
+function appServerInstancePayload(
+  state: "healthy" | "degraded" | "draining" | "restarting" | "stopped",
+  overrides: { last_error?: string } = {}
+) {
+  return {
+    instance_key: "default",
+    scope: "connector",
+    endpoint_type: "managed",
+    state,
+    active_turn_count: 0,
+    generation: 1,
+    status_summary: "Managed app-server report.",
+    last_error: overrides.last_error
+  };
+}
+
+type AppServerInstanceDoRow = {
+  id: string;
+  connector_id: string;
+  instance_key: string;
+  scope: "connector" | "workspace" | "thread";
+  endpoint_type: "managed" | "external";
+  state: "healthy" | "degraded" | "draining" | "restarting" | "stopped";
+  active_turn_count: number;
+  generation: number;
+  status_summary: string | null;
+  last_error: string | null;
+  report_fingerprint: string;
+  last_seen_at: string;
+  state_changed_at: string;
+  summary_changed_at: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
+  const rows = new Map<string, AppServerInstanceDoRow>();
+  const counters = { writes: 0 };
+  return {
+    prepare(sql: string) {
+      if (/SELECT id\s+FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { id: connectorId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+        return {
+          bind(connectorId: string, instanceKey: string) {
+            return {
+              async first() {
+                return rows.get(`${connectorId}:${instanceKey}`) ?? null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO app_server_instances/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            connectorId: string,
+            instanceKey: string,
+            scope: AppServerInstanceDoRow["scope"],
+            endpointType: AppServerInstanceDoRow["endpoint_type"],
+            state: AppServerInstanceDoRow["state"],
+            activeTurnCount: number,
+            generation: number,
+            statusSummary: string | null,
+            lastError: string | null,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            createdAt: string,
+            updatedAt: string
+          ) {
+            return {
+              async run() {
+                counters.writes += 1;
+                rows.set(`${connectorId}:${instanceKey}`, {
+                  id,
+                  connector_id: connectorId,
+                  instance_key: instanceKey,
+                  scope,
+                  endpoint_type: endpointType,
+                  state,
+                  active_turn_count: activeTurnCount,
+                  generation,
+                  status_summary: statusSummary,
+                  last_error: lastError,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  created_at: createdAt,
+                  updated_at: updatedAt
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM app_server_instances/.test(sql) && /state <> 'stopped'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            return {
+              async all() {
+                return {
+                  results: [...rows.values()].filter(
+                    (row) => row.connector_id === connectorId && row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in app-server DO fake: ${sql}`);
+    },
+    get writes() {
+      return counters.writes;
+    }
+  } as unknown as D1Database & { readonly writes: number };
 }
 
 function staleReleaseDispatchDb(): D1Database & {

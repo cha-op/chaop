@@ -17,7 +17,7 @@
 - [done] PR0: Merge the tracked Web deploy script with full tests, three review lanes, and resolved GitHub conversations.
 - [done] PR1: Clean up execution UX and capability wording so `codex_exec` is private fallback only.
 - [done] PR2: Add connector-managed single app-server lifecycle.
-- [todo] PR3: Add a cost-safe AppServerInstance state model with dedupe, debounce, batching, and rate limits.
+- [done] PR3: Add a cost-safe AppServerInstance state model with dedupe, debounce, batching, and rate limits.
 - [todo] PR4: Add AppServerInstance state UI in Operations and Host Sessions surfaces.
 - [todo] PR5: Make managed app-server execution the default command path.
 - [todo] PR6: Add drain, scheduled restart, and upgrade flow.

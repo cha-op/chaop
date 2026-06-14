@@ -165,6 +165,11 @@ impl AgentConfig {
             capabilities.push("app_server_threads".to_owned());
             capabilities.push("app_server_archive".to_owned());
         }
+        if self.session_inventory.app_server_url.is_some()
+            || self.session_inventory.managed_app_server.enabled
+        {
+            capabilities.push("app_server_instance_state".to_owned());
+        }
         capabilities
     }
 

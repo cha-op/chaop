@@ -7,14 +7,176 @@ import {
   ensureConnectorInventory,
   failStaleExplicitAppServerCommandTargets,
   listThreadEventsInDb,
+  markAppServerInstancesStoppedForConnector,
   markConnectorDisconnected,
   pendingCommandsForConnector,
   recordAgentEvent,
+  recordAppServerInstances,
   recordHostSessionBackfillEvents,
   recordHostSessions,
   updateConnectorCapabilities
 } from "./db.js";
 import type { Env } from "./types.js";
+
+test("recordAppServerInstances inserts the first healthy report", async () => {
+  const db = appServerInstancesDb();
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  assert.equal(db.writes, 1);
+  assert.equal(result.app_server_instances.length, 1);
+  assert.equal(result.app_server_instances[0]?.state, "healthy");
+});
+
+test("recordAppServerInstances skips duplicate healthy reports inside debounce window", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:05:00.000Z");
+
+  assert.equal(db.writes, 1);
+  assert.deepEqual(result.app_server_instances, []);
+});
+
+test("recordAppServerInstances persists unchanged summaries after debounce window", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:16:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.equal(result.app_server_instances[0]?.updated_at, "2026-06-14T10:16:00.000Z");
+});
+
+test("recordAppServerInstances persists degraded edges immediately", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("degraded", { last_error: "Health check failed" })]
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.equal(result.app_server_instances[0]?.state, "degraded");
+  assert.equal(result.app_server_instances[0]?.last_error, "Health check failed");
+});
+
+test("recordAppServerInstances refreshes unchanged degraded summaries after debounce window", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("degraded", { last_error: "Health check failed" })]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const skipped = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("degraded", { last_error: "Health check failed" })]
+  }, "2026-06-14T10:05:00.000Z");
+  const refreshed = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("degraded", { last_error: "Health check failed" })]
+  }, "2026-06-14T10:16:00.000Z");
+
+  assert.deepEqual(skipped.app_server_instances, []);
+  assert.equal(db.writes, 2);
+  assert.equal(refreshed.app_server_instances[0]?.state, "degraded");
+  assert.equal(refreshed.app_server_instances[0]?.last_seen_at, "2026-06-14T10:16:00.000Z");
+});
+
+test("recordAppServerInstances returns a complete connector snapshot when any snapshot row changes", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: [
+      appServerInstanceReport("healthy", { instance_key: "default" }),
+      appServerInstanceReport("healthy", { instance_key: "secondary" })
+    ]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: [
+      appServerInstanceReport("healthy", { instance_key: "default" }),
+      appServerInstanceReport("degraded", {
+        instance_key: "secondary",
+        last_error: "Health check failed"
+      })
+    ]
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(db.writes, 3);
+  assert.deepEqual(
+    result.app_server_instances.map((instance) => [instance.instance_key, instance.state]),
+    [["default", "healthy"], ["secondary", "degraded"]]
+  );
+});
+
+test("recordAppServerInstances returns a complete connector snapshot when unchanged snapshot rows are debounced", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: [
+      appServerInstanceReport("healthy", { instance_key: "default" }),
+      appServerInstanceReport("healthy", { instance_key: "secondary" })
+    ]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: [
+      appServerInstanceReport("healthy", { instance_key: "default" }),
+      appServerInstanceReport("healthy", { instance_key: "secondary" })
+    ]
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.deepEqual(
+    result.app_server_instances.map((instance) => [instance.instance_key, instance.state]),
+    [["default", "healthy"], ["secondary", "healthy"]]
+  );
+});
+
+test("recordAppServerInstances marks omitted snapshot instances stopped", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: []
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(result.app_server_instances.length, 1);
+  assert.equal(result.app_server_instances[0]?.state, "stopped");
+  assert.equal(result.app_server_instances[0]?.status_summary, "Instance was omitted from the latest connector snapshot.");
+});
+
+test("markAppServerInstancesStoppedForConnector stops active instances", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const stopped = await markAppServerInstancesStoppedForConnector(
+    { DB: db } as Env,
+    "connector-1",
+    "2026-06-14T10:01:00.000Z"
+  );
+
+  assert.equal(stopped.length, 1);
+  assert.equal(stopped[0]?.state, "stopped");
+  assert.equal(stopped[0]?.status_summary, "Connector went offline before reporting app-server state.");
+});
 
 test("recordAgentEvent ignores stale events from a connector that lost the lease", async () => {
   const db = agentEventGuardDb({
@@ -353,6 +515,7 @@ test("markConnectorDisconnected fails active commands and marks connector offlin
   assert.equal(db.commandFailures, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
+  assert.equal(db.appServerInstanceStops, 1);
   assert.equal(db.connectorOfflineUpdates, 1);
 });
 
@@ -399,6 +562,7 @@ test("ensureConnectorInventory retires duplicate connectors through disconnect c
   assert.equal(db.retargetedAttachedCommands, 1);
   assert.equal(db.retargetedExplicitAppServerCommands, 1);
   assert.equal(db.deletedOldHostSessions, 1);
+  assert.equal(db.appServerInstanceStops, 1);
   assert.equal(db.retiredConnectorTokens, 1);
 });
 
@@ -1526,8 +1690,32 @@ function connectorDisconnectedDb() {
     commandFailures: 0,
     taskUpdates: 0,
     eventInserts: 0,
+    appServerInstanceStops: 0,
     connectorOfflineUpdates: 0
   };
+  const appServerRows = new Map<string, AppServerInstanceTestRow>([
+    [
+      "connector-online:default",
+      {
+        id: "app-server-connector-online-default",
+        connector_id: "connector-online",
+        instance_key: "default",
+        scope: "connector",
+        endpoint_type: "managed",
+        state: "healthy",
+        active_turn_count: 0,
+        generation: 1,
+        status_summary: "Managed app-server report.",
+        last_error: null,
+        report_fingerprint: "fingerprint-1",
+        last_seen_at: "2026-06-12T10:00:00.000Z",
+        state_changed_at: "2026-06-12T10:00:00.000Z",
+        summary_changed_at: "2026-06-12T10:00:00.000Z",
+        created_at: "2026-06-12T10:00:00.000Z",
+        updated_at: "2026-06-12T10:00:00.000Z"
+      }
+    ]
+  ]);
   const db = {
     prepare(sql: string) {
       if (/FROM commands/.test(sql) && /lease_owner_connector_id = \?/.test(sql) && /state IN \('leased', 'running'\)/.test(sql)) {
@@ -1648,6 +1836,58 @@ function connectorDisconnectedDb() {
         };
       }
 
+      if (/FROM app_server_instances/.test(sql) && /state <> 'stopped'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [...appServerRows.values()].filter(
+                    (row) => row.connector_id === connectorId && row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE app_server_instances/.test(sql) && /SET state = 'stopped'/.test(sql)) {
+        return {
+          bind(
+            statusSummary: string,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            updatedAt: string,
+            id: string
+          ) {
+            return {
+              async run() {
+                const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
+                assert.ok(row);
+                counters.appServerInstanceStops += 1;
+                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                  ...row,
+                  state: "stopped",
+                  active_turn_count: 0,
+                  status_summary: statusSummary,
+                  last_error: null,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  updated_at: updatedAt
+                });
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get commandFailures() {
@@ -1658,6 +1898,9 @@ function connectorDisconnectedDb() {
     },
     get eventInserts() {
       return counters.eventInserts;
+    },
+    get appServerInstanceStops() {
+      return counters.appServerInstanceStops;
     },
     get connectorOfflineUpdates() {
       return counters.connectorOfflineUpdates;
@@ -1725,8 +1968,32 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
     retargetedAttachedCommands: 0,
     retargetedExplicitAppServerCommands: 0,
     deletedOldHostSessions: 0,
+    appServerInstanceStops: 0,
     retiredConnectorTokens: 0
   };
+  const appServerRows = new Map<string, AppServerInstanceTestRow>([
+    [
+      "connector-old:default",
+      {
+        id: "app-server-connector-old-default",
+        connector_id: "connector-old",
+        instance_key: "default",
+        scope: "connector",
+        endpoint_type: "managed",
+        state: "healthy",
+        active_turn_count: 0,
+        generation: 1,
+        status_summary: "Managed app-server report.",
+        last_error: null,
+        report_fingerprint: "fingerprint-1",
+        last_seen_at: "2026-06-12T10:00:00.000Z",
+        state_changed_at: "2026-06-12T10:00:00.000Z",
+        summary_changed_at: "2026-06-12T10:00:00.000Z",
+        created_at: "2026-06-12T10:00:00.000Z",
+        updated_at: "2026-06-12T10:00:00.000Z"
+      }
+    ]
+  ]);
   const db = {
     prepare(sql: string) {
       if (/SELECT id\s+FROM connectors\s+WHERE id <> \? AND name = \? AND hostname = \?/.test(sql)) {
@@ -1854,6 +2121,58 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
             return {
               async run() {
                 return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM app_server_instances/.test(sql) && /state <> 'stopped'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-old");
+            return {
+              async all() {
+                return {
+                  results: [...appServerRows.values()].filter(
+                    (row) => row.connector_id === connectorId && row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE app_server_instances/.test(sql) && /SET state = 'stopped'/.test(sql)) {
+        return {
+          bind(
+            statusSummary: string,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            updatedAt: string,
+            id: string
+          ) {
+            return {
+              async run() {
+                const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
+                assert.ok(row);
+                counters.appServerInstanceStops += 1;
+                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                  ...row,
+                  state: "stopped",
+                  active_turn_count: 0,
+                  status_summary: statusSummary,
+                  last_error: null,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  updated_at: updatedAt
+                });
+                return { meta: { changes: 1 } };
               }
             };
           }
@@ -2037,6 +2356,9 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
     },
     get deletedOldHostSessions() {
       return counters.deletedOldHostSessions;
+    },
+    get appServerInstanceStops() {
+      return counters.appServerInstanceStops;
     },
     get retiredConnectorTokens() {
       return counters.retiredConnectorTokens;
@@ -3068,4 +3390,196 @@ function localThreadConnectorDb(row: { id: string } | null): D1Database {
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     }
   } as unknown as D1Database;
+}
+
+function appServerInstanceReport(
+  state: "healthy" | "degraded" | "draining" | "restarting" | "stopped",
+  overrides: {
+    instance_key?: string;
+    active_turn_count?: number;
+    generation?: number;
+    status_summary?: string;
+    last_error?: string;
+  } = {}
+) {
+  return {
+    instance_key: overrides.instance_key ?? "default",
+    scope: "connector" as const,
+    endpoint_type: "managed" as const,
+    state,
+    active_turn_count: overrides.active_turn_count ?? 0,
+    generation: overrides.generation ?? 1,
+    status_summary: overrides.status_summary ?? "Managed app-server report.",
+    last_error: overrides.last_error
+  };
+}
+
+type AppServerInstanceTestRow = {
+  id: string;
+  connector_id: string;
+  instance_key: string;
+  scope: "connector" | "workspace" | "thread";
+  endpoint_type: "managed" | "external";
+  state: "healthy" | "degraded" | "draining" | "restarting" | "stopped";
+  active_turn_count: number;
+  generation: number;
+  status_summary: string | null;
+  last_error: string | null;
+  report_fingerprint: string;
+  last_seen_at: string;
+  state_changed_at: string;
+  summary_changed_at: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function appServerInstancesDb(): D1Database & { writes: number } {
+  const rows = new Map<string, AppServerInstanceTestRow>();
+  const db = {
+    writes: 0,
+    prepare(sql: string) {
+      if (/SELECT id\s+FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-1");
+            return {
+              async first() {
+                return { id: connectorId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+        return {
+          bind(connectorId: string, instanceKey: string) {
+            return {
+              async first() {
+                return rows.get(`${connectorId}:${instanceKey}`) ?? null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO app_server_instances/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            connectorId: string,
+            instanceKey: string,
+            scope: AppServerInstanceTestRow["scope"],
+            endpointType: AppServerInstanceTestRow["endpoint_type"],
+            state: AppServerInstanceTestRow["state"],
+            activeTurnCount: number,
+            generation: number,
+            statusSummary: string | null,
+            lastError: string | null,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            createdAt: string,
+            updatedAt: string
+          ) {
+            return {
+              async run() {
+                db.writes += 1;
+                rows.set(`${connectorId}:${instanceKey}`, {
+                  id,
+                  connector_id: connectorId,
+                  instance_key: instanceKey,
+                  scope,
+                  endpoint_type: endpointType,
+                  state,
+                  active_turn_count: activeTurnCount,
+                  generation,
+                  status_summary: statusSummary,
+                  last_error: lastError,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  created_at: createdAt,
+                  updated_at: updatedAt
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM app_server_instances/.test(sql) && /state <> 'stopped'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            return {
+              async all() {
+                return {
+                  results: [...rows.values()].filter(
+                    (row) => row.connector_id === connectorId && row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM app_server_instances/.test(sql) && /WHERE connector_id = \?/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            return {
+              async all() {
+                return {
+                  results: [...rows.values()]
+                    .filter((row) => row.connector_id === connectorId)
+                    .sort((left, right) => left.instance_key.localeCompare(right.instance_key))
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE app_server_instances/.test(sql) && /SET state = 'stopped'/.test(sql)) {
+        return {
+          bind(
+            statusSummary: string,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            updatedAt: string,
+            id: string
+          ) {
+            return {
+              async run() {
+                db.writes += 1;
+                const row = [...rows.values()].find((candidate) => candidate.id === id);
+                assert.ok(row);
+                rows.set(`${row.connector_id}:${row.instance_key}`, {
+                  ...row,
+                  state: "stopped",
+                  active_turn_count: 0,
+                  status_summary: statusSummary,
+                  last_error: null,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  updated_at: updatedAt
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in app-server instance fake: ${sql}`);
+    }
+  };
+  return db as unknown as D1Database & { writes: number };
 }

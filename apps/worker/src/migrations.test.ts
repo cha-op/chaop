@@ -50,6 +50,20 @@ test("command execution mode is added by forward migration", async () => {
   );
 });
 
+test("app-server instances are added by forward migration", async () => {
+  const migration = await readMigration("0010_app_server_instances.sql");
+
+  assert.match(migration, /CREATE TABLE app_server_instances/);
+  assert.match(
+    migration,
+    /state TEXT NOT NULL CHECK \(state IN \('healthy', 'degraded', 'draining', 'restarting', 'stopped'\)\)/
+  );
+  assert.match(migration, /UNIQUE\(connector_id, instance_key\)/);
+  assert.match(migration, /CREATE INDEX idx_app_server_instances_connector_state/);
+  assert.match(migration, /CREATE INDEX idx_app_server_instances_state_updated/);
+  assert.match(migration, /CREATE INDEX idx_app_server_instances_last_seen/);
+});
+
 async function readMigration(fileName: string): Promise<string> {
   return await readFile(new URL(fileName, migrationsDir), "utf8");
 }

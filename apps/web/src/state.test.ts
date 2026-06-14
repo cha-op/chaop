@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { BootstrapPayload, HostSessionSummary, TaskArchiveResponse } from "@chaop/protocol";
+import type {
+  AppServerInstanceSummary,
+  BootstrapPayload,
+  HostSessionSummary,
+  TaskArchiveResponse
+} from "@chaop/protocol";
 import {
   archiveSyncNotice,
   archiveSyncWarning,
@@ -15,6 +20,7 @@ import {
   MANAGED_APP_SERVER_UNAVAILABLE,
   managedAppServerCommandAvailable,
   mergeBootstrapPayload,
+  mergeAppServerInstances,
   mergeConnectorSummaries,
   normaliseCommandMode
 } from "./state.ts";
@@ -49,6 +55,76 @@ test("mergeBootstrapPayload keeps realtime host sessions newer than bootstrap sy
   const merged = mergeBootstrapPayload(current, incoming);
 
   assert.deepEqual(merged.host_sessions, [currentSession]);
+});
+
+test("mergeBootstrapPayload keeps newer app-server instance state over stale bootstrap", () => {
+  const currentInstance = appServerInstance("app-server-1", "degraded", "2026-06-12T10:02:00.000Z");
+  const incomingInstance = appServerInstance("app-server-1", "healthy", "2026-06-12T10:01:00.000Z");
+  const current = payload({ app_server_instances: [currentInstance] });
+  const incoming = payload({ app_server_instances: [incomingInstance] });
+
+  const merged = mergeBootstrapPayload(current, incoming);
+
+  assert.deepEqual(merged.app_server_instances, [currentInstance]);
+});
+
+test("mergeBootstrapPayload removes app-server instances omitted from bootstrap snapshot", () => {
+  const current = payload({
+    app_server_instances: [
+      appServerInstance("app-server-a", "healthy", "2026-06-12T10:02:00.000Z"),
+      appServerInstance("app-server-b", "stopped", "2026-06-12T10:02:00.000Z")
+    ]
+  });
+  const incoming = payload({
+    app_server_instances: [
+      appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z")
+    ]
+  });
+
+  const merged = mergeBootstrapPayload(current, incoming);
+
+  assert.deepEqual(merged.app_server_instances, [current.app_server_instances[0]]);
+});
+
+test("mergeBootstrapPayload normalises legacy bootstrap without app-server instances", () => {
+  const incoming = payload();
+  delete (incoming as Partial<BootstrapPayload>).app_server_instances;
+
+  const merged = mergeBootstrapPayload(undefined, incoming);
+
+  assert.deepEqual(merged.app_server_instances, []);
+});
+
+test("mergeBootstrapPayload keeps current app-server instances when legacy bootstrap omits the field", () => {
+  const currentInstance = appServerInstance("app-server-1", "healthy", "2026-06-12T10:02:00.000Z");
+  const current = payload({ app_server_instances: [currentInstance] });
+  const incoming = payload();
+  delete (incoming as Partial<BootstrapPayload>).app_server_instances;
+
+  const merged = mergeBootstrapPayload(current, incoming);
+
+  assert.deepEqual(merged.app_server_instances, [currentInstance]);
+});
+
+test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {
+  const retained = appServerInstance("app-server-retained", "healthy", "2026-06-12T10:00:00.000Z", "connector-2");
+  const replaced = appServerInstance("app-server-old", "healthy", "2026-06-12T10:00:00.000Z", "connector-1");
+  const incoming = appServerInstance("app-server-new", "degraded", "2026-06-12T10:01:00.000Z", "connector-1");
+
+  const merged = mergeAppServerInstances([retained, replaced], [incoming], { snapshotConnectorId: "connector-1" });
+
+  assert.deepEqual(merged, [retained, incoming]);
+});
+
+test("mergeAppServerInstances keeps newer rows from stale connector snapshots", () => {
+  const retained = appServerInstance("app-server-retained", "healthy", "2026-06-12T10:00:00.000Z", "connector-2");
+  const current = appServerInstance("app-server-current", "degraded", "2026-06-12T10:02:00.000Z", "connector-1");
+  const omitted = appServerInstance("app-server-omitted", "healthy", "2026-06-12T10:02:00.000Z", "connector-1");
+  const staleIncoming = appServerInstance("app-server-current", "healthy", "2026-06-12T10:01:00.000Z", "connector-1");
+
+  const merged = mergeAppServerInstances([retained, current, omitted], [staleIncoming], { snapshotConnectorId: "connector-1" });
+
+  assert.deepEqual(merged, [retained, current]);
 });
 
 test("localThreadWorkspaceId uses the selected thread workspace", () => {
@@ -443,6 +519,7 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
     tasks: [],
     host_sessions: [],
     host_session_syncs: [],
+    app_server_instances: [],
     task_categories: [],
     running_commands: [],
     events: [],
@@ -457,6 +534,27 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
     },
     server_time: "2026-06-12T10:00:00.000Z",
     ...overrides
+  };
+}
+
+function appServerInstance(
+  id: string,
+  state: AppServerInstanceSummary["state"],
+  updatedAt: string,
+  connectorId = "connector-1"
+): AppServerInstanceSummary {
+  return {
+    id,
+    connector_id: connectorId,
+    instance_key: "default",
+    scope: "connector",
+    endpoint_type: "managed",
+    state,
+    active_turn_count: 0,
+    generation: 1,
+    last_seen_at: updatedAt,
+    state_changed_at: updatedAt,
+    updated_at: updatedAt
   };
 }
 
