@@ -487,6 +487,29 @@ test("normaliseCommandMode promotes placeholder only for implicit managed app-se
     }),
     "app_server"
   );
+  assert.equal(
+    normaliseCommandMode("codex_cli_fallback", data, "thread-api", {
+      showCliFallback: true,
+      preferManagedAppServer: true
+    }),
+    "app_server"
+  );
+  assert.equal(
+    normaliseCommandMode(
+      "codex_cli_fallback",
+      payload({
+        connectors: [connector("connector-a", ["codex_exec"])],
+        workspaces: [workspace("workspace-api", ["connector-a"])],
+        threads: [thread("thread-api", "workspace-api")]
+      }),
+      "thread-api",
+      {
+        showCliFallback: true,
+        preferManagedAppServer: true
+      }
+    ),
+    "placeholder"
+  );
 });
 
 test("historyBackfillNotice summarises imported history", () => {

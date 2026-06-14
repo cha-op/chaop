@@ -241,6 +241,10 @@ export function normaliseCommandMode(
   threadId: string | undefined,
   options: { showCliFallback: boolean; preferManagedAppServer?: boolean }
 ): CommandExecutionMode {
+  if (options.preferManagedAppServer) {
+    return defaultCommandMode(data, threadId);
+  }
+
   if (mode === "app_server" && !managedAppServerCommandAvailable(data, threadId)) {
     return "placeholder";
   }
@@ -250,10 +254,6 @@ export function normaliseCommandMode(
     if (!options.showCliFallback || !codexCliFallbackAvailable(data, thread?.workspace_id)) {
       return defaultCommandMode(data, threadId);
     }
-  }
-
-  if (options.preferManagedAppServer && mode === "placeholder") {
-    return defaultCommandMode(data, threadId);
   }
 
   return mode;
