@@ -7,14 +7,104 @@ import {
   ensureConnectorInventory,
   failStaleExplicitAppServerCommandTargets,
   listThreadEventsInDb,
+  markAppServerInstancesStoppedForConnector,
   markConnectorDisconnected,
   pendingCommandsForConnector,
   recordAgentEvent,
+  recordAppServerInstances,
   recordHostSessionBackfillEvents,
   recordHostSessions,
   updateConnectorCapabilities
 } from "./db.js";
 import type { Env } from "./types.js";
+
+test("recordAppServerInstances inserts the first healthy report", async () => {
+  const db = appServerInstancesDb();
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  assert.equal(db.writes, 1);
+  assert.equal(result.app_server_instances.length, 1);
+  assert.equal(result.app_server_instances[0]?.state, "healthy");
+});
+
+test("recordAppServerInstances skips duplicate healthy reports inside debounce window", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:05:00.000Z");
+
+  assert.equal(db.writes, 1);
+  assert.deepEqual(result.app_server_instances, []);
+});
+
+test("recordAppServerInstances persists unchanged healthy summary after debounce window", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:16:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.equal(result.app_server_instances[0]?.updated_at, "2026-06-14T10:16:00.000Z");
+});
+
+test("recordAppServerInstances persists degraded edges immediately", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("degraded", { last_error: "Health check failed" })]
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.equal(result.app_server_instances[0]?.state, "degraded");
+  assert.equal(result.app_server_instances[0]?.last_error, "Health check failed");
+});
+
+test("recordAppServerInstances marks omitted snapshot instances stopped", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: []
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(result.app_server_instances.length, 1);
+  assert.equal(result.app_server_instances[0]?.state, "stopped");
+  assert.equal(result.app_server_instances[0]?.status_summary, "Instance was omitted from the latest connector snapshot.");
+});
+
+test("markAppServerInstancesStoppedForConnector stops active instances", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("healthy")]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const stopped = await markAppServerInstancesStoppedForConnector(
+    { DB: db } as Env,
+    "connector-1",
+    "2026-06-14T10:01:00.000Z"
+  );
+
+  assert.equal(stopped.length, 1);
+  assert.equal(stopped[0]?.state, "stopped");
+  assert.equal(stopped[0]?.status_summary, "Connector went offline before reporting app-server state.");
+});
 
 test("recordAgentEvent ignores stale events from a connector that lost the lease", async () => {
   const db = agentEventGuardDb({
@@ -3068,4 +3158,179 @@ function localThreadConnectorDb(row: { id: string } | null): D1Database {
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     }
   } as unknown as D1Database;
+}
+
+function appServerInstanceReport(
+  state: "healthy" | "degraded" | "draining" | "restarting" | "stopped",
+  overrides: {
+    active_turn_count?: number;
+    generation?: number;
+    status_summary?: string;
+    last_error?: string;
+  } = {}
+) {
+  return {
+    instance_key: "default",
+    scope: "connector" as const,
+    endpoint_type: "managed" as const,
+    state,
+    active_turn_count: overrides.active_turn_count ?? 0,
+    generation: overrides.generation ?? 1,
+    status_summary: overrides.status_summary ?? "Managed app-server report.",
+    last_error: overrides.last_error
+  };
+}
+
+type AppServerInstanceTestRow = {
+  id: string;
+  connector_id: string;
+  instance_key: string;
+  scope: "connector" | "workspace" | "thread";
+  endpoint_type: "managed" | "external";
+  state: "healthy" | "degraded" | "draining" | "restarting" | "stopped";
+  active_turn_count: number;
+  generation: number;
+  status_summary: string | null;
+  last_error: string | null;
+  report_fingerprint: string;
+  last_seen_at: string;
+  state_changed_at: string;
+  summary_changed_at: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function appServerInstancesDb(): D1Database & { writes: number } {
+  const rows = new Map<string, AppServerInstanceTestRow>();
+  const db = {
+    writes: 0,
+    prepare(sql: string) {
+      if (/SELECT id\s+FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-1");
+            return {
+              async first() {
+                return { id: connectorId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+        return {
+          bind(connectorId: string, instanceKey: string) {
+            return {
+              async first() {
+                return rows.get(`${connectorId}:${instanceKey}`) ?? null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO app_server_instances/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            connectorId: string,
+            instanceKey: string,
+            scope: AppServerInstanceTestRow["scope"],
+            endpointType: AppServerInstanceTestRow["endpoint_type"],
+            state: AppServerInstanceTestRow["state"],
+            activeTurnCount: number,
+            generation: number,
+            statusSummary: string | null,
+            lastError: string | null,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            createdAt: string,
+            updatedAt: string
+          ) {
+            return {
+              async run() {
+                db.writes += 1;
+                rows.set(`${connectorId}:${instanceKey}`, {
+                  id,
+                  connector_id: connectorId,
+                  instance_key: instanceKey,
+                  scope,
+                  endpoint_type: endpointType,
+                  state,
+                  active_turn_count: activeTurnCount,
+                  generation,
+                  status_summary: statusSummary,
+                  last_error: lastError,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  created_at: createdAt,
+                  updated_at: updatedAt
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM app_server_instances/.test(sql) && /state <> 'stopped'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            return {
+              async all() {
+                return {
+                  results: [...rows.values()].filter(
+                    (row) => row.connector_id === connectorId && row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE app_server_instances/.test(sql) && /SET state = 'stopped'/.test(sql)) {
+        return {
+          bind(
+            statusSummary: string,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            updatedAt: string,
+            id: string
+          ) {
+            return {
+              async run() {
+                db.writes += 1;
+                const row = [...rows.values()].find((candidate) => candidate.id === id);
+                assert.ok(row);
+                rows.set(`${row.connector_id}:${row.instance_key}`, {
+                  ...row,
+                  state: "stopped",
+                  active_turn_count: 0,
+                  status_summary: statusSummary,
+                  last_error: null,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  updated_at: updatedAt
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in app-server instance fake: ${sql}`);
+    }
+  };
+  return db as unknown as D1Database & { writes: number };
 }

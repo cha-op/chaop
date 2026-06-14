@@ -1,4 +1,5 @@
 import type {
+  AppServerInstanceSummary,
   BootstrapPayload,
   CommandSummary,
   CreateCommandRequest,
@@ -29,7 +30,12 @@ export function mergeBootstrapPayload(
     running_commands: mergeById(incoming.running_commands, current.running_commands, newerByUpdatedAt),
     events: mergeById(incoming.events, current.events, newerByCreatedAt),
     host_sessions: mergeHostSessions(incoming.host_sessions, current.host_sessions),
-    host_session_syncs: hostSessionSyncs
+    host_session_syncs: hostSessionSyncs,
+    app_server_instances: mergeById(
+      incoming.app_server_instances,
+      current.app_server_instances,
+      newerAppServerInstance
+    )
   };
 }
 
@@ -54,6 +60,25 @@ export function mergeConnectorSummaries(
     ...current.map((item) => {
       const incomingItem = incomingById.get(item.id);
       return incomingItem ? newerConnector(incomingItem, item) : item;
+    }),
+    ...incoming.filter((item) => !knownIds.has(item.id))
+  ];
+}
+
+export function mergeAppServerInstances(
+  current: AppServerInstanceSummary[],
+  incoming: AppServerInstanceSummary[],
+  options: { snapshotConnectorId?: string | undefined } = {}
+): AppServerInstanceSummary[] {
+  const incomingById = new Map(incoming.map((item) => [item.id, item]));
+  const retainedCurrent = current.filter(
+    (item) => options.snapshotConnectorId === undefined || item.connector_id !== options.snapshotConnectorId
+  );
+  const knownIds = new Set(retainedCurrent.map((item) => item.id));
+  return [
+    ...retainedCurrent.map((item) => {
+      const incomingItem = incomingById.get(item.id);
+      return incomingItem ? newerAppServerInstance(incomingItem, item) : item;
     }),
     ...incoming.filter((item) => !knownIds.has(item.id))
   ];
@@ -258,6 +283,13 @@ function newerConnector(incoming: ConnectorSummary, current: ConnectorSummary): 
   if (incomingTime && currentTime && currentTime < incomingTime) return incoming;
   if (incomingTime && currentTime && currentTime > incomingTime) return current;
   return incoming;
+}
+
+function newerAppServerInstance(
+  incoming: AppServerInstanceSummary,
+  current: AppServerInstanceSummary
+): AppServerInstanceSummary {
+  return current.updated_at > incoming.updated_at ? current : incoming;
 }
 
 function connectorTimestamp(connector: ConnectorSummary): string | undefined {

@@ -20,6 +20,11 @@ pub struct AppServerManager {
     child: Option<Child>,
     last_start_failure: Option<Instant>,
     shutdown_requested: fn() -> bool,
+    state: AppServerInstanceState,
+    generation: u64,
+    active_turn_count: u32,
+    status_summary: Option<String>,
+    last_error: Option<String>,
 }
 
 impl AppServerManager {
@@ -35,6 +40,15 @@ impl AppServerManager {
             child: None,
             last_start_failure: None,
             shutdown_requested,
+            state: if managed.enabled || config.session_inventory.app_server_url.is_some() {
+                AppServerInstanceState::Stopped
+            } else {
+                AppServerInstanceState::Stopped
+            },
+            generation: 0,
+            active_turn_count: 0,
+            status_summary: None,
+            last_error: None,
         }
     }
 
@@ -71,6 +85,40 @@ impl AppServerManager {
         runtime
     }
 
+    pub fn instance_snapshot(&self, config: &AgentConfig) -> Option<AppServerInstanceSnapshot> {
+        if !self.enabled && config.session_inventory.app_server_url.is_none() {
+            return None;
+        }
+        Some(AppServerInstanceSnapshot {
+            instance_key: "default".to_owned(),
+            scope: "connector".to_owned(),
+            endpoint_type: if self.enabled { "managed" } else { "external" }.to_owned(),
+            state: if self.enabled {
+                self.state.as_str().to_owned()
+            } else {
+                "healthy".to_owned()
+            },
+            active_turn_count: self.active_turn_count,
+            generation: self.generation,
+            status_summary: self.status_summary.clone().or_else(|| {
+                Some(if self.enabled {
+                    "Managed app-server state is available.".to_owned()
+                } else {
+                    "External app-server endpoint is configured.".to_owned()
+                })
+            }),
+            last_error: self.last_error.clone(),
+        })
+    }
+
+    pub fn begin_turn(&mut self) {
+        self.active_turn_count = self.active_turn_count.saturating_add(1);
+    }
+
+    pub fn finish_turn(&mut self) {
+        self.active_turn_count = self.active_turn_count.saturating_sub(1);
+    }
+
     fn probe_ready(&self, config: &AgentConfig) -> Option<String> {
         let Some(listen_url) = self.validated_listen_url() else {
             return None;
@@ -90,6 +138,11 @@ impl AppServerManager {
 
     fn ensure_ready(&mut self, config: &AgentConfig) -> Option<String> {
         let Some(listen_url) = self.validated_listen_url() else {
+            self.set_state(
+                AppServerInstanceState::Degraded,
+                "Managed app-server listen URL is missing or not loopback.",
+                Some("Invalid managed app-server listen URL."),
+            );
             return None;
         };
 
@@ -100,16 +153,36 @@ impl AppServerManager {
         )
         .is_ok()
         {
+            self.set_state(
+                AppServerInstanceState::Healthy,
+                "Managed app-server is healthy.",
+                None,
+            );
             return Some(listen_url);
         }
 
         if !self.can_attempt_start(config) {
+            self.set_state(
+                AppServerInstanceState::Degraded,
+                "Managed app-server restart backoff is active.",
+                Some("Health check failed while restart backoff is active."),
+            );
             return None;
         }
         if (self.shutdown_requested)() {
+            self.set_state(
+                AppServerInstanceState::Stopped,
+                "Connector shutdown requested before managed app-server start.",
+                None,
+            );
             return None;
         }
         if self.child.is_some() {
+            self.set_state(
+                AppServerInstanceState::Restarting,
+                "Restarting unhealthy managed app-server.",
+                None,
+            );
             self.stop_child("restarting unhealthy managed app-server");
         }
 
@@ -117,40 +190,76 @@ impl AppServerManager {
             Ok(child) => {
                 self.child = Some(child);
                 if self.wait_until_ready(config, &listen_url) {
+                    self.set_state(
+                        AppServerInstanceState::Healthy,
+                        "Managed app-server is healthy.",
+                        None,
+                    );
                     Some(listen_url)
                 } else {
                     self.stop_child(
                         "managed app-server did not become healthy before startup timeout",
                     );
                     self.record_start_failure();
+                    self.set_state(
+                        AppServerInstanceState::Degraded,
+                        "Managed app-server did not become healthy before startup timeout.",
+                        Some("Startup health check timed out."),
+                    );
                     None
                 }
             }
             Err(error) => {
                 eprintln!("failed to start managed app-server: {error}");
                 self.record_start_failure();
+                self.set_state(
+                    AppServerInstanceState::Degraded,
+                    "Failed to start managed app-server.",
+                    Some(&error.to_string()),
+                );
                 None
             }
         }
+    }
+
+    fn set_state(
+        &mut self,
+        state: AppServerInstanceState,
+        summary: &str,
+        last_error: Option<&str>,
+    ) {
+        if self.state != state {
+            self.generation = self.generation.saturating_add(1);
+        }
+        self.state = state;
+        self.status_summary = Some(summary.to_owned());
+        self.last_error = last_error.map(str::to_owned);
     }
 
     fn clear_exited_child(&mut self) {
         let Some(child) = self.child.as_mut() else {
             return;
         };
-        let should_cleanup = match child.try_wait() {
+        let cleanup_reason = match child.try_wait() {
             Ok(Some(status)) => {
                 eprintln!("managed app-server exited with status {status}");
-                true
+                Some((
+                    "Managed app-server exited unexpectedly.",
+                    format!("Process exited with status {status}."),
+                ))
             }
-            Ok(None) => false,
+            Ok(None) => None,
             Err(error) => {
                 eprintln!("failed to inspect managed app-server status: {error}");
-                true
+                Some((
+                    "Failed to inspect managed app-server status.",
+                    error.to_string(),
+                ))
             }
         };
 
-        if should_cleanup {
+        if let Some((summary, error)) = cleanup_reason {
+            self.set_state(AppServerInstanceState::Degraded, summary, Some(&error));
             self.stop_child("managed app-server exited; cleaning up process group");
             self.record_start_failure();
         }
@@ -275,6 +384,37 @@ impl AppServerManager {
             thread::sleep(Duration::from_millis(100));
         }
         false
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppServerInstanceSnapshot {
+    pub instance_key: String,
+    pub scope: String,
+    pub endpoint_type: String,
+    pub state: String,
+    pub active_turn_count: u32,
+    pub generation: u64,
+    pub status_summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppServerInstanceState {
+    Healthy,
+    Degraded,
+    Restarting,
+    Stopped,
+}
+
+impl AppServerInstanceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Restarting => "restarting",
+            Self::Stopped => "stopped",
+        }
     }
 }
 

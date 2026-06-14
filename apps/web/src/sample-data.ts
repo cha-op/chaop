@@ -152,6 +152,22 @@ export function fallbackBootstrap(): BootstrapPayload {
         stored_session_count: 2
       }
     ],
+    app_server_instances: [
+      {
+        id: "app-server-sample-managed",
+        connector_id: "connector-mac-studio",
+        instance_key: "default",
+        scope: "connector",
+        endpoint_type: "managed",
+        state: "healthy",
+        active_turn_count: 1,
+        generation: 1,
+        status_summary: "Managed app-server is accepting turns.",
+        last_seen_at: "2026-06-09T21:58:05.000Z",
+        state_changed_at: "2026-06-09T21:57:50.000Z",
+        updated_at: "2026-06-09T21:58:05.000Z"
+      }
+    ],
     task_categories: [
       { id: "release", name: "Release", colour: "#2563eb" },
       { id: "incident", name: "Incident", colour: "#dc2626" },

@@ -3,6 +3,7 @@ import { customElement, state } from "lit/decorators.js";
 import {
   groupTasksByState,
   TASK_STATE_LABELS,
+  type AppServerInstancesUpdatePayload,
   type BootstrapPayload,
   type CommandSummary,
   type ConnectorSummary,
@@ -42,6 +43,7 @@ import {
   MANAGED_APP_SERVER_UNAVAILABLE,
   managedAppServerCommandAvailable,
   mergeBootstrapPayload,
+  mergeAppServerInstances,
   mergeConnectorSummaries,
   normaliseCommandMode,
   type CommandExecutionMode
@@ -55,6 +57,7 @@ type RealtimeThreadEventPayload = {
 };
 type RealtimeConnectorsPayload = ConnectorsUpdatePayload;
 type RealtimeHostSessionsPayload = HostSessionsUpdatePayload;
+type RealtimeAppServerInstancesPayload = AppServerInstancesUpdatePayload;
 
 const FALLBACK_POLL_MS = 10_000;
 const SOCKET_RECONNECT_MS = 3_000;
@@ -1036,6 +1039,12 @@ export class ChaopApp extends LitElement {
     if (envelope.kind === "connectors.updated" && isRealtimeConnectorsPayload(envelope.payload)) {
       this.applyConnectors(envelope.payload);
     }
+    if (
+      envelope.kind === "app_server_instances.updated" &&
+      isRealtimeAppServerInstancesPayload(envelope.payload)
+    ) {
+      this.applyAppServerInstances(envelope.payload);
+    }
   }
 
   private scheduleRealtimeReconnect(): void {
@@ -1104,6 +1113,18 @@ export class ChaopApp extends LitElement {
     if (hasUnknownConnector) {
       void this.load();
     }
+  }
+
+  private applyAppServerInstances(payload: AppServerInstancesUpdatePayload): void {
+    if (!this.data) return;
+    this.data = {
+      ...this.data,
+      app_server_instances: mergeAppServerInstances(
+        this.data.app_server_instances,
+        payload.app_server_instances,
+        { snapshotConnectorId: payload.snapshot ? payload.connector_id : undefined }
+      )
+    };
   }
 
   private upsertCommand(command: CommandSummary): void {
@@ -1340,6 +1361,31 @@ function isRealtimeConnectorsPayload(value: unknown): value is RealtimeConnector
       );
     }) &&
     (syncedAt === undefined || typeof syncedAt === "string")
+  );
+}
+
+function isRealtimeAppServerInstancesPayload(value: unknown): value is RealtimeAppServerInstancesPayload {
+  if (typeof value !== "object" || value === null) return false;
+  const instances = (value as { app_server_instances?: unknown }).app_server_instances;
+  const syncedAt = (value as { synced_at?: unknown }).synced_at;
+  const connectorId = (value as { connector_id?: unknown }).connector_id;
+  const snapshot = (value as { snapshot?: unknown }).snapshot;
+  return (
+    Array.isArray(instances) &&
+    instances.every((instance) => {
+      if (typeof instance !== "object" || instance === null) return false;
+      const record = instance as Record<string, unknown>;
+      return (
+        typeof record.id === "string" &&
+        typeof record.connector_id === "string" &&
+        typeof record.instance_key === "string" &&
+        typeof record.state === "string" &&
+        typeof record.updated_at === "string"
+      );
+    }) &&
+    (syncedAt === undefined || typeof syncedAt === "string") &&
+    (connectorId === undefined || typeof connectorId === "string") &&
+    (snapshot === undefined || typeof snapshot === "boolean")
   );
 }
 

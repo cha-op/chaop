@@ -1,8 +1,10 @@
 import type {
   AgentBackfillEvent,
+  AgentAppServerInstancesReport,
   AgentBootstrapRequest,
   AgentCommandEvent,
   AgentHostSessionsReport,
+  AppServerInstanceSummary,
   AttachHostSessionResponse,
   BootstrapPayload,
   CommandDispatch,
@@ -30,6 +32,7 @@ import type { BrowserIdentity } from "./auth.js";
 const DEFAULT_WORKSPACE_ID = "workspace-api";
 const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
+const APP_SERVER_HEALTHY_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
 
 export class CommandTargetError extends Error {
   constructor(
@@ -68,6 +71,7 @@ export async function loadBootstrapFromDb(
     threads,
     hostSessions,
     hostSessionSyncs,
+    appServerInstances,
     categories,
     tasks,
     runningCommands,
@@ -78,6 +82,7 @@ export async function loadBootstrapFromDb(
     listThreads(env),
     listHostSessions(env),
     listHostSessionSyncs(env),
+    listAppServerInstances(env),
     listTaskCategories(env),
     listTasks(env),
     listRecentCommands(env),
@@ -91,6 +96,7 @@ export async function loadBootstrapFromDb(
     threads,
     host_sessions: hostSessions,
     host_session_syncs: hostSessionSyncs,
+    app_server_instances: appServerInstances,
     task_categories: categories,
     tasks,
     running_commands: runningCommands,
@@ -98,6 +104,225 @@ export async function loadBootstrapFromDb(
     budget,
     server_time: new Date().toISOString()
   };
+}
+
+export type RecordAppServerInstancesResult = {
+  app_server_instances: AppServerInstanceSummary[];
+  synced_at: string;
+  snapshot: boolean;
+};
+
+export async function recordAppServerInstances(
+  env: Env,
+  connectorId: string,
+  report: AgentAppServerInstancesReport,
+  syncedAt = new Date().toISOString()
+): Promise<RecordAppServerInstancesResult> {
+  if (!env.DB) return { app_server_instances: [], synced_at: syncedAt, snapshot: report.snapshot === true };
+
+  const connector = await env.DB.prepare(
+    `SELECT id
+     FROM connectors
+     WHERE id = ?
+     LIMIT 1`
+  )
+    .bind(connectorId)
+    .first<{ id: string }>();
+  if (!connector) return { app_server_instances: [], synced_at: syncedAt, snapshot: report.snapshot === true };
+
+  const persisted: AppServerInstanceSummary[] = [];
+  const reportedKeys = new Set<string>();
+  for (const instance of report.instances) {
+    reportedKeys.add(instance.instance_key);
+    const fingerprint = appServerInstanceFingerprint(instance);
+    const existing = await env.DB.prepare(
+      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+              active_turn_count, generation, status_summary, last_error,
+              report_fingerprint, last_seen_at, state_changed_at,
+              summary_changed_at, created_at, updated_at
+       FROM app_server_instances
+       WHERE connector_id = ? AND instance_key = ?
+       LIMIT 1`
+    )
+      .bind(connectorId, instance.instance_key)
+      .first<AppServerInstanceRow>();
+    const shouldPersist = shouldPersistAppServerInstance(existing, instance, fingerprint, syncedAt);
+    if (!shouldPersist) continue;
+
+    const id = existing?.id ?? appServerInstanceId(connectorId, instance.instance_key);
+    const stateChangedAt = existing && existing.state === instance.state
+      ? existing.state_changed_at
+      : syncedAt;
+    const summaryChangedAt = existing && existing.report_fingerprint === fingerprint && instance.state !== "healthy"
+      ? existing.summary_changed_at
+      : syncedAt;
+    await env.DB.prepare(
+      `INSERT INTO app_server_instances (
+         id, connector_id, instance_key, scope, endpoint_type, state,
+         active_turn_count, generation, status_summary, last_error,
+         report_fingerprint, last_seen_at, state_changed_at, summary_changed_at,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(connector_id, instance_key) DO UPDATE SET
+         scope = excluded.scope,
+         endpoint_type = excluded.endpoint_type,
+         state = excluded.state,
+         active_turn_count = excluded.active_turn_count,
+         generation = excluded.generation,
+         status_summary = excluded.status_summary,
+         last_error = excluded.last_error,
+         report_fingerprint = excluded.report_fingerprint,
+         last_seen_at = excluded.last_seen_at,
+         state_changed_at = excluded.state_changed_at,
+         summary_changed_at = excluded.summary_changed_at,
+         updated_at = excluded.updated_at`
+    )
+      .bind(
+        id,
+        connectorId,
+        instance.instance_key,
+        instance.scope,
+        instance.endpoint_type,
+        instance.state,
+        instance.active_turn_count ?? 0,
+        instance.generation ?? 0,
+        instance.status_summary ?? null,
+        instance.last_error ?? null,
+        fingerprint,
+        syncedAt,
+        stateChangedAt,
+        summaryChangedAt,
+        existing?.created_at ?? syncedAt,
+        syncedAt
+      )
+      .run();
+
+    const row = await env.DB.prepare(
+      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+              active_turn_count, generation, status_summary, last_error,
+              last_seen_at, state_changed_at, updated_at
+       FROM app_server_instances
+       WHERE connector_id = ? AND instance_key = ?
+       LIMIT 1`
+    )
+      .bind(connectorId, instance.instance_key)
+      .first<AppServerInstanceRow>();
+    if (row) persisted.push(appServerInstanceFromRow(row));
+  }
+
+  if (report.snapshot === true) {
+    const omitted = await allRows<AppServerInstanceRow>(
+      env.DB.prepare(
+        `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+                active_turn_count, generation, status_summary, last_error,
+                report_fingerprint, last_seen_at, state_changed_at,
+                summary_changed_at, created_at, updated_at
+         FROM app_server_instances
+         WHERE connector_id = ?
+           AND state <> 'stopped'`
+      ).bind(connectorId)
+    );
+    for (const row of omitted) {
+      if (reportedKeys.has(row.instance_key)) continue;
+      const stoppedSummary = "Instance was omitted from the latest connector snapshot.";
+      const stoppedFingerprint = appServerStoppedFingerprint(row, stoppedSummary);
+      await env.DB.prepare(
+        `UPDATE app_server_instances
+         SET state = 'stopped',
+             active_turn_count = 0,
+             status_summary = ?,
+             last_error = NULL,
+             report_fingerprint = ?,
+             last_seen_at = ?,
+             state_changed_at = ?,
+             summary_changed_at = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+        .bind(
+          stoppedSummary,
+          stoppedFingerprint,
+          syncedAt,
+          syncedAt,
+          syncedAt,
+          syncedAt,
+          row.id
+        )
+        .run();
+      persisted.push(appServerInstanceFromRow({
+        ...row,
+        state: "stopped",
+        active_turn_count: 0,
+        status_summary: stoppedSummary,
+        last_error: null,
+        last_seen_at: syncedAt,
+        state_changed_at: syncedAt,
+        updated_at: syncedAt
+      }));
+    }
+  }
+
+  return { app_server_instances: persisted, synced_at: syncedAt, snapshot: report.snapshot === true };
+}
+
+export async function markAppServerInstancesStoppedForConnector(
+  env: Env,
+  connectorId: string,
+  syncedAt = new Date().toISOString()
+): Promise<AppServerInstanceSummary[]> {
+  if (!env.DB) return [];
+
+  const rows = await allRows<AppServerInstanceRow>(
+    env.DB.prepare(
+      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+              active_turn_count, generation, status_summary, last_error,
+              report_fingerprint, last_seen_at, state_changed_at,
+              summary_changed_at, created_at, updated_at
+       FROM app_server_instances
+       WHERE connector_id = ?
+         AND state <> 'stopped'`
+    ).bind(connectorId)
+  );
+
+  const stopped: AppServerInstanceSummary[] = [];
+  for (const row of rows) {
+    const stoppedSummary = "Connector went offline before reporting app-server state.";
+    const fingerprint = appServerStoppedFingerprint(row, stoppedSummary);
+    await env.DB.prepare(
+      `UPDATE app_server_instances
+       SET state = 'stopped',
+           active_turn_count = 0,
+           status_summary = ?,
+           last_error = NULL,
+           report_fingerprint = ?,
+           last_seen_at = ?,
+           state_changed_at = ?,
+           summary_changed_at = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+      .bind(
+        stoppedSummary,
+        fingerprint,
+        syncedAt,
+        syncedAt,
+        syncedAt,
+        syncedAt,
+        row.id
+      )
+      .run();
+    stopped.push(appServerInstanceFromRow({
+      ...row,
+      state: "stopped",
+      active_turn_count: 0,
+      status_summary: stoppedSummary,
+      last_error: null,
+      last_seen_at: syncedAt,
+      state_changed_at: syncedAt,
+      updated_at: syncedAt
+    }));
+  }
+  return stopped;
 }
 
 export async function recordHostSessions(
@@ -2744,6 +2969,26 @@ export async function getConnectorSummary(
   return row ? connectorSummaryFromRow(row) : undefined;
 }
 
+async function listAppServerInstances(env: Env): Promise<AppServerInstanceSummary[]> {
+  const rows = await allRows<AppServerInstanceRow>(
+    env.DB!.prepare(
+      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+              active_turn_count, generation, status_summary, last_error,
+              last_seen_at, state_changed_at, updated_at
+       FROM app_server_instances
+       ORDER BY CASE state
+          WHEN 'healthy' THEN 0
+          WHEN 'degraded' THEN 1
+          WHEN 'restarting' THEN 2
+          WHEN 'draining' THEN 3
+          WHEN 'stopped' THEN 4
+          ELSE 5
+        END, updated_at DESC`
+    )
+  );
+  return rows.map(appServerInstanceFromRow);
+}
+
 function connectorSummaryFromRow(row: ConnectorRow): ConnectorSummary {
   return {
     id: row.id,
@@ -2758,6 +3003,87 @@ function connectorSummaryFromRow(row: ConnectorRow): ConnectorSummary {
     last_seen_at: row.last_seen_at ?? undefined,
     updated_at: row.updated_at ?? undefined
   };
+}
+
+function appServerInstanceFromRow(row: AppServerInstanceRow): AppServerInstanceSummary {
+  return {
+    id: row.id,
+    connector_id: row.connector_id,
+    instance_key: row.instance_key,
+    scope: row.scope,
+    endpoint_type: row.endpoint_type,
+    state: row.state,
+    active_turn_count: row.active_turn_count,
+    generation: row.generation,
+    status_summary: row.status_summary ?? undefined,
+    last_error: row.last_error ?? undefined,
+    last_seen_at: row.last_seen_at,
+    state_changed_at: row.state_changed_at,
+    updated_at: row.updated_at
+  };
+}
+
+function shouldPersistAppServerInstance(
+  existing: AppServerInstanceRow | null,
+  instance: AgentAppServerInstancesReport["instances"][number],
+  fingerprint: string,
+  syncedAt: string
+): boolean {
+  if (!existing) return true;
+  if (existing.state !== instance.state) return true;
+  if (existing.endpoint_type !== instance.endpoint_type) return true;
+  if (existing.scope !== instance.scope) return true;
+  if (existing.active_turn_count !== (instance.active_turn_count ?? 0)) return true;
+  if (existing.generation !== (instance.generation ?? 0)) return true;
+  if (instance.state !== "healthy") return existing.report_fingerprint !== fingerprint;
+  if (existing.report_fingerprint !== fingerprint) return true;
+  const lastSummaryChanged = Date.parse(existing.summary_changed_at);
+  const current = Date.parse(syncedAt);
+  if (Number.isNaN(lastSummaryChanged) || Number.isNaN(current)) return true;
+  return current - lastSummaryChanged >= APP_SERVER_HEALTHY_SUMMARY_DEBOUNCE_MS;
+}
+
+function appServerInstanceFingerprint(instance: AgentAppServerInstancesReport["instances"][number]): string {
+  return stableFingerprint([
+    instance.instance_key,
+    instance.scope,
+    instance.endpoint_type,
+    instance.state,
+    String(instance.active_turn_count ?? 0),
+    String(instance.generation ?? 0),
+    instance.status_summary ?? "",
+    instance.last_error ?? ""
+  ]);
+}
+
+function appServerSummaryFingerprint(row: AppServerInstanceRow): string {
+  return stableFingerprint([
+    row.instance_key,
+    row.scope,
+    row.endpoint_type,
+    row.state,
+    String(row.active_turn_count),
+    String(row.generation),
+    row.status_summary ?? "",
+    row.last_error ?? ""
+  ]);
+}
+
+function appServerStoppedFingerprint(row: AppServerInstanceRow, summary: string): string {
+  return stableFingerprint([
+    row.instance_key,
+    row.scope,
+    row.endpoint_type,
+    "stopped",
+    "0",
+    String(row.generation),
+    summary,
+    ""
+  ]);
+}
+
+function appServerInstanceId(connectorId: string, instanceKey: string): string {
+  return `app-server-${stableFingerprint([connectorId, instanceKey])}`;
 }
 
 function parseCapabilities(value: string | null): string[] {
@@ -3443,6 +3769,10 @@ function stableHash(value: string): string {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
+function stableFingerprint(parts: string[]): string {
+  return stableHash(parts.join("\u001f"));
+}
+
 function normaliseBackfillCreatedAt(value: string): string {
   const trimmed = value.trim();
   return Number.isNaN(Date.parse(trimmed)) ? "1970-01-01T00:00:00.000Z" : trimmed;
@@ -3464,6 +3794,14 @@ type ConnectorRow = {
   budget_state: ConnectorSummary["budget_state"];
   last_seen_at: string | null;
   updated_at: string | null;
+};
+
+type AppServerInstanceRow = Omit<AppServerInstanceSummary, "status_summary" | "last_error"> & {
+  status_summary: string | null;
+  last_error: string | null;
+  report_fingerprint: string;
+  summary_changed_at: string;
+  created_at: string;
 };
 
 type WorkspaceRow = {

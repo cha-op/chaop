@@ -98,6 +98,57 @@ export type ConnectorSummary = {
   updated_at?: string | undefined;
 };
 
+export type AppServerInstanceState =
+  | "healthy"
+  | "degraded"
+  | "draining"
+  | "restarting"
+  | "stopped";
+
+export type AppServerEndpointType = "managed" | "external";
+
+export type AppServerInstanceScope = "connector" | "workspace" | "thread";
+
+export type AppServerInstanceSummary = {
+  id: string;
+  connector_id: string;
+  instance_key: string;
+  scope: AppServerInstanceScope;
+  endpoint_type: AppServerEndpointType;
+  state: AppServerInstanceState;
+  active_turn_count: number;
+  generation: number;
+  status_summary?: string | undefined;
+  last_error?: string | undefined;
+  last_seen_at: string;
+  state_changed_at: string;
+  updated_at: string;
+};
+
+export type AgentAppServerInstance = {
+  instance_key: string;
+  scope: AppServerInstanceScope;
+  endpoint_type: AppServerEndpointType;
+  state: AppServerInstanceState;
+  active_turn_count?: number | undefined;
+  generation?: number | undefined;
+  status_summary?: string | undefined;
+  last_error?: string | undefined;
+  reason?: "edge" | "summary" | "shutdown" | undefined;
+};
+
+export type AgentAppServerInstancesReport = {
+  snapshot?: boolean | undefined;
+  instances: AgentAppServerInstance[];
+};
+
+export type AppServerInstancesUpdatePayload = {
+  app_server_instances: AppServerInstanceSummary[];
+  connector_id?: string | undefined;
+  synced_at?: string | undefined;
+  snapshot?: boolean | undefined;
+};
+
 export type WorkspaceSummary = {
   id: string;
   name: string;
@@ -271,6 +322,7 @@ export type BootstrapPayload = {
   tasks: TaskSummary[];
   host_sessions: HostSessionSummary[];
   host_session_syncs: HostSessionSyncSummary[];
+  app_server_instances: AppServerInstanceSummary[];
   task_categories: TaskCategory[];
   running_commands: CommandSummary[];
   events: ThreadEvent[];
