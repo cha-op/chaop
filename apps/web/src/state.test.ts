@@ -4,11 +4,18 @@ import type { BootstrapPayload, HostSessionSummary, TaskArchiveResponse } from "
 import {
   archiveSyncNotice,
   archiveSyncWarning,
+  codexCliFallbackAvailable,
+  commandExecutionModeForRequest,
+  commandModeLabel,
+  commandTypeForMode,
   historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
   localThreadWorkspaceId,
-  mergeBootstrapPayload
+  MANAGED_APP_SERVER_UNAVAILABLE,
+  managedAppServerCommandAvailable,
+  mergeBootstrapPayload,
+  normaliseCommandMode
 } from "./state.ts";
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
@@ -136,6 +143,90 @@ test("localThreadConnectorId drops stale connector selections", () => {
 
   assert.equal(localThreadConnectorId(data, "workspace-docs", "connector-a"), undefined);
   assert.equal(localThreadConnectorId(data, "workspace-docs", "connector-b"), "connector-b");
+});
+
+test("command mode labels keep UI modes separate from protocol types", () => {
+  assert.equal(commandModeLabel("placeholder"), "Placeholder");
+  assert.equal(commandModeLabel("app_server"), "App-server");
+  assert.equal(commandModeLabel("codex_cli_fallback"), "CLI fallback");
+  assert.equal(commandTypeForMode("placeholder"), "placeholder");
+  assert.equal(commandTypeForMode("app_server"), "codex");
+  assert.equal(commandTypeForMode("codex_cli_fallback"), "codex");
+  assert.equal(commandExecutionModeForRequest("placeholder"), undefined);
+  assert.equal(commandExecutionModeForRequest("app_server"), "app_server");
+  assert.equal(commandExecutionModeForRequest("codex_cli_fallback"), "codex_cli_fallback");
+  assert.equal(MANAGED_APP_SERVER_UNAVAILABLE, "No managed app-server connector is online.");
+});
+
+test("managedAppServerCommandAvailable requires an attached app-server session and capable connector", () => {
+  const attachedSession = {
+    ...hostSession("session-app-server"),
+    connector_id: "connector-a",
+    attached_thread_id: "thread-api",
+    app_server_present: true
+  };
+  const data = payload({
+    connectors: [connector("connector-a", ["codex_app_server_exec"])],
+    threads: [thread("thread-api", "workspace-api")],
+    host_sessions: [attachedSession]
+  });
+
+  assert.equal(managedAppServerCommandAvailable(data, "thread-api"), true);
+  assert.equal(
+    managedAppServerCommandAvailable(
+      {
+        ...data,
+        connectors: [connector("connector-a", ["codex_exec"])]
+      },
+      "thread-api"
+    ),
+    false
+  );
+  assert.equal(
+    managedAppServerCommandAvailable(
+      {
+        ...data,
+        host_sessions: [{ ...attachedSession, app_server_present: false }]
+      },
+      "thread-api"
+    ),
+    false
+  );
+});
+
+test("codexCliFallbackAvailable is scoped to online workspace connectors", () => {
+  const data = payload({
+    connectors: [
+      connector("connector-a", ["codex_exec"]),
+      connector("connector-b", ["codex_exec"], "offline")
+    ],
+    workspaces: [
+      workspace("workspace-api", ["connector-a"]),
+      workspace("workspace-docs", ["connector-b"])
+    ]
+  });
+
+  assert.equal(codexCliFallbackAvailable(data, "workspace-api"), true);
+  assert.equal(codexCliFallbackAvailable(data, "workspace-docs"), false);
+  assert.equal(codexCliFallbackAvailable(data, "missing-workspace"), false);
+});
+
+test("normaliseCommandMode drops unavailable app-server and hidden CLI fallback modes", () => {
+  const data = payload({
+    connectors: [connector("connector-a", ["codex_exec"])],
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    threads: [thread("thread-api", "workspace-api")]
+  });
+
+  assert.equal(normaliseCommandMode("app_server", data, "thread-api", { showCliFallback: true }), "placeholder");
+  assert.equal(
+    normaliseCommandMode("codex_cli_fallback", data, "thread-api", { showCliFallback: false }),
+    "placeholder"
+  );
+  assert.equal(
+    normaliseCommandMode("codex_cli_fallback", data, "thread-api", { showCliFallback: true }),
+    "codex_cli_fallback"
+  );
 });
 
 test("historyBackfillNotice summarises imported history", () => {

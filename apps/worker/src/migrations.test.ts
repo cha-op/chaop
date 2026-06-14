@@ -41,6 +41,15 @@ test("command target connector source is added by forward migration", async () =
   assert.doesNotMatch(migration, /lease_target_host_session_id =/);
 });
 
+test("command execution mode is added by forward migration", async () => {
+  const migration = await readMigration("0009_command_execution_mode.sql");
+
+  assert.match(
+    migration,
+    /ALTER TABLE commands ADD COLUMN execution_mode TEXT CHECK \(execution_mode IN \('app_server', 'codex_cli_fallback'\)\)/
+  );
+});
+
 async function readMigration(fileName: string): Promise<string> {
   return await readFile(new URL(fileName, migrationsDir), "utf8");
 }

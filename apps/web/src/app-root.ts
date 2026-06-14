@@ -30,11 +30,19 @@ import {
 import {
   archiveSyncNotice,
   archiveSyncWarning,
+  codexCliFallbackAvailable,
+  commandExecutionModeForRequest,
+  commandModeLabel,
+  commandTypeForMode,
   historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
   localThreadWorkspaceId,
-  mergeBootstrapPayload
+  MANAGED_APP_SERVER_UNAVAILABLE,
+  managedAppServerCommandAvailable,
+  mergeBootstrapPayload,
+  normaliseCommandMode,
+  type CommandExecutionMode
 } from "./state.js";
 
 type View = "operations-map" | "task-board" | "host-sessions" | "thread-centre" | "budget-board";
@@ -47,6 +55,7 @@ type RealtimeHostSessionsPayload = HostSessionsUpdatePayload;
 
 const FALLBACK_POLL_MS = 10_000;
 const SOCKET_RECONNECT_MS = 3_000;
+const SHOW_CODEX_CLI_FALLBACK = import.meta.env.VITE_CHAOP_SHOW_CODEX_CLI_FALLBACK === "true";
 
 @customElement("chaop-app")
 export class ChaopApp extends LitElement {
@@ -68,7 +77,7 @@ export class ChaopApp extends LitElement {
   private commandPrompt = "Summarise the current failure pattern and next action.";
 
   @state()
-  private commandType: CommandSummary["type"] = "placeholder";
+  private commandMode: CommandExecutionMode = "placeholder";
 
   @state()
   private commandState: "idle" | "submitting" | "accepted" | "failed" = "idle";
@@ -405,8 +414,11 @@ export class ChaopApp extends LitElement {
             ></textarea>
           </label>
           <div class="mode-control" role="group" aria-label="Execution mode">
-            ${this.commandModeButton("placeholder", "Placeholder")}
-            ${this.commandModeButton("codex", "Codex exec")}
+            ${this.commandModeButton("placeholder")}
+            ${managedAppServerCommandAvailable(this.data, thread.id) ? this.commandModeButton("app_server") : nothing}
+            ${SHOW_CODEX_CLI_FALLBACK && codexCliFallbackAvailable(this.data, thread.workspace_id)
+              ? this.commandModeButton("codex_cli_fallback")
+              : nothing}
           </div>
           <button
             class="primary-action"
@@ -414,11 +426,11 @@ export class ChaopApp extends LitElement {
             ?disabled=${this.commandState === "submitting" || this.commandPrompt.trim().length === 0}
             @click=${this.submitCommand}
           >
-            ${this.commandState === "submitting" ? "Submitting..." : `Run ${formatCommandType(this.commandType)} command`}
+            ${this.commandState === "submitting" ? "Submitting..." : `Run ${commandModeLabel(this.commandMode)} command`}
           </button>
           ${this.commandState === "accepted"
             ? html`<p class="command-status success">
-                ${formatCommandType(this.commandType)} command accepted${this.lastCommandId ? `: ${this.lastCommandId}` : ""}.
+                ${commandModeLabel(this.commandMode)} command accepted${this.lastCommandId ? `: ${this.lastCommandId}` : ""}.
               </p>`
             : nothing}
           ${this.commandState === "failed"
@@ -449,11 +461,11 @@ export class ChaopApp extends LitElement {
           </div>
           <div class="section-heading">
             <h2>Lease</h2>
-            <span>${formatCommandType(this.commandType)} target</span>
+            <span>${commandModeLabel(this.commandMode)} target</span>
           </div>
           <dl class="facts">
             <div><dt>Mode</dt><dd>Interactive</dd></div>
-            <div><dt>Execution</dt><dd>${formatCommandType(command?.type ?? this.commandType)}</dd></div>
+            <div><dt>Execution</dt><dd>${command ? formatCommandExecution(command) : commandModeLabel(this.commandMode)}</dd></div>
             <div><dt>Target</dt><dd>${command?.target_connector_id ?? "Auto-selected"}</dd></div>
             <div><dt>Command state</dt><dd>${command?.state ?? "No live command"}</dd></div>
             <div><dt>Task</dt><dd>${task?.title ?? "Thread only"}</dd></div>
@@ -618,6 +630,7 @@ export class ChaopApp extends LitElement {
     }
 
     const task = this.taskForThread(thread.id);
+    this.ensureCommandMode();
     this.commandState = "submitting";
     this.actionError = undefined;
     this.actionNotice = undefined;
@@ -626,7 +639,8 @@ export class ChaopApp extends LitElement {
         workspace_id: thread.workspace_id,
         thread_id: thread.id,
         task_id: task?.id,
-        type: this.commandType,
+        type: commandTypeForMode(this.commandMode),
+        execution_mode: commandExecutionModeForRequest(this.commandMode),
         prompt: this.commandPrompt
       });
       this.lastCommandId = response.command.id;
@@ -676,7 +690,7 @@ export class ChaopApp extends LitElement {
           ${this.newThreadState === "creating" ? "Creating..." : "New local thread"}
         </button>
         ${!canCreate
-          ? html`<p class="form-hint">No online app-server connector is available.</p>`
+          ? html`<p class="form-hint">${MANAGED_APP_SERVER_UNAVAILABLE}</p>`
           : nothing}
       </form>
     `;
@@ -694,7 +708,7 @@ export class ChaopApp extends LitElement {
     }
     if (localThreadConnectors(this.data, workspaceId).length === 0) {
       this.newThreadState = "failed";
-      this.actionError = "No online app-server connector is available for local thread creation";
+      this.actionError = `${MANAGED_APP_SERVER_UNAVAILABLE} Local thread creation requires app-server thread capability.`;
       return;
     }
 
@@ -850,6 +864,7 @@ export class ChaopApp extends LitElement {
 
   private openThread(threadId: string): void {
     this.selectedThreadId = threadId;
+    this.ensureCommandMode();
     window.location.hash = `thread-centre?thread=${encodeURIComponent(threadId)}`;
     void this.loadSelectedThreadEvents().catch((error) => {
       this.actionError = actionErrorMessage("Thread events refresh failed", error);
@@ -865,6 +880,7 @@ export class ChaopApp extends LitElement {
     if (!this.data || this.view !== "thread-centre") return;
     const selected = this.selectedThread();
     this.selectedThreadId = selected?.id;
+    this.ensureCommandMode();
   }
 
   private activeThreads(): ThreadSummary[] {
@@ -940,19 +956,29 @@ export class ChaopApp extends LitElement {
     };
   }
 
-  private commandModeButton(type: CommandSummary["type"], label: string) {
+  private commandModeButton(mode: CommandExecutionMode) {
     return html`
       <button
         type="button"
-        class=${this.commandType === type ? "active" : ""}
+        class=${this.commandMode === mode ? "active" : ""}
         ?disabled=${this.commandState === "submitting"}
         @click=${() => {
-          this.commandType = type;
+          this.commandMode = mode;
         }}
       >
-        ${label}
+        ${commandModeLabel(mode)}
       </button>
     `;
+  }
+
+  private ensureCommandMode(): void {
+    const thread = this.selectedThread();
+    const nextMode = normaliseCommandMode(this.commandMode, this.data, thread?.id, {
+      showCliFallback: SHOW_CODEX_CLI_FALLBACK
+    });
+    if (nextMode !== this.commandMode) {
+      this.commandMode = nextMode;
+    }
   }
 
   private connectRealtime(): void {
@@ -1057,6 +1083,7 @@ export class ChaopApp extends LitElement {
         })
       ]
     };
+    this.ensureCommandMode();
   }
 
   private upsertCommand(command: CommandSummary): void {
@@ -1150,7 +1177,14 @@ function formatMode(mode: string): string {
 }
 
 function formatCommandType(type: CommandSummary["type"]): string {
-  return type === "codex" ? "Codex exec" : "Placeholder";
+  return type === "codex" ? "Codex" : "Placeholder";
+}
+
+function formatCommandExecution(command: CommandSummary): string {
+  if (command.execution_mode) {
+    return commandModeLabel(command.execution_mode);
+  }
+  return formatCommandType(command.type);
 }
 
 function realtimeLabel(state: RealtimeState): string {

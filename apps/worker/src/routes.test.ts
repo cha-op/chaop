@@ -857,6 +857,36 @@ test("host session detach dispatches app-server capable connectors after releasi
   assert.deepEqual(dispatchedConnectorIds, ["connector-online", "connector-replacement"]);
 });
 
+test("host session detach does not release or fail CLI fallback commands", async () => {
+  const db = hostSessionDetachDb({
+    detachedCommandState: "leased",
+    releaseDetachedCommands: true,
+    detachedCommandExecutionMode: "codex_cli_fallback"
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(db.commandReleases, 0);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.connectorActivityUpdates, 0);
+});
+
 test("host session detach does not release same-session leases owned by a replacement connector", async () => {
   const db = hostSessionDetachDb({
     detachedCommandState: "leased",
@@ -1287,6 +1317,43 @@ test("command creation rejects unknown command type", async () => {
   assert.deepEqual(await response.json(), { error: "Invalid command payload" });
 });
 
+test("command creation rejects unknown execution mode", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        type: "codex",
+        execution_mode: "shell",
+        prompt: "Summarise current errors"
+      })
+    }),
+    devEnv
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid command payload" });
+});
+
+test("command creation rejects execution mode without codex command type", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "placeholder",
+        execution_mode: "codex_cli_fallback",
+        prompt: "Summarise current errors"
+      })
+    }),
+    devEnv
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "Invalid command payload" });
+});
+
 test("command creation accepts executable target connectors when D1 is bound", async () => {
   const envWithExecutableConnector: Env = {
     ...devEnv,
@@ -1360,6 +1427,73 @@ test("command creation targets the connector that owns an attached host session"
   assert.equal(response.status, 202);
   assert.equal(body.command.type, "codex");
   assert.equal(body.command.target_connector_id, "connector-attached");
+});
+
+test("command creation routes CLI fallback away from attached app-server sessions", async () => {
+  const envWithAttachedSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        supportsCodex: true,
+        supportsAppServerExec: false,
+        expectedTargetConnectorIdSource: "auto",
+        expectedAutoConnectorId: "connector-online",
+        expectedExecutionMode: "codex_cli_fallback"
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        execution_mode: "codex_cli_fallback",
+        prompt: "Run through the private CLI fallback"
+      })
+    }),
+    envWithAttachedSession
+  );
+  const body = (await response.json()) as { command: { target_connector_id?: string; type: string } };
+
+  assert.equal(response.status, 202);
+  assert.equal(body.command.type, "codex");
+  assert.equal(body.command.target_connector_id, "connector-online");
+});
+
+test("command creation rejects app-server execution without an attached app-server session", async () => {
+  const envWithNonAppServerSession: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: false
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        execution_mode: "app_server",
+        prompt: "Run through the managed app-server path"
+      })
+    }),
+    envWithNonAppServerSession
+  );
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), {
+    error: "App-server execution requires an attached app-server host session"
+  });
 });
 
 test("command creation accepts attached app-server commands without codex_exec capability", async () => {
@@ -1706,6 +1840,8 @@ function commandTargetDb(
     supportsAppServerExec?: boolean;
     guardedCommandInsertChanges?: number;
     expectedTargetConnectorIdSource?: "explicit" | "attached" | "auto";
+    expectedAutoConnectorId?: string;
+    expectedExecutionMode?: "app_server" | "codex_cli_fallback";
   } = {}
 ): D1Database {
   const supportsCodex = options.supportsCodex ?? true;
@@ -1857,6 +1993,28 @@ function commandTargetDb(
         };
       }
 
+      if (/SELECT c\.id/.test(sql) && /ORDER BY c\.last_seen_at DESC/.test(sql)) {
+        assert.match(sql, /workspace_connectors/);
+        assert.match(sql, /wc\.workspace_id = \?/);
+        assert.match(sql, /wc\.can_execute = 1/);
+        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /capabilities_json LIKE/);
+        return {
+          bind(workspaceId: string, commandType: string) {
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(commandType === "placeholder" || commandType === "codex", true);
+            return {
+              async first() {
+                if (commandType === "codex" && !supportsCodex) {
+                  return null;
+                }
+                return row ? { id: options.expectedAutoConnectorId ?? row.id } : null;
+              }
+            };
+          }
+        };
+      }
+
       if (/SELECT last_seq/.test(sql)) {
         throw new Error("appendEvent must allocate event sequence with UPDATE ... RETURNING");
       }
@@ -1907,9 +2065,11 @@ function commandTargetDb(
             if (/WHERE EXISTS/.test(sql)) {
               const targetConnectorIdSource = args[8];
               const leaseTargetHostSessionId = args[9];
-              const appServerPresentGuard = args[24];
+              const executionMode = args[10];
+              const appServerPresentGuard = args[25];
               assert.equal(targetConnectorId, "connector-attached");
               assert.equal(targetConnectorIdSource, options.expectedTargetConnectorIdSource ?? "attached");
+              assert.equal(executionMode, options.expectedExecutionMode ?? null);
               assert.equal(
                 leaseTargetHostSessionId,
                 attachedThreadAppServerPresent ? "session-attached-thread" : null
@@ -1921,6 +2081,10 @@ function commandTargetDb(
               assert.match(sql, /hs\.session_id = \?/);
               assert.match(sql, /ORDER BY\s+CASE WHEN \? IS NOT NULL AND hs2\.attached_task_id = \?/);
               assert.match(sql, /OR NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hst/);
+            } else {
+              const executionMode = args[9];
+              assert.equal(targetConnectorId, options.expectedAutoConnectorId ?? row?.id ?? null);
+              assert.equal(executionMode, options.expectedExecutionMode ?? null);
             }
             return {
               async run() {
@@ -2777,6 +2941,7 @@ function hostSessionDetachDb(options: {
   detachedCommandFailureChanges?: number;
   releaseDetachedCommands?: boolean;
   detachedLeaseOwnedByReplacement?: boolean;
+  detachedCommandExecutionMode?: "app_server" | "codex_cli_fallback";
 } = {}): D1Database & {
   readonly commandReleases: number;
   readonly commandFailures: number;
@@ -2828,6 +2993,7 @@ function hostSessionDetachDb(options: {
       if (/FROM commands cmd/.test(sql)) {
         assert.equal(attachmentCleared, true);
         assert.match(sql, /cmd\.type = 'codex'/);
+        assert.match(sql, /COALESCE\(cmd\.execution_mode, ''\) <> 'codex_cli_fallback'/);
         assert.match(sql, /cmd\.target_connector_id = \?/);
         assert.match(sql, /cmd\.target_connector_id IS NULL/);
         assert.match(sql, /cmd\.state = 'pending'/);
@@ -2884,7 +3050,11 @@ function hostSessionDetachDb(options: {
               async all() {
                 const commandWasReleased = counters.commandReleases > 0;
                 return {
-                  results: options.returnDetachedCommands === false || commandWasReleased || options.detachedLeaseOwnedByReplacement ? [] : [
+                  results: options.returnDetachedCommands === false
+                    || commandWasReleased
+                    || options.detachedLeaseOwnedByReplacement
+                    || options.detachedCommandExecutionMode === "codex_cli_fallback"
+                    ? [] : [
                     {
                       id: "command-detached",
                       workspace_id: "workspace-api",
@@ -2894,6 +3064,7 @@ function hostSessionDetachDb(options: {
                       prompt: "Continue this attached session",
                       state: options.detachedCommandState ?? "pending",
                       target_connector_id: "connector-online",
+                      execution_mode: options.detachedCommandExecutionMode ?? null,
                       lease_owner_connector_id: "connector-online",
                       created_at: "2026-06-12T10:01:00.000Z",
                       updated_at: "2026-06-12T10:01:00.000Z"
@@ -2908,6 +3079,7 @@ function hostSessionDetachDb(options: {
 
       if (/UPDATE commands/.test(sql) && /SET state = 'pending'/.test(sql)) {
         assert.match(sql, /target_connector_id = CASE WHEN target_connector_id_source = 'attached' THEN NULL ELSE target_connector_id END/);
+        assert.match(sql, /COALESCE\(execution_mode, ''\) <> 'codex_cli_fallback'/);
         assert.match(sql, /target_connector_id_source = CASE WHEN target_connector_id_source = 'attached' THEN 'auto' ELSE target_connector_id_source END/);
         assert.match(sql, /lease_owner_connector_id = NULL/);
         assert.match(sql, /lease_until = NULL/);
@@ -2973,7 +3145,10 @@ function hostSessionDetachDb(options: {
             return {
               async run() {
                 const changes =
-                  options.releaseDetachedCommands && counters.commandReleases === 0 && !options.detachedLeaseOwnedByReplacement
+                  options.releaseDetachedCommands
+                    && counters.commandReleases === 0
+                    && !options.detachedLeaseOwnedByReplacement
+                    && options.detachedCommandExecutionMode !== "codex_cli_fallback"
                     ? 1
                     : 0;
                 counters.commandReleases += changes;
@@ -3010,6 +3185,7 @@ function hostSessionDetachDb(options: {
       if (/UPDATE commands/.test(sql) && /state = 'failed'/.test(sql)) {
         assert.match(sql, /workspace_id = \?/);
         assert.match(sql, /type = 'codex'/);
+        assert.match(sql, /COALESCE\(execution_mode, ''\) <> 'codex_cli_fallback'/);
         assert.match(sql, /target_connector_id = \? OR target_connector_id IS NULL/);
         assert.match(sql, /state = 'pending'\s+AND lease_target_host_session_id = \?/);
         assert.match(sql, /state = 'leased'/);
@@ -3059,7 +3235,10 @@ function hostSessionDetachDb(options: {
             assert.equal(excludedFallbackHostSessionId, "host-session-1");
             return {
               async run() {
-                const changes = options.detachedCommandFailureChanges ?? 1;
+                const changes =
+                  options.detachedCommandExecutionMode === "codex_cli_fallback"
+                    ? 0
+                    : options.detachedCommandFailureChanges ?? 1;
                 counters.commandFailures += changes;
                 return { meta: { changes } };
               }

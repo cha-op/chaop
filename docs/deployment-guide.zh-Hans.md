@@ -6,13 +6,13 @@
 
 本文说明如何为 Codex 控制面的第一轮部署切片准备 Cloudflare 和 connector 配置。
 
-第一轮切片采用 Cloudflare-first。Rust connector 默认支持 placeholder execution，也可以通过私有 connector 配置显式开启本机 `codex exec` 或 Codex app-server 执行：
+第一轮切片采用 Cloudflare-first。Rust connector 默认支持 placeholder execution，也可以通过私有 connector 配置显式开启 managed Codex app-server execution，或私有本机 `codex exec` fallback：
 
 ```text
 Browser GUI -> Cloudflare Access -> Worker / Durable Object -> D1 / R2 -> Rust connector -> Worker / Durable Object -> Browser GUI
 ```
 
-当前实现状态：仓库可以把 command lifecycle 写入 D1，通过 Durable Object dispatch pending command，接收 Rust connector 发回的 lifecycle events，把本机 Codex sessions attach 成 task/thread 视图，并且在 connector 配置了 `session_inventory.app_server_url` 时创建新的本机 Codex app-server thread、同步已 attach Host Session tasks 的 archive/unarchive 状态。私有 connector 配置可以通过 CLI adapter（`execution.mode = "codex_exec"`）或 app-server protocol（`execution.mode = "app_server"`）运行本机 Codex 工作。R2 artefact capture 仍然保留给后续切片。
+当前实现状态：仓库可以把 command lifecycle 写入 D1，通过 Durable Object dispatch pending command，接收 Rust connector 发回的 lifecycle events，把本机 Codex sessions attach 成 task/thread 视图，并且在 connector 配置了 `session_inventory.app_server_url` 时创建新的本机 Codex app-server thread、同步已 attach Host Session tasks 的 archive/unarchive 状态。预期产品执行路径是 app-server protocol（`execution.mode = "app_server"`）。CLI adapter（`execution.mode = "codex_exec"`）保留为 private fallback/comparison path。R2 artefact capture 仍然保留给后续切片。
 
 不要把密钥提交到 Git。敏感值只通过本地忽略文件、密码管理器，或者直接执行 `wrangler secret put` 来提供。
 
@@ -338,9 +338,9 @@ app_server_timeout_seconds = 2
 # app_server_url = "ws://127.0.0.1:9876"
 ```
 
-`mode = "placeholder"` 是安全默认值。要运行真实本机 Codex 工作，只在私有部署配置里设置下列模式之一。
+`mode = "placeholder"` 是安全默认值。要运行真实本机 Codex 工作，优先在私有部署配置里使用 app-server adapter。
 
-Codex CLI adapter 配置：
+Private Codex CLI fallback 配置：
 
 ```toml
 [execution]
@@ -350,6 +350,8 @@ codex_sandbox = "read-only"
 codex_timeout_seconds = 300
 codex_output_max_bytes = 262144
 ```
+
+不要把它暴露成 Browser 默认执行路径。GUI 默认隐藏 CLI fallback；只有 Web build 显式设置 `VITE_CHAOP_SHOW_CODEX_CLI_FALLBACK=true` 时才显示。生产部署应保持未设置。
 
 Codex app-server adapter 配置：
 
@@ -371,15 +373,15 @@ codex_model = "gpt-5.5"
 extra_args = ["--skip-git-repo-check"]
 ```
 
-只有本机 Codex CLI 确实需要时才加入可选设置。`codex_exec` 和 `app_server` 都可能消耗 Codex/OpenAI 额度或 API budget；让真实执行无人值守运行前，请先按 [成本模型](cost-aware.zh-Hans.md) 设置告警。
+只有本机 Codex CLI 确实需要时才加入可选设置。`app_server` 和 private `codex_exec` fallback 都可能消耗 Codex/OpenAI 额度或 API budget；让真实执行无人值守运行前，请先按 [成本模型](cost-aware.zh-Hans.md) 设置告警。
 Prompt 会通过 stdin 传给 Codex，不放在命令行参数里。除非有明确运维理由，不要放宽 timeout 和 output cap。
-由 `launchctl` 或其他 service manager 启动的常驻 connector，请使用绝对 `codex_command` 路径。这类进程不一定继承交互式 shell 的 `PATH`；如果找不到 executable，Codex exec 会在使用 workspace `cwd` 之前就失败。
+由 `launchctl` 或其他 service manager 启动的常驻 connector，请使用绝对 `codex_command` 路径。这类进程不一定继承交互式 shell 的 `PATH`；如果找不到 executable，private CLI fallback command 会在使用 workspace `cwd` 之前就失败。
 
 Session inventory 默认开启。Connector 会从 `CODEX_HOME` 或 `~/.codex` 读取本机 Codex metadata，上报 session id、title、cwd、更新时间和 title 来源；普通 inventory report 不会上传 rollout transcripts。Title 解析优先使用 metadata 或 rollout 里的标题，其次使用可选 app-server `Thread.name`，再其次使用本地 history 里的近期 prompt，最后 fallback 到 cwd 和 session id。设置 `session_inventory.enabled = false` 会同时禁用 Host Session inventory 和 Host Session history backfill capability。
 
 当用户明确 attach 某个 Host Session 时，Worker 会向该 session 所属 connector 请求这个单一 session 的有界 history backfill。Connector 会读取匹配的本机 rollout，跳过注入的 developer/context records、reasoning records 和 tool output records，只返回简短的 user、assistant 和 tool call 摘要。如果找不到 rollout，则 fallback 到该 session 在 `history.jsonl` 里的近期 prompt。导入的 events 会保留本机原始事件时间，所以旧 history backfill 不会在全局 recent-event feed 里挤掉更新的 control-plane events。Backfill 失败不会阻止 attachment；Browser 仍会显示已 attach thread，并单独显示 backfill warning。
 
-当 Chaop 需要创建新的本机 Codex app-server thread、使用 app-server title、通过 app-server protocol 运行已 attach thread command，或在能解析到对应 app-server thread 时让已 attach Host Session 的 archive 状态和本机 app-server 保持同步时，设置 `session_inventory.app_server_url`。只有配置了这个 URL 的 connector 才会声明 `app_server_threads` 和 `app_server_archive` capabilities；只有同时配置这个 URL 且 `execution.mode = "app_server"` 时，connector 才会声明 `codex_app_server_exec`。这和只适用于 CLI 的 `codex_exec` capability 是分开的。如果没有在线 connector 声明 `app_server_threads`，Worker 会拒绝新建本机 thread 请求。已 attach 的 app-server command execution 要求 owning connector 声明 `codex_app_server_exec`；Chaop 会拒绝 command creation 或 lease，而不是 fallback 到另一台 connector 的 `codex_exec`。Connector 不声明 `app_server_archive` 时，archive/unarchive 会保持 D1-only；声明后，Chaop 会先更新 D1，然后 connector 把存储的 Codex session id 解析成 app-server thread id，再调用 `thread/archive` 或 `thread/unarchive`。同步失败会作为 Browser warning 回传，不会阻止本地 archive 状态更新。`app_server_timeout_seconds` 应保持较短，避免 app-server 停止时让 connector 启动、thread 创建、command setup 或 archive 同步等待过久。
+当 Chaop 需要创建新的本机 Codex app-server thread、使用 app-server title、通过 app-server protocol 运行已 attach thread command，或在能解析到对应 app-server thread 时让已 attach Host Session 的 archive 状态和本机 app-server 保持同步时，设置 `session_inventory.app_server_url`。只有配置了这个 URL 的 connector 才会声明 `app_server_threads` 和 `app_server_archive` capabilities；只有同时配置这个 URL 且 `execution.mode = "app_server"` 时，connector 才会声明 `codex_app_server_exec`。这和只适用于 CLI 的 `codex_exec` capability 是分开的。如果没有在线 managed app-server connector 声明 `app_server_threads`，Worker 会拒绝新建本机 thread 请求。已 attach 的 app-server command execution 要求 owning connector 声明 `codex_app_server_exec`；Chaop 会拒绝 command creation 或 lease，而不是 fallback 到另一台 connector 的 `codex_exec`。Connector 不声明 `app_server_archive` 时，archive/unarchive 会保持 D1-only；声明后，Chaop 会先更新 D1，然后 connector 把存储的 Codex session id 解析成 app-server thread id，再调用 `thread/archive` 或 `thread/unarchive`。同步失败会作为 Browser warning 回传，不会阻止本地 archive 状态更新。`app_server_timeout_seconds` 应保持较短，避免 app-server 停止时让 connector 启动、thread 创建、command setup 或 archive 同步等待过久。
 
 新建本机 thread 一律使用 connector 配置里的 `workspace_root` 作为启动 cwd；Browser API 不接受也不会转发任意 cwd。
 App-server command execution 只会运行在已经 attach 到本机 app-server Host Session 的 Chaop thread/task 上。Worker 会在 `command.dispatch` 里带上已 attach 的本机 session id 和 cwd，connector 再把 session 解析成当前 app-server thread id，并从该 cwd 调用 `thread/resume` 和 `turn/start`。Command setup 会在 `codex_timeout_seconds` 预算内继续翻页扫描 app-server thread list；当连接取消或超时时，如果已经知道 turn id，或还能从 `turn/start` response 里恢复 turn id，connector 会 best-effort 发送 `turn/interrupt`。Chaop 只记录 lifecycle events 和最终 assistant message 摘要；本机 commandExecution output 默认不会上传。
@@ -472,7 +474,7 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - 如果 service-token smoke tests 收到 Worker 返回的身份类 `401`，检查 Access policy 是否允许该 service token，以及 service-token headers 是否能到达 API route。
 - 如果 Browser command submission 在到达 Worker 前失败，检查请求是否已经变成 CORS preflight；要么保持 simple request 形态，要么允许 `OPTIONS /api/*` 通过 Cloudflare Access。
 - 如果 connector 返回 `401`，检查 `AGENT_BOOTSTRAP_SECRET`，并确认 `/connector/bootstrap` 和 `/ws/agent` 没有被 Browser Access 拦截。
-- 如果 Codex exec 返回 `Codex executable not found`，请把 `execution.codex_command` 设置成 connector process 可执行的绝对路径，例如当前 macOS 部署中的 `/opt/homebrew/bin/codex`。这和被 attach session 的 `cwd` 是两回事。
+- 如果 private CLI fallback 返回 `Codex executable not found`，请把 `execution.codex_command` 设置成 connector process 可执行的绝对路径，例如当前 macOS 部署中的 `/opt/homebrew/bin/codex`。这和被 attach session 的 `cwd` 是两回事。
 - 如果 app-server execution 在 turn 开始前失败，检查 `execution.mode = "app_server"`、`session_inventory.app_server_url` 是否已设置、目标 Chaop thread 是否已经 attach 到 app-server Host Session，以及 app-server 是否正在配置的 listener 上运行。
 - 如果 connector 已连接但一直收不到 command，检查 connector bootstrap 是否已经写入 workspace membership，command 是否 target 到可执行 connector，以及已部署 Worker 是否绑定 `WorkspaceDO`。
 - 如果 New local thread 返回 app-server 错误，检查 `codex app-server --listen ws://127.0.0.1:9876` 是否正在运行、`session_inventory.app_server_url` 是否匹配，以及修改配置后是否已经重启 connector。
