@@ -623,6 +623,7 @@ fn handle_text_message(
             &dispatch.command,
             app_server_wrong_execution_mode_events(),
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )?;
@@ -637,6 +638,7 @@ fn handle_text_message(
             &dispatch.command,
             vec![codex_exec_started_event(&config.workspace_root)],
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )? {
@@ -646,6 +648,7 @@ fn handle_text_message(
             socket,
             config,
             &dispatch.command.prompt,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         );
@@ -654,6 +657,7 @@ fn handle_text_message(
             &dispatch.command,
             events?,
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )?;
@@ -669,6 +673,7 @@ fn handle_text_message(
                 &dispatch.command,
                 app_server_missing_target_events(),
                 config,
+                app_server_instances_state,
                 host_sessions_state,
                 deferred_messages,
             )?;
@@ -680,6 +685,7 @@ fn handle_text_message(
                 &dispatch.command,
                 app_server_non_app_server_target_events(&target_host_session.session_id),
                 config,
+                app_server_instances_state,
                 host_sessions_state,
                 deferred_messages,
             )?;
@@ -693,6 +699,7 @@ fn handle_text_message(
             )],
             Some(&target_host_session.session_id),
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )? {
@@ -717,6 +724,7 @@ fn handle_text_message(
             target_host_session.cwd.as_deref(),
             &dispatch.command.id,
             &dispatch.command.prompt,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         );
@@ -734,6 +742,7 @@ fn handle_text_message(
             &dispatch.command,
             events?,
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )?;
@@ -745,6 +754,7 @@ fn handle_text_message(
         &dispatch.command,
         command_events(&dispatch.command),
         config,
+        app_server_instances_state,
         host_sessions_state,
         deferred_messages,
     )?;
@@ -931,6 +941,7 @@ fn wait_for_codex_exec_events(
     socket: &mut AgentSocket,
     config: &AgentConfig,
     prompt: &str,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<Vec<ConnectorEvent>, Box<dyn std::error::Error>> {
@@ -975,6 +986,7 @@ fn wait_for_codex_exec_events(
                     socket,
                     text.as_ref(),
                     config,
+                    app_server_instances_state,
                     host_sessions_state,
                     deferred_messages,
                 )?;
@@ -1001,6 +1013,7 @@ fn wait_for_app_server_command_events(
     cwd: Option<&str>,
     command_id: &str,
     prompt: &str,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<Vec<ConnectorEvent>, Box<dyn std::error::Error>> {
@@ -1049,6 +1062,7 @@ fn wait_for_app_server_command_events(
                     socket,
                     text.as_ref(),
                     config,
+                    app_server_instances_state,
                     host_sessions_state,
                     deferred_messages,
                 )?;
@@ -1091,14 +1105,18 @@ fn handle_background_text_message(
     socket: &mut AgentSocket,
     text: &str,
     config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
     if envelope.kind == "host_sessions.refresh" {
         send_host_sessions(socket, config, host_sessions_state, true)?;
-    } else if host_sessions_ack_message(&envelope) {
-        acknowledge_host_sessions(host_sessions_state);
+    } else if handle_background_ack_message(
+        &envelope,
+        app_server_instances_state,
+        host_sessions_state,
+    ) {
     } else if envelope.kind == "thread.create" {
         let dispatch: ThreadCreateDispatch = serde_json::from_value(envelope.payload)?;
         handle_thread_create(socket, &dispatch, config, host_sessions_state)?;
@@ -1112,6 +1130,22 @@ fn handle_background_text_message(
         deferred_messages.push_back(text.to_owned());
     }
     Ok(())
+}
+
+fn handle_background_ack_message(
+    envelope: &Envelope,
+    app_server_instances_state: &mut AppServerInstancesSendState,
+    host_sessions_state: &mut HostSessionsSendState,
+) -> bool {
+    if app_server_instances_ack_message(envelope) {
+        acknowledge_app_server_instances(app_server_instances_state);
+        return true;
+    }
+    if host_sessions_ack_message(envelope) {
+        acknowledge_host_sessions(host_sessions_state);
+        return true;
+    }
+    false
 }
 
 fn requires_app_server_execution_mode(dispatch: &CommandDispatch) -> bool {
@@ -1173,6 +1207,7 @@ fn dispatch_events(
     command: &CommandPayload,
     events: Vec<ConnectorEvent>,
     config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1182,6 +1217,7 @@ fn dispatch_events(
         events,
         None,
         config,
+        app_server_instances_state,
         host_sessions_state,
         deferred_messages,
     )
@@ -1193,6 +1229,7 @@ fn dispatch_events_for_target_host_session(
     events: Vec<ConnectorEvent>,
     target_host_session_id: Option<&str>,
     config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1210,6 +1247,7 @@ fn dispatch_events_for_target_host_session(
             &command.id,
             &event.kind,
             config,
+            app_server_instances_state,
             host_sessions_state,
             deferred_messages,
         )? {
@@ -1304,6 +1342,7 @@ fn wait_for_ack(
     command_id: &str,
     event_kind: &str,
     config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1327,6 +1366,7 @@ fn wait_for_ack(
                         socket,
                         text.as_ref(),
                         config,
+                        app_server_instances_state,
                         host_sessions_state,
                         deferred_messages,
                     )?,
@@ -1397,15 +1437,16 @@ fn set_socket_read_timeout(
 mod tests {
     use super::{
         AckWaitAction, AgentReadyState, AppServerInstancesSendState, CommandDispatch,
-        CommandPayload, CommandTargetHostSession, CommandType, HostSessionsSendState,
+        CommandPayload, CommandTargetHostSession, CommandType, Envelope, HostSessionsSendState,
         acknowledge_agent_ready, acknowledge_app_server_instances, acknowledge_host_sessions,
         agent_event_message, agent_ready_ack_message, agent_ready_message,
         agent_ready_retry_interval, app_server_instance_summary_interval,
         app_server_instances_message, apply_agent_ready_ack_text,
         apply_app_server_instances_ack_text, apply_host_sessions_ack_text, classify_ack_wait_text,
-        command_events, host_sessions_ack_message, host_sessions_interval, host_sessions_message,
-        host_sessions_retry_interval, is_read_timeout, requires_app_server_execution_mode,
-        should_send_agent_ready, should_send_app_server_instances, should_send_host_sessions,
+        command_events, handle_background_ack_message, host_sessions_ack_message,
+        host_sessions_interval, host_sessions_message, host_sessions_retry_interval,
+        is_read_timeout, requires_app_server_execution_mode, should_send_agent_ready,
+        should_send_app_server_instances, should_send_host_sessions,
     };
     use crate::app_server_manager::AppServerManager;
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
@@ -1789,6 +1830,34 @@ mod tests {
 
         assert!(applied);
         assert_eq!(state.last_acked.as_deref(), Some(message.as_str()));
+    }
+
+    #[test]
+    fn background_app_server_instances_ack_is_consumed_without_defer() {
+        let message =
+            r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let text = r#"{"kind":"server.ack","payload":{"kind":"agent.app_server_instances"}}"#;
+        let envelope: Envelope = serde_json::from_str(text).expect("envelope");
+        let mut app_server_instances_state = AppServerInstancesSendState {
+            last_sent: Some(message.clone()),
+            last_sent_at: Some(Instant::now()),
+            last_acked: None,
+        };
+        let mut host_sessions_state = HostSessionsSendState::default();
+
+        assert_eq!(
+            classify_ack_wait_text(text, "command-1", "command.started").expect("classify"),
+            AckWaitAction::Defer
+        );
+        assert!(handle_background_ack_message(
+            &envelope,
+            &mut app_server_instances_state,
+            &mut host_sessions_state
+        ));
+        assert_eq!(
+            app_server_instances_state.last_acked.as_deref(),
+            Some(message.as_str())
+        );
     }
 
     #[test]

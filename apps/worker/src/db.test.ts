@@ -44,7 +44,7 @@ test("recordAppServerInstances skips duplicate healthy reports inside debounce w
   assert.deepEqual(result.app_server_instances, []);
 });
 
-test("recordAppServerInstances persists unchanged healthy summary after debounce window", async () => {
+test("recordAppServerInstances persists unchanged summaries after debounce window", async () => {
   const db = appServerInstancesDb();
   await recordAppServerInstances({ DB: db } as Env, "connector-1", {
     instances: [appServerInstanceReport("healthy")]
@@ -71,6 +71,53 @@ test("recordAppServerInstances persists degraded edges immediately", async () =>
   assert.equal(db.writes, 2);
   assert.equal(result.app_server_instances[0]?.state, "degraded");
   assert.equal(result.app_server_instances[0]?.last_error, "Health check failed");
+});
+
+test("recordAppServerInstances refreshes unchanged degraded summaries after debounce window", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("degraded", { last_error: "Health check failed" })]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const skipped = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("degraded", { last_error: "Health check failed" })]
+  }, "2026-06-14T10:05:00.000Z");
+  const refreshed = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [appServerInstanceReport("degraded", { last_error: "Health check failed" })]
+  }, "2026-06-14T10:16:00.000Z");
+
+  assert.deepEqual(skipped.app_server_instances, []);
+  assert.equal(db.writes, 2);
+  assert.equal(refreshed.app_server_instances[0]?.state, "degraded");
+  assert.equal(refreshed.app_server_instances[0]?.last_seen_at, "2026-06-14T10:16:00.000Z");
+});
+
+test("recordAppServerInstances returns a complete connector snapshot when any snapshot row changes", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: [
+      appServerInstanceReport("healthy", { instance_key: "default" }),
+      appServerInstanceReport("healthy", { instance_key: "secondary" })
+    ]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: [
+      appServerInstanceReport("healthy", { instance_key: "default" }),
+      appServerInstanceReport("degraded", {
+        instance_key: "secondary",
+        last_error: "Health check failed"
+      })
+    ]
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(db.writes, 3);
+  assert.deepEqual(
+    result.app_server_instances.map((instance) => [instance.instance_key, instance.state]),
+    [["default", "healthy"], ["secondary", "degraded"]]
+  );
 });
 
 test("recordAppServerInstances marks omitted snapshot instances stopped", async () => {
@@ -3163,6 +3210,7 @@ function localThreadConnectorDb(row: { id: string } | null): D1Database {
 function appServerInstanceReport(
   state: "healthy" | "degraded" | "draining" | "restarting" | "stopped",
   overrides: {
+    instance_key?: string;
     active_turn_count?: number;
     generation?: number;
     status_summary?: string;
@@ -3170,7 +3218,7 @@ function appServerInstanceReport(
   } = {}
 ) {
   return {
-    instance_key: "default",
+    instance_key: overrides.instance_key ?? "default",
     scope: "connector" as const,
     endpoint_type: "managed" as const,
     state,
@@ -3287,6 +3335,22 @@ function appServerInstancesDb(): D1Database & { writes: number } {
                   results: [...rows.values()].filter(
                     (row) => row.connector_id === connectorId && row.state !== "stopped"
                   )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM app_server_instances/.test(sql) && /WHERE connector_id = \?/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            return {
+              async all() {
+                return {
+                  results: [...rows.values()]
+                    .filter((row) => row.connector_id === connectorId)
+                    .sort((left, right) => left.instance_key.localeCompare(right.instance_key))
                 };
               }
             };

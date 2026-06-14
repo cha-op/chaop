@@ -32,7 +32,7 @@ import type { BrowserIdentity } from "./auth.js";
 const DEFAULT_WORKSPACE_ID = "workspace-api";
 const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
-const APP_SERVER_HEALTHY_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
+const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
 
 export class CommandTargetError extends Error {
   constructor(
@@ -153,7 +153,7 @@ export async function recordAppServerInstances(
     const stateChangedAt = existing && existing.state === instance.state
       ? existing.state_changed_at
       : syncedAt;
-    const summaryChangedAt = existing && existing.report_fingerprint === fingerprint && instance.state !== "healthy"
+    const summaryChangedAt = existing && existing.report_fingerprint === fingerprint
       ? existing.summary_changed_at
       : syncedAt;
     await env.DB.prepare(
@@ -260,6 +260,14 @@ export async function recordAppServerInstances(
         updated_at: syncedAt
       }));
     }
+  }
+
+  if (report.snapshot === true && persisted.length > 0) {
+    return {
+      app_server_instances: await listAppServerInstancesForConnector(env, connectorId),
+      synced_at: syncedAt,
+      snapshot: true
+    };
   }
 
   return { app_server_instances: persisted, synced_at: syncedAt, snapshot: report.snapshot === true };
@@ -2989,6 +2997,20 @@ async function listAppServerInstances(env: Env): Promise<AppServerInstanceSummar
   return rows.map(appServerInstanceFromRow);
 }
 
+async function listAppServerInstancesForConnector(env: Env, connectorId: string): Promise<AppServerInstanceSummary[]> {
+  const rows = await allRows<AppServerInstanceRow>(
+    env.DB!.prepare(
+      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+              active_turn_count, generation, status_summary, last_error,
+              last_seen_at, state_changed_at, updated_at
+       FROM app_server_instances
+       WHERE connector_id = ?
+       ORDER BY instance_key ASC`
+    ).bind(connectorId)
+  );
+  return rows.map(appServerInstanceFromRow);
+}
+
 function connectorSummaryFromRow(row: ConnectorRow): ConnectorSummary {
   return {
     id: row.id,
@@ -3035,12 +3057,11 @@ function shouldPersistAppServerInstance(
   if (existing.scope !== instance.scope) return true;
   if (existing.active_turn_count !== (instance.active_turn_count ?? 0)) return true;
   if (existing.generation !== (instance.generation ?? 0)) return true;
-  if (instance.state !== "healthy") return existing.report_fingerprint !== fingerprint;
   if (existing.report_fingerprint !== fingerprint) return true;
-  const lastSummaryChanged = Date.parse(existing.summary_changed_at);
+  const lastSeen = Date.parse(existing.last_seen_at);
   const current = Date.parse(syncedAt);
-  if (Number.isNaN(lastSummaryChanged) || Number.isNaN(current)) return true;
-  return current - lastSummaryChanged >= APP_SERVER_HEALTHY_SUMMARY_DEBOUNCE_MS;
+  if (Number.isNaN(lastSeen) || Number.isNaN(current)) return true;
+  return current - lastSeen >= APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS;
 }
 
 function appServerInstanceFingerprint(instance: AgentAppServerInstancesReport["instances"][number]): string {
