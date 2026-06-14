@@ -245,6 +245,14 @@ API: api.example.com
 
 Build the web app with `VITE_CHAOP_API_BASE_URL=https://api.example.com`, and configure the Worker runtime with `CHAOP_API_DOMAIN=api.example.com`. The GUI uses the Vite value for browser fetches; the Worker uses the runtime value when issuing connector control URLs.
 
+Deploy the Browser GUI static Worker with:
+
+```bash
+VITE_CHAOP_API_BASE_URL=https://api.example.com pnpm deploy:web
+```
+
+The script writes a temporary Wrangler static-assets config under `.codex-tmp/deploy/web/` and deploys the `chaop-web` Worker by default. It explicitly disables `workers.dev` and preview URLs, so production access must come through the Cloudflare-managed custom domain or route that is covered by Access. Override the Worker name with `CHAOP_WEB_WORKER_NAME` when a deployment uses a different static Worker.
+
 The API hostname serves:
 
 ```text
