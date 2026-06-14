@@ -436,7 +436,7 @@ fn acknowledge_host_sessions(state: &mut HostSessionsSendState) {
 fn send_app_server_instances(
     socket: &mut AgentSocket,
     config: &AgentConfig,
-    app_server: &AppServerManager,
+    app_server: &mut AppServerManager,
     state: &mut AppServerInstancesSendState,
     force: bool,
     snapshot: bool,
@@ -488,7 +488,7 @@ fn acknowledge_app_server_instances(state: &mut AppServerInstancesSendState) {
 
 fn app_server_instances_message(
     config: &AgentConfig,
-    app_server: &AppServerManager,
+    app_server: &mut AppServerManager,
     snapshot: bool,
 ) -> Option<String> {
     let instance = app_server.instance_snapshot(config)?;
@@ -1869,7 +1869,7 @@ mod tests {
         let mut manager = AppServerManager::new(&config);
         manager.begin_turn();
 
-        let message = app_server_instances_message(&config, &manager, true).expect("message");
+        let message = app_server_instances_message(&config, &mut manager, true).expect("message");
         let value: Value = serde_json::from_str(&message).expect("json");
 
         assert_eq!(

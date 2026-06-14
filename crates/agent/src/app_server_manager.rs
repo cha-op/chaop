@@ -12,6 +12,7 @@ use tungstenite::http::Uri;
 
 const APP_SERVER_SPAWN_ATTEMPTS: usize = 3;
 const APP_SERVER_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(20);
+const APP_SERVER_EXTERNAL_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct AppServerManager {
@@ -19,6 +20,7 @@ pub struct AppServerManager {
     listen_url: Option<String>,
     child: Option<Child>,
     last_start_failure: Option<Instant>,
+    last_external_probe: Option<Instant>,
     shutdown_requested: fn() -> bool,
     state: AppServerInstanceState,
     generation: u64,
@@ -39,12 +41,9 @@ impl AppServerManager {
             listen_url,
             child: None,
             last_start_failure: None,
+            last_external_probe: None,
             shutdown_requested,
-            state: if managed.enabled || config.session_inventory.app_server_url.is_some() {
-                AppServerInstanceState::Stopped
-            } else {
-                AppServerInstanceState::Stopped
-            },
+            state: AppServerInstanceState::Stopped,
             generation: 0,
             active_turn_count: 0,
             status_summary: None,
@@ -85,19 +84,18 @@ impl AppServerManager {
         runtime
     }
 
-    pub fn instance_snapshot(&self, config: &AgentConfig) -> Option<AppServerInstanceSnapshot> {
+    pub fn instance_snapshot(&mut self, config: &AgentConfig) -> Option<AppServerInstanceSnapshot> {
         if !self.enabled && config.session_inventory.app_server_url.is_none() {
             return None;
+        }
+        if !self.enabled {
+            self.refresh_external_state(config);
         }
         Some(AppServerInstanceSnapshot {
             instance_key: "default".to_owned(),
             scope: "connector".to_owned(),
             endpoint_type: if self.enabled { "managed" } else { "external" }.to_owned(),
-            state: if self.enabled {
-                self.state.as_str().to_owned()
-            } else {
-                "healthy".to_owned()
-            },
+            state: self.state.as_str().to_owned(),
             active_turn_count: self.active_turn_count,
             generation: self.generation,
             status_summary: self.status_summary.clone().or_else(|| {
@@ -117,6 +115,31 @@ impl AppServerManager {
 
     pub fn finish_turn(&mut self) {
         self.active_turn_count = self.active_turn_count.saturating_sub(1);
+    }
+
+    fn refresh_external_state(&mut self, config: &AgentConfig) {
+        let Some(url) = config.session_inventory.app_server_url.as_deref() else {
+            return;
+        };
+        let now = Instant::now();
+        if self.last_external_probe.is_some_and(|last_probe| {
+            now.saturating_duration_since(last_probe) < APP_SERVER_EXTERNAL_PROBE_INTERVAL
+        }) {
+            return;
+        }
+        self.last_external_probe = Some(now);
+        match app_server_health_check(url, config.session_inventory.app_server_timeout_seconds) {
+            Ok(()) => self.set_state(
+                AppServerInstanceState::Healthy,
+                "External app-server is healthy.",
+                None,
+            ),
+            Err(error) => self.set_state(
+                AppServerInstanceState::Degraded,
+                "External app-server health check failed.",
+                Some(&error.to_string()),
+            ),
+        }
     }
 
     fn probe_ready(&self, config: &AgentConfig) -> Option<String> {
@@ -553,6 +576,23 @@ mod tests {
                 .capabilities()
                 .contains(&"codex_app_server_exec".to_owned())
         );
+    }
+
+    #[test]
+    fn external_instance_snapshot_reports_unreachable_endpoint_as_degraded() {
+        let mut config = config_with_managed(false);
+        config.session_inventory.app_server_url = Some("not-a-url".to_owned());
+        let mut manager = AppServerManager::new(&config);
+
+        let snapshot = manager.instance_snapshot(&config).expect("snapshot");
+
+        assert_eq!(snapshot.endpoint_type, "external");
+        assert_eq!(snapshot.state, "degraded");
+        assert_eq!(
+            snapshot.status_summary.as_deref(),
+            Some("External app-server health check failed.")
+        );
+        assert!(snapshot.last_error.is_some());
     }
 
     #[test]
