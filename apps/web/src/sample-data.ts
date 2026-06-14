@@ -166,6 +166,35 @@ export function fallbackBootstrap(): BootstrapPayload {
         last_seen_at: "2026-06-09T21:58:05.000Z",
         state_changed_at: "2026-06-09T21:57:50.000Z",
         updated_at: "2026-06-09T21:58:05.000Z"
+      },
+      {
+        id: "app-server-sample-external",
+        connector_id: "connector-buildbox",
+        instance_key: "external-4545",
+        scope: "workspace",
+        endpoint_type: "external",
+        state: "degraded",
+        active_turn_count: 0,
+        generation: 1,
+        status_summary: "External app-server health check timed out.",
+        last_error: "Health probe exceeded the connector timeout.",
+        last_seen_at: "2026-06-09T21:54:30.000Z",
+        state_changed_at: "2026-06-09T21:54:30.000Z",
+        updated_at: "2026-06-09T21:54:30.000Z"
+      },
+      {
+        id: "app-server-sample-restarting",
+        connector_id: "connector-laptop",
+        instance_key: "default",
+        scope: "connector",
+        endpoint_type: "managed",
+        state: "restarting",
+        active_turn_count: 0,
+        generation: 3,
+        status_summary: "Connector is restarting the managed listener.",
+        last_seen_at: "2026-06-09T19:20:00.000Z",
+        state_changed_at: "2026-06-09T19:19:40.000Z",
+        updated_at: "2026-06-09T19:20:00.000Z"
       }
     ],
     task_categories: [

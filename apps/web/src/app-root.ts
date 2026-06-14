@@ -3,6 +3,7 @@ import { customElement, state } from "lit/decorators.js";
 import {
   groupTasksByState,
   TASK_STATE_LABELS,
+  type AppServerInstanceSummary,
   type AppServerInstancesUpdatePayload,
   type BootstrapPayload,
   type CommandSummary,
@@ -30,6 +31,8 @@ import {
   unarchiveTask
 } from "./api.js";
 import {
+  appServerInstanceStateLabel,
+  appServerInstancesForConnector,
   archiveSyncNotice,
   archiveSyncWarning,
   codexCliFallbackAvailable,
@@ -45,6 +48,7 @@ import {
   mergeBootstrapPayload,
   mergeAppServerInstances,
   mergeConnectorSummaries,
+  primaryAppServerInstanceForConnector,
   normaliseCommandMode,
   type CommandExecutionMode
 } from "./state.js";
@@ -251,6 +255,7 @@ export class ChaopApp extends LitElement {
   }
 
   private renderOperationsMap() {
+    const appServerInstances = this.appServerInstancesForDisplay();
     return html`
       <section class="page-grid map-grid">
         <section class="panel primary">
@@ -264,10 +269,14 @@ export class ChaopApp extends LitElement {
         </section>
         <aside class="panel">
           <div class="section-heading">
-            <h2>Look next</h2>
-            <span>Focused leads</span>
+            <h2>App-server instances</h2>
+            <span>${appServerInstances.length} reported</span>
           </div>
-          ${this.data!.threads.slice(0, 3).map((thread) => this.threadLead(thread))}
+          <div class="instance-list">
+            ${appServerInstances.length > 0
+              ? appServerInstances.map((instance) => this.appServerInstanceCard(instance, "full"))
+              : html`<p class="muted">No app-server instances reported by connectors.</p>`}
+          </div>
         </aside>
       </section>
     `;
@@ -281,20 +290,9 @@ export class ChaopApp extends LitElement {
           <span>${connector.hostname}</span>
         </div>
         <span class="status ${connector.status}">${connector.status}</span>
-        <span>${connector.logical_agent_count} agents</span>
-        <span>${connector.active_command_count} running</span>
+        <span>${connector.logical_agent_count} agents · ${connector.active_command_count} running</span>
         <span class="chip ${connector.realtime_mode}">${formatMode(connector.realtime_mode)}</span>
       </div>
-    `;
-  }
-
-  private threadLead(thread: ThreadSummary) {
-    return html`
-      <a class="lead" href=${threadHref(thread.id)}>
-        <strong>${thread.title}</strong>
-        <span>${thread.state} · seq ${thread.last_seq}</span>
-        <span class="chip ${thread.realtime_mode}">${formatMode(thread.realtime_mode)}</span>
-      </a>
     `;
   }
 
@@ -514,6 +512,7 @@ export class ChaopApp extends LitElement {
     const attached = this.data!.host_sessions.filter((session) => this.isActiveAttachedHostSession(session));
     const unattached = this.data!.host_sessions.filter((session) => !session.attached_thread_id);
     const lastSyncedAt = this.hostSessionsLastSyncedAt();
+    const appServerInstances = this.appServerInstancesForDisplay();
 
     return html`
       <section class="page-grid sessions-grid">
@@ -549,6 +548,15 @@ export class ChaopApp extends LitElement {
           <div class="session-list compact-list">
             ${attached.map((session) => this.hostSessionRow(session))}
           </div>
+          <div class="section-heading">
+            <h2>App-server</h2>
+            <span>${appServerInstances.length} instances</span>
+          </div>
+          <div class="instance-list compact-instance-list">
+            ${appServerInstances.length > 0
+              ? appServerInstances.map((instance) => this.appServerInstanceCard(instance, "compact"))
+              : html`<p class="muted">No app-server state reported yet.</p>`}
+          </div>
         </aside>
       </section>
     `;
@@ -556,6 +564,7 @@ export class ChaopApp extends LitElement {
 
   private hostSessionRow(session: HostSessionSummary) {
     const attachedThreadId = session.attached_thread_id;
+    const instance = primaryAppServerInstanceForConnector(this.data, session.connector_id);
     return html`
       <article
         class=${attachedThreadId ? "session-row clickable" : "session-row"}
@@ -569,6 +578,13 @@ export class ChaopApp extends LitElement {
           <span>${session.hostname} · ${session.cwd ?? "Unknown cwd"}</span>
         </div>
         <span class="chip ${session.title_source}">${titleSourceLabel(session.title_source)}</span>
+        ${instance
+          ? html`<span class="chip ${instance.state}" title=${instanceTooltip(instance, this.clockNow)}>
+              ${appServerInstanceStateLabel(instance.state)}
+            </span>`
+          : session.app_server_present
+            ? html`<span class="chip waiting_for_upload">App server</span>`
+            : nothing}
         ${attachedThreadId
           ? html`
               <span class="chip realtime">Attached</span>
@@ -593,6 +609,46 @@ export class ChaopApp extends LitElement {
                 Attach
               </button>
             `}
+      </article>
+    `;
+  }
+
+  private appServerInstanceCard(instance: AppServerInstanceSummary, density: "full" | "compact") {
+    const connector = this.data!.connectors.find((item) => item.id === instance.connector_id);
+    const detail = instance.last_error ?? instance.status_summary;
+    return html`
+      <article class=${`instance-card ${density}`}>
+        <header>
+          <div>
+            <strong>${connector?.name ?? instance.connector_id}</strong>
+            <span>${connector?.hostname ?? "Unknown host"}</span>
+          </div>
+          <span class="chip ${instance.state}">${appServerInstanceStateLabel(instance.state)}</span>
+        </header>
+        <dl class="instance-facts">
+          <div><dt>Scope</dt><dd>${formatMode(instance.scope)}</dd></div>
+          <div><dt>Endpoint</dt><dd>${formatMode(instance.endpoint_type)}</dd></div>
+          <div><dt>Turns</dt><dd>${instance.active_turn_count}</dd></div>
+          ${density === "full" ? html`<div><dt>Generation</dt><dd>${instance.generation}</dd></div>` : nothing}
+          <div>
+            <dt>Changed</dt>
+            <dd title=${formatAbsoluteIso(instance.state_changed_at)}>
+              ${formatRelativeIso(instance.state_changed_at, this.clockNow)}
+            </dd>
+          </div>
+          <div>
+            <dt>Seen</dt>
+            <dd title=${formatAbsoluteIso(instance.last_seen_at)}>${formatRelativeIso(instance.last_seen_at, this.clockNow)}</dd>
+          </div>
+        </dl>
+        ${density === "full"
+          ? html`
+              <p class="instance-key"><code>${instance.instance_key}</code></p>
+              ${detail ? html`<p class="instance-summary">${detail}</p>` : nothing}
+            `
+          : detail
+            ? html`<p class="instance-summary">${detail}</p>`
+            : nothing}
       </article>
     `;
   }
@@ -916,6 +972,22 @@ export class ChaopApp extends LitElement {
     return candidates.sort().at(-1);
   }
 
+  private appServerInstancesForDisplay(): AppServerInstanceSummary[] {
+    if (!this.data) return [];
+    const byKnownConnector = this.data.connectors.flatMap((connector) =>
+      appServerInstancesForConnector(this.data, connector.id)
+    );
+    const knownIds = new Set(byKnownConnector.map((instance) => instance.id));
+    const unknownConnectorInstances = this.data.app_server_instances
+      .filter((instance) => !knownIds.has(instance.id))
+      .sort((left, right) => {
+        const connectorDelta = left.connector_id.localeCompare(right.connector_id);
+        if (connectorDelta !== 0) return connectorDelta;
+        return left.instance_key.localeCompare(right.instance_key);
+      });
+    return [...byKnownConnector, ...unknownConnectorInstances];
+  }
+
   private threadListItem(thread: ThreadSummary) {
     const task = this.taskForThread(thread.id);
     return html`
@@ -1189,10 +1261,6 @@ function hashPath(): string {
   return window.location.hash.replace("#", "").split("?")[0] ?? "";
 }
 
-function threadHref(threadId: string): string {
-  return `#thread-centre?thread=${encodeURIComponent(threadId)}`;
-}
-
 function viewTitle(view: View): string {
   return {
     "operations-map": "Operations Map",
@@ -1245,6 +1313,12 @@ function titleSourceLabel(source: HostSessionSummary["title_source"]): string {
   }[source];
 }
 
+function instanceTooltip(instance: AppServerInstanceSummary, nowMs: number): string {
+  const changed = formatRelativeIso(instance.state_changed_at, nowMs);
+  const seen = formatRelativeIso(instance.last_seen_at, nowMs);
+  return `${formatMode(instance.scope)} ${formatMode(instance.endpoint_type)} app-server, ${instance.active_turn_count} active turns, changed ${changed}, seen ${seen}`;
+}
+
 function refreshSummary(dispatchedTo: number): string {
   if (dispatchedTo === 0) return "No online connector accepted the refresh request.";
   if (dispatchedTo === 1) return "Refresh requested from 1 online connector.";
@@ -1259,7 +1333,23 @@ function formatSyncStatus(iso: string | undefined, nowMs: number): string {
     dateStyle: "medium",
     timeStyle: "medium"
   });
-  return `Last synced: ${timestamp} (${formatAge(nowMs - syncedAt.getTime())} ago)`;
+  return `Last synced: ${timestamp} (${formatRelativeIso(iso, nowMs)})`;
+}
+
+function formatRelativeIso(iso: string, nowMs: number): string {
+  const timestamp = new Date(iso).getTime();
+  if (Number.isNaN(timestamp)) return "unknown";
+  const age = formatAge(nowMs - timestamp);
+  return age === "just now" ? age : `${age} ago`;
+}
+
+function formatAbsoluteIso(iso: string): string {
+  const timestamp = new Date(iso);
+  if (Number.isNaN(timestamp.getTime())) return "Unknown";
+  return timestamp.toLocaleString("en-GB", {
+    dateStyle: "medium",
+    timeStyle: "medium"
+  });
 }
 
 function formatAge(ageMs: number): string {

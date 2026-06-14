@@ -7,6 +7,8 @@ import type {
   TaskArchiveResponse
 } from "@chaop/protocol";
 import {
+  appServerInstanceStateLabel,
+  appServerInstancesForConnector,
   archiveSyncNotice,
   archiveSyncWarning,
   codexCliFallbackAvailable,
@@ -22,7 +24,8 @@ import {
   mergeBootstrapPayload,
   mergeAppServerInstances,
   mergeConnectorSummaries,
-  normaliseCommandMode
+  normaliseCommandMode,
+  primaryAppServerInstanceForConnector
 } from "./state.ts";
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
@@ -125,6 +128,33 @@ test("mergeAppServerInstances keeps newer rows from stale connector snapshots", 
   const merged = mergeAppServerInstances([retained, current, omitted], [staleIncoming], { snapshotConnectorId: "connector-1" });
 
   assert.deepEqual(merged, [retained, current]);
+});
+
+test("appServerInstancesForConnector filters and sorts operator-visible instance state", () => {
+  const healthyBusy = {
+    ...appServerInstance("app-server-healthy-busy", "healthy", "2026-06-12T10:03:00.000Z", "connector-1"),
+    active_turn_count: 3
+  };
+  const degraded = appServerInstance("app-server-degraded", "degraded", "2026-06-12T10:01:00.000Z", "connector-1");
+  const healthyIdle = appServerInstance("app-server-healthy-idle", "healthy", "2026-06-12T10:04:00.000Z", "connector-1");
+  const otherConnector = appServerInstance("app-server-other", "stopped", "2026-06-12T10:05:00.000Z", "connector-2");
+  const data = payload({
+    app_server_instances: [healthyIdle, otherConnector, healthyBusy, degraded]
+  });
+
+  const instances = appServerInstancesForConnector(data, "connector-1");
+
+  assert.deepEqual(
+    instances.map((instance) => instance.id),
+    ["app-server-degraded", "app-server-healthy-busy", "app-server-healthy-idle"]
+  );
+  assert.equal(primaryAppServerInstanceForConnector(data, "connector-1"), degraded);
+  assert.equal(primaryAppServerInstanceForConnector(data, "missing-connector"), undefined);
+});
+
+test("appServerInstanceStateLabel uses operator-facing state text", () => {
+  assert.equal(appServerInstanceStateLabel("healthy"), "healthy");
+  assert.equal(appServerInstanceStateLabel("restarting"), "restarting");
 });
 
 test("localThreadWorkspaceId uses the selected thread workspace", () => {
