@@ -9,6 +9,7 @@ import type {
 import {
   appServerInstanceStateLabel,
   appServerInstancesForConnector,
+  appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
   codexCliFallbackAvailable,
@@ -138,8 +139,14 @@ test("appServerInstancesForConnector filters and sorts operator-visible instance
   const degraded = appServerInstance("app-server-degraded", "degraded", "2026-06-12T10:01:00.000Z", "connector-1");
   const healthyIdle = appServerInstance("app-server-healthy-idle", "healthy", "2026-06-12T10:04:00.000Z", "connector-1");
   const otherConnector = appServerInstance("app-server-other", "stopped", "2026-06-12T10:05:00.000Z", "connector-2");
+  const laterConnectorDegraded = appServerInstance(
+    "app-server-later-connector-degraded",
+    "degraded",
+    "2026-06-12T10:06:00.000Z",
+    "connector-3"
+  );
   const data = payload({
-    app_server_instances: [healthyIdle, otherConnector, healthyBusy, degraded]
+    app_server_instances: [healthyIdle, otherConnector, healthyBusy, degraded, laterConnectorDegraded]
   });
 
   const instances = appServerInstancesForConnector(data, "connector-1");
@@ -150,6 +157,16 @@ test("appServerInstancesForConnector filters and sorts operator-visible instance
   );
   assert.equal(primaryAppServerInstanceForConnector(data, "connector-1"), degraded);
   assert.equal(primaryAppServerInstanceForConnector(data, "missing-connector"), undefined);
+  assert.deepEqual(
+    appServerInstancesForDisplay(data).map((instance) => instance.id),
+    [
+      "app-server-later-connector-degraded",
+      "app-server-degraded",
+      "app-server-other",
+      "app-server-healthy-busy",
+      "app-server-healthy-idle"
+    ]
+  );
 });
 
 test("appServerInstanceStateLabel uses operator-facing state text", () => {

@@ -662,6 +662,10 @@ h2 {
   display: none;
 }
 
+.compact-list .session-row .app-server-health-chip {
+  display: inline-block;
+}
+
 textarea {
   min-height: 104px;
   resize: vertical;

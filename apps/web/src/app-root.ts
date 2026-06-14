@@ -32,7 +32,7 @@ import {
 } from "./api.js";
 import {
   appServerInstanceStateLabel,
-  appServerInstancesForConnector,
+  appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
   codexCliFallbackAvailable,
@@ -255,7 +255,7 @@ export class ChaopApp extends LitElement {
   }
 
   private renderOperationsMap() {
-    const appServerInstances = this.appServerInstancesForDisplay();
+    const appServerInstances = appServerInstancesForDisplay(this.data);
     return html`
       <section class="page-grid map-grid">
         <section class="panel primary">
@@ -512,7 +512,7 @@ export class ChaopApp extends LitElement {
     const attached = this.data!.host_sessions.filter((session) => this.isActiveAttachedHostSession(session));
     const unattached = this.data!.host_sessions.filter((session) => !session.attached_thread_id);
     const lastSyncedAt = this.hostSessionsLastSyncedAt();
-    const appServerInstances = this.appServerInstancesForDisplay();
+    const appServerInstances = appServerInstancesForDisplay(this.data);
 
     return html`
       <section class="page-grid sessions-grid">
@@ -579,11 +579,11 @@ export class ChaopApp extends LitElement {
         </div>
         <span class="chip ${session.title_source}">${titleSourceLabel(session.title_source)}</span>
         ${instance
-          ? html`<span class="chip ${instance.state}" title=${instanceTooltip(instance, this.clockNow)}>
+          ? html`<span class="chip ${instance.state} app-server-health-chip" title=${instanceTooltip(instance, this.clockNow)}>
               ${appServerInstanceStateLabel(instance.state)}
             </span>`
           : session.app_server_present
-            ? html`<span class="chip waiting_for_upload">App server</span>`
+            ? html`<span class="chip waiting_for_upload app-server-health-chip">App server</span>`
             : nothing}
         ${attachedThreadId
           ? html`
@@ -970,22 +970,6 @@ export class ChaopApp extends LitElement {
       ...(this.data?.host_session_syncs.map((sync) => sync.synced_at).filter(Boolean) ?? [])
     ].filter((value): value is string => typeof value === "string" && value.length > 0);
     return candidates.sort().at(-1);
-  }
-
-  private appServerInstancesForDisplay(): AppServerInstanceSummary[] {
-    if (!this.data) return [];
-    const byKnownConnector = this.data.connectors.flatMap((connector) =>
-      appServerInstancesForConnector(this.data, connector.id)
-    );
-    const knownIds = new Set(byKnownConnector.map((instance) => instance.id));
-    const unknownConnectorInstances = this.data.app_server_instances
-      .filter((instance) => !knownIds.has(instance.id))
-      .sort((left, right) => {
-        const connectorDelta = left.connector_id.localeCompare(right.connector_id);
-        if (connectorDelta !== 0) return connectorDelta;
-        return left.instance_key.localeCompare(right.instance_key);
-      });
-    return [...byKnownConnector, ...unknownConnectorInstances];
   }
 
   private threadListItem(thread: ThreadSummary) {

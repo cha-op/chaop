@@ -32,6 +32,12 @@ export function appServerInstancesForConnector(
     .sort(compareAppServerInstancesForDisplay);
 }
 
+export function appServerInstancesForDisplay(
+  data: BootstrapPayload | undefined
+): AppServerInstanceSummary[] {
+  return [...(data?.app_server_instances ?? [])].sort(compareAppServerInstancesForDisplay);
+}
+
 export function primaryAppServerInstanceForConnector(
   data: BootstrapPayload | undefined,
   connectorId: string
@@ -299,6 +305,9 @@ function compareAppServerInstancesForDisplay(
 
   const updatedDelta = right.updated_at.localeCompare(left.updated_at);
   if (updatedDelta !== 0) return updatedDelta;
+
+  const connectorDelta = left.connector_id.localeCompare(right.connector_id);
+  if (connectorDelta !== 0) return connectorDelta;
 
   return left.instance_key.localeCompare(right.instance_key);
 }
