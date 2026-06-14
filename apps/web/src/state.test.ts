@@ -15,6 +15,7 @@ import {
   MANAGED_APP_SERVER_UNAVAILABLE,
   managedAppServerCommandAvailable,
   mergeBootstrapPayload,
+  mergeConnectorSummaries,
   normaliseCommandMode
 } from "./state.ts";
 
@@ -95,6 +96,74 @@ test("localThreadConnectors filters connectors by workspace", () => {
   );
 });
 
+test("mergeConnectorSummaries replaces known connectors and keeps existing order", () => {
+  const merged = mergeConnectorSummaries(
+    [
+      connector("connector-a", ["placeholder_commands"]),
+      connector("connector-b", ["app_server_threads"])
+    ],
+    [
+      connector("connector-a", ["codex_app_server_exec"]),
+      connector("connector-c", ["app_server_threads"])
+    ]
+  );
+
+  assert.deepEqual(
+    merged.map((item) => [item.id, item.capabilities]),
+    [
+      ["connector-a", ["codex_app_server_exec"]],
+      ["connector-b", ["app_server_threads"]],
+      ["connector-c", ["app_server_threads"]]
+    ]
+  );
+});
+
+test("mergeBootstrapPayload keeps newer realtime connector state over stale bootstrap", () => {
+  const current = payload({
+    connectors: [
+      connector(
+        "connector-a",
+        [],
+        "offline",
+        "2026-06-12T10:01:00.000Z"
+      )
+    ]
+  });
+  const incoming = payload({
+    connectors: [
+      connector(
+        "connector-a",
+        ["codex_app_server_exec"],
+        "online",
+        "2026-06-12T10:00:00.000Z"
+      )
+    ]
+  });
+
+  const merged = mergeBootstrapPayload(current, incoming);
+
+  assert.equal(merged.connectors[0]?.status, "offline");
+  assert.deepEqual(merged.connectors[0]?.capabilities, []);
+});
+
+test("mergeBootstrapPayload removes connectors omitted from bootstrap snapshot", () => {
+  const current = payload({
+    connectors: [
+      connector("connector-a", ["codex_app_server_exec"], "online"),
+      connector("connector-b", ["app_server_threads"], "online")
+    ]
+  });
+  const incoming = payload({
+    connectors: [
+      connector("connector-a", ["codex_app_server_exec"], "online")
+    ]
+  });
+
+  const merged = mergeBootstrapPayload(current, incoming);
+
+  assert.deepEqual(merged.connectors.map((item) => item.id), ["connector-a"]);
+});
+
 test("localThreadConnectors only includes app-server capable connectors", () => {
   const data = payload({
     connectors: [
@@ -112,7 +181,7 @@ test("localThreadConnectors only includes app-server capable connectors", () => 
   );
 });
 
-test("localThreadConnectors skips offline app-server connectors", () => {
+test("localThreadConnectors skips unavailable app-server connectors", () => {
   const data = payload({
     connectors: [
       connector("connector-a", ["app_server_threads"], "offline"),
@@ -125,7 +194,7 @@ test("localThreadConnectors skips offline app-server connectors", () => {
 
   assert.deepEqual(
     localThreadConnectors(data, "workspace-api").map((item) => item.id),
-    ["connector-b"]
+    []
   );
 });
 
@@ -186,6 +255,16 @@ test("managedAppServerCommandAvailable requires an attached app-server session a
     managedAppServerCommandAvailable(
       {
         ...data,
+        connectors: [connector("connector-a", ["codex_app_server_exec"], "degraded")]
+      },
+      "thread-api"
+    ),
+    false
+  );
+  assert.equal(
+    managedAppServerCommandAvailable(
+      {
+        ...data,
         host_sessions: [{ ...attachedSession, app_server_present: false }]
       },
       "thread-api"
@@ -198,16 +277,19 @@ test("codexCliFallbackAvailable is scoped to online workspace connectors", () =>
   const data = payload({
     connectors: [
       connector("connector-a", ["codex_exec"]),
-      connector("connector-b", ["codex_exec"], "offline")
+      connector("connector-b", ["codex_exec"], "offline"),
+      connector("connector-c", ["codex_exec"], "degraded")
     ],
     workspaces: [
       workspace("workspace-api", ["connector-a"]),
-      workspace("workspace-docs", ["connector-b"])
+      workspace("workspace-docs", ["connector-b"]),
+      workspace("workspace-ops", ["connector-c"])
     ]
   });
 
   assert.equal(codexCliFallbackAvailable(data, "workspace-api"), true);
   assert.equal(codexCliFallbackAvailable(data, "workspace-docs"), false);
+  assert.equal(codexCliFallbackAvailable(data, "workspace-ops"), false);
   assert.equal(codexCliFallbackAvailable(data, "missing-workspace"), false);
 });
 
@@ -381,7 +463,8 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
 function connector(
   id: string,
   capabilities: string[] = [],
-  status: "online" | "offline" | "degraded" = "online"
+  status: "online" | "offline" | "degraded" = "online",
+  updatedAt?: string
 ) {
   return {
     id,
@@ -392,7 +475,8 @@ function connector(
     logical_agent_count: 1,
     active_command_count: 0,
     realtime_mode: "realtime" as const,
-    budget_state: "normal" as const
+    budget_state: "normal" as const,
+    updated_at: updatedAt
   };
 }
 

@@ -1,12 +1,14 @@
+use crate::app_server_manager::AppServerManager;
 use crate::config::{AgentConfig, ExecutionMode};
 use crate::executor::{codex_exec_result_events_with_cancel, codex_exec_started_event};
 use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
 use crate::session_inventory::{
-    app_server_command_result_events_with_cancel, app_server_command_started_event,
-    build_host_session_backfill, build_host_sessions_report, create_app_server_thread,
-    set_app_server_thread_archived,
+    AgentHostSessionsReport, InventoryScope, app_server_command_result_events_with_cancel,
+    app_server_command_started_event, build_host_session_backfill, build_host_sessions_report,
+    create_app_server_thread, set_app_server_thread_archived,
 };
+use crate::shutdown::{install_signal_handlers, shutdown_requested};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -26,6 +28,7 @@ use tungstenite::{Error as WebSocketError, Message, connect};
 type AgentSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
 const CONNECTOR_READ_TICK_SECONDS: u64 = 5;
 const CONNECTOR_RECONNECT_BACKOFF_SECONDS: u64 = 2;
+const AGENT_READY_RETRY_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -37,6 +40,20 @@ pub enum RunMode {
 struct Envelope {
     kind: String,
     payload: serde_json::Value,
+}
+
+#[derive(Debug, Default)]
+struct AgentReadyState {
+    last_sent: Option<String>,
+    last_sent_at: Option<Instant>,
+    last_acked: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct HostSessionsSendState {
+    last_sent: Option<String>,
+    last_sent_at: Option<Instant>,
+    last_acked: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,21 +110,32 @@ pub fn run_connector(
     config: &AgentConfig,
     run_mode: RunMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    install_signal_handlers()?;
+    let mut app_server = AppServerManager::new(config);
+    if shutdown_requested() {
+        return Ok(());
+    }
     loop {
-        match run_connected_session(config, run_mode) {
+        match run_connected_session(config, &mut app_server, run_mode) {
             Ok(()) if run_mode == RunMode::Once => return Ok(()),
+            Ok(()) if shutdown_requested() => return Ok(()),
             Ok(()) => {}
+            Err(_) if shutdown_requested() => return Ok(()),
             Err(error) if run_mode == RunMode::Once => return Err(error),
             Err(error) => {
                 eprintln!("connector connection ended: {error}; reconnecting");
             }
         }
-        thread::sleep(reconnect_backoff());
+        sleep_until_reconnect_or_shutdown();
+        if shutdown_requested() {
+            return Ok(());
+        }
     }
 }
 
 fn run_connected_session(
     config: &AgentConfig,
+    app_server: &mut AppServerManager,
     run_mode: RunMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let token = fs::read_to_string(&config.token_file)?.trim().to_owned();
@@ -123,28 +151,57 @@ fn run_connected_session(
     let (mut socket, _) = connect(request)?;
     configure_socket(&mut socket)?;
     set_socket_read_timeout(&mut socket, Some(connector_read_tick()))?;
-    socket.send(Message::Text(
-        json!({ "kind": "agent.ready" }).to_string().into(),
-    ))?;
-    let mut last_host_sessions_message = None;
+    let mut runtime_config = app_server.runtime_config(config);
+    let mut agent_ready_state = AgentReadyState::default();
+    let mut host_sessions_state = HostSessionsSendState::default();
     let mut deferred_messages = VecDeque::<String>::new();
-    send_host_sessions(&mut socket, config, &mut last_host_sessions_message, true)?;
-    let mut next_host_sessions_at = Instant::now() + host_sessions_interval(config);
+    if send_agent_ready(&mut socket, &runtime_config, &mut agent_ready_state, true)?
+        .should_send_host_sessions()
+    {
+        send_host_sessions(&mut socket, &runtime_config, &mut host_sessions_state, true)?;
+    }
+    let mut next_host_sessions_at = Instant::now() + host_sessions_interval(&runtime_config);
 
     loop {
+        if shutdown_requested() {
+            let _ = socket.close(None);
+            return Ok(());
+        }
         let message = match deferred_messages.pop_front() {
             Some(text) => Message::Text(text.into()),
             None => match socket.read() {
                 Ok(message) => message,
                 Err(error) if is_read_timeout(&error) => {
-                    if Instant::now() >= next_host_sessions_at {
+                    if shutdown_requested() {
+                        let _ = socket.close(None);
+                        return Ok(());
+                    }
+                    runtime_config = app_server.runtime_config(config);
+                    if send_agent_ready(
+                        &mut socket,
+                        &runtime_config,
+                        &mut agent_ready_state,
+                        false,
+                    )?
+                    .should_send_host_sessions()
+                    {
                         send_host_sessions(
                             &mut socket,
-                            config,
-                            &mut last_host_sessions_message,
+                            &runtime_config,
+                            &mut host_sessions_state,
+                            true,
+                        )?;
+                        next_host_sessions_at =
+                            Instant::now() + host_sessions_interval(&runtime_config);
+                    } else if Instant::now() >= next_host_sessions_at {
+                        send_host_sessions(
+                            &mut socket,
+                            &runtime_config,
+                            &mut host_sessions_state,
                             false,
                         )?;
-                        next_host_sessions_at = Instant::now() + host_sessions_interval(config);
+                        next_host_sessions_at =
+                            Instant::now() + host_sessions_interval(&runtime_config);
                     }
                     continue;
                 }
@@ -153,11 +210,35 @@ fn run_connected_session(
         };
         match message {
             Message::Text(text) => {
+                if shutdown_requested() {
+                    let _ = socket.close(None);
+                    return Ok(());
+                }
+                if apply_agent_ready_ack_text(text.as_ref(), &mut agent_ready_state)? {
+                    continue;
+                }
+                if apply_host_sessions_ack_text(text.as_ref(), &mut host_sessions_state)? {
+                    continue;
+                }
+                runtime_config = app_server.runtime_config(config);
+                if send_agent_ready(&mut socket, &runtime_config, &mut agent_ready_state, false)?
+                    .should_send_host_sessions()
+                {
+                    send_host_sessions(
+                        &mut socket,
+                        &runtime_config,
+                        &mut host_sessions_state,
+                        true,
+                    )?;
+                    next_host_sessions_at =
+                        Instant::now() + host_sessions_interval(&runtime_config);
+                }
                 if handle_text_message(
                     &mut socket,
                     text.as_ref(),
-                    config,
-                    &mut last_host_sessions_message,
+                    &runtime_config,
+                    &mut agent_ready_state,
+                    &mut host_sessions_state,
                     &mut deferred_messages,
                 )? && run_mode == RunMode::Once
                 {
@@ -173,52 +254,178 @@ fn run_connected_session(
     }
 }
 
+fn send_agent_ready(
+    socket: &mut AgentSocket,
+    config: &AgentConfig,
+    state: &mut AgentReadyState,
+    force: bool,
+) -> Result<AgentReadySend, Box<dyn std::error::Error>> {
+    let message = agent_ready_message(&config.capabilities());
+    let now = Instant::now();
+    if !should_send_agent_ready(&message, state, force, now) {
+        return Ok(AgentReadySend::NotSent);
+    }
+    let changed = state.last_sent.as_deref() != Some(message.as_str());
+    socket.send(Message::Text(message.clone().into()))?;
+    state.last_sent = Some(message);
+    state.last_sent_at = Some(now);
+    Ok(if changed {
+        AgentReadySend::SentChangedPayload
+    } else {
+        AgentReadySend::SentSamePayload
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentReadySend {
+    NotSent,
+    SentSamePayload,
+    SentChangedPayload,
+}
+
+impl AgentReadySend {
+    fn should_send_host_sessions(self) -> bool {
+        matches!(self, Self::SentChangedPayload)
+    }
+}
+
+fn should_send_agent_ready(
+    message: &str,
+    state: &AgentReadyState,
+    force: bool,
+    now: Instant,
+) -> bool {
+    if force {
+        return true;
+    }
+    if state.last_acked.as_deref() == Some(message) {
+        return false;
+    }
+    if state.last_sent.as_deref() == Some(message)
+        && state.last_sent_at.is_some_and(|sent_at| {
+            now.saturating_duration_since(sent_at) < agent_ready_retry_interval()
+        })
+    {
+        return false;
+    }
+    true
+}
+
+fn acknowledge_agent_ready(state: &mut AgentReadyState, message: String) {
+    state.last_sent = Some(message.clone());
+    state.last_sent_at = None;
+    state.last_acked = Some(message);
+}
+
+fn agent_ready_message(capabilities: &[String]) -> String {
+    json!({
+        "kind": "agent.ready",
+        "payload": {
+            "capabilities": capabilities
+        }
+    })
+    .to_string()
+}
+
 fn send_host_sessions(
     socket: &mut AgentSocket,
     config: &AgentConfig,
-    last_sent: &mut Option<String>,
+    state: &mut HostSessionsSendState,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(message) = host_sessions_message(config) else {
-        return Ok(());
-    };
-    if !force && last_sent.as_deref() == Some(message.as_str()) {
+    let message = host_sessions_message(config);
+    let now = Instant::now();
+    if !should_send_host_sessions(&message, state, force, now) {
         return Ok(());
     }
     socket.send(Message::Text(message.clone().into()))?;
-    *last_sent = Some(message);
+    state.last_sent = Some(message);
+    state.last_sent_at = Some(now);
+    state.last_acked = None;
     Ok(())
 }
 
-fn host_sessions_message(config: &AgentConfig) -> Option<String> {
-    let Ok(report) = build_host_sessions_report(config) else {
-        return None;
-    };
-    Some(
-        json!({
-            "kind": "agent.host_sessions",
-            "payload": report
+fn should_send_host_sessions(
+    message: &str,
+    state: &HostSessionsSendState,
+    force: bool,
+    now: Instant,
+) -> bool {
+    if force {
+        return true;
+    }
+    if state.last_acked.as_deref() == Some(message) {
+        return false;
+    }
+    if state.last_sent.as_deref() == Some(message)
+        && state.last_sent_at.is_some_and(|sent_at| {
+            now.saturating_duration_since(sent_at) < host_sessions_retry_interval()
         })
-        .to_string(),
-    )
+    {
+        return false;
+    }
+    true
+}
+
+fn acknowledge_host_sessions(state: &mut HostSessionsSendState) {
+    let Some(message) = state.last_sent.clone() else {
+        return;
+    };
+    state.last_sent_at = None;
+    state.last_acked = Some(message);
+}
+
+fn host_sessions_message(config: &AgentConfig) -> String {
+    let report = build_host_sessions_report(config).unwrap_or_else(|error| {
+        eprintln!("chaop-agent: host session inventory failed: {error}");
+        fallback_host_sessions_report(config)
+    });
+    json!({
+        "kind": "agent.host_sessions",
+        "payload": report
+    })
+    .to_string()
+}
+
+fn fallback_host_sessions_report(config: &AgentConfig) -> AgentHostSessionsReport {
+    AgentHostSessionsReport {
+        sessions: Vec::new(),
+        inventory_scope: InventoryScope::Incremental,
+        app_server_inventory_ok: config
+            .session_inventory
+            .app_server_url
+            .as_ref()
+            .map(|_| false),
+    }
 }
 
 fn handle_text_message(
     socket: &mut AgentSocket,
     text: &str,
     config: &AgentConfig,
-    last_host_sessions_message: &mut Option<String>,
+    agent_ready_state: &mut AgentReadyState,
+    host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
     if envelope.kind == "host_sessions.refresh" {
-        send_host_sessions(socket, config, last_host_sessions_message, true)?;
+        send_host_sessions(socket, config, host_sessions_state, true)?;
+        return Ok(false);
+    }
+
+    if let Some(message) = agent_ready_ack_message(&envelope) {
+        acknowledge_agent_ready(agent_ready_state, message);
+        return Ok(false);
+    }
+
+    if host_sessions_ack_message(&envelope) {
+        acknowledge_host_sessions(host_sessions_state);
         return Ok(false);
     }
 
     if envelope.kind == "thread.create" {
         let dispatch: ThreadCreateDispatch = serde_json::from_value(envelope.payload)?;
-        handle_thread_create(socket, &dispatch, config, last_host_sessions_message)?;
+        handle_thread_create(socket, &dispatch, config, host_sessions_state)?;
         return Ok(false);
     }
 
@@ -230,7 +437,7 @@ fn handle_text_message(
 
     if envelope.kind == "thread.archive_sync" {
         let dispatch: ThreadArchiveSyncDispatch = serde_json::from_value(envelope.payload)?;
-        handle_thread_archive_sync(socket, &dispatch, config, last_host_sessions_message)?;
+        handle_thread_archive_sync(socket, &dispatch, config, host_sessions_state)?;
         return Ok(false);
     }
 
@@ -247,7 +454,7 @@ fn handle_text_message(
             &dispatch.command,
             app_server_wrong_execution_mode_events(),
             config,
-            last_host_sessions_message,
+            host_sessions_state,
             deferred_messages,
         )?;
         return Ok(true);
@@ -261,7 +468,7 @@ fn handle_text_message(
             &dispatch.command,
             vec![codex_exec_started_event(&config.workspace_root)],
             config,
-            last_host_sessions_message,
+            host_sessions_state,
             deferred_messages,
         )? {
             return Ok(true);
@@ -270,7 +477,7 @@ fn handle_text_message(
             socket,
             config,
             &dispatch.command.prompt,
-            last_host_sessions_message,
+            host_sessions_state,
             deferred_messages,
         );
         dispatch_events(
@@ -278,7 +485,7 @@ fn handle_text_message(
             &dispatch.command,
             events?,
             config,
-            last_host_sessions_message,
+            host_sessions_state,
             deferred_messages,
         )?;
         return Ok(true);
@@ -293,7 +500,7 @@ fn handle_text_message(
                 &dispatch.command,
                 app_server_missing_target_events(),
                 config,
-                last_host_sessions_message,
+                host_sessions_state,
                 deferred_messages,
             )?;
             return Ok(true);
@@ -304,7 +511,7 @@ fn handle_text_message(
                 &dispatch.command,
                 app_server_non_app_server_target_events(&target_host_session.session_id),
                 config,
-                last_host_sessions_message,
+                host_sessions_state,
                 deferred_messages,
             )?;
             return Ok(true);
@@ -317,7 +524,7 @@ fn handle_text_message(
             )],
             Some(&target_host_session.session_id),
             config,
-            last_host_sessions_message,
+            host_sessions_state,
             deferred_messages,
         )? {
             return Ok(true);
@@ -329,7 +536,7 @@ fn handle_text_message(
             target_host_session.cwd.as_deref(),
             &dispatch.command.id,
             &dispatch.command.prompt,
-            last_host_sessions_message,
+            host_sessions_state,
             deferred_messages,
         );
         dispatch_events(
@@ -337,7 +544,7 @@ fn handle_text_message(
             &dispatch.command,
             events?,
             config,
-            last_host_sessions_message,
+            host_sessions_state,
             deferred_messages,
         )?;
         return Ok(true);
@@ -348,7 +555,7 @@ fn handle_text_message(
         &dispatch.command,
         command_events(&dispatch.command),
         config,
-        last_host_sessions_message,
+        host_sessions_state,
         deferred_messages,
     )?;
     Ok(true)
@@ -358,7 +565,7 @@ fn handle_thread_create(
     socket: &mut AgentSocket,
     dispatch: &ThreadCreateDispatch,
     config: &AgentConfig,
-    last_host_sessions_message: &mut Option<String>,
+    host_sessions_state: &mut HostSessionsSendState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match create_app_server_thread(config, dispatch.title.as_deref()) {
         Ok(session) => {
@@ -374,7 +581,7 @@ fn handle_thread_create(
                 .to_string()
                 .into(),
             ))?;
-            send_host_sessions(socket, config, last_host_sessions_message, true)?;
+            send_host_sessions(socket, config, host_sessions_state, true)?;
         }
         Err(error) => {
             socket.send(Message::Text(
@@ -392,6 +599,63 @@ fn handle_thread_create(
         }
     }
     Ok(())
+}
+
+fn agent_ready_ack_message(envelope: &Envelope) -> Option<String> {
+    if envelope.kind != "server.ack"
+        || envelope
+            .payload
+            .get("kind")
+            .and_then(|value| value.as_str())
+            != Some("agent.ready")
+    {
+        return None;
+    }
+
+    envelope
+        .payload
+        .get("capabilities")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .map(|capabilities| agent_ready_message(&capabilities))
+}
+
+fn apply_agent_ready_ack_text(
+    text: &str,
+    state: &mut AgentReadyState,
+) -> Result<bool, serde_json::Error> {
+    let envelope: Envelope = serde_json::from_str(text)?;
+    let Some(message) = agent_ready_ack_message(&envelope) else {
+        return Ok(false);
+    };
+    acknowledge_agent_ready(state, message);
+    Ok(true)
+}
+
+fn host_sessions_ack_message(envelope: &Envelope) -> bool {
+    envelope.kind == "server.ack"
+        && envelope
+            .payload
+            .get("kind")
+            .and_then(|value| value.as_str())
+            == Some("agent.host_sessions")
+}
+
+fn apply_host_sessions_ack_text(
+    text: &str,
+    state: &mut HostSessionsSendState,
+) -> Result<bool, serde_json::Error> {
+    let envelope: Envelope = serde_json::from_str(text)?;
+    if !host_sessions_ack_message(&envelope) {
+        return Ok(false);
+    }
+    acknowledge_host_sessions(state);
+    Ok(true)
 }
 
 fn handle_host_session_backfill(
@@ -437,7 +701,7 @@ fn handle_thread_archive_sync(
     socket: &mut AgentSocket,
     dispatch: &ThreadArchiveSyncDispatch,
     config: &AgentConfig,
-    last_host_sessions_message: &mut Option<String>,
+    host_sessions_state: &mut HostSessionsSendState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match set_app_server_thread_archived(config, &dispatch.session_id, dispatch.archived) {
         Ok(synced) => {
@@ -453,7 +717,7 @@ fn handle_thread_archive_sync(
                 .to_string()
                 .into(),
             ))?;
-            send_host_sessions(socket, config, last_host_sessions_message, true)?;
+            send_host_sessions(socket, config, host_sessions_state, true)?;
         }
         Err(error) => {
             socket.send(Message::Text(
@@ -477,7 +741,7 @@ fn wait_for_codex_exec_events(
     socket: &mut AgentSocket,
     config: &AgentConfig,
     prompt: &str,
-    last_host_sessions_message: &mut Option<String>,
+    host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<Vec<ConnectorEvent>, Box<dyn std::error::Error>> {
     let execution = config.execution.clone();
@@ -498,6 +762,10 @@ fn wait_for_codex_exec_events(
 
     set_socket_read_timeout(socket, Some(connector_read_tick()))?;
     loop {
+        if shutdown_requested() {
+            cancel_codex_worker(&cancel, worker.take())?;
+            return Err("connector shutdown requested while codex exec was running".into());
+        }
         match receiver.try_recv() {
             Ok(events) => {
                 join_codex_worker(worker.take())?;
@@ -517,7 +785,7 @@ fn wait_for_codex_exec_events(
                     socket,
                     text.as_ref(),
                     config,
-                    last_host_sessions_message,
+                    host_sessions_state,
                     deferred_messages,
                 )?;
             }
@@ -543,7 +811,7 @@ fn wait_for_app_server_command_events(
     cwd: Option<&str>,
     command_id: &str,
     prompt: &str,
-    last_host_sessions_message: &mut Option<String>,
+    host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<Vec<ConnectorEvent>, Box<dyn std::error::Error>> {
     let worker_config = config.clone();
@@ -568,6 +836,10 @@ fn wait_for_app_server_command_events(
 
     set_socket_read_timeout(socket, Some(connector_read_tick()))?;
     loop {
+        if shutdown_requested() {
+            cancel_codex_worker(&cancel, worker.take())?;
+            return Err("connector shutdown requested while app-server command was running".into());
+        }
         match receiver.try_recv() {
             Ok(events) => {
                 join_codex_worker(worker.take())?;
@@ -587,7 +859,7 @@ fn wait_for_app_server_command_events(
                     socket,
                     text.as_ref(),
                     config,
-                    last_host_sessions_message,
+                    host_sessions_state,
                     deferred_messages,
                 )?;
             }
@@ -629,21 +901,23 @@ fn handle_background_text_message(
     socket: &mut AgentSocket,
     text: &str,
     config: &AgentConfig,
-    last_host_sessions_message: &mut Option<String>,
+    host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
     if envelope.kind == "host_sessions.refresh" {
-        send_host_sessions(socket, config, last_host_sessions_message, true)?;
+        send_host_sessions(socket, config, host_sessions_state, true)?;
+    } else if host_sessions_ack_message(&envelope) {
+        acknowledge_host_sessions(host_sessions_state);
     } else if envelope.kind == "thread.create" {
         let dispatch: ThreadCreateDispatch = serde_json::from_value(envelope.payload)?;
-        handle_thread_create(socket, &dispatch, config, last_host_sessions_message)?;
+        handle_thread_create(socket, &dispatch, config, host_sessions_state)?;
     } else if envelope.kind == "host_session.backfill" {
         let dispatch: HostSessionBackfillDispatch = serde_json::from_value(envelope.payload)?;
         handle_host_session_backfill(socket, &dispatch, config)?;
     } else if envelope.kind == "thread.archive_sync" {
         let dispatch: ThreadArchiveSyncDispatch = serde_json::from_value(envelope.payload)?;
-        handle_thread_archive_sync(socket, &dispatch, config, last_host_sessions_message)?;
+        handle_thread_archive_sync(socket, &dispatch, config, host_sessions_state)?;
     } else {
         deferred_messages.push_back(text.to_owned());
     }
@@ -709,7 +983,7 @@ fn dispatch_events(
     command: &CommandPayload,
     events: Vec<ConnectorEvent>,
     config: &AgentConfig,
-    last_host_sessions_message: &mut Option<String>,
+    host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     dispatch_events_for_target_host_session(
@@ -718,7 +992,7 @@ fn dispatch_events(
         events,
         None,
         config,
-        last_host_sessions_message,
+        host_sessions_state,
         deferred_messages,
     )
 }
@@ -729,7 +1003,7 @@ fn dispatch_events_for_target_host_session(
     events: Vec<ConnectorEvent>,
     target_host_session_id: Option<&str>,
     config: &AgentConfig,
-    last_host_sessions_message: &mut Option<String>,
+    host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     for event in events {
@@ -746,7 +1020,7 @@ fn dispatch_events_for_target_host_session(
             &command.id,
             &event.kind,
             config,
-            last_host_sessions_message,
+            host_sessions_state,
             deferred_messages,
         )? {
             return Ok(false);
@@ -807,6 +1081,22 @@ fn reconnect_backoff() -> Duration {
     Duration::from_secs(CONNECTOR_RECONNECT_BACKOFF_SECONDS)
 }
 
+fn agent_ready_retry_interval() -> Duration {
+    Duration::from_secs(AGENT_READY_RETRY_SECONDS)
+}
+
+fn host_sessions_retry_interval() -> Duration {
+    agent_ready_retry_interval()
+}
+
+fn sleep_until_reconnect_or_shutdown() {
+    let deadline = Instant::now() + reconnect_backoff();
+    while Instant::now() < deadline && !shutdown_requested() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
 fn is_read_timeout(error: &WebSocketError) -> bool {
     matches!(
         error,
@@ -820,33 +1110,37 @@ fn wait_for_ack(
     command_id: &str,
     event_kind: &str,
     config: &AgentConfig,
-    last_host_sessions_message: &mut Option<String>,
+    host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     set_socket_read_timeout(socket, Some(Duration::from_secs(10)))?;
     loop {
+        if shutdown_requested() {
+            set_socket_read_timeout(socket, Some(connector_read_tick()))?;
+            return Err("connector shutdown requested before command acknowledgement".into());
+        }
         match socket.read()? {
             Message::Text(text) => {
                 match classify_ack_wait_text(text.as_ref(), command_id, event_kind)? {
                     AckWaitAction::Matched { accepted } => {
-                        set_socket_read_timeout(socket, None)?;
+                        set_socket_read_timeout(socket, Some(connector_read_tick()))?;
                         return Ok(accepted);
                     }
                     AckWaitAction::HostSessionsRefresh => {
-                        send_host_sessions(socket, config, last_host_sessions_message, true)?;
+                        send_host_sessions(socket, config, host_sessions_state, true)?;
                     }
                     AckWaitAction::Defer => handle_background_text_message(
                         socket,
                         text.as_ref(),
                         config,
-                        last_host_sessions_message,
+                        host_sessions_state,
                         deferred_messages,
                     )?,
                 }
             }
             Message::Ping(payload) => socket.send(Message::Pong(payload))?,
             Message::Close(_) => {
-                set_socket_read_timeout(socket, None)?;
+                set_socket_read_timeout(socket, Some(connector_read_tick()))?;
                 return Err("connection closed before command acknowledgement".into());
             }
             _ => {}
@@ -908,14 +1202,20 @@ fn set_socket_read_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        AckWaitAction, CommandDispatch, CommandPayload, CommandTargetHostSession, CommandType,
-        agent_event_message, classify_ack_wait_text, command_events, host_sessions_interval,
-        is_read_timeout, requires_app_server_execution_mode,
+        AckWaitAction, AgentReadyState, CommandDispatch, CommandPayload, CommandTargetHostSession,
+        CommandType, HostSessionsSendState, acknowledge_agent_ready, acknowledge_host_sessions,
+        agent_event_message, agent_ready_ack_message, agent_ready_message,
+        agent_ready_retry_interval, apply_agent_ready_ack_text, apply_host_sessions_ack_text,
+        classify_ack_wait_text, command_events, host_sessions_ack_message, host_sessions_interval,
+        host_sessions_message, host_sessions_retry_interval, is_read_timeout,
+        requires_app_server_execution_mode, should_send_agent_ready, should_send_host_sessions,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use crate::placeholder::ConnectorEvent;
+    use serde_json::Value;
+    use std::fs;
     use std::io::{self, ErrorKind};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tungstenite::Error as WebSocketError;
 
     #[test]
@@ -1054,6 +1354,61 @@ mod tests {
     }
 
     #[test]
+    fn host_sessions_message_sends_incremental_fallback_on_inventory_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("history.jsonl")).expect("history dir");
+        let mut config = test_config();
+        config.session_inventory.codex_home = Some(temp.path().to_path_buf());
+
+        let message = host_sessions_message(&config);
+        let value: Value = serde_json::from_str(&message).expect("host sessions json");
+
+        assert_eq!(
+            value.pointer("/kind").and_then(Value::as_str),
+            Some("agent.host_sessions")
+        );
+        assert_eq!(
+            value
+                .pointer("/payload/sessions")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            value
+                .pointer("/payload/inventory_scope")
+                .and_then(Value::as_str),
+            Some("incremental")
+        );
+        assert!(value.pointer("/payload/app_server_inventory_ok").is_none());
+    }
+
+    #[test]
+    fn host_sessions_message_marks_app_server_inventory_untrusted_on_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(temp.path().join("history.jsonl")).expect("history dir");
+        let mut config = test_config();
+        config.session_inventory.codex_home = Some(temp.path().to_path_buf());
+        config.session_inventory.app_server_url = Some("ws://127.0.0.1:1".to_owned());
+
+        let message = host_sessions_message(&config);
+        let value: Value = serde_json::from_str(&message).expect("host sessions json");
+
+        assert_eq!(
+            value
+                .pointer("/payload/app_server_inventory_ok")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            value
+                .pointer("/payload/inventory_scope")
+                .and_then(Value::as_str),
+            Some("incremental")
+        );
+    }
+
+    #[test]
     fn recognises_socket_read_timeouts() {
         assert!(is_read_timeout(&WebSocketError::Io(io::Error::from(
             ErrorKind::TimedOut
@@ -1100,6 +1455,175 @@ mod tests {
         .expect("classified");
 
         assert_eq!(action, AckWaitAction::Matched { accepted: false });
+    }
+
+    #[test]
+    fn agent_ready_ack_records_acknowledged_capabilities() {
+        let envelope: super::Envelope = serde_json::from_str(
+            r#"{"kind":"server.ack","payload":{"kind":"agent.ready","capabilities":["placeholder_commands"]}}"#,
+        )
+        .expect("envelope");
+
+        let expected = agent_ready_message(&["placeholder_commands".to_owned()]);
+        assert_eq!(
+            agent_ready_ack_message(&envelope).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn acknowledged_agent_ready_suppresses_same_payload_until_forced() {
+        let mut state = AgentReadyState::default();
+        let message = agent_ready_message(&["placeholder_commands".to_owned()]);
+        let now = Instant::now();
+
+        acknowledge_agent_ready(&mut state, message.clone());
+
+        assert!(!should_send_agent_ready(
+            &message,
+            &state,
+            false,
+            now + Duration::from_secs(60)
+        ));
+        assert!(should_send_agent_ready(
+            &message,
+            &state,
+            true,
+            now + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn unacknowledged_agent_ready_retries_only_after_interval() {
+        let mut state = AgentReadyState::default();
+        let message = agent_ready_message(&["placeholder_commands".to_owned()]);
+        let changed_message = agent_ready_message(&["codex_app_server_exec".to_owned()]);
+        let now = Instant::now();
+
+        state.last_sent = Some(message.clone());
+        state.last_sent_at = Some(now);
+
+        assert!(!should_send_agent_ready(
+            &message,
+            &state,
+            false,
+            now + (agent_ready_retry_interval() - Duration::from_secs(1))
+        ));
+        assert!(should_send_agent_ready(
+            &message,
+            &state,
+            false,
+            now + agent_ready_retry_interval()
+        ));
+        assert!(should_send_agent_ready(
+            &changed_message,
+            &state,
+            false,
+            now + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn agent_ready_ack_text_updates_sent_and_acked_state() {
+        let mut state = AgentReadyState::default();
+
+        let applied = apply_agent_ready_ack_text(
+            r#"{"kind":"server.ack","payload":{"kind":"agent.ready","capabilities":["placeholder_commands"]}}"#,
+            &mut state,
+        )
+        .expect("parsed ack");
+
+        let expected = agent_ready_message(&["placeholder_commands".to_owned()]);
+        assert!(applied);
+        assert_eq!(state.last_sent.as_deref(), Some(expected.as_str()));
+        assert!(state.last_sent_at.is_none());
+        assert_eq!(state.last_acked.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn host_sessions_ack_records_latest_sent_payload() {
+        let envelope: super::Envelope = serde_json::from_str(
+            r#"{"kind":"server.ack","payload":{"kind":"agent.host_sessions"}}"#,
+        )
+        .expect("envelope");
+        assert!(host_sessions_ack_message(&envelope));
+
+        let mut state = HostSessionsSendState::default();
+        let now = Instant::now();
+        state.last_sent = Some("host-sessions-v1".to_owned());
+        state.last_sent_at = Some(now);
+
+        let applied = apply_host_sessions_ack_text(
+            r#"{"kind":"server.ack","payload":{"kind":"agent.host_sessions"}}"#,
+            &mut state,
+        )
+        .expect("parsed ack");
+
+        assert!(applied);
+        assert_eq!(state.last_sent.as_deref(), Some("host-sessions-v1"));
+        assert!(state.last_sent_at.is_none());
+        assert_eq!(state.last_acked.as_deref(), Some("host-sessions-v1"));
+    }
+
+    #[test]
+    fn acknowledged_host_sessions_suppress_same_payload_until_forced() {
+        let mut state = HostSessionsSendState::default();
+        let message = r#"{"kind":"agent.host_sessions","payload":{"sessions":[]}}"#;
+        let now = Instant::now();
+        state.last_sent = Some(message.to_owned());
+
+        acknowledge_host_sessions(&mut state);
+
+        assert!(!should_send_host_sessions(
+            message,
+            &state,
+            false,
+            now + Duration::from_secs(60)
+        ));
+        assert!(should_send_host_sessions(
+            message,
+            &state,
+            true,
+            now + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn unacknowledged_host_sessions_retries_only_after_interval() {
+        let mut state = HostSessionsSendState::default();
+        let message = r#"{"kind":"agent.host_sessions","payload":{"sessions":[]}}"#;
+        let changed_message =
+            r#"{"kind":"agent.host_sessions","payload":{"sessions":[{"id":"session-1"}]}}"#;
+        let now = Instant::now();
+
+        state.last_sent = Some(message.to_owned());
+        state.last_sent_at = Some(now);
+
+        assert!(!should_send_host_sessions(
+            message,
+            &state,
+            false,
+            now + (host_sessions_retry_interval() - Duration::from_secs(1))
+        ));
+        assert!(should_send_host_sessions(
+            message,
+            &state,
+            false,
+            now + host_sessions_retry_interval()
+        ));
+        assert!(should_send_host_sessions(
+            changed_message,
+            &state,
+            false,
+            now + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn changed_agent_ready_payload_forces_host_session_refresh() {
+        assert!(!super::AgentReadySend::NotSent.should_send_host_sessions());
+        assert!(!super::AgentReadySend::SentSamePayload.should_send_host_sessions());
+        assert!(super::AgentReadySend::SentChangedPayload.should_send_host_sessions());
     }
 
     fn test_config() -> AgentConfig {

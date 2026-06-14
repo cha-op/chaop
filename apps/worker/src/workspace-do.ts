@@ -4,6 +4,7 @@ import {
   type HostSessionBackfillDispatch,
   type HostSessionBackfillResult,
   type AgentHostSessionsReport,
+  type ConnectorsUpdatePayload,
   type HostSessionsUpdatePayload,
   type LocalThreadCreateDispatch,
   type LocalThreadCreateResult,
@@ -12,11 +13,17 @@ import {
   type ThreadEvent
 } from "@chaop/protocol";
 import {
-  failStaleExplicitAppServerCommandTargets,
-  markConnectorDisconnected,
+  cleanupStaleExplicitAppServerCommandTargets,
+  failActiveCommandsForConnector,
+  getConnectorSummary,
+  markConnectorDegraded,
+  markConnectorOffline,
+  markConnectorOnline,
   pendingCommandsForConnector,
   recordAgentEvent,
-  recordHostSessions
+  recordHostSessions,
+  releaseLeasedCommandsForConnector,
+  updateConnectorCapabilities
 } from "./db.js";
 import type { Env } from "./types.js";
 
@@ -28,6 +35,9 @@ type SocketAttachment = {
   socketType?: string;
   connectorId?: string;
   connectedAt?: number;
+  agentReady?: boolean;
+  pendingHostSessionsDispatch?: boolean;
+  activeCommandIds?: string[];
 };
 
 export class WorkspaceDO implements DurableObject {
@@ -105,10 +115,6 @@ export class WorkspaceDO implements DurableObject {
         createEnvelope("server.hello", { type: "worker", id: "workspace-do-global" }, { socket_type: socketType })
       )
     );
-    if (socketType === "agent" && connectorId) {
-      await this.sendPendingCommands(server, connectorId);
-    }
-
     return new Response(null, {
       status: 101,
       webSocket: client
@@ -154,7 +160,42 @@ export class WorkspaceDO implements DurableObject {
     }
 
     if (message.kind === "agent.ready") {
-      await this.sendPendingCommands(ws, connectorId);
+      if (
+        message.payload !== undefined &&
+        message.payload !== null &&
+        !isAgentReadyPayload(message.payload)
+      ) {
+        ws.send(
+          JSON.stringify(
+            createEnvelope("server.error", { type: "worker", id: "workspace-do-global" }, {
+              error: "Invalid agent.ready payload"
+            })
+          )
+        );
+        return;
+      }
+      const wasReady = isReadyAgentSocket(ws, connectorId);
+      const readyPayload = isAgentReadyPayload(message.payload) ? message.payload : undefined;
+      const capabilitiesChanged = readyPayload
+        ? await updateConnectorCapabilities(this.env, connectorId, readyPayload.capabilities)
+        : false;
+      this.markAgentReady(ws, connectorId, readyPayload !== undefined && (!wasReady || capabilitiesChanged));
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            kind: "agent.ready",
+            capabilities: readyPayload ? readyPayload.capabilities : []
+          })
+        )
+      );
+      if (readyPayload && (!wasReady || capabilitiesChanged)) {
+        await this.broadcastConnectorUpdate(connectorId);
+      }
+      if (!readyPayload && !wasReady) {
+        await markConnectorOnline(this.env, connectorId);
+        await this.broadcastConnectorUpdate(connectorId);
+        await this.sendPendingCommandsAndReleased(ws, connectorId);
+      }
       return;
     }
 
@@ -180,6 +221,9 @@ export class WorkspaceDO implements DurableObject {
       for (const releasedConnectorId of result.released_connector_ids) {
         await this.sendPendingCommandsToAgents(releasedConnectorId);
       }
+      if (this.consumePendingHostSessionsDispatch(ws, connectorId)) {
+        await this.sendPendingCommandsAndReleased(ws, connectorId);
+      }
       return;
     }
 
@@ -202,11 +246,14 @@ export class WorkspaceDO implements DurableObject {
       const resultFinalCommandEvent =
         result.event?.kind === "command.finished" || result.event?.kind === "command.failed";
       if (result.accepted && (finalCommandEvent || resultFinalCommandEvent)) {
-        await this.sendPendingCommands(ws, connectorId);
+        this.clearSocketCommand(ws, connectorId, message.payload.command_id);
+        await this.sendPendingCommandsAndReleased(ws, connectorId);
       } else if (!result.accepted && result.dispatch_pending) {
+        this.clearSocketCommand(ws, connectorId, message.payload.command_id);
         await this.sendPendingCommandsToAgents();
       } else if (!result.accepted && (finalCommandEvent || resultFinalCommandEvent)) {
-        await this.sendPendingCommands(ws, connectorId);
+        this.clearSocketCommand(ws, connectorId, message.payload.command_id);
+        await this.sendPendingCommandsAndReleased(ws, connectorId);
       }
       return;
     }
@@ -259,6 +306,23 @@ export class WorkspaceDO implements DurableObject {
     }
   }
 
+  private async broadcastConnectorUpdate(
+    connectorId: string,
+    options: { degraded?: boolean; includeOffline?: boolean } = {}
+  ): Promise<void> {
+    const connector = await getConnectorSummary(this.env, connectorId, options);
+    if (!connector) return;
+    const syncedAt = new Date().toISOString();
+    this.broadcastToBrowsers(connectorsMessage({
+      connectors: [
+        options.degraded
+          ? { ...connector, status: "degraded", capabilities: [], updated_at: syncedAt }
+          : connector
+      ],
+      synced_at: syncedAt
+    }));
+  }
+
   private async broadcastThreadEvents(request: Request): Promise<Response> {
     const body = await request.json().catch(() => undefined) as { events?: unknown } | undefined;
     const events = Array.isArray(body?.events) ? body.events.filter(isThreadEvent) : [];
@@ -275,13 +339,27 @@ export class WorkspaceDO implements DurableObject {
     if (attachment?.socketType !== "agent" || !attachment.connectorId) {
       return;
     }
-    if (hasPeerAgentSocket(this.ctx, attachment.connectorId, ws)) {
-      return;
-    }
+    const hasAuthenticatedPeer = hasPeerAgentSocket(this.ctx, attachment.connectorId, ws);
+    const hasReadyPeer = hasReadyPeerAgentSocket(this.ctx, attachment.connectorId, ws);
+    const activeCommandIds = socketActiveCommandIds(ws, attachment.connectorId);
 
-    const events = await markConnectorDisconnected(this.env, attachment.connectorId);
-    for (const event of events) {
-      this.broadcastToBrowsers(threadEventMessage(event));
+    if (!hasReadyPeer || activeCommandIds.length > 0) {
+      const events = await failActiveCommandsForConnector(
+        this.env,
+        attachment.connectorId,
+        hasReadyPeer ? { commandIds: activeCommandIds } : {}
+      );
+      for (const event of events) {
+        this.broadcastToBrowsers(threadEventMessage(event));
+      }
+      if (!hasReadyPeer && hasAuthenticatedPeer) {
+        await markConnectorDegraded(this.env, attachment.connectorId);
+        await this.broadcastConnectorUpdate(attachment.connectorId, { degraded: true });
+      }
+    }
+    if (!hasAuthenticatedPeer) {
+      await markConnectorOffline(this.env, attachment.connectorId);
+      await this.broadcastConnectorUpdate(attachment.connectorId, { includeOffline: true });
     }
   }
 
@@ -505,48 +583,201 @@ export class WorkspaceDO implements DurableObject {
     ws: WebSocket,
     connectorId: string,
     options: { skipStaleExplicitCleanup?: boolean } = {}
-  ): Promise<void> {
+  ): Promise<string[]> {
+    if (!isReadyAgentSocket(ws, connectorId) || hasPendingHostSessionsDispatch(ws, connectorId)) {
+      return [];
+    }
+    let releasedConnectorIds: string[] = [];
     if (!options.skipStaleExplicitCleanup) {
-      const failedEvents = await failStaleExplicitAppServerCommandTargets(this.env, connectorId);
-      for (const event of failedEvents) {
-        this.broadcastToBrowsers(threadEventMessage(event));
-      }
+      releasedConnectorIds = await this.cleanupStaleExplicitAppServerCommandTargets(connectorId);
     }
     const dispatches = await pendingCommandsForConnector(this.env, connectorId);
     for (const payload of dispatches) {
       const command = payload.command;
-      ws.send(
-        JSON.stringify(
-          createEnvelope("command.dispatch", { type: "worker", id: "workspace-do-global" }, payload, {
-            workspace_id: command.workspace_id,
-            thread_id: command.thread_id,
-            command_id: command.id,
-            target: { type: "connector", id: connectorId }
-          })
-        )
-      );
+      this.recordSocketCommand(ws, connectorId, command.id);
+      try {
+        ws.send(
+          JSON.stringify(
+            createEnvelope("command.dispatch", { type: "worker", id: "workspace-do-global" }, payload, {
+              workspace_id: command.workspace_id,
+              thread_id: command.thread_id,
+              command_id: command.id,
+              target: { type: "connector", id: connectorId }
+            })
+          )
+        );
+      } catch {
+        this.clearSocketCommand(ws, connectorId, command.id);
+        const markedUnavailable = this.markSocketDispatchUnavailable(ws, connectorId);
+        await releaseLeasedCommandsForConnector(this.env, connectorId, [command.id]);
+        if (markedUnavailable && !hasReadyPeerAgentSocket(this.ctx, connectorId, ws)) {
+          await markConnectorDegraded(this.env, connectorId);
+          await this.broadcastConnectorUpdate(connectorId, { degraded: true });
+        }
+        if (markedUnavailable) {
+          await this.sendPendingCommandsToAgents(connectorId);
+        }
+      }
     }
+    return releasedConnectorIds;
+  }
+
+  private async sendPendingCommandsAndReleased(ws: WebSocket, connectorId: string): Promise<void> {
+    const releasedConnectorIds = await this.sendPendingCommands(ws, connectorId);
+    for (const releasedConnectorId of releasedConnectorIds) {
+      if (releasedConnectorId !== connectorId) {
+        await this.sendPendingCommandsToAgents(releasedConnectorId);
+      }
+    }
+  }
+
+  private async cleanupStaleExplicitAppServerCommandTargets(connectorId: string): Promise<string[]> {
+    const result = await cleanupStaleExplicitAppServerCommandTargets(this.env, connectorId);
+    for (const event of result.failed_events) {
+      this.broadcastToBrowsers(threadEventMessage(event));
+    }
+    return result.released_connector_ids;
   }
 
   private async sendPendingCommandsToAgents(connectorId?: string): Promise<WebSocket[]> {
     if (connectorId) {
-      const failedEvents = await failStaleExplicitAppServerCommandTargets(this.env, connectorId);
-      for (const event of failedEvents) {
-        this.broadcastToBrowsers(threadEventMessage(event));
-      }
       const sockets = this.ctx.getWebSockets(`agent:${connectorId}`);
+      if (sockets.some((socket) => hasPendingHostSessionsDispatch(socket, connectorId))) {
+        return [];
+      }
+      const releasedConnectorIds = await this.cleanupStaleExplicitAppServerCommandTargets(connectorId);
+      const targetConnectorIds = new Set([connectorId, ...releasedConnectorIds]);
+      const readySockets = [...targetConnectorIds].flatMap((targetConnectorId) => {
+        const targetSockets = this.ctx.getWebSockets(`agent:${targetConnectorId}`);
+        return targetSockets.some((socket) => hasPendingHostSessionsDispatch(socket, targetConnectorId))
+          ? []
+          : agentSocketsForConnector({ getWebSockets: () => targetSockets }, targetConnectorId).slice(0, 1);
+      });
+      if (readySockets.length === 0) {
+        return [];
+      }
       await Promise.all(
-        sockets.map((socket) => this.sendPendingCommands(socket, connectorId, { skipStaleExplicitCleanup: true }))
+        readySockets.map((socket) => {
+          const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
+          return attachment?.connectorId
+            ? this.sendPendingCommands(socket, attachment.connectorId, { skipStaleExplicitCleanup: true })
+            : undefined;
+        })
       );
-      return sockets;
+      return readySockets;
     }
 
     const sockets = this.ctx.getWebSockets("agent");
-    await Promise.all(sockets.map((socket) => {
+    const connectorIds = new Set<string>();
+    const pendingRefreshConnectorIds = new Set<string>();
+    for (const socket of sockets) {
       const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
-      return attachment?.connectorId ? this.sendPendingCommands(socket, attachment.connectorId) : undefined;
+      if (attachment?.connectorId) {
+        connectorIds.add(attachment.connectorId);
+        if (hasPendingHostSessionsDispatch(socket, attachment.connectorId)) {
+          pendingRefreshConnectorIds.add(attachment.connectorId);
+        }
+      }
+    }
+    for (const cleanupConnectorId of connectorIds) {
+      if (pendingRefreshConnectorIds.has(cleanupConnectorId)) {
+        continue;
+      }
+      const releasedConnectorIds = await this.cleanupStaleExplicitAppServerCommandTargets(cleanupConnectorId);
+      for (const releasedConnectorId of releasedConnectorIds) {
+        connectorIds.add(releasedConnectorId);
+      }
+    }
+    const readySockets = [...connectorIds].flatMap((connectorId) =>
+      pendingRefreshConnectorIds.has(connectorId)
+        ? []
+        : sockets
+          .filter((socket) => isDispatchReadyAgentSocket(socket, connectorId))
+          .sort((left, right) => socketConnectedAt(right) - socketConnectedAt(left))
+          .slice(0, 1)
+    );
+    await Promise.all(readySockets.map((socket) => {
+      const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
+      return attachment?.connectorId
+        ? this.sendPendingCommands(socket, attachment.connectorId, { skipStaleExplicitCleanup: true })
+        : undefined;
     }));
-    return sockets;
+    return readySockets;
+  }
+
+  private markAgentReady(ws: WebSocket, connectorId: string, pendingHostSessionsDispatch = false): void {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
+    ws.serializeAttachment({
+      ...attachment,
+      socketType: "agent",
+      connectorId,
+      agentReady: true,
+      pendingHostSessionsDispatch: attachment?.pendingHostSessionsDispatch === true || pendingHostSessionsDispatch
+    });
+  }
+
+  private consumePendingHostSessionsDispatch(ws: WebSocket, connectorId: string): boolean {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
+    if (
+      attachment?.socketType !== "agent" ||
+      attachment.connectorId !== connectorId ||
+      attachment.agentReady !== true ||
+      attachment.pendingHostSessionsDispatch !== true
+    ) {
+      return false;
+    }
+    ws.serializeAttachment({
+      ...attachment,
+      pendingHostSessionsDispatch: false
+    });
+    return true;
+  }
+
+  private recordSocketCommand(ws: WebSocket, connectorId: string, commandId: string): void {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
+    if (
+      attachment?.socketType !== "agent"
+      || attachment.connectorId !== connectorId
+      || typeof ws.serializeAttachment !== "function"
+    ) {
+      return;
+    }
+    ws.serializeAttachment({
+      ...attachment,
+      activeCommandIds: [...new Set([...(attachment.activeCommandIds ?? []), commandId])]
+    });
+  }
+
+  private clearSocketCommand(ws: WebSocket, connectorId: string, commandId: string): void {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
+    if (
+      attachment?.socketType !== "agent"
+      || attachment.connectorId !== connectorId
+      || typeof ws.serializeAttachment !== "function"
+    ) {
+      return;
+    }
+    ws.serializeAttachment({
+      ...attachment,
+      activeCommandIds: (attachment.activeCommandIds ?? []).filter((item) => item !== commandId)
+    });
+  }
+
+  private markSocketDispatchUnavailable(ws: WebSocket, connectorId: string): boolean {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
+    if (
+      attachment?.socketType !== "agent"
+      || attachment.connectorId !== connectorId
+      || typeof ws.serializeAttachment !== "function"
+    ) {
+      return false;
+    }
+    ws.serializeAttachment({
+      ...attachment,
+      agentReady: false,
+      pendingHostSessionsDispatch: false
+    });
+    return true;
   }
 }
 
@@ -555,21 +786,66 @@ export function hasPeerAgentSocket(
   connectorId: string,
   socket: WebSocket
 ): boolean {
-  return ctx.getWebSockets(`agent:${connectorId}`).some((candidate) => candidate !== socket);
+  return ctx.getWebSockets(`agent:${connectorId}`)
+    .some((candidate) => candidate !== socket && isAgentSocketForConnector(candidate, connectorId));
+}
+
+export function hasReadyPeerAgentSocket(
+  ctx: Pick<DurableObjectState, "getWebSockets">,
+  connectorId: string,
+  socket: WebSocket
+): boolean {
+  return ctx.getWebSockets(`agent:${connectorId}`)
+    .some((candidate) => candidate !== socket && isReadyAgentSocket(candidate, connectorId));
 }
 
 export function agentSocketsForConnector(
   ctx: Pick<DurableObjectState, "getWebSockets">,
   connectorId: string
 ): WebSocket[] {
-  return [...ctx.getWebSockets(`agent:${connectorId}`)].sort(
-    (left, right) => socketConnectedAt(right) - socketConnectedAt(left)
-  );
+  return [...ctx.getWebSockets(`agent:${connectorId}`)]
+    .filter((socket) => isReadyAgentSocket(socket, connectorId))
+    .sort((left, right) => socketConnectedAt(right) - socketConnectedAt(left));
 }
 
 function socketConnectedAt(socket: WebSocket): number {
   const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
   return typeof attachment?.connectedAt === "number" ? attachment.connectedAt : 0;
+}
+
+function socketActiveCommandIds(socket: WebSocket, connectorId: string): string[] {
+  const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+  if (attachment?.socketType !== "agent" || attachment.connectorId !== connectorId) {
+    return [];
+  }
+  return Array.isArray(attachment.activeCommandIds) ? attachment.activeCommandIds.filter(Boolean) : [];
+}
+
+function isReadyAgentSocket(socket: WebSocket, connectorId: string): boolean {
+  const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+  return (
+    attachment?.socketType === "agent" &&
+    attachment.connectorId === connectorId &&
+    attachment.agentReady === true
+  );
+}
+
+function isDispatchReadyAgentSocket(socket: WebSocket, connectorId: string): boolean {
+  return isReadyAgentSocket(socket, connectorId) && !hasPendingHostSessionsDispatch(socket, connectorId);
+}
+
+function isAgentSocketForConnector(socket: WebSocket, connectorId: string): boolean {
+  const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+  return attachment?.socketType === "agent" && attachment.connectorId === connectorId;
+}
+
+function hasPendingHostSessionsDispatch(socket: WebSocket, connectorId: string): boolean {
+  const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+  return (
+    attachment?.socketType === "agent" &&
+    attachment.connectorId === connectorId &&
+    attachment.pendingHostSessionsDispatch === true
+  );
 }
 
 export function threadEventMessage(event: ThreadEvent): string {
@@ -587,6 +863,12 @@ export function hostSessionsMessage(payload: HostSessionsUpdatePayload): string 
   );
 }
 
+export function connectorsMessage(payload: ConnectorsUpdatePayload): string {
+  return JSON.stringify(
+    createEnvelope("connectors.updated", { type: "worker", id: "workspace-do-global" }, payload)
+  );
+}
+
 function parseMessage(text: string): { kind?: string; payload?: unknown } | undefined {
   try {
     const value = JSON.parse(text) as unknown;
@@ -594,6 +876,15 @@ function parseMessage(text: string): { kind?: string; payload?: unknown } | unde
   } catch {
     return undefined;
   }
+}
+
+function isAgentReadyPayload(value: unknown): value is { capabilities: string[] } {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    Array.isArray(record.capabilities) &&
+    record.capabilities.every((capability) => typeof capability === "string")
+  );
 }
 
 function jsonResponse(payload: unknown, status = 200): Response {

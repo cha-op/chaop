@@ -89,12 +89,13 @@ export async function issueAgentToken(
       id, name, hostname, token_hash, status, realtime_mode, budget_state,
       logical_agent_count, active_command_count, capabilities_json, workspace_root,
       last_seen_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'online', 'summary', 'normal', 0, 0, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, 'degraded', 'summary', 'normal', 0, 0, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       hostname = excluded.hostname,
       token_hash = excluded.token_hash,
-      status = 'online',
+      status = 'degraded',
+      active_command_count = 0,
       capabilities_json = excluded.capabilities_json,
       workspace_root = excluded.workspace_root,
       last_seen_at = excluded.last_seen_at,
@@ -134,23 +135,14 @@ export async function authenticateAgentToken(request: Request, env: Env): Promis
 
   const tokenHash = await sha256Hex(token);
   const row = await env.DB.prepare(
-    "SELECT id, status FROM connectors WHERE token_hash = ? LIMIT 1"
+    "SELECT id FROM connectors WHERE token_hash = ? LIMIT 1"
   )
     .bind(tokenHash)
-    .first<{ id: string; status: string }>();
+    .first<{ id: string }>();
 
   if (!row) {
     return { ok: false, status: 401, message: "Invalid connector token" };
   }
-
-  const now = new Date().toISOString();
-  await env.DB.prepare(
-    `UPDATE connectors
-     SET status = 'online', last_seen_at = ?, updated_at = ?
-     WHERE id = ?`
-  )
-    .bind(now, now, row.id)
-    .run();
 
   return { ok: true, connectorId: row.id };
 }

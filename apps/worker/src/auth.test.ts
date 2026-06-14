@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { authenticateAgentToken, identityFromAccessPayload } from "./auth.js";
+import { authenticateAgentToken, identityFromAccessPayload, issueAgentToken } from "./auth.js";
 import type { Env } from "./types.js";
 
 test("Access email identity is normalised for browser API users", () => {
@@ -26,7 +26,7 @@ test("Access service token identity can omit email", () => {
   });
 });
 
-test("offline connector tokens can authenticate and mark the connector online", async () => {
+test("connector tokens authenticate without marking the connector dispatch-ready", async () => {
   const db = offlineConnectorTokenDb();
   const result = await authenticateAgentToken(
     new Request("https://api.example.com/ws/agent", {
@@ -41,37 +41,93 @@ test("offline connector tokens can authenticate and mark the connector online", 
   );
 
   assert.deepEqual(result, { ok: true, connectorId: "connector-offline" });
-  assert.equal(db.onlineUpdates, 1);
+  assert.equal(db.prepareCount, 1);
+});
+
+test("connector bootstrap token issuance registers connector as degraded until agent.ready", async () => {
+  const db = tokenIssueDb();
+  const token = await issueAgentToken(
+    "connector-online",
+    {
+      DB: db,
+      AGENT_BOOTSTRAP_SECRET: "test-bootstrap"
+    } as Env,
+    {
+      connectorName: "mac-studio",
+      hostname: "mac-studio.local",
+      workspaceRoot: "/workspace",
+      capabilities: ["codex_exec"]
+    }
+  );
+
+  assert.equal(token.startsWith("chaop_agent_"), true);
+  assert.equal(db.connectorWrites, 1);
 });
 
 function offlineConnectorTokenDb() {
   const counters = {
-    onlineUpdates: 0
+    prepareCount: 0
   };
   const db = {
     prepare(sql: string) {
-      if (/SELECT id, status FROM connectors WHERE token_hash = \?/.test(sql)) {
+      counters.prepareCount += 1;
+      if (/SELECT id FROM connectors WHERE token_hash = \?/.test(sql)) {
         return {
           bind(tokenHash: string) {
             assert.match(tokenHash, /^[0-9a-f]{64}$/);
             return {
               async first() {
-                return { id: "connector-offline", status: "offline" };
+                return { id: "connector-offline" };
               }
             };
           }
         };
       }
 
-      if (/UPDATE connectors/.test(sql) && /status = 'online'/.test(sql)) {
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get prepareCount() {
+      return counters.prepareCount;
+    }
+  };
+
+  return db as D1Database & typeof counters;
+}
+
+function tokenIssueDb() {
+  const counters = {
+    connectorWrites: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/INSERT INTO connectors/.test(sql)) {
+        assert.match(sql, /VALUES \(\?, \?, \?, \?, 'degraded'/);
+        assert.match(sql, /status = 'degraded'/);
+        assert.match(sql, /active_command_count = 0/);
         return {
-          bind(lastSeenAt: string, updatedAt: string, connectorId: string) {
+          bind(
+            connectorId: string,
+            connectorName: string,
+            hostname: string,
+            tokenHash: string,
+            capabilitiesJson: string,
+            workspaceRoot: string,
+            lastSeenAt: string,
+            createdAt: string,
+            updatedAt: string
+          ) {
+            assert.equal(connectorId, "connector-online");
+            assert.equal(connectorName, "mac-studio");
+            assert.equal(hostname, "mac-studio.local");
+            assert.match(tokenHash, /^[0-9a-f]{64}$/);
+            assert.deepEqual(JSON.parse(capabilitiesJson), ["codex_exec"]);
+            assert.equal(workspaceRoot, "/workspace");
             assert.match(lastSeenAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
-            assert.equal(connectorId, "connector-offline");
             return {
               async run() {
-                counters.onlineUpdates += 1;
+                counters.connectorWrites += 1;
                 return { success: true };
               }
             };
@@ -81,8 +137,8 @@ function offlineConnectorTokenDb() {
 
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
-    get onlineUpdates() {
-      return counters.onlineUpdates;
+    get connectorWrites() {
+      return counters.connectorWrites;
     }
   };
 

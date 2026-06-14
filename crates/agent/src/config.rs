@@ -56,6 +56,22 @@ pub struct SessionInventoryConfig {
     pub app_server_url: Option<String>,
     #[serde(default = "default_app_server_timeout_seconds")]
     pub app_server_timeout_seconds: u64,
+    #[serde(default)]
+    pub managed_app_server: ManagedAppServerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedAppServerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub listen_url: Option<String>,
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    #[serde(default = "default_managed_app_server_startup_timeout_seconds")]
+    pub startup_timeout_seconds: u64,
+    #[serde(default = "default_managed_app_server_restart_backoff_seconds")]
+    pub restart_backoff_seconds: u64,
 }
 
 impl Default for ExecutionConfig {
@@ -82,6 +98,19 @@ impl Default for SessionInventoryConfig {
             report_interval_seconds: default_session_inventory_report_interval_seconds(),
             app_server_url: None,
             app_server_timeout_seconds: default_app_server_timeout_seconds(),
+            managed_app_server: ManagedAppServerConfig::default(),
+        }
+    }
+}
+
+impl Default for ManagedAppServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_url: None,
+            extra_args: Vec::new(),
+            startup_timeout_seconds: default_managed_app_server_startup_timeout_seconds(),
+            restart_backoff_seconds: default_managed_app_server_restart_backoff_seconds(),
         }
     }
 }
@@ -114,7 +143,7 @@ impl AgentConfig {
         toml::from_str(&content).map_err(ConfigError::Parse)
     }
 
-    pub fn bootstrap_request(&self, hostname: &str) -> BootstrapRequest {
+    pub fn capabilities(&self) -> Vec<String> {
         let mut capabilities = vec![
             "placeholder_commands".to_owned(),
             "event_stream_summary".to_owned(),
@@ -136,12 +165,15 @@ impl AgentConfig {
             capabilities.push("app_server_threads".to_owned());
             capabilities.push("app_server_archive".to_owned());
         }
+        capabilities
+    }
 
+    pub fn bootstrap_request(&self, hostname: &str) -> BootstrapRequest {
         BootstrapRequest {
             connector_name: self.connector_name.clone(),
             hostname: hostname.to_owned(),
             workspace_root: self.workspace_root.to_string_lossy().into_owned(),
-            capabilities,
+            capabilities: self.capabilities(),
         }
     }
 
@@ -181,6 +213,14 @@ fn default_session_inventory_report_interval_seconds() -> u64 {
 
 fn default_app_server_timeout_seconds() -> u64 {
     2
+}
+
+fn default_managed_app_server_startup_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_managed_app_server_restart_backoff_seconds() -> u64 {
+    5
 }
 
 #[derive(Debug)]
@@ -233,6 +273,68 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
             "/Users/you/.chaop/bootstrap.secret"
         );
         assert_eq!(config.execution.mode, super::ExecutionMode::Placeholder);
+    }
+
+    #[test]
+    fn loads_managed_app_server_config() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("agent.toml");
+        fs::write(
+            &config_path,
+            r#"
+connector_name = "mac-studio"
+control_url = "wss://api.example.com/ws/agent"
+bootstrap_url = "https://api.example.com/connector/bootstrap"
+workspace_root = "/Users/you/Program"
+token_file = "/Users/you/.chaop/connector.token"
+spool_db = "/Users/you/.chaop/connector-spool.sqlite"
+
+[bootstrap]
+secret_file = "/Users/you/.chaop/bootstrap.secret"
+
+[execution]
+mode = "app_server"
+
+[session_inventory.managed_app_server]
+enabled = true
+listen_url = "ws://127.0.0.1:6174"
+extra_args = ["--ws-project-doc-max-bytes", "131072"]
+startup_timeout_seconds = 3
+restart_backoff_seconds = 2
+"#,
+        )
+        .expect("write config");
+
+        let config = AgentConfig::load(config_path).expect("load config");
+
+        assert_eq!(config.execution.mode, super::ExecutionMode::AppServer);
+        assert!(config.session_inventory.managed_app_server.enabled);
+        assert_eq!(
+            config
+                .session_inventory
+                .managed_app_server
+                .listen_url
+                .as_deref(),
+            Some("ws://127.0.0.1:6174")
+        );
+        assert_eq!(
+            config
+                .session_inventory
+                .managed_app_server
+                .startup_timeout_seconds,
+            3
+        );
+        assert_eq!(
+            config
+                .session_inventory
+                .managed_app_server
+                .restart_backoff_seconds,
+            2
+        );
+        assert_eq!(
+            config.session_inventory.managed_app_server.extra_args,
+            vec!["--ws-project-doc-max-bytes", "131072"]
+        );
     }
 
     #[test]

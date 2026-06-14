@@ -884,6 +884,15 @@ fn load_app_server_sessions(
     })
 }
 
+pub fn app_server_health_check(
+    url: &str,
+    timeout_seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+    let mut socket = connect_app_server(url, timeout)?;
+    initialize_app_server_connection(&mut socket)
+}
+
 fn read_app_server_inventory_page(
     socket: &mut AppServerSocket,
     request_id: i64,

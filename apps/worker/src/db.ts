@@ -578,7 +578,7 @@ async function releaseCommandsForDetachedAppServerHostSession(
          )
            AND hs.app_server_present = 1
            AND wc.can_execute = 1
-           AND c.status <> 'offline'
+           AND c.status = 'online'
            AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
            AND (
              commands.target_connector_id_source = 'attached'
@@ -633,7 +633,7 @@ async function executableAppServerConnectorIdsForWorkspace(
          ON wc.connector_id = c.id
        WHERE wc.workspace_id = ?
          AND wc.can_execute = 1
-         AND c.status <> 'offline'
+         AND c.status = 'online'
          AND c.capabilities_json LIKE '%"codex_app_server_exec"%'`
     ).bind(workspaceId)
   );
@@ -720,7 +720,7 @@ async function failCommandsForDetachedAppServerHostSession(
            )
              AND hs.app_server_present = 1
              AND wc.can_execute = 1
-             AND c.status <> 'offline'
+             AND c.status = 'online'
              AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
              AND (cmd.target_connector_id IS NULL OR hs.connector_id = cmd.target_connector_id)
          )
@@ -810,7 +810,7 @@ async function failCommandsForDetachedAppServerHostSession(
            )
              AND hs.app_server_present = 1
              AND wc.can_execute = 1
-             AND c.status <> 'offline'
+             AND c.status = 'online'
              AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
              AND (commands.target_connector_id IS NULL OR hs.connector_id = commands.target_connector_id)
          )`
@@ -1131,6 +1131,67 @@ export async function ensureConnectorInventory(
     .run();
 }
 
+export async function updateConnectorCapabilities(
+  env: Env,
+  connectorId: string,
+  capabilities: string[]
+): Promise<boolean> {
+  if (!env.DB) return false;
+
+  const now = new Date().toISOString();
+  const capabilitiesJson = JSON.stringify([...new Set(capabilities)]);
+  const result = await env.DB.prepare(
+    `UPDATE connectors
+     SET status = 'online',
+         capabilities_json = ?,
+         last_seen_at = ?,
+         updated_at = ?
+     WHERE id = ?
+       AND (
+         status <> 'online'
+         OR capabilities_json IS NULL
+         OR capabilities_json <> ?
+       )`
+  )
+    .bind(capabilitiesJson, now, now, connectorId, capabilitiesJson)
+    .run();
+  return (result.meta?.changes ?? 0) > 0;
+}
+
+export async function markConnectorOnline(env: Env, connectorId: string): Promise<boolean> {
+  if (!env.DB) return false;
+
+  const now = new Date().toISOString();
+  const result = await env.DB.prepare(
+    `UPDATE connectors
+     SET status = 'online',
+         last_seen_at = ?,
+         updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(now, now, connectorId)
+    .run();
+  return (result.meta?.changes ?? 0) > 0;
+}
+
+export async function markConnectorDegraded(
+  env: Env,
+  connectorId: string,
+  now = new Date().toISOString()
+): Promise<void> {
+  if (!env.DB) return;
+
+  await env.DB.prepare(
+    `UPDATE connectors
+     SET status = 'degraded',
+         active_command_count = 0,
+         updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(now, connectorId)
+    .run();
+}
+
 export async function createCommandInDb(
   env: Env,
   user: BrowserIdentity,
@@ -1413,7 +1474,7 @@ export async function pendingCommandsForConnector(
            WHERE wc.workspace_id = cmd.workspace_id
              AND wc.connector_id = ?
              AND wc.can_execute = 1
-             AND c.status <> 'offline'
+             AND c.status = 'online'
              AND (
                cmd.type <> 'codex'
                OR (
@@ -1557,7 +1618,7 @@ export async function pendingCommandsForConnector(
            WHERE wc.workspace_id = commands.workspace_id
              AND wc.connector_id = ?
              AND wc.can_execute = 1
-             AND c.status <> 'offline'
+             AND c.status = 'online'
              AND (hs_guard.id IS NULL OR hs_guard.connector_id = ?)
              AND (
                commands.type <> 'codex'
@@ -1622,25 +1683,106 @@ export async function pendingCommandsForConnector(
   });
 }
 
+export async function releaseLeasedCommandsForConnector(
+  env: Env,
+  connectorId: string,
+  commandIds: string[]
+): Promise<number> {
+  if (!env.DB) return 0;
+
+  const scopedCommandIds = [...new Set(commandIds)].filter(Boolean);
+  if (scopedCommandIds.length === 0) return 0;
+
+  const now = new Date().toISOString();
+  let released = 0;
+  for (const commandId of scopedCommandIds) {
+    const result = await env.DB.prepare(
+      `UPDATE commands
+       SET state = 'pending', lease_owner_connector_id = NULL, lease_until = NULL, updated_at = ?
+       WHERE id = ? AND lease_owner_connector_id = ? AND state = 'leased'`
+    )
+      .bind(now, commandId, connectorId)
+      .run();
+    released += (result.meta as { changes?: number } | undefined)?.changes ?? 0;
+  }
+
+  if (released > 0) {
+    await updateConnectorActivity(env, connectorId);
+  }
+  return released;
+}
+
 export async function failStaleExplicitAppServerCommandTargets(
   env: Env,
   connectorId: string,
   now = new Date().toISOString()
 ): Promise<ThreadEvent[]> {
-  if (!env.DB) return [];
+  return (await cleanupStaleExplicitAppServerCommandTargets(env, connectorId, now)).failed_events;
+}
+
+export async function cleanupStaleExplicitAppServerCommandTargets(
+  env: Env,
+  connectorId: string,
+  now = new Date().toISOString()
+): Promise<{ failed_events: ThreadEvent[]; released_connector_ids: string[] }> {
+  if (!env.DB) return { failed_events: [], released_connector_ids: [] };
 
   const commands = await allRows<CommandRow & {
+    target_connector_id_source: CommandTargetConnectorIdSource | null;
     lease_owner_connector_id: string | null;
     lease_target_host_session_id: string | null;
   }>(
     env.DB.prepare(
       `SELECT id, workspace_id, thread_id, task_id, type, prompt, state,
-              target_connector_id, lease_owner_connector_id, created_at, updated_at,
+              target_connector_id, target_connector_id_source, lease_owner_connector_id, created_at, updated_at,
               lease_target_host_session_id
        FROM commands cmd
        WHERE cmd.type = 'codex'
-         AND cmd.target_connector_id = ?
-         AND cmd.target_connector_id_source = 'explicit'
+         AND (
+           cmd.target_connector_id = ?
+           OR (
+             cmd.target_connector_id IS NULL
+             AND cmd.target_connector_id_source = 'auto'
+             AND EXISTS (
+               SELECT 1
+               FROM host_sessions hs_scope
+               WHERE hs_scope.workspace_id = cmd.workspace_id
+                 AND hs_scope.connector_id = ?
+                 AND (
+                   hs_scope.session_id = cmd.lease_target_host_session_id
+                   OR hs_scope.id = COALESCE(
+                     (
+                       SELECT hs_task.id
+                       FROM host_sessions hs_task
+                       WHERE hs_task.workspace_id = cmd.workspace_id
+                         AND cmd.task_id IS NOT NULL
+                         AND hs_task.attached_task_id = cmd.task_id
+                       ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+                       LIMIT 1
+                     ),
+                     (
+                       SELECT hs_thread.id
+                       FROM host_sessions hs_thread
+                       WHERE hs_thread.workspace_id = cmd.workspace_id
+                         AND cmd.thread_id IS NOT NULL
+                         AND hs_thread.attached_thread_id = cmd.thread_id
+                         AND (
+                           cmd.task_id IS NULL
+                           OR NOT EXISTS (
+                             SELECT 1
+                             FROM host_sessions hst
+                             WHERE hst.workspace_id = cmd.workspace_id
+                               AND hst.attached_task_id = cmd.task_id
+                           )
+                         )
+                       ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+                       LIMIT 1
+                     )
+                   )
+                 )
+             )
+           )
+         )
          AND cmd.lease_target_host_session_id IS NOT NULL
          AND (
            cmd.state = 'pending'
@@ -1691,16 +1833,25 @@ export async function failStaleExplicitAppServerCommandTargets(
              AND hs.session_id = cmd.lease_target_host_session_id
              AND COALESCE(hs.app_server_present, 0) = 1
              AND wc.can_execute = 1
-             AND c.status <> 'offline'
+             AND c.status = 'online'
              AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
          )
        ORDER BY cmd.created_at ASC
        LIMIT 20`
-    ).bind(connectorId, connectorId, now, connectorId)
+    ).bind(connectorId, connectorId, connectorId, now, connectorId)
   );
 
   const failedEvents: ThreadEvent[] = [];
+  const releasedConnectorIds = new Set<string>();
   for (const command of commands) {
+    const releaseConnectorIds = await releaseStaleAttachedAppServerCommandTarget(env, connectorId, command, now);
+    if (releaseConnectorIds.length > 0) {
+      for (const releasedConnectorId of releaseConnectorIds) {
+        releasedConnectorIds.add(releasedConnectorId);
+      }
+      continue;
+    }
+
     const result = await env.DB.prepare(
       `UPDATE commands
        SET state = 'failed',
@@ -1709,8 +1860,13 @@ export async function failStaleExplicitAppServerCommandTargets(
            updated_at = ?
        WHERE id = ?
          AND type = 'codex'
-         AND target_connector_id = ?
-         AND target_connector_id_source = 'explicit'
+         AND (
+           target_connector_id = ?
+           OR (
+             target_connector_id IS NULL
+             AND target_connector_id_source = 'auto'
+           )
+         )
          AND lease_target_host_session_id IS NOT NULL
          AND (
            state = 'pending'
@@ -1761,7 +1917,7 @@ export async function failStaleExplicitAppServerCommandTargets(
              AND hs.session_id = commands.lease_target_host_session_id
              AND COALESCE(hs.app_server_present, 0) = 1
              AND wc.can_execute = 1
-             AND c.status <> 'offline'
+             AND c.status = 'online'
              AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
          )`
     )
@@ -1792,7 +1948,7 @@ export async function failStaleExplicitAppServerCommandTargets(
         command_id: command.id,
         kind: "command.failed",
         priority: "P1",
-        summary: "Explicit app-server target changed before the command could start."
+        summary: unavailableAppServerCommandSummary(command.target_connector_id_source)
       });
       if (event) {
         failedEvents.push(event);
@@ -1800,7 +1956,162 @@ export async function failStaleExplicitAppServerCommandTargets(
     }
   }
 
-  return failedEvents;
+  return {
+    failed_events: failedEvents,
+    released_connector_ids: [...releasedConnectorIds]
+  };
+}
+
+function unavailableAppServerCommandSummary(source: CommandTargetConnectorIdSource | null): string {
+  return source === "explicit"
+    ? "Explicit app-server target changed before the command could start."
+    : "App-server target became unavailable before the command could start.";
+}
+
+async function releaseStaleAttachedAppServerCommandTarget(
+  env: Env,
+  connectorId: string,
+  command: {
+    id: string;
+    workspace_id: string;
+    state: CommandSummary["state"];
+    target_connector_id_source: CommandTargetConnectorIdSource | null;
+    lease_owner_connector_id: string | null;
+    lease_target_host_session_id: string | null;
+  },
+  now: string
+): Promise<string[]> {
+  if (
+    !["attached", "auto"].includes(command.target_connector_id_source ?? "") ||
+    !command.lease_target_host_session_id
+  ) {
+    return [];
+  }
+
+  const result = await env.DB!.prepare(
+    `UPDATE commands
+     SET state = 'pending',
+         target_connector_id = NULL,
+         target_connector_id_source = 'auto',
+         lease_owner_connector_id = NULL,
+         lease_until = NULL,
+         lease_target_host_session_id = (
+           SELECT hs.session_id
+           FROM host_sessions hs
+           WHERE hs.id = COALESCE(
+             (
+               SELECT hs_task.id
+               FROM host_sessions hs_task
+               WHERE hs_task.workspace_id = commands.workspace_id
+                 AND commands.task_id IS NOT NULL
+                 AND hs_task.attached_task_id = commands.task_id
+               ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+               LIMIT 1
+             ),
+             (
+               SELECT hs_thread.id
+               FROM host_sessions hs_thread
+               WHERE hs_thread.workspace_id = commands.workspace_id
+                 AND commands.thread_id IS NOT NULL
+                 AND hs_thread.attached_thread_id = commands.thread_id
+                 AND (
+                   commands.task_id IS NULL
+                   OR NOT EXISTS (
+                     SELECT 1
+                     FROM host_sessions hst
+                     WHERE hst.workspace_id = commands.workspace_id
+                       AND hst.attached_task_id = commands.task_id
+                   )
+                 )
+               ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+               LIMIT 1
+             )
+           )
+         ),
+         updated_at = ?
+     WHERE id = ?
+       AND type = 'codex'
+       AND (
+         target_connector_id = ?
+         OR (
+           target_connector_id IS NULL
+           AND target_connector_id_source = 'auto'
+         )
+       )
+       AND target_connector_id_source IN ('attached', 'auto')
+       AND lease_target_host_session_id IS NOT NULL
+       AND lease_target_host_session_id = ?
+       AND (
+         state = 'pending'
+         OR (
+           state = 'leased'
+           AND lease_owner_connector_id = ?
+           AND lease_until IS NOT NULL
+           AND lease_until < ?
+         )
+       )
+       AND EXISTS (
+         SELECT 1
+         FROM host_sessions hs
+         INNER JOIN connectors c ON c.id = hs.connector_id
+         INNER JOIN workspace_connectors wc
+           ON wc.workspace_id = commands.workspace_id
+          AND wc.connector_id = hs.connector_id
+         WHERE hs.id = COALESCE(
+           (
+             SELECT hs_task.id
+             FROM host_sessions hs_task
+             WHERE hs_task.workspace_id = commands.workspace_id
+               AND commands.task_id IS NOT NULL
+               AND hs_task.attached_task_id = commands.task_id
+             ORDER BY hs_task.updated_at DESC, hs_task.id DESC
+             LIMIT 1
+           ),
+           (
+             SELECT hs_thread.id
+             FROM host_sessions hs_thread
+             WHERE hs_thread.workspace_id = commands.workspace_id
+               AND commands.thread_id IS NOT NULL
+               AND hs_thread.attached_thread_id = commands.thread_id
+               AND (
+                 commands.task_id IS NULL
+                 OR NOT EXISTS (
+                   SELECT 1
+                   FROM host_sessions hst
+                   WHERE hst.workspace_id = commands.workspace_id
+                     AND hst.attached_task_id = commands.task_id
+                 )
+               )
+             ORDER BY hs_thread.updated_at DESC, hs_thread.id DESC
+             LIMIT 1
+           )
+         )
+           AND (hs.connector_id <> ? OR hs.session_id <> ?)
+           AND COALESCE(hs.app_server_present, 0) = 1
+           AND wc.can_execute = 1
+           AND c.status = 'online'
+           AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
+       )`
+  )
+    .bind(
+      now,
+      command.id,
+      connectorId,
+      command.lease_target_host_session_id,
+      connectorId,
+      now,
+      connectorId,
+      command.lease_target_host_session_id
+    )
+    .run();
+
+  const released = Boolean((result.meta as { changes?: number } | undefined)?.changes);
+  if (released && command.state === "leased" && command.lease_owner_connector_id) {
+    await updateConnectorActivity(env, command.lease_owner_connector_id);
+  }
+  return released
+    ? executableAppServerConnectorIdsForWorkspace(env, command.workspace_id)
+    : [];
 }
 
 export async function recordAgentEvent(
@@ -2014,7 +2325,7 @@ async function releaseRejectedAppServerStartLease(
            AND (hs.connector_id <> ? OR hs.session_id <> ?)
            AND hs.app_server_present = 1
            AND wc.can_execute = 1
-           AND c.status <> 'offline'
+           AND c.status = 'online'
            AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
            AND (? OR commands.target_connector_id IS NULL OR hs.connector_id = commands.target_connector_id)
        )`
@@ -2100,19 +2411,35 @@ async function failRejectedExplicitAppServerStartLease(
   });
 }
 
-export async function markConnectorDisconnected(env: Env, connectorId: string): Promise<ThreadEvent[]> {
+export async function failActiveCommandsForConnector(
+  env: Env,
+  connectorId: string,
+  options: { commandIds?: string[]; refreshConnectorActivity?: boolean; now?: string } = {}
+): Promise<ThreadEvent[]> {
   if (!env.DB) return [];
 
-  const now = new Date().toISOString();
-  const activeCommands = await allRows<CommandRow>(
-    env.DB.prepare(
-      `SELECT id, workspace_id, thread_id, task_id, type, prompt, state, target_connector_id, created_at, updated_at
-       FROM commands
-       WHERE lease_owner_connector_id = ? AND state IN ('leased', 'running')
-       ORDER BY updated_at ASC`
-    )
-      .bind(connectorId)
-  );
+  const now = options.now ?? new Date().toISOString();
+  const scopedCommandIds = options.commandIds ? [...new Set(options.commandIds)].filter(Boolean) : undefined;
+  const activeCommands = scopedCommandIds
+    ? (await Promise.all(scopedCommandIds.map((commandId) =>
+      env.DB!.prepare(
+        `SELECT id, workspace_id, thread_id, task_id, type, prompt, state, target_connector_id, created_at, updated_at
+         FROM commands
+         WHERE id = ? AND lease_owner_connector_id = ? AND state IN ('leased', 'running')
+         LIMIT 1`
+      )
+        .bind(commandId, connectorId)
+        .first<CommandRow>()
+    ))).filter((row): row is CommandRow => Boolean(row))
+    : await allRows<CommandRow>(
+      env.DB.prepare(
+        `SELECT id, workspace_id, thread_id, task_id, type, prompt, state, target_connector_id, created_at, updated_at
+         FROM commands
+         WHERE lease_owner_connector_id = ? AND state IN ('leased', 'running')
+         ORDER BY updated_at ASC`
+      )
+        .bind(connectorId)
+    );
 
   const events: ThreadEvent[] = [];
   for (const command of activeCommands) {
@@ -2152,6 +2479,16 @@ export async function markConnectorDisconnected(env: Env, connectorId: string): 
     }
   }
 
+  if (options.refreshConnectorActivity !== false) {
+    await updateConnectorActivity(env, connectorId);
+  }
+
+  return events;
+}
+
+export async function markConnectorOffline(env: Env, connectorId: string, now = new Date().toISOString()): Promise<void> {
+  if (!env.DB) return;
+
   await env.DB.prepare(
     `UPDATE connectors
      SET status = 'offline', active_command_count = 0, updated_at = ?
@@ -2159,7 +2496,17 @@ export async function markConnectorDisconnected(env: Env, connectorId: string): 
   )
     .bind(now, connectorId)
     .run();
+}
 
+export async function markConnectorDisconnected(env: Env, connectorId: string): Promise<ThreadEvent[]> {
+  if (!env.DB) return [];
+
+  const now = new Date().toISOString();
+  const events = await failActiveCommandsForConnector(env, connectorId, {
+    now,
+    refreshConnectorActivity: false
+  });
+  await markConnectorOffline(env, connectorId, now);
   return events;
 }
 
@@ -2369,13 +2716,36 @@ async function listConnectors(env: Env): Promise<ConnectorSummary[]> {
   const rows = await allRows<ConnectorRow>(
     env.DB!.prepare(
       `SELECT id, name, hostname, status, realtime_mode, budget_state,
-        logical_agent_count, active_command_count, capabilities_json, last_seen_at
+        logical_agent_count, active_command_count, capabilities_json, last_seen_at, updated_at
        FROM connectors
        WHERE status <> 'offline'
        ORDER BY CASE status WHEN 'online' THEN 0 WHEN 'degraded' THEN 1 ELSE 2 END, updated_at DESC`
     )
   );
-  return rows.map((row) => ({
+  return rows.map(connectorSummaryFromRow);
+}
+
+export async function getConnectorSummary(
+  env: Env,
+  connectorId: string,
+  options: { includeOffline?: boolean } = {}
+): Promise<ConnectorSummary | undefined> {
+  if (!env.DB) return undefined;
+
+  const row = await env.DB.prepare(
+    `SELECT id, name, hostname, status, realtime_mode, budget_state,
+        logical_agent_count, active_command_count, capabilities_json, last_seen_at, updated_at
+     FROM connectors
+     WHERE id = ?
+       AND (? = 1 OR status <> 'offline')`
+  )
+    .bind(connectorId, options.includeOffline ? 1 : 0)
+    .first<ConnectorRow>();
+  return row ? connectorSummaryFromRow(row) : undefined;
+}
+
+function connectorSummaryFromRow(row: ConnectorRow): ConnectorSummary {
+  return {
     id: row.id,
     name: row.name,
     hostname: row.hostname,
@@ -2385,8 +2755,9 @@ async function listConnectors(env: Env): Promise<ConnectorSummary[]> {
     active_command_count: row.active_command_count,
     realtime_mode: row.realtime_mode,
     budget_state: row.budget_state,
-    last_seen_at: row.last_seen_at ?? undefined
-  }));
+    last_seen_at: row.last_seen_at ?? undefined,
+    updated_at: row.updated_at ?? undefined
+  };
 }
 
 function parseCapabilities(value: string | null): string[] {
@@ -2594,7 +2965,7 @@ async function chooseConnectorForWorkspace(
     `SELECT c.id
      FROM connectors c
      INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
-     WHERE wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+     WHERE wc.workspace_id = ? AND wc.can_execute = 1 AND c.status = 'online'
        AND (? <> 'codex' OR c.capabilities_json LIKE '%"codex_exec"%')
      ORDER BY c.last_seen_at DESC, c.updated_at DESC
      LIMIT 1`
@@ -2657,7 +3028,7 @@ async function findBestLocalThreadConnector(
     `SELECT c.id
      FROM connectors c
      INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
-     WHERE wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+     WHERE wc.workspace_id = ? AND wc.can_execute = 1 AND c.status = 'online'
        AND c.capabilities_json LIKE '%"app_server_threads"%'
      ORDER BY c.last_seen_at DESC, c.updated_at DESC
      LIMIT 1`
@@ -2676,7 +3047,7 @@ async function findLocalThreadConnector(
     `SELECT c.id
      FROM connectors c
      INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
-     WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+     WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status = 'online'
        AND c.capabilities_json LIKE '%"app_server_threads"%'
      LIMIT 1`
   )
@@ -2756,7 +3127,7 @@ async function assertConnectorCanExecute(
     `SELECT c.id
      FROM connectors c
      INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
-     WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status <> 'offline'
+     WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status = 'online'
        AND (
          ? <> 'codex'
          OR (
@@ -3092,6 +3463,7 @@ type ConnectorRow = {
   realtime_mode: ConnectorSummary["realtime_mode"];
   budget_state: ConnectorSummary["budget_state"];
   last_seen_at: string | null;
+  updated_at: string | null;
 };
 
 type WorkspaceRow = {

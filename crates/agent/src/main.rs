@@ -1,3 +1,4 @@
+use chaop_agent::app_server_manager::AppServerManager;
 use chaop_agent::config::AgentConfig;
 use chaop_agent::connector::{RunMode, run_connector};
 use chaop_agent::placeholder::placeholder_event_stream;
@@ -29,7 +30,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let hostname = arg_value(&args, "--hostname").unwrap_or("localhost");
-    let request = config.bootstrap_request(hostname);
+    let mut app_server = AppServerManager::new(&config);
+    let runtime_config = app_server.runtime_config_without_start(&config);
+    let request = runtime_config.bootstrap_request(hostname);
     println!("{}", serde_json::to_string_pretty(&request)?);
     Ok(())
 }

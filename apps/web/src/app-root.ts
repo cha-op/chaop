@@ -6,6 +6,7 @@ import {
   type BootstrapPayload,
   type CommandSummary,
   type ConnectorSummary,
+  type ConnectorsUpdatePayload,
   type CreateLocalThreadResponse,
   type HostSessionsUpdatePayload,
   type HostSessionSummary,
@@ -41,6 +42,7 @@ import {
   MANAGED_APP_SERVER_UNAVAILABLE,
   managedAppServerCommandAvailable,
   mergeBootstrapPayload,
+  mergeConnectorSummaries,
   normaliseCommandMode,
   type CommandExecutionMode
 } from "./state.js";
@@ -51,6 +53,7 @@ type RealtimeState = "connecting" | "live" | "polling";
 type RealtimeThreadEventPayload = {
   event: ThreadEvent;
 };
+type RealtimeConnectorsPayload = ConnectorsUpdatePayload;
 type RealtimeHostSessionsPayload = HostSessionsUpdatePayload;
 
 const FALLBACK_POLL_MS = 10_000;
@@ -1030,6 +1033,9 @@ export class ChaopApp extends LitElement {
     if (envelope.kind === "host_sessions.updated" && isRealtimeHostSessionsPayload(envelope.payload)) {
       this.applyHostSessions(envelope.payload);
     }
+    if (envelope.kind === "connectors.updated" && isRealtimeConnectorsPayload(envelope.payload)) {
+      this.applyConnectors(envelope.payload);
+    }
   }
 
   private scheduleRealtimeReconnect(): void {
@@ -1084,6 +1090,20 @@ export class ChaopApp extends LitElement {
       ]
     };
     this.ensureCommandMode();
+  }
+
+  private applyConnectors(payload: ConnectorsUpdatePayload): void {
+    if (!this.data) return;
+    const knownIds = new Set(this.data.connectors.map((connector) => connector.id));
+    const hasUnknownConnector = payload.connectors.some((connector) => !knownIds.has(connector.id));
+    this.data = {
+      ...this.data,
+      connectors: mergeConnectorSummaries(this.data.connectors, payload.connectors)
+    };
+    this.ensureCommandMode();
+    if (hasUnknownConnector) {
+      void this.load();
+    }
   }
 
   private upsertCommand(command: CommandSummary): void {
@@ -1301,6 +1321,25 @@ function isRealtimeHostSessionsPayload(value: unknown): value is RealtimeHostSes
     (syncedAt === undefined || typeof syncedAt === "string") &&
     (connectorId === undefined || typeof connectorId === "string") &&
     (snapshot === undefined || typeof snapshot === "boolean")
+  );
+}
+
+function isRealtimeConnectorsPayload(value: unknown): value is RealtimeConnectorsPayload {
+  if (typeof value !== "object" || value === null) return false;
+  const connectors = (value as { connectors?: unknown }).connectors;
+  const syncedAt = (value as { synced_at?: unknown }).synced_at;
+  return (
+    Array.isArray(connectors) &&
+    connectors.every((connector) => {
+      if (typeof connector !== "object" || connector === null) return false;
+      const record = connector as Record<string, unknown>;
+      return (
+        typeof record.id === "string" &&
+        Array.isArray(record.capabilities) &&
+        record.capabilities.every((item) => typeof item === "string")
+      );
+    }) &&
+    (syncedAt === undefined || typeof syncedAt === "string")
   );
 }
 

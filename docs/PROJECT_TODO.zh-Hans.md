@@ -16,7 +16,7 @@
 - [done] 为 attach 到本机 app-server Host Session 的 Chaop thread 加入真实 Codex app-server protocol execution。
 - [done] PR0：合并已跟踪的 Web deploy script，并通过完整测试、三重 review 和 GitHub conversations resolved 检查。
 - [done] PR1：清理 execution UX 和 capability 文案，让 `codex_exec` 只作为 private fallback。
-- [todo] PR2：增加 connector-managed single app-server lifecycle。
+- [done] PR2：增加 connector-managed single app-server lifecycle。
 - [todo] PR3：增加 cost-safe AppServerInstance state model，覆盖 dedupe、debounce、batching 和 rate limits。
 - [todo] PR4：在 Operations 和 Host Sessions 相关界面加入 AppServerInstance state UI。
 - [todo] PR5：让 managed app-server execution 成为默认 command path。
