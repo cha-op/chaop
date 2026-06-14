@@ -39,6 +39,7 @@ import {
   commandExecutionModeForRequest,
   commandModeLabel,
   commandTypeForMode,
+  defaultCommandMode,
   historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
@@ -88,6 +89,8 @@ export class ChaopApp extends LitElement {
 
   @state()
   private commandMode: CommandExecutionMode = "placeholder";
+
+  private commandModeExplicit = false;
 
   @state()
   private commandState: "idle" | "submitting" | "accepted" | "failed" = "idle";
@@ -223,7 +226,11 @@ export class ChaopApp extends LitElement {
 
   private readonly onHashChange = (): void => {
     this.view = viewFromHash();
-    this.selectedThreadId = threadIdFromHash();
+    const nextThreadId = threadIdFromHash();
+    if (nextThreadId !== this.selectedThreadId) {
+      this.commandModeExplicit = false;
+    }
+    this.selectedThreadId = nextThreadId;
     this.ensureSelectedThread();
     void this.loadSelectedThreadEvents().catch((error) => {
       this.actionError = actionErrorMessage("Thread events refresh failed", error);
@@ -926,6 +933,7 @@ export class ChaopApp extends LitElement {
 
   private openThread(threadId: string): void {
     this.selectedThreadId = threadId;
+    this.commandModeExplicit = false;
     this.ensureCommandMode();
     window.location.hash = `thread-centre?thread=${encodeURIComponent(threadId)}`;
     void this.loadSelectedThreadEvents().catch((error) => {
@@ -1026,6 +1034,7 @@ export class ChaopApp extends LitElement {
         ?disabled=${this.commandState === "submitting"}
         @click=${() => {
           this.commandMode = mode;
+          this.commandModeExplicit = true;
         }}
       >
         ${commandModeLabel(mode)}
@@ -1035,11 +1044,17 @@ export class ChaopApp extends LitElement {
 
   private ensureCommandMode(): void {
     const thread = this.selectedThread();
+    if (!this.commandModeExplicit && this.commandMode === "placeholder") {
+      this.commandMode = defaultCommandMode(this.data, thread?.id);
+      return;
+    }
     const nextMode = normaliseCommandMode(this.commandMode, this.data, thread?.id, {
-      showCliFallback: SHOW_CODEX_CLI_FALLBACK
+      showCliFallback: SHOW_CODEX_CLI_FALLBACK,
+      preferManagedAppServer: !this.commandModeExplicit
     });
     if (nextMode !== this.commandMode) {
       this.commandMode = nextMode;
+      this.commandModeExplicit = false;
     }
   }
 

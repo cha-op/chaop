@@ -10,6 +10,7 @@
 - Tasks now have one required primary thread, and local Codex sessions can be attached as task/thread pairs from Host Sessions.
 - The Rust connector defaults to placeholder execution and can opt in to local Codex CLI execution with private `execution.mode = "codex_exec"` configuration, or attached-thread Codex app-server execution with private `execution.mode = "app_server"` plus `session_inventory.app_server_url`.
 - Thread Command Centre now separates display execution modes from protocol command types: managed app-server execution is shown as the product path, while the Codex CLI fallback is hidden unless the Web build explicitly enables it.
+- Thread Command Centre now defaults implicit command submissions to managed app-server execution when the selected thread has an attached app-server Host Session; the Worker also infers `execution_mode = "app_server"` for that target and rejects bare `codex` requests that would otherwise fall through to `codex_exec`.
 - The Rust connector reports lightweight local Codex session inventory, can optionally use app-server `Thread.name` values for title enrichment, and can create new local app-server threads when `session_inventory.app_server_url` is configured.
 - The Rust connector can now manage one dedicated local Codex app-server listener, health-check it before advertising app-server capabilities, and refresh connector capabilities through `agent.ready`.
 - Operations Map and Host Sessions now surface AppServerInstance state, including connector identity, endpoint type, active turns, changed/seen age, and unhealthy lifecycle states.
@@ -28,6 +29,7 @@
 - Execution UX cleanup source: `docs/project_journal/2026/06/2026-06-14-execution-ux-capabilities-2b7d4e.md`
 - Connector-managed app-server source: `docs/project_journal/2026/06/2026-06-14-connector-managed-app-server-7a8e1f.md`
 - AppServerInstance UI source: `docs/project_journal/2026/06/2026-06-14-app-server-instance-ui-4b6d91.md`
+- Default app-server command path source: `docs/project_journal/2026/06/2026-06-14-default-app-server-command-path-a5d8c0.md`
 - Cost-aware source: `docs/cost-aware.md`
 - Local journal index: optional generated `docs/project_journal/INDEX.md`; do not commit it.
 

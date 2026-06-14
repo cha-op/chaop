@@ -202,6 +202,13 @@ export function commandModeLabel(mode: CommandExecutionMode): string {
   }[mode];
 }
 
+export function defaultCommandMode(
+  data: BootstrapPayload | undefined,
+  threadId: string | undefined
+): CommandExecutionMode {
+  return managedAppServerCommandAvailable(data, threadId) ? "app_server" : "placeholder";
+}
+
 export function managedAppServerCommandAvailable(
   data: BootstrapPayload | undefined,
   threadId: string | undefined
@@ -232,7 +239,7 @@ export function normaliseCommandMode(
   mode: CommandExecutionMode,
   data: BootstrapPayload | undefined,
   threadId: string | undefined,
-  options: { showCliFallback: boolean }
+  options: { showCliFallback: boolean; preferManagedAppServer?: boolean }
 ): CommandExecutionMode {
   if (mode === "app_server" && !managedAppServerCommandAvailable(data, threadId)) {
     return "placeholder";
@@ -241,8 +248,12 @@ export function normaliseCommandMode(
   if (mode === "codex_cli_fallback") {
     const thread = data?.threads.find((item) => item.id === threadId);
     if (!options.showCliFallback || !codexCliFallbackAvailable(data, thread?.workspace_id)) {
-      return "placeholder";
+      return defaultCommandMode(data, threadId);
     }
+  }
+
+  if (options.preferManagedAppServer && mode === "placeholder") {
+    return defaultCommandMode(data, threadId);
   }
 
   return mode;

@@ -1456,7 +1456,7 @@ test("command creation accepts executable target connectors when D1 is bound", a
   assert.equal(body.command.target_connector_id, "connector-online");
 });
 
-test("command creation preserves codex type for capable target connectors when D1 is bound", async () => {
+test("command creation rejects codex commands without app-server attachment or explicit CLI fallback", async () => {
   const envWithExecutableConnector: Env = {
     ...devEnv,
     DB: commandTargetDb({ id: "connector-online" })
@@ -1474,10 +1474,45 @@ test("command creation preserves codex type for capable target connectors when D
     }),
     envWithExecutableConnector
   );
-  const body = (await response.json()) as { command: { target_connector_id?: string; type: string } };
+
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), {
+    error: "Codex commands require an attached app-server host session or explicit CLI fallback execution mode"
+  });
+});
+
+test("command creation accepts explicit CLI fallback target connectors", async () => {
+  const envWithExecutableConnector: Env = {
+    ...devEnv,
+    DB: commandTargetDb(
+      { id: "connector-online" },
+      {
+        expectedTargetConnectorIdSource: "explicit",
+        expectedExecutionMode: "codex_cli_fallback"
+      }
+    )
+  };
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        type: "codex",
+        execution_mode: "codex_cli_fallback",
+        prompt: "Say exactly: chaop-smoke",
+        target_connector_id: "connector-online"
+      })
+    }),
+    envWithExecutableConnector
+  );
+  const body = (await response.json()) as {
+    command: { target_connector_id?: string; type: string; execution_mode?: string };
+  };
 
   assert.equal(response.status, 202);
   assert.equal(body.command.type, "codex");
+  assert.equal(body.command.execution_mode, "codex_cli_fallback");
   assert.equal(body.command.target_connector_id, "connector-online");
 });
 
@@ -1486,7 +1521,11 @@ test("command creation targets the connector that owns an attached host session"
     ...devEnv,
     DB: commandTargetDb(
       { id: "connector-online" },
-      { attachedThreadConnectorId: "connector-attached", attachedThreadAppServerPresent: true }
+      {
+        attachedThreadConnectorId: "connector-attached",
+        attachedThreadAppServerPresent: true,
+        expectedExecutionMode: "app_server"
+      }
     )
   };
   const response = await handleRequest(
@@ -1501,10 +1540,13 @@ test("command creation targets the connector that owns an attached host session"
     }),
     envWithAttachedSession
   );
-  const body = (await response.json()) as { command: { target_connector_id?: string; type: string } };
+  const body = (await response.json()) as {
+    command: { target_connector_id?: string; type: string; execution_mode?: string };
+  };
 
   assert.equal(response.status, 202);
   assert.equal(body.command.type, "codex");
+  assert.equal(body.command.execution_mode, "app_server");
   assert.equal(body.command.target_connector_id, "connector-attached");
 });
 
@@ -1584,7 +1626,8 @@ test("command creation accepts attached app-server commands without codex_exec c
         attachedThreadConnectorId: "connector-attached",
         attachedThreadAppServerPresent: true,
         supportsCodex: false,
-        supportsAppServerExec: true
+        supportsAppServerExec: true,
+        expectedExecutionMode: "app_server"
       }
     )
   };
@@ -1600,10 +1643,13 @@ test("command creation accepts attached app-server commands without codex_exec c
     }),
     envWithAttachedSession
   );
-  const body = (await response.json()) as { command: { target_connector_id?: string; type: string } };
+  const body = (await response.json()) as {
+    command: { target_connector_id?: string; type: string; execution_mode?: string };
+  };
 
   assert.equal(response.status, 202);
   assert.equal(body.command.type, "codex");
+  assert.equal(body.command.execution_mode, "app_server");
   assert.equal(body.command.target_connector_id, "connector-attached");
 });
 
@@ -1617,7 +1663,8 @@ test("command creation rejects attached app-server commands when the attachment 
         attachedThreadAppServerPresent: true,
         supportsCodex: false,
         supportsAppServerExec: true,
-        guardedCommandInsertChanges: 0
+        guardedCommandInsertChanges: 0,
+        expectedExecutionMode: "app_server"
       }
     )
   };
@@ -1640,7 +1687,7 @@ test("command creation rejects attached app-server commands when the attachment 
   });
 });
 
-test("command creation rejects attached non-app-server commands when the attachment changes before insert", async () => {
+test("command creation rejects attached placeholder commands when the attachment changes before insert", async () => {
   const envWithDetachedSession: Env = {
     ...devEnv,
     DB: commandTargetDb(
@@ -1658,8 +1705,7 @@ test("command creation rejects attached non-app-server commands when the attachm
       body: JSON.stringify({
         workspace_id: "workspace-api",
         thread_id: "thread-orders-500",
-        type: "codex",
-        prompt: "Continue the attached CLI session"
+        prompt: "Record a placeholder command for the attached session"
       })
     }),
     envWithDetachedSession
@@ -1682,7 +1728,8 @@ test("command creation rejects explicit attached targets when the attachment cha
         supportsCodex: false,
         supportsAppServerExec: true,
         guardedCommandInsertChanges: 0,
-        expectedTargetConnectorIdSource: "explicit"
+        expectedTargetConnectorIdSource: "explicit",
+        expectedExecutionMode: "app_server"
       }
     )
   };
@@ -1762,7 +1809,7 @@ test("command creation rejects attached app-server commands when the owner lacks
   assert.deepEqual(await response.json(), { error: "Target connector not available" });
 });
 
-test("command creation rejects codex target connectors without codex_exec capability", async () => {
+test("command creation rejects explicit CLI fallback target connectors without codex_exec capability", async () => {
   const envWithPlaceholderConnector: Env = {
     ...devEnv,
     DB: commandTargetDb({ id: "connector-online" }, { supportsCodex: false })
@@ -1774,6 +1821,7 @@ test("command creation rejects codex target connectors without codex_exec capabi
         workspace_id: "workspace-api",
         thread_id: "thread-orders-500",
         type: "codex",
+        execution_mode: "codex_cli_fallback",
         prompt: "Say exactly: chaop-smoke",
         target_connector_id: "connector-online"
       })

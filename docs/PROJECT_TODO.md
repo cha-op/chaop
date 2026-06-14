@@ -19,7 +19,7 @@
 - [done] PR2: Add connector-managed single app-server lifecycle.
 - [done] PR3: Add a cost-safe AppServerInstance state model with dedupe, debounce, batching, and rate limits.
 - [done] PR4: Add AppServerInstance state UI in Operations and Host Sessions surfaces.
-- [todo] PR5: Make managed app-server execution the default command path.
+- [done] PR5: Make managed app-server execution the default command path.
 - [todo] PR6: Add drain, scheduled restart, and upgrade flow.
 - [todo] PR7: Add the multi-instance and thread placement foundation.
 - [todo] PR8: Replace Budget Board placeholders with real bounded usage/cost metrics.
