@@ -245,6 +245,14 @@ API: api.example.com
 
 构建 web app 时设置 `VITE_CHAOP_API_BASE_URL=https://api.example.com`，Worker 运行时设置 `CHAOP_API_DOMAIN=api.example.com`。GUI 用 Vite 变量发起浏览器请求；Worker 用运行时变量签发 connector control URL。
 
+使用下面的命令部署 Browser GUI 静态 Worker：
+
+```bash
+VITE_CHAOP_API_BASE_URL=https://api.example.com pnpm deploy:web
+```
+
+该脚本会在 `.codex-tmp/deploy/web/` 下写入临时 Wrangler static-assets 配置，并默认部署 `chaop-web` Worker。它会显式关闭 `workers.dev` 和 preview URLs，因此生产访问必须通过已被 Access 覆盖的 Cloudflare custom domain 或 route。如果某个部署使用不同的静态 Worker 名称，可以用 `CHAOP_WEB_WORKER_NAME` 覆盖。
+
 API 主机名承载：
 
 ```text
