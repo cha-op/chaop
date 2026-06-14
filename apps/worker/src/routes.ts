@@ -695,6 +695,9 @@ async function appServerArchiveAvailability(
   if (row.status === "offline") {
     return { available: false, error: "Connector is offline" };
   }
+  if (row.status !== "online") {
+    return { available: false, error: "Connector is not ready" };
+  }
   try {
     const capabilities = JSON.parse(row.capabilities_json ?? "[]") as unknown;
     if (Array.isArray(capabilities) && capabilities.includes("app_server_archive")) {
@@ -711,7 +714,7 @@ async function connectorHasCapability(env: Env, connectorId: string, capability:
   const row = await env.DB.prepare(
     `SELECT capabilities_json
      FROM connectors
-     WHERE id = ? AND status <> 'offline'
+     WHERE id = ? AND status = 'online'
      LIMIT 1`
   )
     .bind(connectorId)

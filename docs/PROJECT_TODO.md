@@ -16,7 +16,7 @@
 - [done] Add real Codex app-server protocol execution for Chaop threads attached to local app-server Host Sessions.
 - [done] PR0: Merge the tracked Web deploy script with full tests, three review lanes, and resolved GitHub conversations.
 - [done] PR1: Clean up execution UX and capability wording so `codex_exec` is private fallback only.
-- [todo] PR2: Add connector-managed single app-server lifecycle.
+- [done] PR2: Add connector-managed single app-server lifecycle.
 - [todo] PR3: Add a cost-safe AppServerInstance state model with dedupe, debounce, batching, and rate limits.
 - [todo] PR4: Add AppServerInstance state UI in Operations and Host Sessions surfaces.
 - [todo] PR5: Make managed app-server execution the default command path.

@@ -336,6 +336,13 @@ report_interval_seconds = 60
 app_server_timeout_seconds = 2
 # codex_home = "/Users/you/.codex"
 # app_server_url = "ws://127.0.0.1:9876"
+
+[session_inventory.managed_app_server]
+enabled = false
+# listen_url = "ws://127.0.0.1:9876"
+# extra_args = []
+startup_timeout_seconds = 10
+restart_backoff_seconds = 5
 ```
 
 `mode = "placeholder"` is the safe default. To run real local Codex work, prefer the app-server adapter in a private deployment config.
@@ -361,8 +368,13 @@ mode = "app_server"
 codex_timeout_seconds = 300
 
 [session_inventory]
-app_server_url = "ws://127.0.0.1:9876"
 app_server_timeout_seconds = 2
+
+[session_inventory.managed_app_server]
+enabled = true
+listen_url = "ws://127.0.0.1:9876"
+startup_timeout_seconds = 10
+restart_backoff_seconds = 5
 ```
 
 Optional execution settings:
@@ -373,7 +385,14 @@ codex_model = "gpt-5.5"
 extra_args = ["--skip-git-repo-check"]
 ```
 
-Only add optional settings when the local Codex CLI needs them. `app_server` and the private `codex_exec` fallback can both consume Codex/OpenAI allowance or API budget; set the alerts in [Cost Model](cost-aware.md) before leaving real execution running unattended.
+Optional managed app-server settings:
+
+```toml
+[session_inventory.managed_app_server]
+extra_args = ["--ws-project-doc-max-bytes", "131072"]
+```
+
+Only add optional settings when the local Codex CLI needs them. `execution.extra_args` is reserved for `codex exec` fallback flags; use `session_inventory.managed_app_server.extra_args` for flags that are valid on `codex app-server`. `app_server` and the private `codex_exec` fallback can both consume Codex/OpenAI allowance or API budget; set the alerts in [Cost Model](cost-aware.md) before leaving real execution running unattended.
 Prompts are passed to Codex over stdin, not command-line arguments. Keep the timeout and output cap in place unless there is a specific operator reason to widen them.
 Use an absolute `codex_command` path for long-lived connectors launched by `launchctl` or another service manager. Those processes may not inherit the interactive shell `PATH`; if the executable cannot be found, private CLI fallback commands fail before any workspace `cwd` is used.
 
@@ -381,13 +400,15 @@ Session inventory is enabled by default. The connector reads local Codex metadat
 
 When a user explicitly attaches a Host Session, the Worker asks that session's connector for a bounded history backfill for that single session. The connector reads the matching local rollout, skips injected developer/context records, reasoning records, and tool output records, and returns short user, assistant, and tool-call summaries only. If no rollout is found, it falls back to a recent `history.jsonl` prompt for that session. Imported events keep the original local event timestamp, so old backfilled history does not crowd out newer control-plane events in the global recent-event feed. Backfill failures do not block the attachment; the Browser shows the attached thread and reports the backfill warning separately.
 
-Set `session_inventory.app_server_url` when Chaop should create new local Codex app-server threads, use app-server titles, run attached-thread commands through the app-server protocol, or keep attached Host Session archive state in sync with the local app-server when a matching app-server thread can be resolved. The connector advertises the `app_server_threads` and `app_server_archive` capabilities only when this URL is configured, and advertises `codex_app_server_exec` only when both this URL is configured and `execution.mode = "app_server"`. This is separate from the CLI-only `codex_exec` capability. The Worker rejects new local thread requests when no online managed app-server connector has `app_server_threads`. Attached app-server command execution requires the owning connector to advertise `codex_app_server_exec`; Chaop rejects command creation or leasing instead of falling back to `codex_exec` on a different connector. Archive/unarchive remains D1-only when the connector does not advertise `app_server_archive`; when it does, Chaop updates D1 first, then the connector resolves the stored Codex session id to an app-server thread id before calling `thread/archive` or `thread/unarchive`. Sync failures are returned to the Browser as warnings instead of blocking the local archive state. Keep `app_server_timeout_seconds` short so a stopped app-server cannot stall connector startup, thread creation, command setup, or archive synchronisation longer than necessary.
+Use `session_inventory.managed_app_server.enabled = true` when Chaop should manage one dedicated local Codex app-server listener for this connector. The connector starts `codex app-server` with the configured `execution.codex_profile`, `execution.codex_model`, `session_inventory.managed_app_server.extra_args`, and `--listen <listen_url>` when the listener is absent, health-checks the listener before advertising app-server capabilities, and retries after `restart_backoff_seconds` if the child exits or fails startup. Managed listener URLs must bind to `localhost`, `127.0.0.1`, or `::1`; the connector refuses non-loopback hosts instead of exposing the app-server protocol to a LAN interface. If you already manage the listener with another service manager, leave managed mode disabled and set `session_inventory.app_server_url` to the external listener instead.
+
+In managed mode, the connector advertises `app_server_threads` and `app_server_archive` only while the managed app-server URL is healthy enough to initialise the protocol, and advertises `codex_app_server_exec` only when that URL is healthy and `execution.mode = "app_server"`. It refreshes those capabilities through `agent.ready` after connecting to the Worker, so a degraded managed listener stops being selected for new app-server work. With an externally managed `session_inventory.app_server_url`, capability advertisement follows the configured URL and the external service manager is responsible for keeping the listener healthy. This is separate from the CLI-only `codex_exec` capability. The Worker rejects new local thread requests when no online app-server connector has `app_server_threads`. Attached app-server command execution requires the owning connector to advertise `codex_app_server_exec`; Chaop rejects command creation or leasing instead of falling back to `codex_exec` on a different connector. Archive/unarchive remains D1-only when the connector does not advertise `app_server_archive`; when it does, Chaop updates D1 first, then the connector resolves the stored Codex session id to an app-server thread id before calling `thread/archive` or `thread/unarchive`. Sync failures are returned to the Browser as warnings instead of blocking the local archive state. Keep `app_server_timeout_seconds` short so a stopped app-server cannot stall connector startup, thread creation, command setup, or archive synchronisation longer than necessary.
 
 New local threads always start in the connector's configured `workspace_root`; the Browser API does not accept or forward an arbitrary cwd.
 App-server command execution only runs against a Chaop thread/task attached to a local app-server Host Session. The Worker includes the attached local session id and cwd in `command.dispatch`, and the connector resolves the session to the current app-server thread id before calling `thread/resume` and `turn/start` from that cwd. Command setup can paginate through the app-server thread list under `codex_timeout_seconds`; cancellation or timeout best-effort sends `turn/interrupt` when a turn id is known or can still be recovered from the `turn/start` response. Chaop records lifecycle events and the final assistant message summary only; local commandExecution output is not uploaded by default.
 Archive/unarchive synchronisation only applies to Chaop tasks that are attached to a Host Session and can be resolved in the app-server thread list. Local-only Chaop tasks and history-only Host Sessions still archive only in D1. The connector does not modify local history files for this flow; it talks to the app-server protocol.
 
-Start the local app-server with a private listener that only the connector host can reach:
+If you do not use managed mode, start the local app-server with a private listener that only the connector host can reach:
 
 ```bash
 codex app-server --listen ws://127.0.0.1:9876

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   LocalThreadTargetError,
   chooseConnectorForLocalThread,
+  cleanupStaleExplicitAppServerCommandTargets,
   ensureConnectorInventory,
   failStaleExplicitAppServerCommandTargets,
   listThreadEventsInDb,
@@ -10,7 +11,8 @@ import {
   pendingCommandsForConnector,
   recordAgentEvent,
   recordHostSessionBackfillEvents,
-  recordHostSessions
+  recordHostSessions,
+  updateConnectorCapabilities
 } from "./db.js";
 import type { Env } from "./types.js";
 
@@ -354,6 +356,34 @@ test("markConnectorDisconnected fails active commands and marks connector offlin
   assert.equal(db.connectorOfflineUpdates, 1);
 });
 
+test("updateConnectorCapabilities stores refreshed agent.ready capabilities", async () => {
+  const db = connectorCapabilitiesRefreshDb();
+
+  const changed = await updateConnectorCapabilities(
+    { DB: db } as Env,
+    "connector-online",
+    ["placeholder_commands", "app_server_threads", "app_server_threads"]
+  );
+
+  assert.equal(changed, true);
+  assert.equal(db.updates, 1);
+  assert.deepEqual(db.capabilities, ["placeholder_commands", "app_server_threads"]);
+});
+
+test("updateConnectorCapabilities skips unchanged agent.ready capabilities", async () => {
+  const db = connectorCapabilitiesRefreshDb(["placeholder_commands"]);
+
+  const changed = await updateConnectorCapabilities(
+    { DB: db } as Env,
+    "connector-online",
+    ["placeholder_commands"]
+  );
+
+  assert.equal(changed, false);
+  assert.equal(db.updates, 0);
+  assert.deepEqual(db.capabilities, ["placeholder_commands"]);
+});
+
 test("ensureConnectorInventory retires duplicate connectors through disconnect cleanup", async () => {
   const db = duplicateConnectorRetirementDb();
 
@@ -498,6 +528,81 @@ test("failStaleExplicitAppServerCommandTargets fails pending explicit app-server
   assert.equal(events.length, 1);
   assert.equal(events[0]?.kind, "command.failed");
   assert.equal(events[0]?.summary, "Explicit app-server target changed before the command could start.");
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+});
+
+test("failStaleExplicitAppServerCommandTargets fails attached app-server commands when capability disappears", async () => {
+  const db = staleExplicitAppServerTargetDb({ targetConnectorIdSource: "attached" });
+
+  const events = await failStaleExplicitAppServerCommandTargets(
+    { DB: db } as Env,
+    "connector-online",
+    "2026-06-13T10:00:30.000Z"
+  );
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.kind, "command.failed");
+  assert.equal(events[0]?.summary, "App-server target became unavailable before the command could start.");
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+});
+
+test("failStaleExplicitAppServerCommandTargets releases attached commands to replacement app-server sessions", async () => {
+  const db = staleExplicitAppServerTargetDb({
+    targetConnectorIdSource: "attached",
+    replacementAttachedTarget: true
+  });
+
+  const events = await failStaleExplicitAppServerCommandTargets(
+    { DB: db } as Env,
+    "connector-online",
+    "2026-06-13T10:00:30.000Z"
+  );
+
+  assert.equal(events.length, 0);
+  assert.equal(db.commandReleases, 1);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
+test("cleanupStaleExplicitAppServerCommandTargets reports released app-server connector ids", async () => {
+  const db = staleExplicitAppServerTargetDb({
+    targetConnectorIdSource: "attached",
+    replacementAttachedTarget: true
+  });
+
+  const result = await cleanupStaleExplicitAppServerCommandTargets(
+    { DB: db } as Env,
+    "connector-online",
+    "2026-06-13T10:00:30.000Z"
+  );
+
+  assert.deepEqual(result.failed_events, []);
+  assert.deepEqual(result.released_connector_ids, ["connector-online", "connector-replacement"]);
+  assert.equal(db.commandReleases, 1);
+  assert.equal(db.commandFailures, 0);
+});
+
+test("failStaleExplicitAppServerCommandTargets fails released auto app-server commands when replacement disappears", async () => {
+  const db = staleExplicitAppServerTargetDb({
+    targetConnectorId: null,
+    targetConnectorIdSource: "auto"
+  });
+
+  const events = await failStaleExplicitAppServerCommandTargets(
+    { DB: db } as Env,
+    "connector-online",
+    "2026-06-13T10:00:30.000Z"
+  );
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.kind, "command.failed");
+  assert.equal(events[0]?.summary, "App-server target became unavailable before the command could start.");
+  assert.equal(db.commandReleases, 0);
   assert.equal(db.commandFailures, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
@@ -1562,6 +1667,56 @@ function connectorDisconnectedDb() {
   return db as D1Database & typeof counters;
 }
 
+function connectorCapabilitiesRefreshDb(initialCapabilities: string[] = []) {
+  const counters = {
+    updates: 0,
+    capabilities: initialCapabilities,
+    capabilitiesJson: initialCapabilities.length > 0 ? JSON.stringify(initialCapabilities) : undefined
+  };
+  const db = {
+    prepare(sql: string) {
+      assert.match(sql, /UPDATE connectors/);
+      assert.match(sql, /capabilities_json = \?/);
+      assert.match(sql, /capabilities_json <> \?/);
+      assert.match(sql, /last_seen_at = \?/);
+      assert.match(sql, /updated_at = \?/);
+      return {
+        bind(
+          capabilitiesJson: string,
+          lastSeenAt: string,
+          updatedAt: string,
+          connectorId: string,
+          compareCapabilitiesJson: string
+        ) {
+          assert.match(lastSeenAt, /^\d{4}-\d{2}-\d{2}T/);
+          assert.equal(updatedAt, lastSeenAt);
+          assert.equal(connectorId, "connector-online");
+          assert.equal(compareCapabilitiesJson, capabilitiesJson);
+          return {
+            async run() {
+              if (counters.capabilitiesJson === capabilitiesJson) {
+                return { meta: { changes: 0 } };
+              }
+              counters.capabilitiesJson = capabilitiesJson;
+              counters.capabilities = JSON.parse(capabilitiesJson) as string[];
+              counters.updates += 1;
+              return { meta: { changes: 1 } };
+            }
+          };
+        }
+      };
+    },
+    get updates() {
+      return counters.updates;
+    },
+    get capabilities() {
+      return counters.capabilities;
+    }
+  };
+
+  return db as D1Database & typeof counters;
+}
+
 function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: number } = {}) {
   const counters = {
     commandFailures: 0,
@@ -2112,18 +2267,26 @@ function pendingCommandDispatchDb(options: {
   return db as D1Database & typeof counters;
 }
 
-function staleExplicitAppServerTargetDb() {
+function staleExplicitAppServerTargetDb(options: {
+  targetConnectorId?: string | null;
+  targetConnectorIdSource?: "explicit" | "attached" | "auto";
+  replacementAttachedTarget?: boolean;
+} = {}) {
+  const targetConnectorId = options.targetConnectorId ?? "connector-online";
+  const targetConnectorIdSource = options.targetConnectorIdSource ?? "explicit";
   const counters = {
+    commandReleases: 0,
     commandFailures: 0,
     taskUpdates: 0,
     eventInserts: 0
   };
   const db = {
     prepare(sql: string) {
-      if (/FROM commands cmd/.test(sql) && /target_connector_id_source = 'explicit'/.test(sql)) {
+      if (/FROM commands cmd/.test(sql) && /cmd\.target_connector_id = \?/.test(sql)) {
         assert.match(sql, /cmd\.lease_target_host_session_id IS NOT NULL/);
         assert.match(sql, /cmd\.state = 'pending'/);
         assert.match(sql, /cmd\.state = 'leased'/);
+        assert.doesNotMatch(sql, /cmd\.target_connector_id_source = 'explicit'/);
         assert.match(sql, /AND NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /hs\.session_id = cmd\.lease_target_host_session_id/);
         assert.match(sql, /COALESCE\(hs\.app_server_present, 0\) = 1/);
@@ -2131,11 +2294,13 @@ function staleExplicitAppServerTargetDb() {
         return {
           bind(
             targetConnectorId: string,
+            scopeConnectorId: string,
             leaseOwnerConnectorId: string,
             now: string,
             currentTargetConnectorId: string
           ) {
             assert.equal(targetConnectorId, "connector-online");
+            assert.equal(scopeConnectorId, "connector-online");
             assert.equal(leaseOwnerConnectorId, "connector-online");
             assert.equal(now, "2026-06-13T10:00:30.000Z");
             assert.equal(currentTargetConnectorId, "connector-online");
@@ -2151,7 +2316,8 @@ function staleExplicitAppServerTargetDb() {
                       type: "codex",
                       prompt: "continue",
                       state: "pending",
-                      target_connector_id: "connector-online",
+                      target_connector_id: targetConnectorId,
+                      target_connector_id_source: targetConnectorIdSource,
                       lease_owner_connector_id: null,
                       lease_target_host_session_id: "session-old",
                       created_at: "2026-06-13T10:00:00.000Z",
@@ -2165,11 +2331,75 @@ function staleExplicitAppServerTargetDb() {
         };
       }
 
-      if (/UPDATE commands/.test(sql) && /target_connector_id_source = 'explicit'/.test(sql)) {
+      if (
+        /UPDATE commands/.test(sql) &&
+        /SET state = 'pending'/.test(sql) &&
+        /target_connector_id_source IN \('attached', 'auto'\)/.test(sql)
+      ) {
+        assert.match(sql, /target_connector_id = NULL/);
+        assert.match(sql, /target_connector_id_source = 'auto'/);
+        assert.match(sql, /lease_owner_connector_id = NULL/);
+        assert.match(sql, /lease_until = NULL/);
+        assert.match(sql, /lease_target_host_session_id = \(/);
+        assert.match(sql, /AND \(hs\.connector_id <> \? OR hs\.session_id <> \?\)/);
+        assert.match(sql, /COALESCE\(hs\.app_server_present, 0\) = 1/);
+        assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
+        return {
+          bind(
+            updatedAt: string,
+            commandId: string,
+            targetConnectorId: string,
+            leaseTargetHostSessionId: string,
+            leaseOwnerConnectorId: string,
+            now: string,
+            staleConnectorId: string,
+            staleHostSessionId: string
+          ) {
+            assert.equal(updatedAt, "2026-06-13T10:00:30.000Z");
+            assert.equal(commandId, "command-1");
+            assert.equal(targetConnectorId, "connector-online");
+            assert.equal(leaseTargetHostSessionId, "session-old");
+            assert.equal(leaseOwnerConnectorId, "connector-online");
+            assert.equal(now, "2026-06-13T10:00:30.000Z");
+            assert.equal(staleConnectorId, "connector-online");
+            assert.equal(staleHostSessionId, "session-old");
+            return {
+              async run() {
+                if (options.replacementAttachedTarget) {
+                  counters.commandReleases += 1;
+                  return { meta: { changes: 1 } };
+                }
+                return { meta: { changes: 0 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT DISTINCT c\.id AS connector_id/.test(sql)) {
+        return {
+          bind(workspaceId: string) {
+            assert.equal(workspaceId, "workspace-api");
+            return {
+              async all() {
+                return {
+                  results: [
+                    { connector_id: "connector-online" },
+                    { connector_id: "connector-replacement" }
+                  ]
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /target_connector_id = \?/.test(sql)) {
         assert.match(sql, /SET state = 'failed'/);
         assert.match(sql, /lease_owner_connector_id = NULL/);
         assert.match(sql, /lease_until = NULL/);
         assert.match(sql, /lease_target_host_session_id IS NOT NULL/);
+        assert.doesNotMatch(sql, /target_connector_id_source = 'explicit'/);
         assert.match(sql, /AND NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hs/);
         assert.match(sql, /hs\.session_id = commands\.lease_target_host_session_id/);
         return {
@@ -2246,7 +2476,12 @@ function staleExplicitAppServerTargetDb() {
             assert.equal(seq, 1);
             assert.equal(kind, "command.failed");
             assert.equal(priority, "P1");
-            assert.equal(summary, "Explicit app-server target changed before the command could start.");
+            assert.equal(
+              summary,
+              targetConnectorIdSource === "explicit"
+                ? "Explicit app-server target changed before the command could start."
+                : "App-server target became unavailable before the command could start."
+            );
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             return {
               async run() {
@@ -2259,6 +2494,9 @@ function staleExplicitAppServerTargetDb() {
       }
 
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandReleases() {
+      return counters.commandReleases;
     },
     get commandFailures() {
       return counters.commandFailures;
@@ -2808,7 +3046,7 @@ function localThreadConnectorDb(row: { id: string } | null): D1Database {
       if (/SELECT c\.id/.test(sql) && /app_server_threads/.test(sql)) {
         assert.match(sql, /workspace_connectors/);
         assert.match(sql, /wc\.can_execute = 1/);
-        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.status = 'online'/);
         assert.match(sql, /capabilities_json LIKE/);
         return {
           bind(first: string, second?: string) {

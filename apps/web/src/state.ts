@@ -23,6 +23,7 @@ export function mergeBootstrapPayload(
   const hostSessionSyncs = mergeHostSessionSyncs(incoming.host_session_syncs, current.host_session_syncs);
   return {
     ...incoming,
+    connectors: mergeBootstrapConnectors(current.connectors, incoming.connectors),
     threads: mergeById(incoming.threads, current.threads, newerThread),
     tasks: mergeById(incoming.tasks, current.tasks, newerByUpdatedAt),
     running_commands: mergeById(incoming.running_commands, current.running_commands, newerByUpdatedAt),
@@ -30,6 +31,32 @@ export function mergeBootstrapPayload(
     host_sessions: mergeHostSessions(incoming.host_sessions, current.host_sessions),
     host_session_syncs: hostSessionSyncs
   };
+}
+
+function mergeBootstrapConnectors(
+  current: ConnectorSummary[],
+  incoming: ConnectorSummary[]
+): ConnectorSummary[] {
+  const currentById = new Map(current.map((item) => [item.id, item]));
+  return incoming.map((item) => {
+    const currentItem = currentById.get(item.id);
+    return currentItem ? newerConnector(item, currentItem) : item;
+  });
+}
+
+export function mergeConnectorSummaries(
+  current: ConnectorSummary[],
+  incoming: ConnectorSummary[]
+): ConnectorSummary[] {
+  const incomingById = new Map(incoming.map((item) => [item.id, item]));
+  const knownIds = new Set(current.map((item) => item.id));
+  return [
+    ...current.map((item) => {
+      const incomingItem = incomingById.get(item.id);
+      return incomingItem ? newerConnector(incomingItem, item) : item;
+    }),
+    ...incoming.filter((item) => !knownIds.has(item.id))
+  ];
 }
 
 export function localThreadWorkspaceId(
@@ -54,7 +81,7 @@ export function localThreadConnectors(
   return data.connectors.filter(
     (connector) =>
       connectorIds.has(connector.id) &&
-      connector.status !== "offline" &&
+      connector.status === "online" &&
       connector.capabilities.includes("app_server_threads")
   );
 }
@@ -110,7 +137,7 @@ export function codexCliFallbackAvailable(
   return data.connectors.some(
     (connector) =>
       connectorIds.has(connector.id) &&
-      connector.status !== "offline" &&
+      connector.status === "online" &&
       connector.capabilities.includes("codex_exec")
   );
 }
@@ -177,7 +204,7 @@ function attachedAppServerHostSession(
 }
 
 function connectorCanRunManagedAppServer(connector: ConnectorSummary): boolean {
-  return connector.status !== "offline" && connector.capabilities.includes("codex_app_server_exec");
+  return connector.status === "online" && connector.capabilities.includes("codex_app_server_exec");
 }
 
 function mergeById<T extends { id: string }>(
@@ -223,6 +250,18 @@ function newerThread(incoming: ThreadSummary, current: ThreadSummary): ThreadSum
   if (current.last_seq > incoming.last_seq) return current;
   if (incoming.last_seq > current.last_seq) return incoming;
   return newerByUpdatedAt(incoming, current);
+}
+
+function newerConnector(incoming: ConnectorSummary, current: ConnectorSummary): ConnectorSummary {
+  const incomingTime = connectorTimestamp(incoming);
+  const currentTime = connectorTimestamp(current);
+  if (incomingTime && currentTime && currentTime < incomingTime) return incoming;
+  if (incomingTime && currentTime && currentTime > incomingTime) return current;
+  return incoming;
+}
+
+function connectorTimestamp(connector: ConnectorSummary): string | undefined {
+  return connector.updated_at ?? connector.last_seen_at;
 }
 
 function newerByUpdatedAt<T extends { updated_at: string }>(incoming: T, current: T): T {

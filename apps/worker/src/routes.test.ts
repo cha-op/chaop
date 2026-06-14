@@ -558,6 +558,47 @@ test("task archive warns when attached connector is offline", async () => {
   assert.equal(db.threadArchiveWrites, 1);
 });
 
+test("task archive warns when attached connector is degraded", async () => {
+  const db = taskArchiveSyncDb({ connectorStatus: "degraded" });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/archive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("archive sync should not dispatch");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: { attempted: boolean; connector_id?: string; session_id?: string; archived: boolean; error?: string };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.task.id, "task-host-1");
+  assert.deepEqual(body.archive_sync, {
+    attempted: false,
+    connector_id: "connector-online",
+    session_id: "thread-1",
+    archived: true,
+    error: "Connector is not ready"
+  });
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
+});
+
 test("task archive stays D1-only for non-app-server host sessions", async () => {
   const db = taskArchiveSyncDb({ appServerPresent: false, titleSource: "history" });
   const response = await handleRequest(
@@ -679,6 +720,44 @@ test("host session attach skips backfill when connector lacks capability", async
         get: () => ({
           fetch: async () => {
             throw new Error("DO should not receive backfill requests without connector capability");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    events?: unknown[];
+    backfill?: unknown;
+    host_session: { attached_thread_id?: string };
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.events, undefined);
+  assert.equal(body.backfill, undefined);
+  assert.equal(db.eventInserts, 0);
+});
+
+test("host session attach skips backfill when connector is degraded", async () => {
+  const db = hostSessionAttachBackfillDb({ connectorStatus: "degraded" });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not receive backfill requests for degraded connectors");
           }
         }) as unknown as DurableObjectStub
       } as unknown as DurableObjectNamespace
@@ -1952,7 +2031,7 @@ function commandTargetDb(
         assert.match(sql, /workspace_connectors/);
         assert.match(sql, /wc\.workspace_id = \?/);
         assert.match(sql, /wc\.can_execute = 1/);
-        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.status = 'online'/);
         assert.match(sql, /capabilities_json LIKE/);
         return {
           bind(
@@ -1997,7 +2076,7 @@ function commandTargetDb(
         assert.match(sql, /workspace_connectors/);
         assert.match(sql, /wc\.workspace_id = \?/);
         assert.match(sql, /wc\.can_execute = 1/);
-        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.status = 'online'/);
         assert.match(sql, /capabilities_json LIKE/);
         return {
           bind(workspaceId: string, commandType: string) {
@@ -2187,7 +2266,7 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
       if (/SELECT c\.id/.test(sql) && /app_server_threads/.test(sql)) {
         assert.match(sql, /workspace_connectors/);
         assert.match(sql, /wc\.can_execute = 1/);
-        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.status = 'online'/);
         assert.match(sql, /capabilities_json LIKE/);
         return {
           bind(workspaceId: string) {
@@ -2673,8 +2752,13 @@ function taskArchiveSyncDb(
 }
 
 function hostSessionAttachBackfillDb(
-  options: { supportsBackfill?: boolean | undefined; alreadyAttached?: boolean | undefined } = {}
+  options: {
+    connectorStatus?: string | undefined;
+    supportsBackfill?: boolean | undefined;
+    alreadyAttached?: boolean | undefined;
+  } = {}
 ): D1Database & { readonly eventInserts: number } {
+  const connectorStatus = options.connectorStatus ?? "online";
   const supportsBackfill = options.supportsBackfill ?? true;
   const threadId = "thread-host-session-1-connector-online";
   const taskId = "task-host-session-1-connector-online";
@@ -2739,11 +2823,15 @@ function hostSessionAttachBackfillDb(
       }
 
       if (/SELECT capabilities_json/.test(sql) && /FROM connectors/.test(sql)) {
+        assert.match(sql, /status = 'online'/);
         return {
           bind(connectorId: string) {
             assert.equal(connectorId, "connector-online");
             return {
               async first() {
+                if (connectorStatus !== "online") {
+                  return null;
+                }
                 return {
                   capabilities_json: JSON.stringify(supportsBackfill ? ["host_session_backfill_v2"] : [])
                 };
@@ -3007,7 +3095,7 @@ function hostSessionDetachDb(options: {
         assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
         assert.match(sql, /INNER JOIN workspace_connectors wc/);
         assert.match(sql, /wc\.can_execute = 1/);
-        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.status = 'online'/);
         assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
         assert.match(sql, /WHERE hs\.id = COALESCE\(/);
         assert.match(sql, /hs_task\.id <> \?/);
@@ -3164,7 +3252,7 @@ function hostSessionDetachDb(options: {
         assert.match(sql, /INNER JOIN workspace_connectors wc/);
         assert.match(sql, /wc\.workspace_id = \?/);
         assert.match(sql, /wc\.can_execute = 1/);
-        assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.status = 'online'/);
         assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
         return {
           bind(workspaceId: string) {

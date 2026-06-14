@@ -11,6 +11,7 @@
 - The Rust connector defaults to placeholder execution and can opt in to local Codex CLI execution with private `execution.mode = "codex_exec"` configuration, or attached-thread Codex app-server execution with private `execution.mode = "app_server"` plus `session_inventory.app_server_url`.
 - Thread Command Centre now separates display execution modes from protocol command types: managed app-server execution is shown as the product path, while the Codex CLI fallback is hidden unless the Web build explicitly enables it.
 - The Rust connector reports lightweight local Codex session inventory, can optionally use app-server `Thread.name` values for title enrichment, and can create new local app-server threads when `session_inventory.app_server_url` is configured.
+- The Rust connector can now manage one dedicated local Codex app-server listener, health-check it before advertising app-server capabilities, and refresh connector capabilities through `agent.ready`.
 - Attached Host Sessions now request a bounded single-session history backfill from the connector, importing short rollout/history summaries without broad transcript upload.
 - Archive/unarchive actions for attached Host Session tasks update Chaop's D1 task/thread state first, then try to synchronise resolvable Codex app-server threads through connector `thread/archive` and `thread/unarchive`; sync failures are reported as warnings, and non-app-server sessions remain D1-only.
 - The next delivery workstream is the nine-PR app-server lifecycle roadmap, starting from PR0's Web deploy script and then moving execution UX toward managed app-server operation.
@@ -24,6 +25,7 @@
 - App-server execution source: `docs/project_journal/2026/06/2026-06-13-app-server-execution-e4a7c9.md`
 - App-server lifecycle roadmap source: `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.md`
 - Execution UX cleanup source: `docs/project_journal/2026/06/2026-06-14-execution-ux-capabilities-2b7d4e.md`
+- Connector-managed app-server source: `docs/project_journal/2026/06/2026-06-14-connector-managed-app-server-7a8e1f.md`
 - Cost-aware source: `docs/cost-aware.md`
 - Local journal index: optional generated `docs/project_journal/INDEX.md`; do not commit it.
 

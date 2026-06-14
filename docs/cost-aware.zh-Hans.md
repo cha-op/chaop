@@ -51,6 +51,7 @@ App-server execution 当前只会把 lifecycle events 和最终 assistant messag
 
 - 每台 host 保持一个 Rust connector，本机多个逻辑 agent 都从它聚合。
 - `app_server` 继续按 connector 显式 opt-in；`codex_exec` 只作为 private fallback，并且 Browser 默认隐藏。
+- Managed app-server health checks 是本机 connector probes。只有 `agent.ready` 发生变化时，connector 才会刷新远端 capabilities；持久化 AppServerInstance state model、debounce、batching 和 rate limits 放到下一个 lifecycle 切片。
 - 在明确 artefact upload policy 前，只回传短摘要。
 - 在增加 live stdout streaming 前，先做 server-side per-command event limits。
 - 启用 artefact upload 前，先做 R2 chunking 和 retention rules。

@@ -95,6 +95,7 @@ export type ConnectorSummary = {
   realtime_mode: RealtimeMode;
   budget_state: BudgetState;
   last_seen_at?: string | undefined;
+  updated_at?: string | undefined;
 };
 
 export type WorkspaceSummary = {
@@ -156,6 +157,11 @@ export type HostSessionsUpdatePayload = {
   connector_id?: string | undefined;
   synced_at?: string | undefined;
   snapshot?: boolean | undefined;
+};
+
+export type ConnectorsUpdatePayload = {
+  connectors: ConnectorSummary[];
+  synced_at?: string | undefined;
 };
 
 export type HostSessionSyncSummary = {
