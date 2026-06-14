@@ -62,9 +62,12 @@ struct HostSessionsSendState {
 struct AppServerInstancesSendState {
     last_sent: Option<String>,
     last_sent_id: Option<String>,
+    last_sent_key: Option<String>,
+    last_sent_snapshot: bool,
     last_sent_at: Option<Instant>,
     last_acked: Option<String>,
     last_acked_id: Option<String>,
+    last_acked_key: Option<String>,
     next_report_id: u64,
 }
 
@@ -445,11 +448,17 @@ fn send_app_server_instances(
     force: bool,
     snapshot: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(message) = app_server_instances_message(config, app_server, snapshot) else {
+    let Some(mut message) = app_server_instances_message(config, app_server, snapshot) else {
         return Ok(());
     };
+    let key = app_server_instances_message_key(&message)?;
+    let mut send_snapshot = snapshot;
+    if !snapshot && state.has_unacked_snapshot_for_key(&key) {
+        message = app_server_instances_message_with_snapshot(&message, true)?;
+        send_snapshot = true;
+    }
     let now = Instant::now();
-    if !should_send_app_server_instances(&message, state, force, now) {
+    if !should_send_app_server_instances(&key, state, force, now) {
         return Ok(());
     }
     let report_id = state.next_report_id();
@@ -457,14 +466,17 @@ fn send_app_server_instances(
     socket.send(Message::Text(outbound_message.into()))?;
     state.last_sent = Some(message);
     state.last_sent_id = Some(report_id);
+    state.last_sent_key = Some(key);
+    state.last_sent_snapshot = send_snapshot;
     state.last_sent_at = Some(now);
     state.last_acked = None;
     state.last_acked_id = None;
+    state.last_acked_key = None;
     Ok(())
 }
 
 fn should_send_app_server_instances(
-    message: &str,
+    key: &str,
     state: &AppServerInstancesSendState,
     force: bool,
     now: Instant,
@@ -472,12 +484,12 @@ fn should_send_app_server_instances(
     if force {
         return true;
     }
-    if state.last_acked.as_deref() == Some(message) {
+    if state.last_acked_key.as_deref() == Some(key) {
         return state.last_sent_at.map_or(true, |sent_at| {
             now.saturating_duration_since(sent_at) >= app_server_instance_summary_interval()
         });
     }
-    if state.last_sent.as_deref() == Some(message)
+    if state.last_sent_key.as_deref() == Some(key)
         && state.last_sent_at.is_some_and(|sent_at| {
             now.saturating_duration_since(sent_at) < agent_ready_retry_interval()
         })
@@ -491,6 +503,13 @@ impl AppServerInstancesSendState {
     fn next_report_id(&mut self) -> String {
         self.next_report_id = self.next_report_id.saturating_add(1);
         format!("app-server-report-{}", self.next_report_id)
+    }
+
+    fn has_unacked_snapshot_for_key(&self, key: &str) -> bool {
+        self.last_sent_snapshot
+            && self.last_sent_key.as_deref() == Some(key)
+            && self.last_sent_id.is_some()
+            && self.last_acked_id != self.last_sent_id
     }
 }
 
@@ -508,6 +527,7 @@ fn acknowledge_app_server_instances(
     };
     state.last_acked = Some(message);
     state.last_acked_id = state.last_sent_id.clone();
+    state.last_acked_key = state.last_sent_key.clone();
 }
 
 fn app_server_instances_message(
@@ -556,6 +576,24 @@ fn app_server_instances_message_with_report_id(
 ) -> Result<String, serde_json::Error> {
     let mut value: Value = serde_json::from_str(message)?;
     value["payload"]["report_id"] = json!(report_id);
+    Ok(value.to_string())
+}
+
+fn app_server_instances_message_with_snapshot(
+    message: &str,
+    snapshot: bool,
+) -> Result<String, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(message)?;
+    value["payload"]["snapshot"] = json!(snapshot);
+    Ok(value.to_string())
+}
+
+fn app_server_instances_message_key(message: &str) -> Result<String, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(message)?;
+    if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+        payload.remove("report_id");
+        payload.remove("snapshot");
+    }
     Ok(value.to_string())
 }
 
@@ -1497,12 +1535,13 @@ mod tests {
         acknowledge_agent_ready, acknowledge_app_server_instances, acknowledge_host_sessions,
         agent_event_message, agent_ready_ack_message, agent_ready_message,
         agent_ready_retry_interval, app_server_instance_summary_interval,
-        app_server_instances_message, app_server_instances_message_with_report_id,
-        apply_agent_ready_ack_text, apply_app_server_instances_ack_text,
-        apply_host_sessions_ack_text, bounded_app_server_instance_text, classify_ack_wait_text,
-        command_events, handle_background_ack_message, host_sessions_ack_message,
-        host_sessions_interval, host_sessions_message, host_sessions_retry_interval,
-        is_read_timeout, requires_app_server_execution_mode, should_send_agent_ready,
+        app_server_instances_message, app_server_instances_message_key,
+        app_server_instances_message_with_report_id, apply_agent_ready_ack_text,
+        apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
+        bounded_app_server_instance_text, classify_ack_wait_text, command_events,
+        handle_background_ack_message, host_sessions_ack_message, host_sessions_interval,
+        host_sessions_message, host_sessions_retry_interval, is_read_timeout,
+        requires_app_server_execution_mode, should_send_agent_ready,
         should_send_app_server_instances, should_send_host_sessions,
     };
     use crate::app_server_manager::AppServerManager;
@@ -1827,9 +1866,12 @@ mod tests {
         let mut state = AppServerInstancesSendState {
             last_sent: Some(message.clone()),
             last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(message.clone()),
+            last_sent_snapshot: false,
             last_sent_at: Some(now),
             last_acked: None,
             last_acked_id: None,
+            last_acked_key: None,
             next_report_id: 1,
         };
         acknowledge_app_server_instances(&mut state, Some("report-1"));
@@ -1855,9 +1897,12 @@ mod tests {
         let state = AppServerInstancesSendState {
             last_sent: Some(message.to_owned()),
             last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(message.to_owned()),
+            last_sent_snapshot: false,
             last_sent_at: Some(now),
             last_acked: None,
             last_acked_id: None,
+            last_acked_key: None,
             next_report_id: 1,
         };
 
@@ -1882,9 +1927,12 @@ mod tests {
         let mut state = AppServerInstancesSendState {
             last_sent: Some(message.clone()),
             last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(message.clone()),
+            last_sent_snapshot: false,
             last_sent_at: Some(Instant::now()),
             last_acked: None,
             last_acked_id: None,
+            last_acked_key: None,
             next_report_id: 1,
         };
 
@@ -1897,6 +1945,7 @@ mod tests {
         assert!(applied);
         assert_eq!(state.last_acked.as_deref(), Some(message.as_str()));
         assert_eq!(state.last_acked_id.as_deref(), Some("report-1"));
+        assert_eq!(state.last_acked_key.as_deref(), Some(message.as_str()));
     }
 
     #[test]
@@ -1904,11 +1953,14 @@ mod tests {
         let message =
             r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
         let mut state = AppServerInstancesSendState {
-            last_sent: Some(message),
+            last_sent: Some(message.clone()),
             last_sent_id: Some("report-current".to_owned()),
+            last_sent_key: Some(message),
+            last_sent_snapshot: false,
             last_sent_at: Some(Instant::now()),
             last_acked: None,
             last_acked_id: None,
+            last_acked_key: None,
             next_report_id: 2,
         };
 
@@ -1930,9 +1982,12 @@ mod tests {
         let mut state = AppServerInstancesSendState {
             last_sent: Some(message.clone()),
             last_sent_id: Some("report-current".to_owned()),
+            last_sent_key: Some(message.clone()),
+            last_sent_snapshot: false,
             last_sent_at: Some(Instant::now()),
             last_acked: None,
             last_acked_id: None,
+            last_acked_key: None,
             next_report_id: 2,
         };
 
@@ -1945,6 +2000,7 @@ mod tests {
         assert!(applied);
         assert_eq!(state.last_acked.as_deref(), Some(message.as_str()));
         assert_eq!(state.last_acked_id.as_deref(), Some("report-current"));
+        assert_eq!(state.last_acked_key.as_deref(), Some(message.as_str()));
     }
 
     #[test]
@@ -1976,6 +2032,35 @@ mod tests {
     }
 
     #[test]
+    fn app_server_instances_message_key_ignores_snapshot_and_report_id() {
+        let snapshot = r#"{"kind":"agent.app_server_instances","payload":{"report_id":"report-1","snapshot":true,"instances":[{"instance_key":"default"}]}}"#;
+        let incremental = r#"{"kind":"agent.app_server_instances","payload":{"snapshot":false,"instances":[{"instance_key":"default"}]}}"#;
+
+        assert_eq!(
+            app_server_instances_message_key(snapshot).expect("snapshot key"),
+            app_server_instances_message_key(incremental).expect("incremental key")
+        );
+    }
+
+    #[test]
+    fn unacknowledged_app_server_instances_snapshot_is_tracked_for_snapshot_retry() {
+        let key = r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let state = AppServerInstancesSendState {
+            last_sent: Some(key.clone()),
+            last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(key.clone()),
+            last_sent_snapshot: true,
+            last_sent_at: Some(Instant::now()),
+            last_acked: None,
+            last_acked_id: None,
+            last_acked_key: None,
+            next_report_id: 1,
+        };
+
+        assert!(state.has_unacked_snapshot_for_key(&key));
+    }
+
+    #[test]
     fn background_app_server_instances_ack_is_consumed_without_defer() {
         let message =
             r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
@@ -1984,9 +2069,12 @@ mod tests {
         let mut app_server_instances_state = AppServerInstancesSendState {
             last_sent: Some(message.clone()),
             last_sent_id: Some("report-1".to_owned()),
+            last_sent_key: Some(message.clone()),
+            last_sent_snapshot: false,
             last_sent_at: Some(Instant::now()),
             last_acked: None,
             last_acked_id: None,
+            last_acked_key: None,
             next_report_id: 1,
         };
         let mut host_sessions_state = HostSessionsSendState::default();
@@ -2007,6 +2095,10 @@ mod tests {
         assert_eq!(
             app_server_instances_state.last_acked_id.as_deref(),
             Some("report-1")
+        );
+        assert_eq!(
+            app_server_instances_state.last_acked_key.as_deref(),
+            Some(message.as_str())
         );
     }
 
