@@ -74,7 +74,7 @@ superseded_by:
 - GitHub CI 通过。
 - 完成三重 review：local/manual review、helper-backed independent Codex review，以及可用时的 PR-level GitHub Codex review。
 - 合并前确认所有 GitHub review conversations 都已 resolved。
-- 只在 PR branch 对所选 merge strategy 足够新时合并；合并后更新本地 `master`，再从更新后的 base 创建下一个 PR branch。
+- 只在 PR branch 对所选 merge strategy 足够新时合并；合并后更新本地 target branch，再从更新后的 base 创建下一个 PR branch。
 
 ## Lifecycle Reporting 成本护栏
 - 本机 app-server health probes 可以频繁，但远端写入必须由 state-change 或 summary 触发。

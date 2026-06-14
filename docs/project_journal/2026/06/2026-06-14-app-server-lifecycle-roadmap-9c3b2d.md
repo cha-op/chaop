@@ -74,7 +74,7 @@ superseded_by:
 - Pass GitHub CI.
 - Complete three review lanes: local/manual review, helper-backed independent Codex review, and PR-level GitHub Codex review when available.
 - Verify all GitHub review conversations are resolved before merge.
-- Merge only after the PR branch is current enough for the chosen merge strategy, then update local `master` and create the next PR branch from the updated base.
+- Merge only after the PR branch is current enough for the chosen merge strategy, then update the local target branch and create the next PR branch from that updated base.
 
 ## Cost Guardrails For Lifecycle Reporting
 - Local app-server health probes can be frequent, but remote writes must be state-change or summary driven.
