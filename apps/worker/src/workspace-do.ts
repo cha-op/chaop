@@ -268,7 +268,7 @@ export class WorkspaceDO implements DurableObject {
           })
         )
       );
-      if (result.app_server_instances.length > 0) {
+      if (result.app_server_instances.length > 0 || result.snapshot) {
         this.broadcastToBrowsers(appServerInstancesMessage({
           app_server_instances: result.app_server_instances,
           connector_id: connectorId,

@@ -2987,6 +2987,7 @@ async function listAppServerInstances(env: Env): Promise<AppServerInstanceSummar
        FROM app_server_instances asi
        INNER JOIN connectors c ON c.id = asi.connector_id
        WHERE c.status <> 'offline'
+         AND c.capabilities_json LIKE '%"app_server_instance_state"%'
        ORDER BY CASE asi.state
           WHEN 'healthy' THEN 0
           WHEN 'degraded' THEN 1

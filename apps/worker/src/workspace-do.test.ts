@@ -170,6 +170,48 @@ test("agent app-server instance report is acked and broadcast", async () => {
   assert.equal(update.payload?.app_server_instances?.[0]?.state, "healthy");
 });
 
+test("empty app-server instance snapshot is acked and broadcast", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      return [];
+    }
+  } as unknown as DurableObjectState;
+  const db = appServerInstanceDoDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      snapshot: true,
+      instances: []
+    }
+  }));
+
+  assert.equal(db.writes, 0);
+  assert.equal(agentSent.length, 1);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as { payload?: { count?: number; deduped?: boolean } };
+  assert.equal(ack.payload?.count, 0);
+  assert.equal(ack.payload?.deduped, false);
+  assert.equal(browserSent.length, 1);
+  const update = JSON.parse(browserSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { app_server_instances?: unknown[]; connector_id?: string; snapshot?: boolean };
+  };
+  assert.equal(update.kind, "app_server_instances.updated");
+  assert.equal(update.payload?.connector_id, "connector-online");
+  assert.equal(update.payload?.snapshot, true);
+  assert.deepEqual(update.payload?.app_server_instances, []);
+});
+
 test("duplicate healthy app-server report is acked without D1 write", async () => {
   const agentSent: string[] = [];
   const browserSent: string[] = [];

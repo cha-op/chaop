@@ -1896,6 +1896,7 @@ function readOnlyBootstrapDb(): D1Database {
       if (/FROM app_server_instances/.test(sql)) {
         assert.match(sql, /INNER JOIN connectors c ON c\.id = asi\.connector_id/);
         assert.match(sql, /c\.status <> 'offline'/);
+        assert.match(sql, /c\.capabilities_json LIKE '%"app_server_instance_state"%'/);
       }
       return {
         bind() {
