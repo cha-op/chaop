@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-14
 updated: 2026-06-14
 branch: wip/app-server-instance-state
-pr:
+pr: https://github.com/cha-op/chaop/pull/12
 supersedes: 20260614-9c3b2d
 superseded_by:
 ---
