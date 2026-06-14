@@ -262,7 +262,7 @@ export async function recordAppServerInstances(
     }
   }
 
-  if (report.snapshot === true && persisted.length > 0) {
+  if (report.snapshot === true && (persisted.length > 0 || report.instances.length > 0)) {
     return {
       app_server_instances: await listAppServerInstancesForConnector(env, connectorId),
       synced_at: syncedAt,

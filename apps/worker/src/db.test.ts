@@ -120,6 +120,31 @@ test("recordAppServerInstances returns a complete connector snapshot when any sn
   );
 });
 
+test("recordAppServerInstances returns a complete connector snapshot when unchanged snapshot rows are debounced", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: [
+      appServerInstanceReport("healthy", { instance_key: "default" }),
+      appServerInstanceReport("healthy", { instance_key: "secondary" })
+    ]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: [
+      appServerInstanceReport("healthy", { instance_key: "default" }),
+      appServerInstanceReport("healthy", { instance_key: "secondary" })
+    ]
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.deepEqual(
+    result.app_server_instances.map((instance) => [instance.instance_key, instance.state]),
+    [["default", "healthy"], ["secondary", "healthy"]]
+  );
+});
+
 test("recordAppServerInstances marks omitted snapshot instances stopped", async () => {
   const db = appServerInstancesDb();
   await recordAppServerInstances({ DB: db } as Env, "connector-1", {

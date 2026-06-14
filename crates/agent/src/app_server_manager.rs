@@ -697,11 +697,12 @@ mod tests {
             .spawn_app_server(&config, "ws://127.0.0.1:65530")
             .expect("spawn app-server");
 
-        let recorded = wait_for_file_content(&marker);
+        let expected = codex_home.to_string_lossy().into_owned();
+        let recorded = wait_for_file_content_matching(&marker, |content| content == expected);
         child.kill().expect("kill child");
         child.wait().expect("wait child");
 
-        assert_eq!(recorded, codex_home.to_string_lossy());
+        assert_eq!(recorded, expected);
     }
 
     #[test]
@@ -728,7 +729,8 @@ mod tests {
             .spawn_app_server(&config, "ws://127.0.0.1:65530")
             .expect("spawn app-server");
 
-        let recorded = wait_for_file_content(&marker);
+        let recorded =
+            wait_for_file_content_matching(&marker, |content| content.lines().count() >= 9);
         child.kill().expect("kill child");
         child.wait().expect("wait child");
 
@@ -1041,6 +1043,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("timed out waiting for content in {}", path.display());
+    }
+
+    fn wait_for_file_content_matching(
+        path: &std::path::Path,
+        predicate: impl Fn(&str) -> bool,
+    ) -> String {
+        for _ in 0..250 {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if predicate(&content) {
+                    return content;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!(
+            "timed out waiting for matching content in {}",
+            path.display()
+        );
     }
 
     #[cfg(unix)]
