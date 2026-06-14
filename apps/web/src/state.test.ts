@@ -86,6 +86,26 @@ test("mergeBootstrapPayload removes app-server instances omitted from bootstrap 
   assert.deepEqual(merged.app_server_instances, [current.app_server_instances[0]]);
 });
 
+test("mergeBootstrapPayload normalises legacy bootstrap without app-server instances", () => {
+  const incoming = payload();
+  delete (incoming as Partial<BootstrapPayload>).app_server_instances;
+
+  const merged = mergeBootstrapPayload(undefined, incoming);
+
+  assert.deepEqual(merged.app_server_instances, []);
+});
+
+test("mergeBootstrapPayload keeps current app-server instances when legacy bootstrap omits the field", () => {
+  const currentInstance = appServerInstance("app-server-1", "healthy", "2026-06-12T10:02:00.000Z");
+  const current = payload({ app_server_instances: [currentInstance] });
+  const incoming = payload();
+  delete (incoming as Partial<BootstrapPayload>).app_server_instances;
+
+  const merged = mergeBootstrapPayload(current, incoming);
+
+  assert.deepEqual(merged.app_server_instances, [currentInstance]);
+});
+
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {
   const retained = appServerInstance("app-server-retained", "healthy", "2026-06-12T10:00:00.000Z", "connector-2");
   const replaced = appServerInstance("app-server-old", "healthy", "2026-06-12T10:00:00.000Z", "connector-1");

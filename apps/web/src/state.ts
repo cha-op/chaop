@@ -19,9 +19,15 @@ export function mergeBootstrapPayload(
   current: BootstrapPayload | undefined,
   incoming: BootstrapPayload
 ): BootstrapPayload {
-  if (!current) return incoming;
+  if (!current) {
+    return {
+      ...incoming,
+      app_server_instances: appServerInstancesOrEmpty(incoming)
+    };
+  }
 
   const hostSessionSyncs = mergeHostSessionSyncs(incoming.host_session_syncs, current.host_session_syncs);
+  const incomingAppServerInstances = maybeAppServerInstances(incoming);
   return {
     ...incoming,
     connectors: mergeBootstrapConnectors(current.connectors, incoming.connectors),
@@ -31,11 +37,19 @@ export function mergeBootstrapPayload(
     events: mergeById(incoming.events, current.events, newerByCreatedAt),
     host_sessions: mergeHostSessions(incoming.host_sessions, current.host_sessions),
     host_session_syncs: hostSessionSyncs,
-    app_server_instances: mergeBootstrapAppServerInstances(
-      current.app_server_instances,
-      incoming.app_server_instances
-    )
+    app_server_instances: incomingAppServerInstances
+      ? mergeBootstrapAppServerInstances(appServerInstancesOrEmpty(current), incomingAppServerInstances)
+      : appServerInstancesOrEmpty(current)
   };
+}
+
+function maybeAppServerInstances(payload: BootstrapPayload): AppServerInstanceSummary[] | undefined {
+  const value = (payload as { app_server_instances?: unknown }).app_server_instances;
+  return Array.isArray(value) ? value as AppServerInstanceSummary[] : undefined;
+}
+
+function appServerInstancesOrEmpty(payload: BootstrapPayload): AppServerInstanceSummary[] {
+  return maybeAppServerInstances(payload) ?? [];
 }
 
 function mergeBootstrapConnectors(

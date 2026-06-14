@@ -30,6 +30,7 @@ const CONNECTOR_READ_TICK_SECONDS: u64 = 5;
 const CONNECTOR_RECONNECT_BACKOFF_SECONDS: u64 = 2;
 const AGENT_READY_RETRY_SECONDS: u64 = 10;
 const APP_SERVER_INSTANCE_SUMMARY_SECONDS: u64 = 5 * 60;
+const APP_SERVER_INSTANCE_TEXT_LIMIT: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -502,10 +503,12 @@ fn app_server_instances_message(
                 "generation": instance.generation
             });
             if let Some(status_summary) = instance.status_summary {
-                instance_payload["status_summary"] = json!(status_summary);
+                instance_payload["status_summary"] =
+                    json!(bounded_app_server_instance_text(&status_summary));
             }
             if let Some(last_error) = instance.last_error {
-                instance_payload["last_error"] = json!(last_error);
+                instance_payload["last_error"] =
+                    json!(bounded_app_server_instance_text(&last_error));
             }
             vec![instance_payload]
         }
@@ -522,6 +525,18 @@ fn app_server_instances_message(
         })
         .to_string(),
     )
+}
+
+fn bounded_app_server_instance_text(value: &str) -> String {
+    if value.chars().count() <= APP_SERVER_INSTANCE_TEXT_LIMIT {
+        return value.to_owned();
+    }
+    let mut truncated = value
+        .chars()
+        .take(APP_SERVER_INSTANCE_TEXT_LIMIT.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn host_sessions_message(config: &AgentConfig) -> String {
@@ -1448,10 +1463,11 @@ mod tests {
         agent_event_message, agent_ready_ack_message, agent_ready_message,
         agent_ready_retry_interval, app_server_instance_summary_interval,
         app_server_instances_message, apply_agent_ready_ack_text,
-        apply_app_server_instances_ack_text, apply_host_sessions_ack_text, classify_ack_wait_text,
-        command_events, handle_background_ack_message, host_sessions_ack_message,
-        host_sessions_interval, host_sessions_message, host_sessions_retry_interval,
-        is_read_timeout, requires_app_server_execution_mode, should_send_agent_ready,
+        apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
+        bounded_app_server_instance_text, classify_ack_wait_text, command_events,
+        handle_background_ack_message, host_sessions_ack_message, host_sessions_interval,
+        host_sessions_message, host_sessions_retry_interval, is_read_timeout,
+        requires_app_server_execution_mode, should_send_agent_ready,
         should_send_app_server_instances, should_send_host_sessions,
     };
     use crate::app_server_manager::AppServerManager;
@@ -1893,6 +1909,16 @@ mod tests {
             Some(true)
         );
         assert!(value.pointer("/payload/instances/0/last_error").is_none());
+    }
+
+    #[test]
+    fn app_server_instance_text_is_bounded_for_worker_validation() {
+        assert_eq!(bounded_app_server_instance_text("short"), "short");
+
+        let bounded = bounded_app_server_instance_text(&"x".repeat(600));
+
+        assert_eq!(bounded.chars().count(), 512);
+        assert!(bounded.ends_with("..."));
     }
 
     #[test]

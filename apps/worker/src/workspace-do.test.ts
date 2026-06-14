@@ -457,12 +457,13 @@ test("hasReadyPeerAgentSocket counts only ready peers", () => {
 });
 
 test("closing ready socket with handshaking peer fails active commands without marking offline", async () => {
+  const agentSent: string[] = [];
   const browserSent: string[] = [];
-  const closingSocket = socketWithAttachment({
+  const closingSocket = mutableSocketWithAttachment({
     socketType: "agent",
     connectorId: "connector-online",
     agentReady: true
-  });
+  }, agentSent);
   const handshakingPeer = socketWithAttachment({
     socketType: "agent",
     connectorId: "connector-online"
@@ -480,6 +481,16 @@ test("closing ready socket with handshaking peer fails active commands without m
   const db = socketGoneDb();
   const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
 
+  await workspace.webSocketMessage(closingSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      instances: [appServerInstancePayload("healthy")]
+    }
+  }));
+  assert.equal(db.appServerInstanceWrites, 1);
+  agentSent.length = 0;
+  browserSent.length = 0;
+
   await workspace.webSocketClose(closingSocket);
 
   assert.equal(db.commandFailures, 1);
@@ -488,7 +499,8 @@ test("closing ready socket with handshaking peer fails active commands without m
   assert.equal(db.activityUpdates, 1);
   assert.equal(db.connectorDegradedUpdates, 1);
   assert.equal(db.connectorOfflineUpdates, 0);
-  assert.equal(browserSent.length, 2);
+  assert.equal(db.appServerInstanceWrites, 2);
+  assert.equal(browserSent.length, 3);
   const envelope = JSON.parse(browserSent[0] ?? "{}") as {
     kind?: string;
     payload?: { event?: { kind?: string; summary?: string } };
@@ -496,7 +508,14 @@ test("closing ready socket with handshaking peer fails active commands without m
   assert.equal(envelope.kind, "thread.event");
   assert.equal(envelope.payload?.event?.kind, "command.failed");
   assert.equal(envelope.payload?.event?.summary, "Connector disconnected before the command completed.");
-  const connectorUpdate = JSON.parse(browserSent[1] ?? "{}") as {
+  const appServerUpdate = JSON.parse(browserSent[1] ?? "{}") as {
+    kind?: string;
+    payload?: { app_server_instances?: Array<{ state?: string; active_turn_count?: number }> };
+  };
+  assert.equal(appServerUpdate.kind, "app_server_instances.updated");
+  assert.equal(appServerUpdate.payload?.app_server_instances?.[0]?.state, "stopped");
+  assert.equal(appServerUpdate.payload?.app_server_instances?.[0]?.active_turn_count, 0);
+  const connectorUpdate = JSON.parse(browserSent[2] ?? "{}") as {
     kind?: string;
     payload?: { connectors?: Array<{ id?: string; status?: string; capabilities?: string[]; updated_at?: string }> };
   };
