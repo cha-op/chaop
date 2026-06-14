@@ -390,7 +390,10 @@ export class WorkspaceDO implements DurableObject {
   }
 
   private rememberAppServerReport(connectorId: string, fingerprint: string | undefined): void {
-    if (!fingerprint) return;
+    if (!fingerprint) {
+      this.appServerReportCache.delete(connectorId);
+      return;
+    }
     this.appServerReportCache.set(connectorId, { fingerprint, acceptedAt: Date.now() });
   }
 

@@ -491,27 +491,33 @@ fn app_server_instances_message(
     app_server: &mut AppServerManager,
     snapshot: bool,
 ) -> Option<String> {
-    let instance = app_server.instance_snapshot(config)?;
-    let mut instance_payload = json!({
-        "instance_key": instance.instance_key,
-        "scope": instance.scope,
-        "endpoint_type": instance.endpoint_type,
-        "state": instance.state,
-        "active_turn_count": instance.active_turn_count,
-        "generation": instance.generation
-    });
-    if let Some(status_summary) = instance.status_summary {
-        instance_payload["status_summary"] = json!(status_summary);
-    }
-    if let Some(last_error) = instance.last_error {
-        instance_payload["last_error"] = json!(last_error);
-    }
+    let instances = match app_server.instance_snapshot(config) {
+        Some(instance) => {
+            let mut instance_payload = json!({
+                "instance_key": instance.instance_key,
+                "scope": instance.scope,
+                "endpoint_type": instance.endpoint_type,
+                "state": instance.state,
+                "active_turn_count": instance.active_turn_count,
+                "generation": instance.generation
+            });
+            if let Some(status_summary) = instance.status_summary {
+                instance_payload["status_summary"] = json!(status_summary);
+            }
+            if let Some(last_error) = instance.last_error {
+                instance_payload["last_error"] = json!(last_error);
+            }
+            vec![instance_payload]
+        }
+        None if snapshot => Vec::new(),
+        None => return None,
+    };
     Some(
         json!({
             "kind": "agent.app_server_instances",
             "payload": {
                 "snapshot": snapshot,
-                "instances": [instance_payload]
+                "instances": instances
             }
         })
         .to_string(),
@@ -1887,6 +1893,31 @@ mod tests {
             Some(true)
         );
         assert!(value.pointer("/payload/instances/0/last_error").is_none());
+    }
+
+    #[test]
+    fn app_server_instances_message_sends_empty_snapshot_when_reporting_disabled() {
+        let config = test_config();
+        let mut manager = AppServerManager::new(&config);
+
+        let snapshot_message =
+            app_server_instances_message(&config, &mut manager, true).expect("message");
+        let snapshot_value: Value = serde_json::from_str(&snapshot_message).expect("json");
+
+        assert_eq!(
+            snapshot_value
+                .pointer("/payload/snapshot")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot_value
+                .pointer("/payload/instances")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert!(app_server_instances_message(&config, &mut manager, false).is_none());
     }
 
     #[test]

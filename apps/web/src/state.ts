@@ -31,10 +31,9 @@ export function mergeBootstrapPayload(
     events: mergeById(incoming.events, current.events, newerByCreatedAt),
     host_sessions: mergeHostSessions(incoming.host_sessions, current.host_sessions),
     host_session_syncs: hostSessionSyncs,
-    app_server_instances: mergeById(
-      incoming.app_server_instances,
+    app_server_instances: mergeBootstrapAppServerInstances(
       current.app_server_instances,
-      newerAppServerInstance
+      incoming.app_server_instances
     )
   };
 }
@@ -47,6 +46,17 @@ function mergeBootstrapConnectors(
   return incoming.map((item) => {
     const currentItem = currentById.get(item.id);
     return currentItem ? newerConnector(item, currentItem) : item;
+  });
+}
+
+function mergeBootstrapAppServerInstances(
+  current: AppServerInstanceSummary[],
+  incoming: AppServerInstanceSummary[]
+): AppServerInstanceSummary[] {
+  const currentById = new Map(current.map((item) => [item.id, item]));
+  return incoming.map((item) => {
+    const currentItem = currentById.get(item.id);
+    return currentItem ? newerAppServerInstance(item, currentItem) : item;
   });
 }
 

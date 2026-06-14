@@ -274,11 +274,17 @@ test("app-server edge report bypasses duplicate healthy cache", async () => {
     kind: "agent.app_server_instances",
     payload: { instances: [appServerInstancePayload("degraded", { last_error: "Health failed" })] }
   }));
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: { instances: [appServerInstancePayload("healthy")] }
+  }));
 
-  assert.equal(db.writes, 2);
-  assert.equal(browserSent.length, 2);
+  assert.equal(db.writes, 3);
+  assert.equal(browserSent.length, 3);
   const edgeUpdate = JSON.parse(browserSent[1] ?? "{}") as { payload?: { app_server_instances?: Array<{ state?: string }> } };
   assert.equal(edgeUpdate.payload?.app_server_instances?.[0]?.state, "degraded");
+  const recoveryUpdate = JSON.parse(browserSent[2] ?? "{}") as { payload?: { app_server_instances?: Array<{ state?: string }> } };
+  assert.equal(recoveryUpdate.payload?.app_server_instances?.[0]?.state, "healthy");
 });
 
 test("internal broadcast thread events forwards valid events to browser sockets", async () => {

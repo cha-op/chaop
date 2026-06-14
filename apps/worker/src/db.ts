@@ -2981,18 +2981,20 @@ export async function getConnectorSummary(
 async function listAppServerInstances(env: Env): Promise<AppServerInstanceSummary[]> {
   const rows = await allRows<AppServerInstanceRow>(
     env.DB!.prepare(
-      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
-              active_turn_count, generation, status_summary, last_error,
-              last_seen_at, state_changed_at, updated_at
-       FROM app_server_instances
-       ORDER BY CASE state
+      `SELECT asi.id, asi.connector_id, asi.instance_key, asi.scope, asi.endpoint_type, asi.state,
+              asi.active_turn_count, asi.generation, asi.status_summary, asi.last_error,
+              asi.last_seen_at, asi.state_changed_at, asi.updated_at
+       FROM app_server_instances asi
+       INNER JOIN connectors c ON c.id = asi.connector_id
+       WHERE c.status <> 'offline'
+       ORDER BY CASE asi.state
           WHEN 'healthy' THEN 0
           WHEN 'degraded' THEN 1
           WHEN 'restarting' THEN 2
           WHEN 'draining' THEN 3
           WHEN 'stopped' THEN 4
           ELSE 5
-        END, updated_at DESC`
+        END, asi.updated_at DESC`
     )
   );
   return rows.map(appServerInstanceFromRow);

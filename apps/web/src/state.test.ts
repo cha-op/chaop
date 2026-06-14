@@ -68,6 +68,24 @@ test("mergeBootstrapPayload keeps newer app-server instance state over stale boo
   assert.deepEqual(merged.app_server_instances, [currentInstance]);
 });
 
+test("mergeBootstrapPayload removes app-server instances omitted from bootstrap snapshot", () => {
+  const current = payload({
+    app_server_instances: [
+      appServerInstance("app-server-a", "healthy", "2026-06-12T10:02:00.000Z"),
+      appServerInstance("app-server-b", "stopped", "2026-06-12T10:02:00.000Z")
+    ]
+  });
+  const incoming = payload({
+    app_server_instances: [
+      appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z")
+    ]
+  });
+
+  const merged = mergeBootstrapPayload(current, incoming);
+
+  assert.deepEqual(merged.app_server_instances, [current.app_server_instances[0]]);
+});
+
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {
   const retained = appServerInstance("app-server-retained", "healthy", "2026-06-12T10:00:00.000Z", "connector-2");
   const replaced = appServerInstance("app-server-old", "healthy", "2026-06-12T10:00:00.000Z", "connector-1");
