@@ -12,7 +12,8 @@
 - Rust connector 会上报轻量本机 Codex session inventory，可以可选使用 app-server `Thread.name` 做 title enrichment，并且在配置 `session_inventory.app_server_url` 后可以创建新的本机 app-server thread。
 - 已 attach Host Sessions 现在会向 connector 请求单一 session 的有界 history backfill，导入简短 rollout/history 摘要，而不是上传宽泛 transcript。
 - 已 attach Host Session tasks 的 archive/unarchive 操作现在会先更新 Chaop 的 D1 task/thread 状态，再尝试通过 connector 把可解析的 Codex app-server thread 同步到 `thread/archive` 和 `thread/unarchive` 状态；同步失败会作为 warning 回传，非 app-server sessions 仍然只改 D1。
-- 当前工作流状态记录在 `docs/project_journal/2026/06/2026-06-13-app-server-execution-e4a7c9.zh-Hans.md`。
+- 下一轮交付工作流是九个 PR 的 app-server lifecycle roadmap，从 PR0 的 Web deploy script 开始，再把 execution UX 逐步迁移到 managed app-server operation。
+- 当前工作流状态记录在 `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.zh-Hans.md`。
 
 ## 恢复入口
 - 设计来源：`docs/design-starter.zh-Hans.md`
@@ -20,6 +21,7 @@
 - Codex CLI 执行来源：`docs/project_journal/2026/06/2026-06-10-codex-cli-execution-b7f2c1.zh-Hans.md`
 - Task/thread/session attach 来源：`docs/project_journal/2026/06/2026-06-11-task-thread-session-attach-d6e9f3.zh-Hans.md`
 - App-server execution 来源：`docs/project_journal/2026/06/2026-06-13-app-server-execution-e4a7c9.zh-Hans.md`
+- App-server lifecycle roadmap 来源：`docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.zh-Hans.md`
 - 成本治理来源：`docs/cost-aware.zh-Hans.md`
 - 本地索引：可生成 `docs/project_journal/INDEX.md`，但不要提交。
 
