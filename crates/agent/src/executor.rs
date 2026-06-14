@@ -16,7 +16,7 @@ pub fn codex_exec_started_event(workspace_root: &Path) -> ConnectorEvent {
         kind: "command.started".to_owned(),
         priority: "P1".to_owned(),
         summary: format!(
-            "Connector started Codex exec in {}.",
+            "Connector started Codex CLI fallback in {}.",
             workspace_root.to_string_lossy()
         ),
     }
@@ -46,13 +46,14 @@ pub(crate) fn codex_exec_result_events_with_cancel(
         Ok(output) if output.cancelled => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
-            summary: "Codex exec was cancelled because the connector connection closed.".to_owned(),
+            summary: "Codex CLI fallback was cancelled because the connector connection closed."
+                .to_owned(),
         }],
         Ok(output) if output.timed_out => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
             summary: format!(
-                "Codex exec timed out after {} seconds.",
+                "Codex CLI fallback timed out after {} seconds.",
                 config.codex_timeout_seconds.max(1)
             ),
         }],
@@ -74,7 +75,7 @@ pub(crate) fn codex_exec_result_events_with_cancel(
         Err(error) => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
-            summary: format!("Codex exec could not start: {error}."),
+            summary: format!("Codex CLI fallback could not start: {error}."),
         }],
     }
 }
@@ -209,7 +210,7 @@ fn codex_result_events(
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
             summary: format!(
-                "Codex exec failed{}: {}",
+                "Codex CLI fallback failed{}: {}",
                 code.map(|value| format!(" with exit code {value}"))
                     .unwrap_or_default(),
                 truncate_summary(first_non_empty(stderr, stdout), 600)
@@ -229,7 +230,7 @@ fn codex_result_events(
         events.push(ConnectorEvent {
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
-            summary: "Codex exec completed without an assistant message.".to_owned(),
+            summary: "Codex CLI fallback completed without an assistant message.".to_owned(),
         });
     }
 
@@ -245,15 +246,16 @@ fn codex_result_events(
         events.push(ConnectorEvent {
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
-            summary: "Codex exec output exceeded the connector cap; summaries may be incomplete."
-                .to_owned(),
+            summary:
+                "Codex CLI fallback output exceeded the connector cap; summaries may be incomplete."
+                    .to_owned(),
         });
     }
 
     events.push(ConnectorEvent {
         kind: "command.finished".to_owned(),
         priority: "P1".to_owned(),
-        summary: "Codex exec completed successfully.".to_owned(),
+        summary: "Codex CLI fallback completed successfully.".to_owned(),
     });
     events
 }
@@ -368,7 +370,7 @@ impl CodexUsage {
             .unwrap_or_else(|| "unknown".to_owned());
         let reasoning = self.reasoning_output_tokens.unwrap_or(0);
         format!(
-            "Codex exec usage: {total} total tokens, {input} input ({cached} cached), {output} output, {reasoning} reasoning."
+            "Codex CLI fallback usage: {total} total tokens, {input} input ({cached} cached), {output} output, {reasoning} reasoning."
         )
     }
 }
@@ -397,7 +399,7 @@ mod tests {
         assert_eq!(summary.last_agent_message.as_deref(), Some("chaop-smoke"));
         assert_eq!(
             summary.usage.expect("usage").summary(),
-            "Codex exec usage: 15 total tokens, 12 input (4 cached), 3 output, 1 reasoning."
+            "Codex CLI fallback usage: 15 total tokens, 12 input (4 cached), 3 output, 1 reasoning."
         );
     }
 
@@ -423,7 +425,7 @@ mod tests {
         assert_eq!(events[0].summary, "Codex: done");
         assert_eq!(
             events[1].summary,
-            "Codex exec usage: 9 total tokens, 7 input (0 cached), 2 output, 0 reasoning."
+            "Codex CLI fallback usage: 9 total tokens, 7 input (0 cached), 2 output, 0 reasoning."
         );
     }
 
@@ -435,7 +437,7 @@ mod tests {
         assert_eq!(events[0].kind, "command.failed");
         assert_eq!(
             events[0].summary,
-            "Codex exec failed with exit code 2: network unavailable"
+            "Codex CLI fallback failed with exit code 2: network unavailable"
         );
     }
 
@@ -494,7 +496,7 @@ mod tests {
         assert_eq!(events[0].kind, "command.failed");
         assert_eq!(
             events[0].summary,
-            "Codex exec was cancelled because the connector connection closed."
+            "Codex CLI fallback was cancelled because the connector connection closed."
         );
     }
 }

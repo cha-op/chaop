@@ -1,5 +1,7 @@
 import type {
   BootstrapPayload,
+  CommandSummary,
+  CreateCommandRequest,
   ConnectorSummary,
   HostSessionBackfillSummary,
   HostSessionSummary,
@@ -7,6 +9,10 @@ import type {
   TaskArchiveResponse,
   ThreadSummary
 } from "@chaop/protocol";
+
+export type CommandExecutionMode = "placeholder" | "app_server" | "codex_cli_fallback";
+
+export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
 
 export function mergeBootstrapPayload(
   current: BootstrapPayload | undefined,
@@ -64,6 +70,71 @@ export function localThreadConnectorId(
     : undefined;
 }
 
+export function commandTypeForMode(mode: CommandExecutionMode): CommandSummary["type"] {
+  return mode === "placeholder" ? "placeholder" : "codex";
+}
+
+export function commandExecutionModeForRequest(
+  mode: CommandExecutionMode
+): CreateCommandRequest["execution_mode"] {
+  if (mode === "placeholder") return undefined;
+  return mode;
+}
+
+export function commandModeLabel(mode: CommandExecutionMode): string {
+  return {
+    placeholder: "Placeholder",
+    app_server: "App-server",
+    codex_cli_fallback: "CLI fallback"
+  }[mode];
+}
+
+export function managedAppServerCommandAvailable(
+  data: BootstrapPayload | undefined,
+  threadId: string | undefined
+): boolean {
+  const session = attachedAppServerHostSession(data, threadId);
+  if (!data || !session) return false;
+  const connector = data.connectors.find((item) => item.id === session.connector_id);
+  return Boolean(connector && connectorCanRunManagedAppServer(connector));
+}
+
+export function codexCliFallbackAvailable(
+  data: BootstrapPayload | undefined,
+  workspaceId: string | undefined
+): boolean {
+  if (!data || !workspaceId) return false;
+  const workspace = data.workspaces.find((item) => item.id === workspaceId);
+  if (!workspace) return false;
+  const connectorIds = new Set(workspace.connector_ids);
+  return data.connectors.some(
+    (connector) =>
+      connectorIds.has(connector.id) &&
+      connector.status !== "offline" &&
+      connector.capabilities.includes("codex_exec")
+  );
+}
+
+export function normaliseCommandMode(
+  mode: CommandExecutionMode,
+  data: BootstrapPayload | undefined,
+  threadId: string | undefined,
+  options: { showCliFallback: boolean }
+): CommandExecutionMode {
+  if (mode === "app_server" && !managedAppServerCommandAvailable(data, threadId)) {
+    return "placeholder";
+  }
+
+  if (mode === "codex_cli_fallback") {
+    const thread = data?.threads.find((item) => item.id === threadId);
+    if (!options.showCliFallback || !codexCliFallbackAvailable(data, thread?.workspace_id)) {
+      return "placeholder";
+    }
+  }
+
+  return mode;
+}
+
 export function historyBackfillNotice(backfill: HostSessionBackfillSummary | undefined): string | undefined {
   if (!backfill || !backfill.attempted || backfill.error) return undefined;
   const count = backfill.imported_event_count;
@@ -93,6 +164,20 @@ export function archiveSyncNotice(
   const sync = response.archive_sync;
   if (!sync || !sync.attempted || sync.error) return undefined;
   return `${action} completed. App-server sync completed.`;
+}
+
+function attachedAppServerHostSession(
+  data: BootstrapPayload | undefined,
+  threadId: string | undefined
+): HostSessionSummary | undefined {
+  if (!data || !threadId) return undefined;
+  return data.host_sessions.find(
+    (session) => session.attached_thread_id === threadId && session.app_server_present === true
+  );
+}
+
+function connectorCanRunManagedAppServer(connector: ConnectorSummary): boolean {
+  return connector.status !== "offline" && connector.capabilities.includes("codex_app_server_exec");
 }
 
 function mergeById<T extends { id: string }>(

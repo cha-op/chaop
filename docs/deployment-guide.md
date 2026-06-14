@@ -6,13 +6,13 @@
 
 This guide explains how to prepare the Cloudflare and connector configuration for the first deployment slice of the Codex control plane.
 
-The first slice is Cloudflare-first. The Rust connector supports placeholder execution by default and can opt in to local `codex exec` or Codex app-server execution through private connector configuration:
+The first slice is Cloudflare-first. The Rust connector supports placeholder execution by default and can opt in to managed Codex app-server execution, or to a private local `codex exec` fallback, through private connector configuration:
 
 ```text
 Browser GUI -> Cloudflare Access -> Worker / Durable Object -> D1 / R2 -> Rust connector -> Worker / Durable Object -> Browser GUI
 ```
 
-Current implementation status: the repository can persist command lifecycle rows in D1, dispatch pending commands through the Durable Object, receive lifecycle events from the Rust connector, attach local Codex sessions as task/thread views, create new local Codex app-server threads, and sync archive/unarchive for attached Host Session tasks when the connector has `session_inventory.app_server_url` configured. It can run local Codex work through either the CLI adapter (`execution.mode = "codex_exec"`) or the app-server protocol (`execution.mode = "app_server"`) in private configuration. R2 artefact capture is still reserved for a later slice.
+Current implementation status: the repository can persist command lifecycle rows in D1, dispatch pending commands through the Durable Object, receive lifecycle events from the Rust connector, attach local Codex sessions as task/thread views, create new local Codex app-server threads, and sync archive/unarchive for attached Host Session tasks when the connector has `session_inventory.app_server_url` configured. The intended product execution path is the app-server protocol (`execution.mode = "app_server"`). The CLI adapter (`execution.mode = "codex_exec"`) remains a private fallback/comparison path. R2 artefact capture is still reserved for a later slice.
 
 Keep secrets out of Git. Share sensitive values only through a local ignored file, a password manager, or direct `wrangler secret put` commands.
 
@@ -338,9 +338,9 @@ app_server_timeout_seconds = 2
 # app_server_url = "ws://127.0.0.1:9876"
 ```
 
-`mode = "placeholder"` is the safe default. To run real local Codex work, set one of these modes only in a private deployment config.
+`mode = "placeholder"` is the safe default. To run real local Codex work, prefer the app-server adapter in a private deployment config.
 
-For the Codex CLI adapter:
+For the private Codex CLI fallback:
 
 ```toml
 [execution]
@@ -350,6 +350,8 @@ codex_sandbox = "read-only"
 codex_timeout_seconds = 300
 codex_output_max_bytes = 262144
 ```
+
+Do not expose this as the default Browser execution path. The GUI hides the CLI fallback unless the Web build explicitly sets `VITE_CHAOP_SHOW_CODEX_CLI_FALLBACK=true`; production deployments should leave that unset.
 
 For the Codex app-server adapter:
 
@@ -371,15 +373,15 @@ codex_model = "gpt-5.5"
 extra_args = ["--skip-git-repo-check"]
 ```
 
-Only add optional settings when the local Codex CLI needs them. `codex_exec` and `app_server` can consume Codex/OpenAI allowance or API budget; set the alerts in [Cost Model](cost-aware.md) before leaving real execution running unattended.
+Only add optional settings when the local Codex CLI needs them. `app_server` and the private `codex_exec` fallback can both consume Codex/OpenAI allowance or API budget; set the alerts in [Cost Model](cost-aware.md) before leaving real execution running unattended.
 Prompts are passed to Codex over stdin, not command-line arguments. Keep the timeout and output cap in place unless there is a specific operator reason to widen them.
-Use an absolute `codex_command` path for long-lived connectors launched by `launchctl` or another service manager. Those processes may not inherit the interactive shell `PATH`; if the executable cannot be found, Codex exec commands fail before any workspace `cwd` is used.
+Use an absolute `codex_command` path for long-lived connectors launched by `launchctl` or another service manager. Those processes may not inherit the interactive shell `PATH`; if the executable cannot be found, private CLI fallback commands fail before any workspace `cwd` is used.
 
 Session inventory is enabled by default. The connector reads local Codex metadata from `CODEX_HOME` or `~/.codex`, reports session id, title, cwd, update time, and title source, and does not upload rollout transcripts during ordinary inventory reports. Title resolution prefers metadata or rollout titles, then optional app-server `Thread.name`, then a recent local history prompt, and finally a cwd/session-id fallback. Setting `session_inventory.enabled = false` disables both host session inventory and host session history backfill capability.
 
 When a user explicitly attaches a Host Session, the Worker asks that session's connector for a bounded history backfill for that single session. The connector reads the matching local rollout, skips injected developer/context records, reasoning records, and tool output records, and returns short user, assistant, and tool-call summaries only. If no rollout is found, it falls back to a recent `history.jsonl` prompt for that session. Imported events keep the original local event timestamp, so old backfilled history does not crowd out newer control-plane events in the global recent-event feed. Backfill failures do not block the attachment; the Browser shows the attached thread and reports the backfill warning separately.
 
-Set `session_inventory.app_server_url` when Chaop should create new local Codex app-server threads, use app-server titles, run attached-thread commands through the app-server protocol, or keep attached Host Session archive state in sync with the local app-server when a matching app-server thread can be resolved. The connector advertises the `app_server_threads` and `app_server_archive` capabilities only when this URL is configured, and advertises `codex_app_server_exec` only when both this URL is configured and `execution.mode = "app_server"`. This is separate from the CLI-only `codex_exec` capability. The Worker rejects new local thread requests when no online connector has `app_server_threads`. Attached app-server command execution requires the owning connector to advertise `codex_app_server_exec`; Chaop rejects command creation or leasing instead of falling back to `codex_exec` on a different connector. Archive/unarchive remains D1-only when the connector does not advertise `app_server_archive`; when it does, Chaop updates D1 first, then the connector resolves the stored Codex session id to an app-server thread id before calling `thread/archive` or `thread/unarchive`. Sync failures are returned to the Browser as warnings instead of blocking the local archive state. Keep `app_server_timeout_seconds` short so a stopped app-server cannot stall connector startup, thread creation, command setup, or archive synchronisation longer than necessary.
+Set `session_inventory.app_server_url` when Chaop should create new local Codex app-server threads, use app-server titles, run attached-thread commands through the app-server protocol, or keep attached Host Session archive state in sync with the local app-server when a matching app-server thread can be resolved. The connector advertises the `app_server_threads` and `app_server_archive` capabilities only when this URL is configured, and advertises `codex_app_server_exec` only when both this URL is configured and `execution.mode = "app_server"`. This is separate from the CLI-only `codex_exec` capability. The Worker rejects new local thread requests when no online managed app-server connector has `app_server_threads`. Attached app-server command execution requires the owning connector to advertise `codex_app_server_exec`; Chaop rejects command creation or leasing instead of falling back to `codex_exec` on a different connector. Archive/unarchive remains D1-only when the connector does not advertise `app_server_archive`; when it does, Chaop updates D1 first, then the connector resolves the stored Codex session id to an app-server thread id before calling `thread/archive` or `thread/unarchive`. Sync failures are returned to the Browser as warnings instead of blocking the local archive state. Keep `app_server_timeout_seconds` short so a stopped app-server cannot stall connector startup, thread creation, command setup, or archive synchronisation longer than necessary.
 
 New local threads always start in the connector's configured `workspace_root`; the Browser API does not accept or forward an arbitrary cwd.
 App-server command execution only runs against a Chaop thread/task attached to a local app-server Host Session. The Worker includes the attached local session id and cwd in `command.dispatch`, and the connector resolves the session to the current app-server thread id before calling `thread/resume` and `turn/start` from that cwd. Command setup can paginate through the app-server thread list under `codex_timeout_seconds`; cancellation or timeout best-effort sends `turn/interrupt` when a turn id is known or can still be recovered from the `turn/start` response. Chaop records lifecycle events and the final assistant message summary only; local commandExecution output is not uploaded by default.
@@ -472,7 +474,7 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - If service-token smoke tests get `401` from the Worker with an identity error, check that the Access policy allows the service token and that the service-token headers reach the API route.
 - If Browser command submission fails before reaching the Worker, check whether the request has become a CORS preflight and either keep the simple request shape or allow `OPTIONS /api/*` through Cloudflare Access.
 - If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether `/connector/bootstrap` and `/ws/agent` are excluded from Browser Access.
-- If Codex exec returns `Codex executable not found`, set `execution.codex_command` to an absolute path that the connector process can execute, for example `/opt/homebrew/bin/codex` on this macOS deployment. This is separate from the attached session `cwd`.
+- If the private CLI fallback returns `Codex executable not found`, set `execution.codex_command` to an absolute path that the connector process can execute, for example `/opt/homebrew/bin/codex` on this macOS deployment. This is separate from the attached session `cwd`.
 - If app-server execution fails before the turn starts, check that `execution.mode = "app_server"`, `session_inventory.app_server_url` is set, the target Chaop thread is attached to an app-server Host Session, and the app-server is running on the configured listener.
 - If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
 - If New local thread fails with an app-server error, check that `codex app-server --listen ws://127.0.0.1:9876` is running, `session_inventory.app_server_url` matches it, and the connector was restarted after the config change.

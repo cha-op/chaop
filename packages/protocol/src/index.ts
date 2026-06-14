@@ -202,6 +202,7 @@ export type CommandSummary = {
   thread_id?: string | undefined;
   task_id?: string | undefined;
   type: "placeholder" | "codex";
+  execution_mode?: CommandRequestExecutionMode | undefined;
   prompt: string;
   state:
     | "pending"
@@ -215,6 +216,8 @@ export type CommandSummary = {
   created_at: string;
   updated_at: string;
 };
+
+export type CommandRequestExecutionMode = "app_server" | "codex_cli_fallback";
 
 export type CommandTargetHostSession = {
   session_id: string;
@@ -288,6 +291,7 @@ export type CreateCommandRequest = {
   thread_id?: string | undefined;
   task_id?: string | undefined;
   type?: CommandSummary["type"] | undefined;
+  execution_mode?: CommandRequestExecutionMode | undefined;
   prompt: string;
   target_connector_id?: string | undefined;
 };

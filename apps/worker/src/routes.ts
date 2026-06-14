@@ -138,6 +138,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           thread_id: commandRequest.thread_id,
           task_id: commandRequest.task_id,
           type: commandRequest.type ?? "placeholder",
+          execution_mode: commandRequest.type === "codex" ? commandRequest.execution_mode : undefined,
           prompt: commandRequest.prompt,
           state: "pending",
           target_connector_id: commandRequest.target_connector_id,
@@ -807,6 +808,8 @@ function isCreateCommandRequest(value: unknown): value is CreateCommandRequest {
     optionalString(value.thread_id) &&
     optionalString(value.task_id) &&
     optionalCommandType(value.type) &&
+    optionalCommandExecutionMode(value.execution_mode) &&
+    commandExecutionModeMatchesType(value) &&
     optionalString(value.target_connector_id)
   );
 }
@@ -842,6 +845,14 @@ function optionalString(value: unknown): value is string | undefined {
 
 function optionalCommandType(value: unknown): value is CreateCommandRequest["type"] {
   return value === undefined || value === "placeholder" || value === "codex";
+}
+
+function optionalCommandExecutionMode(value: unknown): value is CreateCommandRequest["execution_mode"] {
+  return value === undefined || value === "app_server" || value === "codex_cli_fallback";
+}
+
+function commandExecutionModeMatchesType(value: Record<string, unknown>): boolean {
+  return value.execution_mode === undefined || value.type === "codex";
 }
 
 function isAgentHostSession(value: unknown): value is AgentHostSession {

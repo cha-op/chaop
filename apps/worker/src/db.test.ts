@@ -414,6 +414,25 @@ test("pendingCommandsForConnector does not store app-server lease targets for pl
   assert.equal(db.connectorActivityUpdates, 1);
 });
 
+test("pendingCommandsForConnector routes CLI fallback without an attached host session target", async () => {
+  const db = pendingCommandDispatchDb({
+    commandExecutionMode: "codex_cli_fallback",
+    commandTargetConnectorId: "connector-online",
+    targetConnectorIdSource: "auto",
+    targetHostSessionAppServerPresent: 1
+  });
+
+  const dispatches = await pendingCommandsForConnector({ DB: db } as Env, "connector-online");
+
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0]?.command.type, "codex");
+  assert.equal(dispatches[0]?.command.execution_mode, "codex_cli_fallback");
+  assert.equal(dispatches[0]?.command.target_connector_id, "connector-online");
+  assert.equal(dispatches[0]?.target_host_session, undefined);
+  assert.equal(db.commandLeaseUpdates, 1);
+  assert.equal(db.connectorActivityUpdates, 1);
+});
+
 test("pendingCommandsForConnector retargets auto commands to the current app-server attachment owner", async () => {
   const db = pendingCommandDispatchDb({
     connectorId: "connector-attached",
@@ -1878,6 +1897,7 @@ function pendingCommandDispatchDb(options: {
   targetConnectorIdSource?: "explicit" | "attached" | "auto";
   targetHostSessionAppServerPresent?: 0 | 1;
   commandType?: "placeholder" | "codex";
+  commandExecutionMode?: "app_server" | "codex_cli_fallback";
   commandLeaseUpdateChanges?: 0 | 1;
   storedLeaseTargetHostSessionId?: string | null;
 } = {}) {
@@ -1886,6 +1906,14 @@ function pendingCommandDispatchDb(options: {
   const targetConnectorIdSource = options.targetConnectorIdSource ?? "attached";
   const targetHostSessionAppServerPresent = options.targetHostSessionAppServerPresent ?? 1;
   const commandType = options.commandType ?? "codex";
+  const selectedHostSessionRowId =
+    options.commandExecutionMode === "codex_cli_fallback" ? null : "host-session-tree-1";
+  const selectedHostSessionId =
+    options.commandExecutionMode === "codex_cli_fallback" ? null : "session-tree-1";
+  const selectedHostSessionCwd =
+    options.commandExecutionMode === "codex_cli_fallback" ? null : "/workspace/project";
+  const selectedHostSessionAppServerPresent =
+    options.commandExecutionMode === "codex_cli_fallback" ? null : targetHostSessionAppServerPresent;
   const counters = {
     commandLeaseUpdates: 0,
     connectorActivityUpdates: 0
@@ -1894,7 +1922,10 @@ function pendingCommandDispatchDb(options: {
     prepare(sql: string) {
       if (/FROM commands cmd/.test(sql) && /LEFT JOIN host_sessions hs/.test(sql)) {
         assert.match(sql, /hs\.session_id AS target_host_session_id/);
-        assert.match(sql, /ON hs\.id = COALESCE\(/);
+        assert.match(
+          sql,
+          /ON COALESCE\(cmd\.execution_mode, ''\) <> 'codex_cli_fallback'\s+AND hs\.id = COALESCE\(/
+        );
         assert.match(sql, /cmd\.task_id IS NOT NULL\s+AND hs_task\.attached_task_id = cmd\.task_id/);
         assert.match(sql, /cmd\.thread_id IS NOT NULL\s+AND hs_thread\.attached_thread_id = cmd\.thread_id/);
         assert.match(sql, /OR NOT EXISTS \(\s+SELECT 1\s+FROM host_sessions hst/);
@@ -1950,16 +1981,17 @@ function pendingCommandDispatchDb(options: {
                       thread_id: "thread-1",
                       task_id: "task-1",
                       type: commandType,
+                      execution_mode: options.commandExecutionMode ?? null,
                       prompt: "Summarise this thread",
                       state: "pending",
                       target_connector_id: commandTargetConnectorId,
                       target_connector_id_source: targetConnectorIdSource,
                       created_at: "2026-06-13T10:00:00.000Z",
                       updated_at: "2026-06-13T10:00:00.000Z",
-                      target_host_session_row_id: "host-session-tree-1",
-                      target_host_session_id: "session-tree-1",
-                      target_host_session_app_server_present: targetHostSessionAppServerPresent,
-                      target_host_session_cwd: "/workspace/project"
+                      target_host_session_row_id: selectedHostSessionRowId,
+                      target_host_session_id: selectedHostSessionId,
+                      target_host_session_app_server_present: selectedHostSessionAppServerPresent,
+                      target_host_session_cwd: selectedHostSessionCwd
                     }
                   ]
                 };
@@ -1971,6 +2003,7 @@ function pendingCommandDispatchDb(options: {
 
       if (/UPDATE commands/.test(sql) && /SET state = 'leased'/.test(sql)) {
         assert.match(sql, /COALESCE\(\s+\(\s+SELECT hs_task\.id/);
+        assert.match(sql, /COALESCE\(commands\.execution_mode, ''\) = 'codex_cli_fallback'/);
         assert.match(sql, /hs_task\.attached_task_id = commands\.task_id/);
         assert.match(sql, /hs_thread\.attached_thread_id = commands\.thread_id/);
         assert.match(sql, /target_connector_id_source = 'auto'\s+AND EXISTS \(\s+SELECT 1\s+FROM host_sessions hs_target/);
@@ -2004,25 +2037,28 @@ function pendingCommandDispatchDb(options: {
             capabilityConnectorId: string,
             capabilityHostSessionConnectorId: string
           ) {
-            assert.equal(targetHostSessionIdForTarget, "session-tree-1");
-            assert.equal(targetHostSessionIsAppServerForTarget, targetHostSessionAppServerPresent);
+            assert.equal(targetHostSessionIdForTarget, selectedHostSessionId);
+            assert.equal(targetHostSessionIsAppServerForTarget, selectedHostSessionAppServerPresent ?? 0);
             assert.equal(retargetConnectorId, connectorIdUnderTest);
-            assert.equal(targetHostSessionIdForSource, "session-tree-1");
-            assert.equal(targetHostSessionIsAppServerForSource, targetHostSessionAppServerPresent);
+            assert.equal(targetHostSessionIdForSource, selectedHostSessionId);
+            assert.equal(targetHostSessionIsAppServerForSource, selectedHostSessionAppServerPresent ?? 0);
             assert.equal(connectorId, connectorIdUnderTest);
             assert.match(leaseUntil, /^\d{4}-\d{2}-\d{2}T/);
-            assert.equal(leaseTargetHostSessionId, commandType === "codex" ? "session-tree-1" : null);
+            assert.equal(
+              leaseTargetHostSessionId,
+              commandType === "codex" && selectedHostSessionAppServerPresent === 1 ? selectedHostSessionId : null
+            );
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(commandId, "command-1");
             assert.match(now, /^\d{4}-\d{2}-\d{2}T/);
-            assert.equal(selectedHostSessionIdForNullGuard, "host-session-tree-1");
-            assert.equal(selectedHostSessionIdForPresentGuard, "host-session-tree-1");
-            assert.equal(selectedHostSessionIdForMatchGuard, "host-session-tree-1");
-            assert.equal(targetHostSessionIdForStoredLeaseGuard, "host-session-tree-1");
+            assert.equal(selectedHostSessionIdForNullGuard, selectedHostSessionRowId);
+            assert.equal(selectedHostSessionIdForPresentGuard, selectedHostSessionRowId);
+            assert.equal(selectedHostSessionIdForMatchGuard, selectedHostSessionRowId);
+            assert.equal(targetHostSessionIdForStoredLeaseGuard, selectedHostSessionRowId);
             assert.equal(targetConnectorId, connectorIdUnderTest);
-            assert.equal(targetHostSessionIdForAutoTargetGuard, "host-session-tree-1");
+            assert.equal(targetHostSessionIdForAutoTargetGuard, selectedHostSessionRowId);
             assert.equal(autoTargetConnectorId, connectorIdUnderTest);
-            assert.equal(targetHostSessionIdForCapabilityGuard, "host-session-tree-1");
+            assert.equal(targetHostSessionIdForCapabilityGuard, selectedHostSessionRowId);
             assert.equal(capabilityConnectorId, connectorIdUnderTest);
             assert.equal(capabilityHostSessionConnectorId, connectorIdUnderTest);
             return {

@@ -665,13 +665,13 @@ fn command_events(command: &CommandPayload) -> Vec<ConnectorEvent> {
             ConnectorEvent {
                 kind: "command.started".to_owned(),
                 priority: "P1".to_owned(),
-                summary: "Connector received a Codex command, but codex_exec is disabled."
+                summary: "Connector received a Codex command, but the CLI fallback is disabled."
                     .to_owned(),
             },
             ConnectorEvent {
                 kind: "command.failed".to_owned(),
                 priority: "P1".to_owned(),
-                summary: "Codex exec is disabled in this connector config.".to_owned(),
+                summary: "Codex CLI fallback is disabled in this connector config.".to_owned(),
             },
         ],
     }
@@ -957,7 +957,7 @@ mod tests {
         );
         assert_eq!(
             events.last().map(|event| event.summary.as_str()),
-            Some("Codex exec is disabled in this connector config.")
+            Some("Codex CLI fallback is disabled in this connector config.")
         );
     }
 

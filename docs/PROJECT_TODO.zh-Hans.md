@@ -14,8 +14,8 @@
 - [done] 为已 attach 的 Host Sessions 增加旧 session history backfill，同时默认不上传宽泛的本机 transcripts。
 - [done] 通过 connector 将 Chaop archive/unarchive 操作同步到本机 Codex app-server archive 状态，同时保持本机 history 文件只读。
 - [done] 为 attach 到本机 app-server Host Session 的 Chaop thread 加入真实 Codex app-server protocol execution。
-- [in_progress] PR0：合并已跟踪的 Web deploy script，并通过完整测试、三重 review 和 GitHub conversations resolved 检查。
-- [todo] PR1：清理 execution UX 和 capability 文案，让 `codex_exec` 只作为 private fallback。
+- [done] PR0：合并已跟踪的 Web deploy script，并通过完整测试、三重 review 和 GitHub conversations resolved 检查。
+- [done] PR1：清理 execution UX 和 capability 文案，让 `codex_exec` 只作为 private fallback。
 - [todo] PR2：增加 connector-managed single app-server lifecycle。
 - [todo] PR3：增加 cost-safe AppServerInstance state model，覆盖 dedupe、debounce、batching 和 rate limits。
 - [todo] PR4：在 Operations 和 Host Sessions 相关界面加入 AppServerInstance state UI。

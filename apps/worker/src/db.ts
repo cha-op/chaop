@@ -517,6 +517,7 @@ async function releaseCommandsForDetachedAppServerHostSession(
          updated_at = ?
      WHERE workspace_id = ?
        AND type = 'codex'
+       AND COALESCE(execution_mode, '') <> 'codex_cli_fallback'
        AND (target_connector_id = ? OR target_connector_id IS NULL)
        AND (
          (
@@ -658,6 +659,7 @@ async function failCommandsForDetachedAppServerHostSession(
        FROM commands cmd
        WHERE cmd.workspace_id = ?
          AND cmd.type = 'codex'
+         AND COALESCE(cmd.execution_mode, '') <> 'codex_cli_fallback'
          AND (cmd.target_connector_id = ? OR cmd.target_connector_id IS NULL)
          AND (
            (
@@ -747,6 +749,7 @@ async function failCommandsForDetachedAppServerHostSession(
        WHERE id = ?
          AND workspace_id = ?
          AND type = 'codex'
+         AND COALESCE(execution_mode, '') <> 'codex_cli_fallback'
          AND (target_connector_id = ? OR target_connector_id IS NULL)
          AND (
            (
@@ -1020,7 +1023,7 @@ export async function chooseConnectorForLocalThread(
     : await findBestLocalThreadConnector(env, request.workspace_id);
 
   if (!connector) {
-    throw new LocalThreadTargetError("No online connector with app-server thread support is available");
+    throw new LocalThreadTargetError("No managed app-server connector with thread support is online");
   }
 
   return connector.id;
@@ -1140,8 +1143,15 @@ export async function createCommandInDb(
   await ensureUser(env, user);
 
   const commandType = request.type ?? "placeholder";
+  if (request.execution_mode && commandType !== "codex") {
+    throw new CommandTargetError("Command execution mode requires codex command type", 400);
+  }
   const scope = await resolveCommandScope(env, request);
-  const attachedTarget = await findAttachedCommandTarget(env, scope);
+  const useAttachedTarget = request.execution_mode !== "codex_cli_fallback";
+  const attachedTarget = useAttachedTarget ? await findAttachedCommandTarget(env, scope) : null;
+  if (request.execution_mode === "app_server" && attachedTarget?.app_server_present !== true) {
+    throw new CommandTargetError("App-server execution requires an attached app-server host session");
+  }
   const attachedTargetForInsert = attachedTarget
     ? {
       connectorId: attachedTarget.connector_id,
@@ -1182,6 +1192,7 @@ export async function createCommandInDb(
     thread_id: scope.threadId,
     task_id: scope.taskId,
     type: commandType,
+    execution_mode: commandType === "codex" ? request.execution_mode : undefined,
     prompt: request.prompt,
     state: "pending",
     target_connector_id: targetConnectorId,
@@ -1234,9 +1245,9 @@ async function insertCommandInDb(
       `INSERT INTO commands (
          id, workspace_id, thread_id, task_id, type, prompt, state,
          target_connector_id, target_connector_id_source, lease_target_host_session_id,
-         created_by, created_at, updated_at
+         execution_mode, created_by, created_at, updated_at
        )
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE EXISTS (
          SELECT 1
          FROM host_sessions hs
@@ -1282,6 +1293,7 @@ async function insertCommandInDb(
         command.target_connector_id,
         options.targetConnectorIdSource,
         options.appServerTargetHostSessionId,
+        command.execution_mode ?? null,
         userId,
         command.created_at,
         command.updated_at,
@@ -1306,8 +1318,8 @@ async function insertCommandInDb(
     `INSERT INTO commands (
        id, workspace_id, thread_id, task_id, type, prompt, state,
        target_connector_id, target_connector_id_source, lease_target_host_session_id,
-       created_by, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+       execution_mode, created_by, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`
   )
     .bind(
       command.id,
@@ -1319,6 +1331,7 @@ async function insertCommandInDb(
       command.state,
       command.target_connector_id ?? null,
       options.targetConnectorIdSource,
+      command.execution_mode ?? null,
       userId,
       command.created_at,
       command.updated_at
@@ -1337,14 +1350,16 @@ export async function pendingCommandsForConnector(
   const rows = await allRows<PendingCommandRow>(
     env.DB.prepare(
       `SELECT cmd.id, cmd.workspace_id, cmd.thread_id, cmd.task_id, cmd.type, cmd.prompt, cmd.state,
-              cmd.target_connector_id, cmd.target_connector_id_source, cmd.created_at, cmd.updated_at,
+              cmd.target_connector_id, cmd.target_connector_id_source, cmd.execution_mode,
+              cmd.created_at, cmd.updated_at,
               hs.id AS target_host_session_row_id,
               hs.session_id AS target_host_session_id,
               hs.app_server_present AS target_host_session_app_server_present,
               hs.cwd AS target_host_session_cwd
        FROM commands cmd
        LEFT JOIN host_sessions hs
-         ON hs.id = COALESCE(
+         ON COALESCE(cmd.execution_mode, '') <> 'codex_cli_fallback'
+        AND hs.id = COALESCE(
           (
             SELECT hs_task.id
             FROM host_sessions hs_task
@@ -1444,6 +1459,8 @@ export async function pendingCommandsForConnector(
            OR (state = 'leased' AND lease_until IS NOT NULL AND lease_until < ?)
          )
          AND (
+           COALESCE(commands.execution_mode, '') = 'codex_cli_fallback'
+           OR
            (
              ? IS NULL
              AND COALESCE(
@@ -2544,7 +2561,7 @@ async function listRecentCommands(env: Env): Promise<CommandSummary[]> {
   const rows = await allRows<CommandRow>(
     env.DB!.prepare(
       `SELECT id, workspace_id, thread_id, task_id, type, prompt, state,
-        target_connector_id, created_at, updated_at
+        execution_mode, target_connector_id, created_at, updated_at
        FROM commands
        ORDER BY created_at DESC
        LIMIT 10`
@@ -2836,6 +2853,7 @@ function commandFromRow(row: CommandRow): CommandSummary {
     thread_id: row.thread_id ?? undefined,
     task_id: row.task_id ?? undefined,
     type: row.type,
+    execution_mode: row.execution_mode ?? undefined,
     prompt: row.prompt,
     state: row.state,
     target_connector_id: row.target_connector_id ?? undefined,
@@ -3104,6 +3122,7 @@ type HostSessionRow = Omit<
 type CommandRow = Omit<CommandSummary, "thread_id" | "task_id" | "target_connector_id"> & {
   thread_id: string | null;
   task_id: string | null;
+  execution_mode?: CommandSummary["execution_mode"] | null;
   target_connector_id: string | null;
 };
 
