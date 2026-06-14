@@ -82,7 +82,10 @@ export function mergeAppServerInstances(
 ): AppServerInstanceSummary[] {
   const incomingById = new Map(incoming.map((item) => [item.id, item]));
   const retainedCurrent = current.filter(
-    (item) => options.snapshotConnectorId === undefined || item.connector_id !== options.snapshotConnectorId
+    (item) =>
+      options.snapshotConnectorId === undefined ||
+      item.connector_id !== options.snapshotConnectorId ||
+      incomingById.has(item.id)
   );
   const knownIds = new Set(retainedCurrent.map((item) => item.id));
   return [

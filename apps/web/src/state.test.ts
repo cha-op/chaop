@@ -96,6 +96,17 @@ test("mergeAppServerInstances applies connector snapshots without dropping incom
   assert.deepEqual(merged, [retained, incoming]);
 });
 
+test("mergeAppServerInstances keeps newer rows from stale connector snapshots", () => {
+  const retained = appServerInstance("app-server-retained", "healthy", "2026-06-12T10:00:00.000Z", "connector-2");
+  const current = appServerInstance("app-server-current", "degraded", "2026-06-12T10:02:00.000Z", "connector-1");
+  const omitted = appServerInstance("app-server-omitted", "healthy", "2026-06-12T10:02:00.000Z", "connector-1");
+  const staleIncoming = appServerInstance("app-server-current", "healthy", "2026-06-12T10:01:00.000Z", "connector-1");
+
+  const merged = mergeAppServerInstances([retained, current, omitted], [staleIncoming], { snapshotConnectorId: "connector-1" });
+
+  assert.deepEqual(merged, [retained, current]);
+});
+
 test("localThreadWorkspaceId uses the selected thread workspace", () => {
   const data = payload({
     workspaces: [
