@@ -12,6 +12,7 @@
 - Thread Command Centre 现在把显示用 execution modes 和 protocol command types 分开：managed app-server execution 会作为产品路径显示，Codex CLI fallback 默认隐藏，除非 Web build 显式开启。
 - Rust connector 会上报轻量本机 Codex session inventory，可以可选使用 app-server `Thread.name` 做 title enrichment，并且在配置 `session_inventory.app_server_url` 后可以创建新的本机 app-server thread。
 - Rust connector 现在可以管理一个专用的本机 Codex app-server listener，在声明 app-server capabilities 前先做健康检查，并通过 `agent.ready` 刷新 connector capabilities。
+- Operations Map 和 Host Sessions 现在会展示 AppServerInstance state，包括 connector identity、endpoint type、active turns、changed/seen age，以及不健康 lifecycle states。
 - 已 attach Host Sessions 现在会向 connector 请求单一 session 的有界 history backfill，导入简短 rollout/history 摘要，而不是上传宽泛 transcript。
 - 已 attach Host Session tasks 的 archive/unarchive 操作现在会先更新 Chaop 的 D1 task/thread 状态，再尝试通过 connector 把可解析的 Codex app-server thread 同步到 `thread/archive` 和 `thread/unarchive` 状态；同步失败会作为 warning 回传，非 app-server sessions 仍然只改 D1。
 - 下一轮交付工作流是九个 PR 的 app-server lifecycle roadmap，从 PR0 的 Web deploy script 开始，再把 execution UX 逐步迁移到 managed app-server operation。
@@ -26,6 +27,7 @@
 - App-server lifecycle roadmap 来源：`docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.zh-Hans.md`
 - Execution UX cleanup 来源：`docs/project_journal/2026/06/2026-06-14-execution-ux-capabilities-2b7d4e.zh-Hans.md`
 - Connector-managed app-server 来源：`docs/project_journal/2026/06/2026-06-14-connector-managed-app-server-7a8e1f.zh-Hans.md`
+- AppServerInstance UI 来源：`docs/project_journal/2026/06/2026-06-14-app-server-instance-ui-4b6d91.zh-Hans.md`
 - 成本治理来源：`docs/cost-aware.zh-Hans.md`
 - 本地索引：可生成 `docs/project_journal/INDEX.md`，但不要提交。
 

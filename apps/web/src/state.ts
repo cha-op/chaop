@@ -15,6 +15,40 @@ export type CommandExecutionMode = "placeholder" | "app_server" | "codex_cli_fal
 
 export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
 
+const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], number> = {
+  degraded: 0,
+  stopped: 1,
+  restarting: 2,
+  draining: 3,
+  healthy: 4
+};
+
+export function appServerInstancesForConnector(
+  data: BootstrapPayload | undefined,
+  connectorId: string
+): AppServerInstanceSummary[] {
+  return (data?.app_server_instances ?? [])
+    .filter((instance) => instance.connector_id === connectorId)
+    .sort(compareAppServerInstancesForDisplay);
+}
+
+export function appServerInstancesForDisplay(
+  data: BootstrapPayload | undefined
+): AppServerInstanceSummary[] {
+  return [...(data?.app_server_instances ?? [])].sort(compareAppServerInstancesForDisplay);
+}
+
+export function primaryAppServerInstanceForConnector(
+  data: BootstrapPayload | undefined,
+  connectorId: string
+): AppServerInstanceSummary | undefined {
+  return appServerInstancesForConnector(data, connectorId)[0];
+}
+
+export function appServerInstanceStateLabel(state: AppServerInstanceSummary["state"]): string {
+  return state.replaceAll("_", " ");
+}
+
 export function mergeBootstrapPayload(
   current: BootstrapPayload | undefined,
   incoming: BootstrapPayload
@@ -257,6 +291,25 @@ function attachedAppServerHostSession(
 
 function connectorCanRunManagedAppServer(connector: ConnectorSummary): boolean {
   return connector.status === "online" && connector.capabilities.includes("codex_app_server_exec");
+}
+
+function compareAppServerInstancesForDisplay(
+  left: AppServerInstanceSummary,
+  right: AppServerInstanceSummary
+): number {
+  const stateDelta = APP_SERVER_INSTANCE_STATE_RANK[left.state] - APP_SERVER_INSTANCE_STATE_RANK[right.state];
+  if (stateDelta !== 0) return stateDelta;
+
+  const turnDelta = right.active_turn_count - left.active_turn_count;
+  if (turnDelta !== 0) return turnDelta;
+
+  const updatedDelta = right.updated_at.localeCompare(left.updated_at);
+  if (updatedDelta !== 0) return updatedDelta;
+
+  const connectorDelta = left.connector_id.localeCompare(right.connector_id);
+  if (connectorDelta !== 0) return connectorDelta;
+
+  return left.instance_key.localeCompare(right.instance_key);
 }
 
 function mergeById<T extends { id: string }>(

@@ -238,8 +238,8 @@ h2 {
 
 .connector-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 100px 100px 100px 150px;
-  gap: 16px;
+  grid-template-columns: minmax(160px, 1fr) auto auto auto;
+  gap: 12px;
   align-items: center;
   padding: 14px 0;
 }
@@ -262,7 +262,8 @@ h2 {
 .status.online,
 .chip.realtime,
 .chip.normal,
-.chip.live {
+.chip.live,
+.chip.healthy {
   background: #dcfce7;
   color: #166534;
 }
@@ -272,14 +273,18 @@ h2 {
 .chip.cost_saving,
 .chip.conservative,
 .chip.connecting,
-.chip.polling {
+.chip.polling,
+.chip.degraded,
+.chip.draining,
+.chip.restarting {
   background: #fef3c7;
   color: #92400e;
 }
 
 .status.offline,
 .chip.throttled,
-.chip.hard_limited {
+.chip.hard_limited,
+.chip.stopped {
   background: #fee2e2;
   color: #991b1b;
 }
@@ -301,6 +306,81 @@ h2 {
   display: grid;
   gap: 7px;
   padding: 14px 0;
+}
+
+.instance-list {
+  display: grid;
+  gap: 10px;
+}
+
+.instance-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fbfdff;
+  padding: 12px;
+}
+
+.instance-card header {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: start;
+}
+
+.instance-card header div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.instance-card header span:not(.chip),
+.instance-key,
+.instance-summary,
+.instance-facts dt {
+  color: #64748b;
+  font-size: 0.84rem;
+}
+
+.instance-card strong,
+.instance-card header span:not(.chip),
+.instance-summary {
+  overflow-wrap: anywhere;
+}
+
+.instance-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin: 12px 0 0;
+}
+
+.instance-facts div {
+  display: grid;
+  gap: 2px;
+  border-top: 1px solid #e6ebf2;
+  padding-top: 8px;
+}
+
+.instance-facts dd {
+  margin: 0;
+}
+
+.instance-key,
+.instance-summary {
+  margin: 10px 0 0;
+}
+
+.instance-key code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.78rem;
+}
+
+.compact-instance-list .instance-card {
+  padding: 10px;
+}
+
+.compact-instance-list .instance-facts {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .task-layout {
@@ -543,7 +623,7 @@ h2 {
 }
 
 .session-row {
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) repeat(4, auto);
 }
 
 .session-row div {
@@ -580,6 +660,10 @@ h2 {
 
 .compact-list .session-row .chip {
   display: none;
+}
+
+.compact-list .session-row .app-server-health-chip {
+  display: inline-block;
 }
 
 textarea {

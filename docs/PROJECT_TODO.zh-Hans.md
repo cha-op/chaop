@@ -18,7 +18,7 @@
 - [done] PR1：清理 execution UX 和 capability 文案，让 `codex_exec` 只作为 private fallback。
 - [done] PR2：增加 connector-managed single app-server lifecycle。
 - [done] PR3：增加 cost-safe AppServerInstance state model，覆盖 dedupe、debounce、batching 和 rate limits。
-- [todo] PR4：在 Operations 和 Host Sessions 相关界面加入 AppServerInstance state UI。
+- [done] PR4：在 Operations 和 Host Sessions 相关界面加入 AppServerInstance state UI。
 - [todo] PR5：让 managed app-server execution 成为默认 command path。
 - [todo] PR6：增加 drain、scheduled restart 和 upgrade flow。
 - [todo] PR7：增加 multi-instance 和 thread placement foundation。
