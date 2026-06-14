@@ -61,8 +61,11 @@ struct HostSessionsSendState {
 #[derive(Debug, Default)]
 struct AppServerInstancesSendState {
     last_sent: Option<String>,
+    last_sent_id: Option<String>,
     last_sent_at: Option<Instant>,
     last_acked: Option<String>,
+    last_acked_id: Option<String>,
+    next_report_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,10 +452,14 @@ fn send_app_server_instances(
     if !should_send_app_server_instances(&message, state, force, now) {
         return Ok(());
     }
-    socket.send(Message::Text(message.clone().into()))?;
+    let report_id = state.next_report_id();
+    let outbound_message = app_server_instances_message_with_report_id(&message, &report_id)?;
+    socket.send(Message::Text(outbound_message.into()))?;
     state.last_sent = Some(message);
+    state.last_sent_id = Some(report_id);
     state.last_sent_at = Some(now);
     state.last_acked = None;
+    state.last_acked_id = None;
     Ok(())
 }
 
@@ -480,11 +487,27 @@ fn should_send_app_server_instances(
     true
 }
 
-fn acknowledge_app_server_instances(state: &mut AppServerInstancesSendState) {
+impl AppServerInstancesSendState {
+    fn next_report_id(&mut self) -> String {
+        self.next_report_id = self.next_report_id.saturating_add(1);
+        format!("app-server-report-{}", self.next_report_id)
+    }
+}
+
+fn acknowledge_app_server_instances(
+    state: &mut AppServerInstancesSendState,
+    report_id: Option<&str>,
+) {
+    if let Some(report_id) = report_id {
+        if state.last_sent_id.as_deref() != Some(report_id) {
+            return;
+        }
+    }
     let Some(message) = state.last_sent.clone() else {
         return;
     };
     state.last_acked = Some(message);
+    state.last_acked_id = state.last_sent_id.clone();
 }
 
 fn app_server_instances_message(
@@ -527,6 +550,15 @@ fn app_server_instances_message(
     )
 }
 
+fn app_server_instances_message_with_report_id(
+    message: &str,
+    report_id: &str,
+) -> Result<String, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(message)?;
+    value["payload"]["report_id"] = json!(report_id);
+    Ok(value.to_string())
+}
+
 fn bounded_app_server_instance_text(value: &str) -> String {
     if value.chars().count() <= APP_SERVER_INSTANCE_TEXT_LIMIT {
         return value.to_owned();
@@ -563,11 +595,14 @@ fn fallback_host_sessions_report(config: &AgentConfig) -> AgentHostSessionsRepor
     }
 }
 
-fn app_server_instances_ack_message(envelope: &Envelope) -> bool {
+fn app_server_instances_ack_message(envelope: &Envelope) -> Option<Option<&str>> {
     if envelope.kind != "server.ack" {
-        return false;
+        return None;
     }
-    envelope.payload.get("kind").and_then(Value::as_str) == Some("agent.app_server_instances")
+    if envelope.payload.get("kind").and_then(Value::as_str) != Some("agent.app_server_instances") {
+        return None;
+    }
+    Some(envelope.payload.get("report_id").and_then(Value::as_str))
 }
 
 fn apply_app_server_instances_ack_text(
@@ -575,11 +610,11 @@ fn apply_app_server_instances_ack_text(
     state: &mut AppServerInstancesSendState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
-    if !app_server_instances_ack_message(&envelope) {
-        return Ok(false);
+    if let Some(report_id) = app_server_instances_ack_message(&envelope) {
+        acknowledge_app_server_instances(state, report_id);
+        return Ok(true);
     }
-    acknowledge_app_server_instances(state);
-    Ok(true)
+    Ok(false)
 }
 
 fn handle_text_message(
@@ -603,8 +638,8 @@ fn handle_text_message(
         return Ok(false);
     }
 
-    if app_server_instances_ack_message(&envelope) {
-        acknowledge_app_server_instances(app_server_instances_state);
+    if let Some(report_id) = app_server_instances_ack_message(&envelope) {
+        acknowledge_app_server_instances(app_server_instances_state, report_id);
         return Ok(false);
     }
 
@@ -1158,8 +1193,8 @@ fn handle_background_ack_message(
     app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
 ) -> bool {
-    if app_server_instances_ack_message(envelope) {
-        acknowledge_app_server_instances(app_server_instances_state);
+    if let Some(report_id) = app_server_instances_ack_message(envelope) {
+        acknowledge_app_server_instances(app_server_instances_state, report_id);
         return true;
     }
     if host_sessions_ack_message(envelope) {
@@ -1462,12 +1497,12 @@ mod tests {
         acknowledge_agent_ready, acknowledge_app_server_instances, acknowledge_host_sessions,
         agent_event_message, agent_ready_ack_message, agent_ready_message,
         agent_ready_retry_interval, app_server_instance_summary_interval,
-        app_server_instances_message, apply_agent_ready_ack_text,
-        apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
-        bounded_app_server_instance_text, classify_ack_wait_text, command_events,
-        handle_background_ack_message, host_sessions_ack_message, host_sessions_interval,
-        host_sessions_message, host_sessions_retry_interval, is_read_timeout,
-        requires_app_server_execution_mode, should_send_agent_ready,
+        app_server_instances_message, app_server_instances_message_with_report_id,
+        apply_agent_ready_ack_text, apply_app_server_instances_ack_text,
+        apply_host_sessions_ack_text, bounded_app_server_instance_text, classify_ack_wait_text,
+        command_events, handle_background_ack_message, host_sessions_ack_message,
+        host_sessions_interval, host_sessions_message, host_sessions_retry_interval,
+        is_read_timeout, requires_app_server_execution_mode, should_send_agent_ready,
         should_send_app_server_instances, should_send_host_sessions,
     };
     use crate::app_server_manager::AppServerManager;
@@ -1791,10 +1826,13 @@ mod tests {
         let now = Instant::now();
         let mut state = AppServerInstancesSendState {
             last_sent: Some(message.clone()),
+            last_sent_id: Some("report-1".to_owned()),
             last_sent_at: Some(now),
             last_acked: None,
+            last_acked_id: None,
+            next_report_id: 1,
         };
-        acknowledge_app_server_instances(&mut state);
+        acknowledge_app_server_instances(&mut state, Some("report-1"));
 
         assert!(!should_send_app_server_instances(
             &message,
@@ -1816,8 +1854,11 @@ mod tests {
         let now = Instant::now();
         let state = AppServerInstancesSendState {
             last_sent: Some(message.to_owned()),
+            last_sent_id: Some("report-1".to_owned()),
             last_sent_at: Some(now),
             last_acked: None,
+            last_acked_id: None,
+            next_report_id: 1,
         };
 
         assert!(!should_send_app_server_instances(
@@ -1840,8 +1881,59 @@ mod tests {
             r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
         let mut state = AppServerInstancesSendState {
             last_sent: Some(message.clone()),
+            last_sent_id: Some("report-1".to_owned()),
             last_sent_at: Some(Instant::now()),
             last_acked: None,
+            last_acked_id: None,
+            next_report_id: 1,
+        };
+
+        let applied = apply_app_server_instances_ack_text(
+            r#"{"kind":"server.ack","payload":{"kind":"agent.app_server_instances","report_id":"report-1"}}"#,
+            &mut state,
+        )
+        .expect("ack");
+
+        assert!(applied);
+        assert_eq!(state.last_acked.as_deref(), Some(message.as_str()));
+        assert_eq!(state.last_acked_id.as_deref(), Some("report-1"));
+    }
+
+    #[test]
+    fn app_server_instances_ack_text_ignores_stale_report_ids() {
+        let message =
+            r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let mut state = AppServerInstancesSendState {
+            last_sent: Some(message),
+            last_sent_id: Some("report-current".to_owned()),
+            last_sent_at: Some(Instant::now()),
+            last_acked: None,
+            last_acked_id: None,
+            next_report_id: 2,
+        };
+
+        let applied = apply_app_server_instances_ack_text(
+            r#"{"kind":"server.ack","payload":{"kind":"agent.app_server_instances","report_id":"report-old"}}"#,
+            &mut state,
+        )
+        .expect("ack");
+
+        assert!(applied);
+        assert!(state.last_acked.is_none());
+        assert!(state.last_acked_id.is_none());
+    }
+
+    #[test]
+    fn app_server_instances_ack_text_accepts_legacy_ack_without_report_id() {
+        let message =
+            r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
+        let mut state = AppServerInstancesSendState {
+            last_sent: Some(message.clone()),
+            last_sent_id: Some("report-current".to_owned()),
+            last_sent_at: Some(Instant::now()),
+            last_acked: None,
+            last_acked_id: None,
+            next_report_id: 2,
         };
 
         let applied = apply_app_server_instances_ack_text(
@@ -1852,18 +1944,50 @@ mod tests {
 
         assert!(applied);
         assert_eq!(state.last_acked.as_deref(), Some(message.as_str()));
+        assert_eq!(state.last_acked_id.as_deref(), Some("report-current"));
+    }
+
+    #[test]
+    fn app_server_instances_message_can_carry_report_id_without_changing_semantic_message() {
+        let mut config = test_config();
+        config.session_inventory.managed_app_server.enabled = true;
+        config.session_inventory.managed_app_server.listen_url =
+            Some("ws://127.0.0.1:65530".to_owned());
+        let mut manager = AppServerManager::new(&config);
+
+        let semantic_message =
+            app_server_instances_message(&config, &mut manager, true).expect("message");
+        let outbound = app_server_instances_message_with_report_id(&semantic_message, "report-1")
+            .expect("outbound");
+        let semantic_value: Value = serde_json::from_str(&semantic_message).expect("semantic json");
+        let outbound_value: Value = serde_json::from_str(&outbound).expect("outbound json");
+
+        assert!(semantic_value.pointer("/payload/report_id").is_none());
+        assert_eq!(
+            outbound_value
+                .pointer("/payload/report_id")
+                .and_then(Value::as_str),
+            Some("report-1")
+        );
+        assert_eq!(
+            semantic_value.pointer("/payload/instances"),
+            outbound_value.pointer("/payload/instances")
+        );
     }
 
     #[test]
     fn background_app_server_instances_ack_is_consumed_without_defer() {
         let message =
             r#"{"kind":"agent.app_server_instances","payload":{"instances":[]}}"#.to_owned();
-        let text = r#"{"kind":"server.ack","payload":{"kind":"agent.app_server_instances"}}"#;
+        let text = r#"{"kind":"server.ack","payload":{"kind":"agent.app_server_instances","report_id":"report-1"}}"#;
         let envelope: Envelope = serde_json::from_str(text).expect("envelope");
         let mut app_server_instances_state = AppServerInstancesSendState {
             last_sent: Some(message.clone()),
+            last_sent_id: Some("report-1".to_owned()),
             last_sent_at: Some(Instant::now()),
             last_acked: None,
+            last_acked_id: None,
+            next_report_id: 1,
         };
         let mut host_sessions_state = HostSessionsSendState::default();
 
@@ -1879,6 +2003,10 @@ mod tests {
         assert_eq!(
             app_server_instances_state.last_acked.as_deref(),
             Some(message.as_str())
+        );
+        assert_eq!(
+            app_server_instances_state.last_acked_id.as_deref(),
+            Some("report-1")
         );
     }
 

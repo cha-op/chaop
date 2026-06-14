@@ -138,6 +138,7 @@ export type AgentAppServerInstance = {
 };
 
 export type AgentAppServerInstancesReport = {
+  report_id?: string | undefined;
   snapshot?: boolean | undefined;
   instances: AgentAppServerInstance[];
 };

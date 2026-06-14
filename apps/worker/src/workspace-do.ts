@@ -264,7 +264,8 @@ export class WorkspaceDO implements DurableObject {
             kind: "agent.app_server_instances",
             count: result.app_server_instances.length,
             synced_at: result.synced_at,
-            deduped
+            deduped,
+            report_id: message.payload.report_id
           })
         )
       );
@@ -982,6 +983,7 @@ function isAgentReadyPayload(value: unknown): value is { capabilities: string[] 
 function isAgentAppServerInstancesReport(value: unknown): value is AgentAppServerInstancesReport {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
+  if (record.report_id !== undefined && !isBoundedString(record.report_id, 128)) return false;
   if (record.snapshot !== undefined && typeof record.snapshot !== "boolean") return false;
   if (!Array.isArray(record.instances) || record.instances.length > 16) return false;
   return record.instances.every(isAgentAppServerInstance);

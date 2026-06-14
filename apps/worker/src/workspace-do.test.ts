@@ -154,16 +154,20 @@ test("agent app-server instance report is acked and broadcast", async () => {
   await workspace.webSocketMessage(agentSocket, JSON.stringify({
     kind: "agent.app_server_instances",
     payload: {
+      report_id: "report-1",
       instances: [appServerInstancePayload("healthy")]
     }
   }));
 
   assert.equal(db.writes, 1);
   assert.equal(agentSent.length, 1);
-  const ack = JSON.parse(agentSent[0] ?? "{}") as { payload?: { kind?: string; count?: number; deduped?: boolean } };
+  const ack = JSON.parse(agentSent[0] ?? "{}") as {
+    payload?: { kind?: string; count?: number; deduped?: boolean; report_id?: string };
+  };
   assert.equal(ack.payload?.kind, "agent.app_server_instances");
   assert.equal(ack.payload?.count, 1);
   assert.equal(ack.payload?.deduped, false);
+  assert.equal(ack.payload?.report_id, "report-1");
   assert.equal(browserSent.length, 1);
   const update = JSON.parse(browserSent[0] ?? "{}") as { kind?: string; payload?: { app_server_instances?: Array<{ state?: string }> } };
   assert.equal(update.kind, "app_server_instances.updated");
