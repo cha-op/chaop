@@ -2739,6 +2739,7 @@ export async function markConnectorDisconnected(env: Env, connectorId: string): 
     now,
     refreshConnectorActivity: false
   });
+  await markAppServerInstancesStoppedForConnector(env, connectorId, now);
   await markConnectorOffline(env, connectorId, now);
   return events;
 }

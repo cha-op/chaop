@@ -490,6 +490,7 @@ test("markConnectorDisconnected fails active commands and marks connector offlin
   assert.equal(db.commandFailures, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
+  assert.equal(db.appServerInstanceStops, 1);
   assert.equal(db.connectorOfflineUpdates, 1);
 });
 
@@ -536,6 +537,7 @@ test("ensureConnectorInventory retires duplicate connectors through disconnect c
   assert.equal(db.retargetedAttachedCommands, 1);
   assert.equal(db.retargetedExplicitAppServerCommands, 1);
   assert.equal(db.deletedOldHostSessions, 1);
+  assert.equal(db.appServerInstanceStops, 1);
   assert.equal(db.retiredConnectorTokens, 1);
 });
 
@@ -1663,8 +1665,32 @@ function connectorDisconnectedDb() {
     commandFailures: 0,
     taskUpdates: 0,
     eventInserts: 0,
+    appServerInstanceStops: 0,
     connectorOfflineUpdates: 0
   };
+  const appServerRows = new Map<string, AppServerInstanceTestRow>([
+    [
+      "connector-online:default",
+      {
+        id: "app-server-connector-online-default",
+        connector_id: "connector-online",
+        instance_key: "default",
+        scope: "connector",
+        endpoint_type: "managed",
+        state: "healthy",
+        active_turn_count: 0,
+        generation: 1,
+        status_summary: "Managed app-server report.",
+        last_error: null,
+        report_fingerprint: "fingerprint-1",
+        last_seen_at: "2026-06-12T10:00:00.000Z",
+        state_changed_at: "2026-06-12T10:00:00.000Z",
+        summary_changed_at: "2026-06-12T10:00:00.000Z",
+        created_at: "2026-06-12T10:00:00.000Z",
+        updated_at: "2026-06-12T10:00:00.000Z"
+      }
+    ]
+  ]);
   const db = {
     prepare(sql: string) {
       if (/FROM commands/.test(sql) && /lease_owner_connector_id = \?/.test(sql) && /state IN \('leased', 'running'\)/.test(sql)) {
@@ -1785,6 +1811,58 @@ function connectorDisconnectedDb() {
         };
       }
 
+      if (/FROM app_server_instances/.test(sql) && /state <> 'stopped'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [...appServerRows.values()].filter(
+                    (row) => row.connector_id === connectorId && row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE app_server_instances/.test(sql) && /SET state = 'stopped'/.test(sql)) {
+        return {
+          bind(
+            statusSummary: string,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            updatedAt: string,
+            id: string
+          ) {
+            return {
+              async run() {
+                const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
+                assert.ok(row);
+                counters.appServerInstanceStops += 1;
+                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                  ...row,
+                  state: "stopped",
+                  active_turn_count: 0,
+                  status_summary: statusSummary,
+                  last_error: null,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  updated_at: updatedAt
+                });
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get commandFailures() {
@@ -1795,6 +1873,9 @@ function connectorDisconnectedDb() {
     },
     get eventInserts() {
       return counters.eventInserts;
+    },
+    get appServerInstanceStops() {
+      return counters.appServerInstanceStops;
     },
     get connectorOfflineUpdates() {
       return counters.connectorOfflineUpdates;
@@ -1862,8 +1943,32 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
     retargetedAttachedCommands: 0,
     retargetedExplicitAppServerCommands: 0,
     deletedOldHostSessions: 0,
+    appServerInstanceStops: 0,
     retiredConnectorTokens: 0
   };
+  const appServerRows = new Map<string, AppServerInstanceTestRow>([
+    [
+      "connector-old:default",
+      {
+        id: "app-server-connector-old-default",
+        connector_id: "connector-old",
+        instance_key: "default",
+        scope: "connector",
+        endpoint_type: "managed",
+        state: "healthy",
+        active_turn_count: 0,
+        generation: 1,
+        status_summary: "Managed app-server report.",
+        last_error: null,
+        report_fingerprint: "fingerprint-1",
+        last_seen_at: "2026-06-12T10:00:00.000Z",
+        state_changed_at: "2026-06-12T10:00:00.000Z",
+        summary_changed_at: "2026-06-12T10:00:00.000Z",
+        created_at: "2026-06-12T10:00:00.000Z",
+        updated_at: "2026-06-12T10:00:00.000Z"
+      }
+    ]
+  ]);
   const db = {
     prepare(sql: string) {
       if (/SELECT id\s+FROM connectors\s+WHERE id <> \? AND name = \? AND hostname = \?/.test(sql)) {
@@ -1991,6 +2096,58 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
             return {
               async run() {
                 return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM app_server_instances/.test(sql) && /state <> 'stopped'/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-old");
+            return {
+              async all() {
+                return {
+                  results: [...appServerRows.values()].filter(
+                    (row) => row.connector_id === connectorId && row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE app_server_instances/.test(sql) && /SET state = 'stopped'/.test(sql)) {
+        return {
+          bind(
+            statusSummary: string,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            updatedAt: string,
+            id: string
+          ) {
+            return {
+              async run() {
+                const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
+                assert.ok(row);
+                counters.appServerInstanceStops += 1;
+                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                  ...row,
+                  state: "stopped",
+                  active_turn_count: 0,
+                  status_summary: statusSummary,
+                  last_error: null,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  updated_at: updatedAt
+                });
+                return { meta: { changes: 1 } };
               }
             };
           }
@@ -2174,6 +2331,9 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
     },
     get deletedOldHostSessions() {
       return counters.deletedOldHostSessions;
+    },
+    get appServerInstanceStops() {
+      return counters.appServerInstanceStops;
     },
     get retiredConnectorTokens() {
       return counters.retiredConnectorTokens;

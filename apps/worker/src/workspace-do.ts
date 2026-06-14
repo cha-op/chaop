@@ -255,7 +255,9 @@ export class WorkspaceDO implements DurableObject {
       const result = deduped
         ? { app_server_instances: [], synced_at: new Date().toISOString(), snapshot: message.payload.snapshot === true }
         : await recordAppServerInstances(this.env, connectorId, message.payload);
-      this.rememberAppServerReport(connectorId, reportFingerprint);
+      if (!deduped) {
+        this.rememberAppServerReport(connectorId, reportFingerprint);
+      }
       ws.send(
         JSON.stringify(
           createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
@@ -428,6 +430,7 @@ export class WorkspaceDO implements DurableObject {
     }
     if (!hasAuthenticatedPeer) {
       const stoppedAt = new Date().toISOString();
+      this.appServerReportCache.delete(attachment.connectorId);
       const stoppedInstances = await markAppServerInstancesStoppedForConnector(this.env, attachment.connectorId, stoppedAt);
       if (stoppedInstances.length > 0) {
         this.broadcastToBrowsers(appServerInstancesMessage({

@@ -1,6 +1,6 @@
 ---
 id: 20260614-6e5f4a-zh-Hans
-title: App-server Instance State
+title: App-server 实例状态
 status: completed
 created: 2026-06-14
 updated: 2026-06-14
@@ -12,7 +12,7 @@ superseded_by:
 
 [ [British English](2026-06-14-app-server-instance-state-6e5f4a.md) | 简体中文 ]
 
-# App-server Instance State
+# App-server 实例状态
 
 ## 摘要
 - PR3 增加独立的 AppServerInstance state channel，不把 app-server health 塞进 Host Session inventory。

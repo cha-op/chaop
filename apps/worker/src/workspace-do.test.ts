@@ -204,6 +204,46 @@ test("duplicate healthy app-server report is acked without D1 write", async () =
   assert.equal(secondAck.payload?.deduped, true);
 });
 
+test("duplicate app-server report cache does not slide on skipped reports", async () => {
+  const originalDateNow = Date.now;
+  let now = 1_000;
+  Date.now = () => now;
+  try {
+    const agentSent: string[] = [];
+    const agentSocket = mutableSocketWithAttachment({
+      socketType: "agent",
+      connectorId: "connector-online",
+      agentReady: true
+    }, agentSent);
+    const ctx = {
+      getWebSockets() {
+        return [];
+      }
+    } as unknown as DurableObjectState;
+    const db = appServerInstanceDoDb();
+    const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+    const message = JSON.stringify({
+      kind: "agent.app_server_instances",
+      payload: {
+        instances: [appServerInstancePayload("healthy")]
+      }
+    });
+
+    await workspace.webSocketMessage(agentSocket, message);
+    now += 30_000;
+    await workspace.webSocketMessage(agentSocket, message);
+    now += 31_000;
+    await workspace.webSocketMessage(agentSocket, message);
+
+    const secondAck = JSON.parse(agentSent[1] ?? "{}") as { payload?: { deduped?: boolean } };
+    const thirdAck = JSON.parse(agentSent[2] ?? "{}") as { payload?: { deduped?: boolean } };
+    assert.equal(secondAck.payload?.deduped, true);
+    assert.equal(thirdAck.payload?.deduped, false);
+  } finally {
+    Date.now = originalDateNow;
+  }
+});
+
 test("app-server edge report bypasses duplicate healthy cache", async () => {
   const agentSent: string[] = [];
   const browserSent: string[] = [];
@@ -521,6 +561,51 @@ test("closing the last authenticated socket broadcasts the offline connector sta
   assert.equal(connectorUpdate.kind, "connectors.updated");
   assert.equal(connectorUpdate.payload?.connectors?.[0]?.id, "connector-online");
   assert.equal(connectorUpdate.payload?.connectors?.[0]?.status, "offline");
+});
+
+test("closing the last authenticated socket clears app-server duplicate cache", async () => {
+  const browserSent: string[] = [];
+  const agentSent: string[] = [];
+  const firstAgentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const reconnectedAgentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  let agentSockets = [firstAgentSocket];
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return agentSockets;
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = socketGoneDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+  const message = JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      instances: [appServerInstancePayload("healthy")]
+    }
+  });
+
+  await workspace.webSocketMessage(firstAgentSocket, message);
+  assert.equal(db.appServerInstanceWrites, 1);
+  await workspace.webSocketClose(firstAgentSocket);
+  assert.equal(db.appServerInstanceWrites, 2);
+  agentSockets = [reconnectedAgentSocket];
+  await workspace.webSocketMessage(reconnectedAgentSocket, message);
+
+  assert.equal(db.appServerInstanceWrites, 3);
+  const reconnectAck = JSON.parse(agentSent[1] ?? "{}") as { payload?: { deduped?: boolean } };
+  assert.equal(reconnectAck.payload?.deduped, false);
 });
 
 test("agentSocketsForConnector prefers the newest ready agent socket", () => {
@@ -1834,17 +1919,95 @@ function socketGoneDb(): D1Database & {
   readonly activityUpdates: number;
   readonly connectorDegradedUpdates: number;
   readonly connectorOfflineUpdates: number;
+  readonly appServerInstanceWrites: number;
 } {
+  const appServerRows = new Map<string, AppServerInstanceDoRow>();
   const counters = {
     commandFailures: 0,
     taskUpdates: 0,
     eventInserts: 0,
     activityUpdates: 0,
     connectorDegradedUpdates: 0,
-    connectorOfflineUpdates: 0
+    connectorOfflineUpdates: 0,
+    appServerInstanceWrites: 0
   };
   return {
     prepare(sql: string) {
+      if (/SELECT id\s+FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { id: connectorId };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+        return {
+          bind(connectorId: string, instanceKey: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return appServerRows.get(`${connectorId}:${instanceKey}`) ?? null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO app_server_instances/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            connectorId: string,
+            instanceKey: string,
+            scope: AppServerInstanceDoRow["scope"],
+            endpointType: AppServerInstanceDoRow["endpoint_type"],
+            state: AppServerInstanceDoRow["state"],
+            activeTurnCount: number,
+            generation: number,
+            statusSummary: string | null,
+            lastError: string | null,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            createdAt: string,
+            updatedAt: string
+          ) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                counters.appServerInstanceWrites += 1;
+                appServerRows.set(`${connectorId}:${instanceKey}`, {
+                  id,
+                  connector_id: connectorId,
+                  instance_key: instanceKey,
+                  scope,
+                  endpoint_type: endpointType,
+                  state,
+                  active_turn_count: activeTurnCount,
+                  generation,
+                  status_summary: statusSummary,
+                  last_error: lastError,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  created_at: appServerRows.get(`${connectorId}:${instanceKey}`)?.created_at ?? createdAt,
+                  updated_at: updatedAt
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
         return {
           bind(connectorId: string) {
@@ -1921,7 +2084,46 @@ function socketGoneDb(): D1Database & {
             assert.equal(connectorId, "connector-online");
             return {
               async all() {
-                return { results: [] };
+                return {
+                  results: [...appServerRows.values()].filter(
+                    (row) => row.connector_id === connectorId && row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE app_server_instances/.test(sql) && /SET state = 'stopped'/.test(sql)) {
+        return {
+          bind(
+            statusSummary: string,
+            reportFingerprint: string,
+            lastSeenAt: string,
+            stateChangedAt: string,
+            summaryChangedAt: string,
+            updatedAt: string,
+            id: string
+          ) {
+            return {
+              async run() {
+                const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
+                assert.ok(row);
+                counters.appServerInstanceWrites += 1;
+                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                  ...row,
+                  state: "stopped",
+                  active_turn_count: 0,
+                  status_summary: statusSummary,
+                  last_error: null,
+                  report_fingerprint: reportFingerprint,
+                  last_seen_at: lastSeenAt,
+                  state_changed_at: stateChangedAt,
+                  summary_changed_at: summaryChangedAt,
+                  updated_at: updatedAt
+                });
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -2098,6 +2300,9 @@ function socketGoneDb(): D1Database & {
     },
     get connectorOfflineUpdates() {
       return counters.connectorOfflineUpdates;
+    },
+    get appServerInstanceWrites() {
+      return counters.appServerInstanceWrites;
     }
   } as D1Database & typeof counters;
 }
