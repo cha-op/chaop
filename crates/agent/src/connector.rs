@@ -814,11 +814,13 @@ fn handle_text_message(
         let events = wait_for_app_server_command_events(
             socket,
             config,
+            app_server,
             &target_host_session.session_id,
             target_host_session.cwd.as_deref(),
             &dispatch.command.id,
             &dispatch.command.prompt,
             app_server_instances_state,
+            agent_ready_state,
             host_sessions_state,
             deferred_messages,
         );
@@ -1031,6 +1033,40 @@ fn handle_thread_archive_sync(
     Ok(())
 }
 
+fn maintain_app_server_runtime_during_wait(
+    socket: &mut AgentSocket,
+    config: &AgentConfig,
+    app_server: &mut AppServerManager,
+    app_server_instances_state: &mut AppServerInstancesSendState,
+    agent_ready_state: &mut AgentReadyState,
+    host_sessions_state: &mut HostSessionsSendState,
+) -> Result<AgentConfig, Box<dyn std::error::Error>> {
+    let runtime_config = app_server.runtime_config(config);
+    if send_agent_ready(socket, &runtime_config, agent_ready_state, false)?
+        .should_send_host_sessions()
+    {
+        send_app_server_instances(
+            socket,
+            &runtime_config,
+            app_server,
+            app_server_instances_state,
+            true,
+            true,
+        )?;
+        send_host_sessions(socket, &runtime_config, host_sessions_state, true)?;
+    } else {
+        send_app_server_instances(
+            socket,
+            &runtime_config,
+            app_server,
+            app_server_instances_state,
+            false,
+            false,
+        )?;
+    }
+    Ok(runtime_config)
+}
+
 fn wait_for_codex_exec_events(
     socket: &mut AgentSocket,
     config: &AgentConfig,
@@ -1103,15 +1139,19 @@ fn wait_for_codex_exec_events(
 fn wait_for_app_server_command_events(
     socket: &mut AgentSocket,
     config: &AgentConfig,
+    app_server: &mut AppServerManager,
     session_id: &str,
     cwd: Option<&str>,
     command_id: &str,
     prompt: &str,
     app_server_instances_state: &mut AppServerInstancesSendState,
+    agent_ready_state: &mut AgentReadyState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<Vec<ConnectorEvent>, Box<dyn std::error::Error>> {
     let worker_config = config.clone();
+    let mut runtime_config = config.clone();
+    let mut next_runtime_maintenance_at = Instant::now() + connector_read_tick();
     let session_id = session_id.to_owned();
     let cwd = cwd.map(ToOwned::to_owned);
     let command_id = command_id.to_owned();
@@ -1150,16 +1190,30 @@ fn wait_for_app_server_command_events(
             Err(TryRecvError::Empty) => {}
         }
 
+        if Instant::now() >= next_runtime_maintenance_at {
+            runtime_config = maintain_app_server_runtime_during_wait(
+                socket,
+                &runtime_config,
+                app_server,
+                app_server_instances_state,
+                agent_ready_state,
+                host_sessions_state,
+            )?;
+            next_runtime_maintenance_at = Instant::now() + connector_read_tick();
+        }
+
         match socket.read() {
             Ok(Message::Text(text)) => {
-                handle_background_text_message(
-                    socket,
-                    text.as_ref(),
-                    config,
-                    app_server_instances_state,
-                    host_sessions_state,
-                    deferred_messages,
-                )?;
+                if !apply_agent_ready_ack_text(text.as_ref(), agent_ready_state)? {
+                    handle_background_text_message(
+                        socket,
+                        text.as_ref(),
+                        &runtime_config,
+                        app_server_instances_state,
+                        host_sessions_state,
+                        deferred_messages,
+                    )?;
+                }
             }
             Ok(Message::Ping(payload)) => socket.send(Message::Pong(payload))?,
             Ok(Message::Close(_)) => {

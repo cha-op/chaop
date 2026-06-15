@@ -175,6 +175,7 @@ impl AppServerManager {
             }
             (None, Some(current)) => {
                 self.last_upgrade_marker_modified = Some(current);
+                self.request_restart(AppServerRestartReason::UpgradeMarker);
             }
             _ => {}
         }
@@ -933,6 +934,29 @@ mod tests {
         manager.active_turn_count = 1;
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(&marker, "after").expect("touch marker");
+
+        let runtime = manager.runtime_config(&config);
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.state, AppServerInstanceState::Draining);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Managed app-server upgrade restart is draining active turns.")
+        );
+    }
+
+    #[test]
+    fn upgrade_marker_creation_drains_active_turns() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let marker = tempdir.path().join("upgrade.marker");
+        let mut config = config_with_managed(true);
+        config
+            .session_inventory
+            .managed_app_server
+            .upgrade_marker_file = Some(marker.clone());
+        let mut manager = AppServerManager::new(&config);
+        manager.active_turn_count = 1;
+        std::fs::write(&marker, "created").expect("create marker");
 
         let runtime = manager.runtime_config(&config);
 

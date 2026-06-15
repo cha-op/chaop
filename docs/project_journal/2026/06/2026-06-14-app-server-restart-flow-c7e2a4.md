@@ -23,6 +23,8 @@ superseded_by:
 - Added managed app-server config for `drain_timeout_seconds`, `scheduled_restart_interval_seconds`, and `upgrade_marker_file`.
 - Added AppServerManager state for pending restarts, scheduled restart deadlines, and upgrade marker modification tracking.
 - Added `draining` lifecycle transitions that return no app-server URL in runtime config, so `agent.ready` stops advertising app-server thread/archive/execution capabilities during drain.
+- Added a bounded app-server runtime maintenance tick while app-server commands are running, so scheduled or marker-triggered restarts can enter drain and report capability changes during long turns.
+- Treat first creation of the configured upgrade marker file as a restart request when the file did not exist at connector startup.
 - Restart attempts clear the pending drain request, reset the periodic schedule, stop the managed child, and reuse the existing health-check/start path.
 - Updated deployment guide examples and operator guidance for scheduled restart and upgrade marker usage.
 
