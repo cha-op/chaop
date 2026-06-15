@@ -14,6 +14,7 @@ import {
   appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
+  budgetPctLabel,
   budgetSourceLabel,
   codexCliFallbackAvailable,
   commandExecutionModeForRequest,
@@ -119,6 +120,13 @@ test("budgetSourceLabel reports unknown source for legacy budget payloads", () =
   delete (budget as Partial<typeof budget>).source;
 
   assert.equal(budgetSourceLabel(budget), "Summary source not reported by this control plane.");
+});
+
+test("budgetPctLabel distinguishes missing samples from zero usage", () => {
+  assert.equal(budgetPctLabel(null), "missing");
+  assert.equal(budgetPctLabel(undefined), "missing");
+  assert.equal(budgetPctLabel(0), "0%");
+  assert.equal(budgetPctLabel(125.4), "125.4%");
 });
 
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {

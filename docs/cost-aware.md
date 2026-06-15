@@ -36,6 +36,7 @@ When D1 is bound, the Browser Budget Board uses Chaop-controlled database signal
 - The worst current `budget_state` from sampled usage windows, online connectors, and unarchived tasks.
 - Delayed events, compacted events, and local spool bytes from the daily usage window when present, otherwise the next available sampled window.
 - Source metadata showing whether the board is backed by D1 usage windows, local sample data, or an empty database.
+- Missing usage windows are displayed as missing samples, not as `0%` usage.
 
 The Worker reads at most one row per window type plus grouped budget-state counts. It does not scan the full event table, call Cloudflare billing APIs, call OpenAI billing APIs, or require deployment-instance secrets. Treat the board as an operator posture view, not as the official invoice source. Keep the Cloudflare and OpenAI budget alerts above enabled.
 

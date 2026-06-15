@@ -150,9 +150,9 @@ export async function loadBudgetSummaryFromDb(
 
   return {
     state: worstBudgetState(states),
-    daily_used_pct: normalisePct(daily?.used_pct),
-    four_hour_used_pct: normalisePct(fourHour?.used_pct),
-    burst_used_pct: normalisePct(burst?.used_pct),
+    daily_used_pct: windowPct(daily),
+    four_hour_used_pct: windowPct(fourHour),
+    burst_used_pct: windowPct(burst),
     delayed_event_count: nonNegativeInteger(primaryWindow?.events_delayed),
     compacted_event_count: nonNegativeInteger(primaryWindow?.events_compacted),
     local_spool_bytes: nonNegativeInteger(primaryWindow?.local_spool_bytes),
@@ -3048,7 +3048,7 @@ async function latestUsageWindow(env: Env, windowType: BudgetWindowType): Promis
             events_received, events_compacted, events_delayed, local_spool_bytes, updated_at
      FROM usage_windows
      WHERE window_type = ?
-     ORDER BY window_end DESC
+     ORDER BY window_end DESC, updated_at DESC
      LIMIT 1`
   )
     .bind(windowType)
@@ -3961,9 +3961,9 @@ function slugPart(value: string): string {
 function emptyBudgetSummary(generatedAt: string): BudgetSummary {
   return {
     state: "normal",
-    daily_used_pct: 0,
-    four_hour_used_pct: 0,
-    burst_used_pct: 0,
+    daily_used_pct: null,
+    four_hour_used_pct: null,
+    burst_used_pct: null,
     delayed_event_count: 0,
     compacted_event_count: 0,
     local_spool_bytes: 0,
@@ -3987,6 +3987,10 @@ function budgetWindowSignalFromRow(row: UsageWindowRow): BudgetWindowSignal {
     local_spool_bytes: nonNegativeInteger(row.local_spool_bytes),
     updated_at: row.updated_at
   };
+}
+
+function windowPct(row: UsageWindowRow | undefined): number | null {
+  return row ? normalisePct(row.used_pct) : null;
 }
 
 function budgetWindowTypeFromString(value: string): BudgetWindowType {

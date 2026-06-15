@@ -338,9 +338,9 @@ export type ThreadEvent = {
 
 export type BudgetSummary = {
   state: BudgetState;
-  daily_used_pct: number;
-  four_hour_used_pct: number;
-  burst_used_pct: number;
+  daily_used_pct: number | null;
+  four_hour_used_pct: number | null;
+  burst_used_pct: number | null;
   delayed_event_count: number;
   compacted_event_count: number;
   local_spool_bytes: number;

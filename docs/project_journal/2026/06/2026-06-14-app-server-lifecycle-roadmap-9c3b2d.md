@@ -79,7 +79,7 @@ Implementation checkpoint:
 - Browser bootstrap and `/api/usage-summary` now use the same D1-backed `BudgetSummary` path when the database binding is available.
 - The Worker samples only the latest `daily`, `four_hour`, and `burst` `usage_windows` rows, backed by `idx_usage_windows_type_end`, plus grouped budget-state counts for online connectors and unarchived tasks.
 - Budget Board now shows source metadata, generated time, sampled usage windows, window freshness, delayed/compacted event counts, and local spool bytes without adding high-frequency polling.
-- Review hardening keeps bootstrap from issuing duplicate connector/task budget-state aggregate queries, labels legacy unknown metric sources explicitly, and preserves over-budget percentages above 100% in the API while clamping only the UI meter control.
+- Review hardening keeps bootstrap from issuing duplicate connector/task budget-state aggregate queries, labels legacy unknown metric sources explicitly, preserves over-budget percentages above 100% in the API while clamping only the UI meter control, reports missing usage windows as missing samples instead of `0%`, and sorts duplicate window-end samples by `updated_at`.
 - Cost and deployment docs now clarify that Budget Board is a bounded Chaop posture view and does not replace Cloudflare or OpenAI billing alerts.
 
 ## Required Merge Gate Per PR

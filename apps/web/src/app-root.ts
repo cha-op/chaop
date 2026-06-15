@@ -38,6 +38,7 @@ import {
   appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
+  budgetPctLabel,
   budgetSourceLabel,
   codexCliFallbackAvailable,
   commandExecutionModeForRequest,
@@ -256,8 +257,8 @@ export class ChaopApp extends LitElement {
         </div>
         <div class="topbar-status">
           <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
-          <span class="chip ${budget.state}">4h ${formatPct(budget.four_hour_used_pct)}</span>
-          <span class="chip ${budget.state}">Day ${formatPct(budget.daily_used_pct)}</span>
+          <span class="chip ${budget.state}">4h ${budgetPctLabel(budget.four_hour_used_pct)}</span>
+          <span class="chip ${budget.state}">Day ${budgetPctLabel(budget.daily_used_pct)}</span>
           <span class="identity">${this.data!.user.email}</span>
         </div>
       </header>
@@ -687,7 +688,7 @@ export class ChaopApp extends LitElement {
               (window) => html`
                 <div>
                   <span>${budgetWindowLabel(window.window_type)}</span>
-                  <strong>${formatPct(window.used_pct)}</strong>
+                  <strong>${budgetPctLabel(window.used_pct)}</strong>
                   <small title=${formatAbsoluteIso(window.updated_at)}>
                     ${window.events_received.toLocaleString("en-GB")} events, updated
                     ${formatRelativeIso(window.updated_at, this.clockNow)}
@@ -1412,11 +1413,6 @@ function budgetWindows(budget: BudgetSummary): BudgetWindow[] {
   return budget.windows ?? [];
 }
 
-function formatPct(value: number): string {
-  const normalised = Number.isFinite(value) ? value : 0;
-  return `${Number.isInteger(normalised) ? normalised.toFixed(0) : normalised.toFixed(1)}%`;
-}
-
 function newerIso(current: string | undefined, incoming: string): string {
   return current && current > incoming ? current : incoming;
 }
@@ -1533,17 +1529,17 @@ function isRealtimeAppServerInstancesPayload(value: unknown): value is RealtimeA
   );
 }
 
-function budgetBar(label: string, value: number) {
+function budgetBar(label: string, value: number | null | undefined) {
   return html`
     <div class="budget-bar">
-      <div><span>${label}</span><strong>${formatPct(value)}</strong></div>
+      <div><span>${label}</span><strong>${budgetPctLabel(value)}</strong></div>
       <meter min="0" max="100" value=${meterPct(value)}></meter>
     </div>
   `;
 }
 
-function meterPct(value: number): number {
-  if (!Number.isFinite(value)) return 0;
+function meterPct(value: number | null | undefined): number {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 0;
   return Math.min(100, Math.max(0, value));
 }
 

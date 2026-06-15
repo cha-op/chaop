@@ -1162,6 +1162,38 @@ test("usage summary returns bounded D1 budget windows", async () => {
   );
 });
 
+test("usage summary marks missing D1 budget windows as unsampled", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/usage-summary", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: budgetSummaryDb(["daily", "burst"])
+    }
+  );
+  const body = (await response.json()) as {
+    source: string;
+    state: string;
+    daily_used_pct: number | null;
+    four_hour_used_pct: number | null;
+    burst_used_pct: number | null;
+    window_sample_count: number;
+    windows: Array<{ window_type: string; used_pct: number }>;
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.source, "d1_usage_windows");
+  assert.equal(body.state, "hard_limited");
+  assert.equal(body.daily_used_pct, null);
+  assert.equal(body.four_hour_used_pct, 88.9);
+  assert.equal(body.burst_used_pct, null);
+  assert.equal(body.window_sample_count, 1);
+  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct]), [["four_hour", 88.9]]);
+});
+
 test("agent bootstrap rejects invalid secret", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/connector/bootstrap", { method: "POST", body: "{}" }),
@@ -2007,7 +2039,7 @@ function readOnlyBootstrapDb(): D1Database {
   } as unknown as D1Database;
 }
 
-function budgetSummaryDb(): D1Database {
+function budgetSummaryDb(omitWindowTypes: string[] = []): D1Database {
   const windows: Record<string, Record<string, unknown>> = {
     daily: {
       id: "usage-daily",
@@ -2049,12 +2081,15 @@ function budgetSummaryDb(): D1Database {
       updated_at: "2026-06-15T09:01:00.000Z"
     }
   };
+  for (const windowType of omitWindowTypes) {
+    delete windows[windowType];
+  }
 
   return {
     prepare(sql: string) {
       if (/FROM usage_windows/.test(sql)) {
         assert.match(sql, /WHERE window_type = \?/);
-        assert.match(sql, /ORDER BY window_end DESC/);
+        assert.match(sql, /ORDER BY window_end DESC, updated_at DESC/);
         assert.match(sql, /LIMIT 1/);
         return {
           bind(windowType: string) {

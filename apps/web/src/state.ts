@@ -38,6 +38,16 @@ export function budgetSourceLabel(budget: BudgetSummary): string {
   return "No usage windows recorded yet.";
 }
 
+export function budgetPctLabel(value: number | null | undefined): string {
+  if (value === null || value === undefined) {
+    return "missing";
+  }
+  if (!Number.isFinite(value)) {
+    return "unknown";
+  }
+  return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}%`;
+}
+
 export function appServerInstancesForConnector(
   data: BootstrapPayload | undefined,
   connectorId: string
