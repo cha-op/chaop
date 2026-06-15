@@ -330,15 +330,26 @@ fn send_agent_ready(
     if !should_send_agent_ready(&message, state, force, now) {
         return Ok(AgentReadySend::NotSent);
     }
-    let changed = state.last_sent.as_deref() != Some(message.as_str());
     socket.send(Message::Text(message.clone().into()))?;
+    Ok(record_agent_ready_sent(state, message, now))
+}
+
+fn record_agent_ready_sent(
+    state: &mut AgentReadyState,
+    message: String,
+    now: Instant,
+) -> AgentReadySend {
+    let changed = state.last_sent.as_deref() != Some(message.as_str());
     state.last_sent = Some(message);
     state.last_sent_at = Some(now);
-    Ok(if changed {
+    if changed {
+        state.last_acked = None;
+    }
+    if changed {
         AgentReadySend::SentChangedPayload
     } else {
         AgentReadySend::SentSamePayload
-    })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,7 +380,7 @@ fn should_send_agent_ready(
     if force {
         return true;
     }
-    if state.last_acked.as_deref() == Some(message) {
+    if state.last_sent.as_deref() == Some(message) && state.last_acked.as_deref() == Some(message) {
         return false;
     }
     if state.last_sent.as_deref() == Some(message)
@@ -1631,7 +1642,7 @@ mod tests {
         bounded_app_server_instance_text, classify_ack_wait_text, command_events,
         handle_background_ack_message, host_sessions_ack_message, host_sessions_interval,
         host_sessions_message, host_sessions_retry_interval, is_read_timeout,
-        requires_app_server_execution_mode, should_send_agent_ready,
+        record_agent_ready_sent, requires_app_server_execution_mode, should_send_agent_ready,
         should_send_app_server_instances, should_send_host_sessions,
     };
     use crate::app_server_manager::AppServerManager;
@@ -1915,6 +1926,31 @@ mod tests {
             &state,
             true,
             now + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn changed_agent_ready_payload_clears_stale_ack_before_restore() {
+        let mut state = AgentReadyState::default();
+        let healthy = agent_ready_message(&[
+            "placeholder_commands".to_owned(),
+            "codex_app_server_exec".to_owned(),
+        ]);
+        let draining = agent_ready_message(&["placeholder_commands".to_owned()]);
+        let now = Instant::now();
+
+        acknowledge_agent_ready(&mut state, healthy.clone());
+        assert_eq!(
+            record_agent_ready_sent(&mut state, draining, now),
+            super::AgentReadySend::SentChangedPayload
+        );
+
+        assert!(state.last_acked.is_none());
+        assert!(should_send_agent_ready(
+            &healthy,
+            &state,
+            false,
+            now + Duration::from_secs(1)
         ));
     }
 

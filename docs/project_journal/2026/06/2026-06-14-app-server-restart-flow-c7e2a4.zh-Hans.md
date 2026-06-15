@@ -25,6 +25,7 @@ superseded_by:
 - 增加 `draining` lifecycle transitions：runtime config 在 drain 期间不返回 app-server URL，因此 `agent.ready` 不再声明 app-server thread/archive/execution capabilities。
 - 在 app-server command 运行期间增加有界的 app-server runtime maintenance tick，因此 scheduled 或 marker-triggered restart 可以在长 turn 期间进入 drain、上报 capability 变化，但不会做普通 health-check restart。
 - App-server command completion 现在会在 final event dispatch 之前推进 runtime state，但恢复 readiness 和刷新 host sessions 会延后到 final command events 被确认之后。
+- `agent.ready` ack tracking 现在会在 capability payload 变化后清除 stale acknowledgements，因此未确认的 draining update 之后，恢复的 app-server capabilities 会被重新发送。
 - 如果 connector 启动时 marker 文件尚不存在，那么配置的 upgrade marker 文件首次创建也会作为 restart request 处理。
 - Upgrade marker restart requests 现在会覆盖 pending scheduled restart requests，因此 operator 触发的本机 marker 不会被 periodic restart 掩盖。
 - 强制 drain-timeout restart 完成后继续保留 operator 可见的 summary；如果强制重启后没有恢复 healthy，也会保留底层 restart error。
