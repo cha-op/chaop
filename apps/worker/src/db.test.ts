@@ -163,8 +163,18 @@ test("recordAppServerInstances persists placement changes inside debounce window
     ]
   }, "2026-06-14T10:01:00.000Z");
 
-  assert.equal(db.writes, 2);
-  assert.equal(result.app_server_instances[0]?.workspace_id, "workspace-api");
+  assert.equal(db.writes, 3);
+  assert.deepEqual(
+    result.app_server_instances.map((instance) => [
+      instance.workspace_id,
+      instance.state,
+      instance.status_summary
+    ]),
+    [
+      ["workspace-api", "healthy", "Managed app-server report."],
+      ["workspace-old", "stopped", "Instance placement was replaced by a newer connector report."]
+    ]
+  );
 });
 
 test("recordAppServerInstances refreshes unchanged degraded summaries after debounce window", async () => {
@@ -1789,7 +1799,7 @@ function connectorDisconnectedDb() {
   };
   const appServerRows = new Map<string, AppServerInstanceTestRow>([
     [
-      "connector-online:default",
+      "connector-online:default:connector",
 	      {
 	        id: "app-server-connector-online-default",
 	        connector_id: "connector-online",
@@ -2070,7 +2080,7 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
   };
   const appServerRows = new Map<string, AppServerInstanceTestRow>([
     [
-      "connector-old:default",
+      "connector-old:default:connector",
 	      {
 	        id: "app-server-connector-old-default",
 	        connector_id: "connector-old",
@@ -3559,7 +3569,32 @@ function appServerInstancesDb(): D1Database & { writes: number } {
         };
       }
 
-      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+      if (/SELECT id, connector_id, instance_key/.test(sql) && /placement_key <> \?/.test(sql)) {
+        return {
+          bind(connectorId: string, instanceKey: string, scope: AppServerInstanceTestRow["scope"], placementKey: string) {
+            return {
+              async all() {
+                return {
+                  results: [...rows.values()].filter(
+                    (row) =>
+                      row.connector_id === connectorId &&
+                      row.instance_key === instanceKey &&
+                      row.scope === scope &&
+                      row.placement_key !== placementKey &&
+                      row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (
+        /SELECT id, connector_id, instance_key/.test(sql) &&
+        /WHERE connector_id = \? AND instance_key = \?/.test(sql) &&
+        /placement_key = \?/.test(sql)
+      ) {
         return {
           bind(connectorId: string, instanceKey: string, placementKey: string) {
             return {

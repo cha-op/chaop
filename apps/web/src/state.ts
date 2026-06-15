@@ -45,6 +45,19 @@ export function primaryAppServerInstanceForConnector(
   return appServerInstancesForConnector(data, connectorId)[0];
 }
 
+export function appServerInstanceForHostSession(
+  data: BootstrapPayload | undefined,
+  session: HostSessionSummary
+): AppServerInstanceSummary | undefined {
+  return appServerInstancesForConnector(data, session.connector_id)
+    .filter((instance) => appServerInstancePlacementRankForHostSession(instance, session) !== undefined)
+    .sort((left, right) => {
+      const leftRank = appServerInstancePlacementRankForHostSession(left, session) ?? 99;
+      const rightRank = appServerInstancePlacementRankForHostSession(right, session) ?? 99;
+      return leftRank - rightRank || compareAppServerInstancesForDisplay(left, right);
+    })[0];
+}
+
 export function appServerInstanceStateLabel(state: AppServerInstanceSummary["state"]): string {
   return state.replaceAll("_", " ");
 }
@@ -55,6 +68,19 @@ export function appServerInstancePlacementLabel(instance: AppServerInstanceSumma
     return instance.workspace_id ? `Workspace ${instance.workspace_id}` : "Workspace";
   }
   return instance.thread_id ? `Thread ${instance.thread_id}` : "Thread";
+}
+
+function appServerInstancePlacementRankForHostSession(
+  instance: AppServerInstanceSummary,
+  session: HostSessionSummary
+): number | undefined {
+  if (instance.scope === "thread") {
+    return session.attached_thread_id && instance.thread_id === session.attached_thread_id ? 0 : undefined;
+  }
+  if (instance.scope === "workspace") {
+    return instance.workspace_id === session.workspace_id ? 1 : undefined;
+  }
+  return 2;
 }
 
 export function mergeBootstrapPayload(

@@ -7,6 +7,7 @@ import type {
   TaskArchiveResponse
 } from "@chaop/protocol";
 import {
+  appServerInstanceForHostSession,
   appServerInstancePlacementLabel,
   appServerInstanceStateLabel,
   appServerInstancesForConnector,
@@ -194,6 +195,60 @@ test("appServerInstancePlacementLabel shows connector, workspace, and thread pla
     }),
     "Thread thread-123"
   );
+});
+
+test("appServerInstanceForHostSession matches the session placement before connector fallback", () => {
+  const connectorWide = appServerInstance("app-server-connector", "healthy", "2026-06-12T10:00:00.000Z", "connector-1");
+  const unrelatedThread = {
+    ...appServerInstance("app-server-other-thread", "degraded", "2026-06-12T10:05:00.000Z", "connector-1"),
+    scope: "thread" as const,
+    thread_id: "thread-other"
+  };
+  const workspaceMatch = {
+    ...appServerInstance("app-server-workspace", "draining", "2026-06-12T10:04:00.000Z", "connector-1"),
+    scope: "workspace" as const,
+    workspace_id: "workspace-api"
+  };
+  const threadMatch = {
+    ...appServerInstance("app-server-thread", "restarting", "2026-06-12T10:03:00.000Z", "connector-1"),
+    scope: "thread" as const,
+    thread_id: "thread-api"
+  };
+  const session = hostSession("session-api", {
+    workspace_id: "workspace-api",
+    attached_thread_id: "thread-api"
+  });
+  const data = payload({
+    app_server_instances: [unrelatedThread, connectorWide, workspaceMatch, threadMatch]
+  });
+
+  assert.equal(appServerInstanceForHostSession(data, session), threadMatch);
+});
+
+test("appServerInstanceForHostSession falls back to matching workspace then connector-wide", () => {
+  const connectorWide = appServerInstance("app-server-connector", "healthy", "2026-06-12T10:00:00.000Z", "connector-1");
+  const workspaceMatch = {
+    ...appServerInstance("app-server-workspace", "degraded", "2026-06-12T10:04:00.000Z", "connector-1"),
+    scope: "workspace" as const,
+    workspace_id: "workspace-api"
+  };
+  const otherWorkspace = {
+    ...appServerInstance("app-server-other-workspace", "stopped", "2026-06-12T10:06:00.000Z", "connector-1"),
+    scope: "workspace" as const,
+    workspace_id: "workspace-docs"
+  };
+  const workspaceSession = hostSession("session-workspace", {
+    workspace_id: "workspace-api"
+  });
+  const connectorSession = hostSession("session-connector", {
+    workspace_id: "workspace-missing"
+  });
+  const data = payload({
+    app_server_instances: [otherWorkspace, connectorWide, workspaceMatch]
+  });
+
+  assert.equal(appServerInstanceForHostSession(data, workspaceSession), workspaceMatch);
+  assert.equal(appServerInstanceForHostSession(data, connectorSession), connectorWide);
 });
 
 test("localThreadWorkspaceId uses the selected thread workspace", () => {
@@ -745,7 +800,7 @@ function thread(id: string, workspaceId: string) {
   };
 }
 
-function hostSession(sessionId: string): HostSessionSummary {
+function hostSession(sessionId: string, overrides: Partial<HostSessionSummary> = {}): HostSessionSummary {
   return {
     id: `host-session-${sessionId}`,
     connector_id: "connector-1",
@@ -755,7 +810,8 @@ function hostSession(sessionId: string): HostSessionSummary {
     title: "Session",
     title_source: "metadata",
     cwd: "/Users/you/Program/project",
-    updated_at: "2026-06-12T10:00:00.000Z"
+    updated_at: "2026-06-12T10:00:00.000Z",
+    ...overrides
   };
 }
 

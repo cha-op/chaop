@@ -2080,7 +2080,33 @@ function socketGoneDb(): D1Database & {
         };
       }
 
-      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+      if (/SELECT id, connector_id, instance_key/.test(sql) && /placement_key <> \?/.test(sql)) {
+        return {
+          bind(connectorId: string, instanceKey: string, scope: AppServerInstanceDoRow["scope"], placementKey: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async all() {
+                return {
+                  results: [...appServerRows.values()].filter(
+                    (row) =>
+                      row.connector_id === connectorId &&
+                      row.instance_key === instanceKey &&
+                      row.scope === scope &&
+                      row.placement_key !== placementKey &&
+                      row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (
+        /SELECT id, connector_id, instance_key/.test(sql) &&
+        /WHERE connector_id = \? AND instance_key = \?/.test(sql) &&
+        /placement_key = \?/.test(sql)
+      ) {
         return {
           bind(connectorId: string, instanceKey: string, placementKey: string) {
             assert.equal(connectorId, "connector-online");
@@ -2526,7 +2552,32 @@ function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
         };
       }
 
-      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+      if (/SELECT id, connector_id, instance_key/.test(sql) && /placement_key <> \?/.test(sql)) {
+        return {
+          bind(connectorId: string, instanceKey: string, scope: AppServerInstanceDoRow["scope"], placementKey: string) {
+            return {
+              async all() {
+                return {
+                  results: [...rows.values()].filter(
+                    (row) =>
+                      row.connector_id === connectorId &&
+                      row.instance_key === instanceKey &&
+                      row.scope === scope &&
+                      row.placement_key !== placementKey &&
+                      row.state !== "stopped"
+                  )
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (
+        /SELECT id, connector_id, instance_key/.test(sql) &&
+        /WHERE connector_id = \? AND instance_key = \?/.test(sql) &&
+        /placement_key = \?/.test(sql)
+      ) {
         return {
           bind(connectorId: string, instanceKey: string, placementKey: string) {
             return {

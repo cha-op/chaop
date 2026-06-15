@@ -150,7 +150,18 @@ export async function recordAppServerInstances(
       .bind(connectorId, instance.instance_key, placementKey)
       .first<AppServerInstanceRow>();
     const shouldPersist = shouldPersistAppServerInstance(existing, instance, fingerprint, syncedAt);
-    if (!shouldPersist) continue;
+    const displaced = await stopDisplacedAppServerInstancePlacements(
+      env,
+      connectorId,
+      instance,
+      placementKey,
+      reportedIdentities,
+      syncedAt
+    );
+    if (!shouldPersist) {
+      persisted.push(...displaced);
+      continue;
+    }
 
     const id = existing?.id ?? appServerInstanceId(connectorId, instance.instance_key, placementKey);
     const stateChangedAt = existing && existing.state === instance.state
@@ -218,7 +229,10 @@ export async function recordAppServerInstances(
     )
       .bind(connectorId, instance.instance_key, placementKey)
       .first<AppServerInstanceRow>();
-    if (row) persisted.push(appServerInstanceFromRow(row));
+    if (row) {
+      persisted.push(appServerInstanceFromRow(row));
+      persisted.push(...displaced);
+    }
   }
 
   if (report.snapshot === true) {
@@ -236,41 +250,14 @@ export async function recordAppServerInstances(
     );
     for (const row of omitted) {
       if (reportedIdentities.has(appServerInstanceIdentityKey(row.instance_key, row.placement_key))) continue;
-      const stoppedSummary = "Instance was omitted from the latest connector snapshot.";
-      const stoppedFingerprint = appServerStoppedFingerprint(row, stoppedSummary);
-      await env.DB.prepare(
-        `UPDATE app_server_instances
-         SET state = 'stopped',
-             active_turn_count = 0,
-             status_summary = ?,
-             last_error = NULL,
-             report_fingerprint = ?,
-             last_seen_at = ?,
-             state_changed_at = ?,
-             summary_changed_at = ?,
-             updated_at = ?
-         WHERE id = ?`
-      )
-        .bind(
-          stoppedSummary,
-          stoppedFingerprint,
-          syncedAt,
-          syncedAt,
-          syncedAt,
-          syncedAt,
-          row.id
+      persisted.push(
+        await stopAppServerInstanceRow(
+          env,
+          row,
+          "Instance was omitted from the latest connector snapshot.",
+          syncedAt
         )
-        .run();
-      persisted.push(appServerInstanceFromRow({
-        ...row,
-        state: "stopped",
-        active_turn_count: 0,
-        status_summary: stoppedSummary,
-        last_error: null,
-        last_seen_at: syncedAt,
-        state_changed_at: syncedAt,
-        updated_at: syncedAt
-      }));
+      );
     }
   }
 
@@ -307,41 +294,14 @@ export async function markAppServerInstancesStoppedForConnector(
 
   const stopped: AppServerInstanceSummary[] = [];
   for (const row of rows) {
-    const stoppedSummary = "Connector went offline before reporting app-server state.";
-    const fingerprint = appServerStoppedFingerprint(row, stoppedSummary);
-    await env.DB.prepare(
-      `UPDATE app_server_instances
-       SET state = 'stopped',
-           active_turn_count = 0,
-           status_summary = ?,
-           last_error = NULL,
-           report_fingerprint = ?,
-           last_seen_at = ?,
-           state_changed_at = ?,
-           summary_changed_at = ?,
-           updated_at = ?
-       WHERE id = ?`
-    )
-      .bind(
-        stoppedSummary,
-        fingerprint,
-        syncedAt,
-        syncedAt,
-        syncedAt,
-        syncedAt,
-        row.id
+    stopped.push(
+      await stopAppServerInstanceRow(
+        env,
+        row,
+        "Connector went offline before reporting app-server state.",
+        syncedAt
       )
-      .run();
-    stopped.push(appServerInstanceFromRow({
-      ...row,
-      state: "stopped",
-      active_turn_count: 0,
-      status_summary: stoppedSummary,
-      last_error: null,
-      last_seen_at: syncedAt,
-      state_changed_at: syncedAt,
-      updated_at: syncedAt
-    }));
+    );
   }
   return stopped;
 }
@@ -3074,6 +3034,88 @@ function appServerInstanceFromRow(row: AppServerInstanceRow): AppServerInstanceS
     state_changed_at: row.state_changed_at,
     updated_at: row.updated_at
   };
+}
+
+async function stopDisplacedAppServerInstancePlacements(
+  env: Env,
+  connectorId: string,
+  instance: AgentAppServerInstancesReport["instances"][number],
+  placementKey: string,
+  reportedIdentities: Set<string>,
+  syncedAt: string
+): Promise<AppServerInstanceSummary[]> {
+  const rows = await allRows<AppServerInstanceRow>(
+    env.DB!.prepare(
+      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id, placement_key,
+              endpoint_type, state,
+              active_turn_count, generation, status_summary, last_error,
+              report_fingerprint, last_seen_at, state_changed_at,
+              summary_changed_at, created_at, updated_at
+       FROM app_server_instances
+       WHERE connector_id = ?
+         AND instance_key = ?
+         AND scope = ?
+         AND placement_key <> ?
+         AND state <> 'stopped'`
+    ).bind(connectorId, instance.instance_key, instance.scope, placementKey)
+  );
+  const stopped: AppServerInstanceSummary[] = [];
+  for (const row of rows) {
+    if (reportedIdentities.has(appServerInstanceIdentityKey(row.instance_key, row.placement_key))) continue;
+    stopped.push(
+      await stopAppServerInstanceRow(
+        env,
+        row,
+        "Instance placement was replaced by a newer connector report.",
+        syncedAt
+      )
+    );
+  }
+  return stopped;
+}
+
+async function stopAppServerInstanceRow(
+  env: Env,
+  row: AppServerInstanceRow,
+  stoppedSummary: string,
+  syncedAt: string
+): Promise<AppServerInstanceSummary> {
+  const fingerprint = appServerStoppedFingerprint(row, stoppedSummary);
+  await env.DB!.prepare(
+    `UPDATE app_server_instances
+     SET state = 'stopped',
+         active_turn_count = 0,
+         status_summary = ?,
+         last_error = NULL,
+         report_fingerprint = ?,
+         last_seen_at = ?,
+         state_changed_at = ?,
+         summary_changed_at = ?,
+         updated_at = ?
+     WHERE id = ?`
+  )
+    .bind(
+      stoppedSummary,
+      fingerprint,
+      syncedAt,
+      syncedAt,
+      syncedAt,
+      syncedAt,
+      row.id
+    )
+    .run();
+  return appServerInstanceFromRow({
+    ...row,
+    state: "stopped",
+    active_turn_count: 0,
+    status_summary: stoppedSummary,
+    last_error: null,
+    report_fingerprint: fingerprint,
+    last_seen_at: syncedAt,
+    state_changed_at: syncedAt,
+    summary_changed_at: syncedAt,
+    updated_at: syncedAt
+  });
 }
 
 function shouldPersistAppServerInstance(

@@ -31,6 +31,7 @@ import {
   unarchiveTask
 } from "./api.js";
 import {
+  appServerInstanceForHostSession,
   appServerInstancePlacementLabel,
   appServerInstanceStateLabel,
   appServerInstancesForDisplay,
@@ -50,7 +51,6 @@ import {
   mergeBootstrapPayload,
   mergeAppServerInstances,
   mergeConnectorSummaries,
-  primaryAppServerInstanceForConnector,
   normaliseCommandMode,
   type CommandExecutionMode
 } from "./state.js";
@@ -572,7 +572,7 @@ export class ChaopApp extends LitElement {
 
   private hostSessionRow(session: HostSessionSummary) {
     const attachedThreadId = session.attached_thread_id;
-    const instance = primaryAppServerInstanceForConnector(this.data, session.connector_id);
+    const instance = appServerInstanceForHostSession(this.data, session);
     return html`
       <article
         class=${attachedThreadId ? "session-row clickable" : "session-row"}
