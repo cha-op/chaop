@@ -38,7 +38,6 @@ const DEFAULT_WORKSPACE_ID = "workspace-api";
 const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
-const BUDGET_WINDOW_TYPES: BudgetWindowType[] = ["daily", "four_hour", "burst"];
 const BUDGET_STATE_RANK: Record<BudgetState, number> = {
   normal: 0,
   recovery: 1,
