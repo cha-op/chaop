@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-14
 updated: 2026-06-14
 branch: wip/app-server-restart-flow
-pr:
+pr: https://github.com/cha-op/chaop/pull/15
 supersedes: 20260614-a5d8c0
 superseded_by:
 ---
