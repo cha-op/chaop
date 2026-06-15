@@ -1,11 +1,11 @@
 ---
 id: 20260614-9c3b2d-zh-Hans
 title: App-server 生命周期路线图
-status: active
+status: completed
 created: 2026-06-14
 updated: 2026-06-15
-branch: wip/web-deploy-script
-pr:
+branch: wip/budget-board-real-metrics
+pr: https://github.com/cha-op/chaop/pull/17
 supersedes: 20260613-e4a7c9
 superseded_by:
 ---
@@ -74,6 +74,12 @@ superseded_by:
 - 用 Chaop 可控来源里的真实 usage/cost signals 替换 Budget Board placeholder data。
 - metric collection 需要 bounded、sampled，并且 cache-friendly。
 - 增加 budget-alert 设置指引，但不提交部署实例值。
+
+实现检查点：
+- Browser bootstrap 和 `/api/usage-summary` 在有 database binding 时，现在会共用 D1-backed `BudgetSummary` 路径。
+- Worker 只 sample 最新的 `daily`、`four_hour` 和 `burst` `usage_windows` rows，并通过 `idx_usage_windows_type_end` 支撑读取；同时只读取 online connectors 和未归档 tasks 的 grouped budget-state counts。
+- Budget Board 现在会显示 source metadata、generated time、sampled usage windows、window freshness、delayed/compacted event counts 和 local spool bytes，但不增加高频 polling。
+- 成本和部署文档现在说明 Budget Board 是有界的 Chaop posture view，不能替代 Cloudflare 或 OpenAI billing alerts。
 
 ## 每个 PR 的合并门禁
 - 跑完整本地 test/build suite 和相关 focused checks。

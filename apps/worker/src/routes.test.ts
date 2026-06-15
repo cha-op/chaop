@@ -1117,6 +1117,51 @@ test("browser bootstrap does not write the user row when D1 is bound", async () 
   assert.equal(body.task_categories.length, 5);
 });
 
+test("usage summary returns bounded D1 budget windows", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/usage-summary", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: budgetSummaryDb()
+    }
+  );
+  const body = (await response.json()) as {
+    source: string;
+    state: string;
+    daily_used_pct: number;
+    four_hour_used_pct: number;
+    burst_used_pct: number;
+    delayed_event_count: number;
+    compacted_event_count: number;
+    local_spool_bytes: number;
+    window_sample_count: number;
+    windows: Array<{ window_type: string; used_pct: number; events_received: number }>;
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.source, "d1_usage_windows");
+  assert.equal(body.state, "hard_limited");
+  assert.equal(body.daily_used_pct, 73.3);
+  assert.equal(body.four_hour_used_pct, 88.9);
+  assert.equal(body.burst_used_pct, 21);
+  assert.equal(body.delayed_event_count, 8);
+  assert.equal(body.compacted_event_count, 55);
+  assert.equal(body.local_spool_bytes, 4096);
+  assert.equal(body.window_sample_count, 3);
+  assert.deepEqual(
+    body.windows.map((window) => [window.window_type, window.used_pct, window.events_received]),
+    [
+      ["daily", 73.3, 1000],
+      ["four_hour", 88.9, 240],
+      ["burst", 21, 18]
+    ]
+  );
+});
+
 test("agent bootstrap rejects invalid secret", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/connector/bootstrap", { method: "POST", body: "{}" }),
@@ -1950,10 +1995,96 @@ function readOnlyBootstrapDb(): D1Database {
         bind() {
           return this;
         },
+        async first() {
+          return undefined;
+        },
         async all() {
           return { results: [] };
         }
       };
+    }
+  } as unknown as D1Database;
+}
+
+function budgetSummaryDb(): D1Database {
+  const windows: Record<string, Record<string, unknown>> = {
+    daily: {
+      id: "usage-daily",
+      window_type: "daily",
+      window_start: "2026-06-15T00:00:00.000Z",
+      window_end: "2026-06-16T00:00:00.000Z",
+      budget_state: "conservative",
+      used_pct: 73.34,
+      events_received: 1000,
+      events_compacted: 55,
+      events_delayed: 8,
+      local_spool_bytes: 4096,
+      updated_at: "2026-06-15T09:00:00.000Z"
+    },
+    four_hour: {
+      id: "usage-four-hour",
+      window_type: "four_hour",
+      window_start: "2026-06-15T08:00:00.000Z",
+      window_end: "2026-06-15T12:00:00.000Z",
+      budget_state: "hard_limited",
+      used_pct: 88.88,
+      events_received: 240,
+      events_compacted: 20,
+      events_delayed: 4,
+      local_spool_bytes: 2048,
+      updated_at: "2026-06-15T09:01:00.000Z"
+    },
+    burst: {
+      id: "usage-burst",
+      window_type: "burst",
+      window_start: "2026-06-15T09:00:00.000Z",
+      window_end: "2026-06-15T09:01:00.000Z",
+      budget_state: "normal",
+      used_pct: 21,
+      events_received: 18,
+      events_compacted: 0,
+      events_delayed: 0,
+      local_spool_bytes: 0,
+      updated_at: "2026-06-15T09:01:00.000Z"
+    }
+  };
+
+  return {
+    prepare(sql: string) {
+      if (/FROM usage_windows/.test(sql)) {
+        assert.match(sql, /WHERE window_type = \?/);
+        assert.match(sql, /ORDER BY window_end DESC/);
+        assert.match(sql, /LIMIT 1/);
+        return {
+          bind(windowType: string) {
+            return {
+              async first() {
+                return windows[windowType];
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM connectors/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        assert.match(sql, /status <> 'offline'/);
+        return {
+          async all() {
+            return { results: [{ budget_state: "throttled", count: 1 }] };
+          }
+        };
+      }
+
+      if (/FROM tasks/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        assert.match(sql, /archived_at IS NULL/);
+        return {
+          async all() {
+            return { results: [{ budget_state: "conservative", count: 2 }] };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in budget summary fake: ${sql}`);
     }
   } as unknown as D1Database;
 }

@@ -28,6 +28,17 @@
 7. 如果本机 Codex 走 API 计费，设置 OpenAI API 月度预算和邮件阈值。
 8. 如果本机 Codex 走 ChatGPT/Codex 计划额度，关注 Codex usage/limit。
 
+## Budget Board 信号
+
+D1 绑定可用时，Browser 里的 Budget Board 会使用 Chaop 自己控制的数据库信号，而不是静态 sample data：
+
+- 分别读取 `daily`、`four_hour` 和 `burst` 的最新一条 `usage_windows` row。
+- 从 sampled usage windows、在线 connectors 和未归档 tasks 中取当前最严重的 `budget_state`。
+- Delayed events、compacted events 和 local spool bytes 优先来自 daily usage window；如果没有 daily window，则使用下一个可用的 sampled window。
+- 页面会显示 source metadata，区分当前是 D1 usage windows、本地 sample data，还是空数据库。
+
+Worker 每种 window type 最多读取一行，再读取 grouped budget-state counts。它不会扫描完整 event table，不会调用 Cloudflare billing APIs，不会调用 OpenAI billing APIs，也不需要部署实例 secrets。请把 Budget Board 当作 operator posture view，而不是官方账单来源；上面的 Cloudflare 和 OpenAI budget alerts 仍然需要开启。
+
 ## 当前防护
 
 主仓库默认仍是 placeholder execution。Managed Codex execution 只通过私有 app-server connector 配置启用：

@@ -731,7 +731,11 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
       burst_used_pct: 0,
       delayed_event_count: 0,
       compacted_event_count: 0,
-      local_spool_bytes: 0
+      local_spool_bytes: 0,
+      source: "empty",
+      generated_at: "2026-06-12T10:00:00.000Z",
+      window_sample_count: 0,
+      windows: []
     },
     server_time: "2026-06-12T10:00:00.000Z",
     ...overrides

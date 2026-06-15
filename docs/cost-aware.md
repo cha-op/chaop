@@ -28,6 +28,17 @@ Configure these before leaving the connector running unattended:
 7. OpenAI API monthly budget and email threshold if local Codex is API-backed.
 8. Codex usage/limit watch if local Codex is ChatGPT-plan-backed.
 
+## Budget Board Signals
+
+When D1 is bound, the Browser Budget Board uses Chaop-controlled database signals instead of static sample data:
+
+- The latest `usage_windows` row for each of `daily`, `four_hour`, and `burst`.
+- The worst current `budget_state` from sampled usage windows, online connectors, and unarchived tasks.
+- Delayed events, compacted events, and local spool bytes from the daily usage window when present, otherwise the next available sampled window.
+- Source metadata showing whether the board is backed by D1 usage windows, local sample data, or an empty database.
+
+The Worker reads at most one row per window type plus grouped budget-state counts. It does not scan the full event table, call Cloudflare billing APIs, call OpenAI billing APIs, or require deployment-instance secrets. Treat the board as an operator posture view, not as the official invoice source. Keep the Cloudflare and OpenAI budget alerts above enabled.
+
 ## Current Safeguards
 
 The main repository defaults to placeholder execution. Managed Codex execution is only enabled by a private app-server connector config:

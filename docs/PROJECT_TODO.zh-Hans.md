@@ -22,4 +22,4 @@
 - [done] PR5：让 managed app-server execution 成为默认 command path。
 - [done] PR6：增加 drain、scheduled restart 和 upgrade flow。
 - [done] PR7：增加 multi-instance 和 thread placement foundation。
-- [todo] PR8：用真实且 bounded 的 usage/cost metrics 替换 Budget Board placeholder。
+- [done] PR8：用真实且 bounded 的 usage/cost metrics 替换 Budget Board placeholder。

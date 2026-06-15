@@ -8,6 +8,10 @@ import type {
   AppServerInstanceSummary,
   AttachHostSessionResponse,
   BootstrapPayload,
+  BudgetState,
+  BudgetSummary,
+  BudgetWindowSignal,
+  BudgetWindowType,
   CommandDispatch,
   CommandTargetHostSession,
   CommandSummary,
@@ -26,7 +30,7 @@ import type {
   ThreadSummary,
   WorkspaceSummary
 } from "@chaop/protocol";
-import { budget, taskCategories } from "./sample-data.js";
+import { taskCategories } from "./sample-data.js";
 import type { Env } from "./types.js";
 import type { BrowserIdentity } from "./auth.js";
 
@@ -34,6 +38,14 @@ const DEFAULT_WORKSPACE_ID = "workspace-api";
 const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
+const BUDGET_WINDOW_TYPES: BudgetWindowType[] = ["daily", "four_hour", "burst"];
+const BUDGET_STATE_RANK: Record<BudgetState, number> = {
+  normal: 0,
+  recovery: 1,
+  conservative: 2,
+  throttled: 3,
+  hard_limited: 4
+};
 
 export class CommandTargetError extends Error {
   constructor(
@@ -76,7 +88,8 @@ export async function loadBootstrapFromDb(
     categories,
     tasks,
     runningCommands,
-    events
+    events,
+    budgetSummary
   ] = await Promise.all([
     listConnectors(env),
     listWorkspaces(env),
@@ -87,7 +100,8 @@ export async function loadBootstrapFromDb(
     listTaskCategories(env),
     listTasks(env),
     listRecentCommands(env),
-    listRecentEvents(env)
+    listRecentEvents(env),
+    loadBudgetSummaryFromDb(env)
   ]);
 
   return {
@@ -102,8 +116,46 @@ export async function loadBootstrapFromDb(
     tasks,
     running_commands: runningCommands,
     events,
-    budget,
+    budget: budgetSummary,
     server_time: new Date().toISOString()
+  };
+}
+
+export async function loadBudgetSummaryFromDb(
+  env: Env,
+  generatedAt = new Date().toISOString()
+): Promise<BudgetSummary> {
+  if (!env.DB) {
+    return emptyBudgetSummary(generatedAt);
+  }
+
+  const [daily, fourHour, burst, connectorStates, taskStates] = await Promise.all([
+    latestUsageWindow(env, "daily"),
+    latestUsageWindow(env, "four_hour"),
+    latestUsageWindow(env, "burst"),
+    listConnectorBudgetStates(env),
+    listTaskBudgetStates(env)
+  ]);
+  const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
+  const primaryWindow = daily ?? fourHour ?? burst;
+  const states = [
+    ...windows.map((window) => budgetStateFromString(window.budget_state)),
+    ...connectorStates.map((row) => budgetStateFromString(row.budget_state)),
+    ...taskStates.map((row) => budgetStateFromString(row.budget_state))
+  ];
+
+  return {
+    state: worstBudgetState(states),
+    daily_used_pct: normalisePct(daily?.used_pct),
+    four_hour_used_pct: normalisePct(fourHour?.used_pct),
+    burst_used_pct: normalisePct(burst?.used_pct),
+    delayed_event_count: nonNegativeInteger(primaryWindow?.events_delayed),
+    compacted_event_count: nonNegativeInteger(primaryWindow?.events_compacted),
+    local_spool_bytes: nonNegativeInteger(primaryWindow?.local_spool_bytes),
+    source: windows.length > 0 ? "d1_usage_windows" : "empty",
+    generated_at: generatedAt,
+    window_sample_count: windows.length,
+    windows: windows.map(budgetWindowSignalFromRow)
   };
 }
 
@@ -2986,6 +3038,42 @@ async function listAppServerInstancesForConnector(env: Env, connectorId: string)
   return rows.map(appServerInstanceFromRow);
 }
 
+async function latestUsageWindow(env: Env, windowType: BudgetWindowType): Promise<UsageWindowRow | undefined> {
+  const row = await env.DB!.prepare(
+    `SELECT id, window_type, window_start, window_end, budget_state, used_pct,
+            events_received, events_compacted, events_delayed, local_spool_bytes, updated_at
+     FROM usage_windows
+     WHERE window_type = ?
+     ORDER BY window_end DESC
+     LIMIT 1`
+  )
+    .bind(windowType)
+    .first<UsageWindowRow>();
+  return row ?? undefined;
+}
+
+async function listConnectorBudgetStates(env: Env): Promise<BudgetStateCountRow[]> {
+  return await allRows<BudgetStateCountRow>(
+    env.DB!.prepare(
+      `SELECT budget_state, COUNT(*) AS count
+       FROM connectors
+       WHERE status <> 'offline'
+       GROUP BY budget_state`
+    )
+  );
+}
+
+async function listTaskBudgetStates(env: Env): Promise<BudgetStateCountRow[]> {
+  return await allRows<BudgetStateCountRow>(
+    env.DB!.prepare(
+      `SELECT budget_state, COUNT(*) AS count
+       FROM tasks
+       WHERE archived_at IS NULL
+       GROUP BY budget_state`
+    )
+  );
+}
+
 function connectorSummaryFromRow(row: ConnectorRow): ConnectorSummary {
   return {
     id: row.id,
@@ -3848,6 +3936,65 @@ function slugPart(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64) || "unknown";
 }
 
+function emptyBudgetSummary(generatedAt: string): BudgetSummary {
+  return {
+    state: "normal",
+    daily_used_pct: 0,
+    four_hour_used_pct: 0,
+    burst_used_pct: 0,
+    delayed_event_count: 0,
+    compacted_event_count: 0,
+    local_spool_bytes: 0,
+    source: "empty",
+    generated_at: generatedAt,
+    window_sample_count: 0,
+    windows: []
+  };
+}
+
+function budgetWindowSignalFromRow(row: UsageWindowRow): BudgetWindowSignal {
+  return {
+    window_type: budgetWindowTypeFromString(row.window_type),
+    window_start: row.window_start,
+    window_end: row.window_end,
+    budget_state: budgetStateFromString(row.budget_state),
+    used_pct: normalisePct(row.used_pct),
+    events_received: nonNegativeInteger(row.events_received),
+    events_compacted: nonNegativeInteger(row.events_compacted),
+    events_delayed: nonNegativeInteger(row.events_delayed),
+    local_spool_bytes: nonNegativeInteger(row.local_spool_bytes),
+    updated_at: row.updated_at
+  };
+}
+
+function budgetWindowTypeFromString(value: string): BudgetWindowType {
+  return value === "four_hour" || value === "burst" ? value : "daily";
+}
+
+function budgetStateFromString(value: string): BudgetState {
+  return value === "conservative" || value === "throttled" || value === "hard_limited" || value === "recovery"
+    ? value
+    : "normal";
+}
+
+function worstBudgetState(states: BudgetState[]): BudgetState {
+  return states.reduce<BudgetState>(
+    (worst, state) => (BUDGET_STATE_RANK[state] > BUDGET_STATE_RANK[worst] ? state : worst),
+    "normal"
+  );
+}
+
+function normalisePct(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  const clamped = Math.min(100, Math.max(0, value));
+  return Math.round(clamped * 10) / 10;
+}
+
+function nonNegativeInteger(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.floor(value));
+}
+
 type ConnectorRow = {
   id: string;
   name: string;
@@ -3871,6 +4018,25 @@ type AppServerInstanceRow = Omit<AppServerInstanceSummary, "workspace_id" | "thr
   report_fingerprint: string;
   summary_changed_at: string;
   created_at: string;
+};
+
+type UsageWindowRow = {
+  id: string;
+  window_type: string;
+  window_start: string;
+  window_end: string;
+  budget_state: string;
+  used_pct: number;
+  events_received: number;
+  events_compacted: number;
+  events_delayed: number;
+  local_spool_bytes: number;
+  updated_at: string;
+};
+
+type BudgetStateCountRow = {
+  budget_state: string;
+  count: number;
 };
 
 type WorkspaceRow = {

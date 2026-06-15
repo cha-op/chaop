@@ -28,6 +28,23 @@ export type BudgetState =
   | "hard_limited"
   | "recovery";
 
+export type BudgetMetricSource = "sample" | "d1_usage_windows" | "empty";
+
+export type BudgetWindowType = "daily" | "four_hour" | "burst";
+
+export type BudgetWindowSignal = {
+  window_type: BudgetWindowType;
+  window_start: string;
+  window_end: string;
+  budget_state: BudgetState;
+  used_pct: number;
+  events_received: number;
+  events_compacted: number;
+  events_delayed: number;
+  local_spool_bytes: number;
+  updated_at: string;
+};
+
 export type RealtimeMode =
   | "realtime"
   | "summary"
@@ -327,6 +344,10 @@ export type BudgetSummary = {
   delayed_event_count: number;
   compacted_event_count: number;
   local_spool_bytes: number;
+  source?: BudgetMetricSource | undefined;
+  generated_at?: string | undefined;
+  window_sample_count?: number | undefined;
+  windows?: BudgetWindowSignal[] | undefined;
 };
 
 export type BootstrapPayload = {

@@ -36,6 +36,7 @@ import {
   ensureConnectorInventory,
   findAttachedHostSessionForTaskInDb,
   listThreadEventsInDb,
+  loadBudgetSummaryFromDb,
   loadBootstrapFromDb,
   recordHostSessionBackfillEvents,
   unarchiveTaskInDb
@@ -73,7 +74,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
     const auth = await authenticateBrowser(request, env);
     if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
-    return json(request, env, budget);
+    if (!env.DB && !allowsSampleData(env)) {
+      return json(request, env, { error: "DB binding is required" }, 503);
+    }
+    const summary = env.DB ? await loadBudgetSummaryFromDb(env) : budget;
+    return json(request, env, summary);
   }
 
   if (request.method === "POST" && url.pathname === "/connector/bootstrap") {

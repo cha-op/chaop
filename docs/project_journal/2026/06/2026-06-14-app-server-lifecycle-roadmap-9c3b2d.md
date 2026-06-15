@@ -1,11 +1,11 @@
 ---
 id: 20260614-9c3b2d
 title: App-server Lifecycle Roadmap
-status: active
+status: completed
 created: 2026-06-14
 updated: 2026-06-15
-branch: wip/web-deploy-script
-pr:
+branch: wip/budget-board-real-metrics
+pr: https://github.com/cha-op/chaop/pull/17
 supersedes: 20260613-e4a7c9
 superseded_by:
 ---
@@ -74,6 +74,12 @@ Implementation checkpoint:
 - Replace the Budget Board placeholder data with real usage/cost signals from Chaop-controlled sources.
 - Keep metric collection bounded, sampled, and cache-friendly.
 - Add budget-alert setup guidance without committing deployment-instance values.
+
+Implementation checkpoint:
+- Browser bootstrap and `/api/usage-summary` now use the same D1-backed `BudgetSummary` path when the database binding is available.
+- The Worker samples only the latest `daily`, `four_hour`, and `burst` `usage_windows` rows, backed by `idx_usage_windows_type_end`, plus grouped budget-state counts for online connectors and unarchived tasks.
+- Budget Board now shows source metadata, generated time, sampled usage windows, window freshness, delayed/compacted event counts, and local spool bytes without adding high-frequency polling.
+- Cost and deployment docs now clarify that Budget Board is a bounded Chaop posture view and does not replace Cloudflare or OpenAI billing alerts.
 
 ## Required Merge Gate Per PR
 - Run the complete local test/build suite and relevant focused checks.

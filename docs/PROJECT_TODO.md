@@ -22,4 +22,4 @@
 - [done] PR5: Make managed app-server execution the default command path.
 - [done] PR6: Add drain, scheduled restart, and upgrade flow.
 - [done] PR7: Add the multi-instance and thread placement foundation.
-- [todo] PR8: Replace Budget Board placeholders with real bounded usage/cost metrics.
+- [done] PR8: Replace Budget Board placeholders with real bounded usage/cost metrics.
