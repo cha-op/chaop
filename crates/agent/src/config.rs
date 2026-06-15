@@ -72,6 +72,12 @@ pub struct ManagedAppServerConfig {
     pub startup_timeout_seconds: u64,
     #[serde(default = "default_managed_app_server_restart_backoff_seconds")]
     pub restart_backoff_seconds: u64,
+    #[serde(default = "default_managed_app_server_drain_timeout_seconds")]
+    pub drain_timeout_seconds: u64,
+    #[serde(default)]
+    pub scheduled_restart_interval_seconds: u64,
+    #[serde(default)]
+    pub upgrade_marker_file: Option<PathBuf>,
 }
 
 impl Default for ExecutionConfig {
@@ -111,6 +117,9 @@ impl Default for ManagedAppServerConfig {
             extra_args: Vec::new(),
             startup_timeout_seconds: default_managed_app_server_startup_timeout_seconds(),
             restart_backoff_seconds: default_managed_app_server_restart_backoff_seconds(),
+            drain_timeout_seconds: default_managed_app_server_drain_timeout_seconds(),
+            scheduled_restart_interval_seconds: 0,
+            upgrade_marker_file: None,
         }
     }
 }
@@ -228,6 +237,10 @@ fn default_managed_app_server_restart_backoff_seconds() -> u64 {
     5
 }
 
+fn default_managed_app_server_drain_timeout_seconds() -> u64 {
+    300
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Read(std::io::Error),
@@ -306,6 +319,9 @@ listen_url = "ws://127.0.0.1:6174"
 extra_args = ["--ws-project-doc-max-bytes", "131072"]
 startup_timeout_seconds = 3
 restart_backoff_seconds = 2
+drain_timeout_seconds = 30
+scheduled_restart_interval_seconds = 3600
+upgrade_marker_file = "/Users/you/.chaop/app-server-upgrade.marker"
 "#,
         )
         .expect("write config");
@@ -335,6 +351,30 @@ restart_backoff_seconds = 2
                 .managed_app_server
                 .restart_backoff_seconds,
             2
+        );
+        assert_eq!(
+            config
+                .session_inventory
+                .managed_app_server
+                .drain_timeout_seconds,
+            30
+        );
+        assert_eq!(
+            config
+                .session_inventory
+                .managed_app_server
+                .scheduled_restart_interval_seconds,
+            3600
+        );
+        assert_eq!(
+            config
+                .session_inventory
+                .managed_app_server
+                .upgrade_marker_file
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .as_deref(),
+            Some("/Users/you/.chaop/app-server-upgrade.marker")
         );
         assert_eq!(
             config.session_inventory.managed_app_server.extra_args,

@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tungstenite::http::Uri;
 
 const APP_SERVER_SPAWN_ATTEMPTS: usize = 3;
@@ -27,6 +27,9 @@ pub struct AppServerManager {
     active_turn_count: u32,
     status_summary: Option<String>,
     last_error: Option<String>,
+    pending_restart: Option<PendingAppServerRestart>,
+    next_scheduled_restart_at: Option<Instant>,
+    last_upgrade_marker_modified: Option<SystemTime>,
 }
 
 impl AppServerManager {
@@ -36,6 +39,8 @@ impl AppServerManager {
             .listen_url
             .clone()
             .or_else(|| config.session_inventory.app_server_url.clone());
+        let last_upgrade_marker_modified =
+            upgrade_marker_modified(managed.upgrade_marker_file.as_ref());
         Self {
             enabled: managed.enabled,
             listen_url,
@@ -48,6 +53,9 @@ impl AppServerManager {
             active_turn_count: 0,
             status_summary: None,
             last_error: None,
+            pending_restart: None,
+            next_scheduled_restart_at: None,
+            last_upgrade_marker_modified,
         }
     }
 
@@ -77,7 +85,7 @@ impl AppServerManager {
 
         let mut runtime = config.clone();
         runtime.session_inventory.app_server_url = if allow_start {
-            self.ensure_ready(config)
+            self.runtime_app_server_url(config)
         } else {
             self.probe_ready(config)
         };
@@ -115,6 +123,134 @@ impl AppServerManager {
 
     pub fn finish_turn(&mut self) {
         self.active_turn_count = self.active_turn_count.saturating_sub(1);
+    }
+
+    fn runtime_app_server_url(&mut self, config: &AgentConfig) -> Option<String> {
+        self.schedule_configured_restart_requests(config);
+        if self.pending_restart.is_some() {
+            return self.advance_pending_restart(config);
+        }
+
+        self.ensure_ready(config)
+    }
+
+    fn schedule_configured_restart_requests(&mut self, config: &AgentConfig) {
+        self.schedule_periodic_restart(config);
+        self.schedule_upgrade_marker_restart(config);
+    }
+
+    fn schedule_periodic_restart(&mut self, config: &AgentConfig) {
+        let interval = Duration::from_secs(
+            config
+                .session_inventory
+                .managed_app_server
+                .scheduled_restart_interval_seconds,
+        );
+        if interval.is_zero() {
+            self.next_scheduled_restart_at = None;
+            return;
+        }
+
+        let now = Instant::now();
+        let Some(next_restart_at) = self.next_scheduled_restart_at else {
+            self.next_scheduled_restart_at = now.checked_add(interval);
+            return;
+        };
+        if now >= next_restart_at {
+            self.request_restart(AppServerRestartReason::Scheduled);
+        }
+    }
+
+    fn schedule_upgrade_marker_restart(&mut self, config: &AgentConfig) {
+        let marker = config
+            .session_inventory
+            .managed_app_server
+            .upgrade_marker_file
+            .as_ref();
+        let modified = upgrade_marker_modified(marker);
+        match (self.last_upgrade_marker_modified, modified) {
+            (Some(previous), Some(current)) if current > previous => {
+                self.last_upgrade_marker_modified = Some(current);
+                self.request_restart(AppServerRestartReason::UpgradeMarker);
+            }
+            (None, Some(current)) => {
+                self.last_upgrade_marker_modified = Some(current);
+            }
+            _ => {}
+        }
+    }
+
+    fn request_restart(&mut self, reason: AppServerRestartReason) {
+        if self.pending_restart.is_some() {
+            return;
+        }
+        self.pending_restart = Some(PendingAppServerRestart {
+            reason,
+            requested_at: Instant::now(),
+        });
+        if self.active_turn_count > 0 {
+            self.set_state(
+                AppServerInstanceState::Draining,
+                reason.draining_summary(),
+                None,
+            );
+        } else {
+            self.set_state(
+                AppServerInstanceState::Restarting,
+                reason.restarting_summary(false),
+                None,
+            );
+        }
+    }
+
+    fn advance_pending_restart(&mut self, config: &AgentConfig) -> Option<String> {
+        let pending = self.pending_restart?;
+        let drain_timeout = Duration::from_secs(
+            config
+                .session_inventory
+                .managed_app_server
+                .drain_timeout_seconds
+                .max(1),
+        );
+        let force_restart =
+            self.active_turn_count > 0 && pending.requested_at.elapsed() >= drain_timeout;
+        if self.active_turn_count > 0 && !force_restart {
+            self.set_state(
+                AppServerInstanceState::Draining,
+                pending.reason.draining_summary(),
+                None,
+            );
+            return None;
+        }
+
+        self.pending_restart = None;
+        self.arm_next_scheduled_restart(config);
+        self.last_start_failure = None;
+        self.set_state(
+            AppServerInstanceState::Restarting,
+            pending.reason.restarting_summary(force_restart),
+            force_restart.then_some("Drain timeout elapsed while active turns were still running."),
+        );
+        self.stop_child(pending.reason.stop_reason(force_restart));
+        let url = self.ensure_ready(config);
+        if url.is_some() {
+            self.arm_next_scheduled_restart(config);
+        }
+        url
+    }
+
+    fn arm_next_scheduled_restart(&mut self, config: &AgentConfig) {
+        let interval = Duration::from_secs(
+            config
+                .session_inventory
+                .managed_app_server
+                .scheduled_restart_interval_seconds,
+        );
+        self.next_scheduled_restart_at = if interval.is_zero() {
+            None
+        } else {
+            Instant::now().checked_add(interval)
+        };
     }
 
     fn refresh_external_state(&mut self, config: &AgentConfig) {
@@ -426,6 +562,7 @@ pub struct AppServerInstanceSnapshot {
 enum AppServerInstanceState {
     Healthy,
     Degraded,
+    Draining,
     Restarting,
     Stopped,
 }
@@ -435,10 +572,60 @@ impl AppServerInstanceState {
         match self {
             Self::Healthy => "healthy",
             Self::Degraded => "degraded",
+            Self::Draining => "draining",
             Self::Restarting => "restarting",
             Self::Stopped => "stopped",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingAppServerRestart {
+    reason: AppServerRestartReason,
+    requested_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppServerRestartReason {
+    Scheduled,
+    UpgradeMarker,
+}
+
+impl AppServerRestartReason {
+    fn draining_summary(self) -> &'static str {
+        match self {
+            Self::Scheduled => "Managed app-server scheduled restart is draining active turns.",
+            Self::UpgradeMarker => "Managed app-server upgrade restart is draining active turns.",
+        }
+    }
+
+    fn restarting_summary(self, forced: bool) -> &'static str {
+        match (self, forced) {
+            (Self::Scheduled, false) => "Managed app-server scheduled restart is in progress.",
+            (Self::Scheduled, true) => {
+                "Managed app-server scheduled restart is forcing after drain timeout."
+            }
+            (Self::UpgradeMarker, false) => "Managed app-server upgrade restart is in progress.",
+            (Self::UpgradeMarker, true) => {
+                "Managed app-server upgrade restart is forcing after drain timeout."
+            }
+        }
+    }
+
+    fn stop_reason(self, forced: bool) -> &'static str {
+        match (self, forced) {
+            (Self::Scheduled, false) => "scheduled managed app-server restart",
+            (Self::Scheduled, true) => "forced scheduled managed app-server restart",
+            (Self::UpgradeMarker, false) => "upgrade marker managed app-server restart",
+            (Self::UpgradeMarker, true) => "forced upgrade marker managed app-server restart",
+        }
+    }
+}
+
+fn upgrade_marker_modified(marker: Option<&std::path::PathBuf>) -> Option<SystemTime> {
+    marker
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
 }
 
 fn is_loopback_listen_url(listen_url: &str) -> bool {
@@ -538,7 +725,10 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppServerManager, is_loopback_listen_url, terminate_child};
+    use super::{
+        AppServerInstanceState, AppServerManager, AppServerRestartReason, is_loopback_listen_url,
+        terminate_child,
+    };
     use crate::config::{
         AgentConfig, BootstrapConfig, ExecutionConfig, ExecutionMode, ManagedAppServerConfig,
         SessionInventoryConfig,
@@ -674,6 +864,141 @@ mod tests {
 
         assert_eq!(runtime.session_inventory.app_server_url, None);
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn scheduled_restart_interval_drains_active_turns_and_hides_capabilities() {
+        let mut config = config_with_managed(true);
+        config
+            .session_inventory
+            .managed_app_server
+            .scheduled_restart_interval_seconds = 60;
+        let mut manager = AppServerManager::new(&config);
+        manager.active_turn_count = 1;
+        manager.next_scheduled_restart_at = Some(Instant::now() - Duration::from_secs(1));
+
+        let runtime = manager.runtime_config(&config);
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.state, AppServerInstanceState::Draining);
+        assert!(
+            !runtime
+                .capabilities()
+                .contains(&"codex_app_server_exec".to_owned())
+        );
+        assert!(
+            !runtime
+                .capabilities()
+                .contains(&"app_server_threads".to_owned())
+        );
+        assert!(
+            !runtime
+                .capabilities()
+                .contains(&"app_server_archive".to_owned())
+        );
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Managed app-server scheduled restart is draining active turns.")
+        );
+    }
+
+    #[test]
+    fn scheduled_restart_interval_keeps_existing_deadline() {
+        let mut config = config_with_managed(true);
+        config
+            .session_inventory
+            .managed_app_server
+            .scheduled_restart_interval_seconds = 60;
+        let mut manager = AppServerManager::new(&config);
+
+        manager.schedule_periodic_restart(&config);
+        let first_deadline = manager.next_scheduled_restart_at;
+        manager.schedule_periodic_restart(&config);
+
+        assert!(first_deadline.is_some());
+        assert_eq!(manager.next_scheduled_restart_at, first_deadline);
+    }
+
+    #[test]
+    fn upgrade_marker_change_drains_active_turns() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let marker = tempdir.path().join("upgrade.marker");
+        std::fs::write(&marker, "before").expect("write marker");
+        let mut config = config_with_managed(true);
+        config
+            .session_inventory
+            .managed_app_server
+            .upgrade_marker_file = Some(marker.clone());
+        let mut manager = AppServerManager::new(&config);
+        manager.active_turn_count = 1;
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&marker, "after").expect("touch marker");
+
+        let runtime = manager.runtime_config(&config);
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.state, AppServerInstanceState::Draining);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Managed app-server upgrade restart is draining active turns.")
+        );
+    }
+
+    #[test]
+    fn managed_app_server_restarts_after_active_turns_drain() {
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .restart_backoff_seconds = 60;
+        let mut manager = AppServerManager::new(&config);
+        manager.begin_turn();
+        manager.request_restart(AppServerRestartReason::Scheduled);
+
+        let draining_runtime = manager.runtime_config(&config);
+        manager.finish_turn();
+        let restart_runtime = manager.runtime_config(&config);
+
+        assert_eq!(draining_runtime.session_inventory.app_server_url, None);
+        assert_eq!(restart_runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.pending_restart, None);
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Failed to start managed app-server.")
+        );
+        assert!(!manager.can_attempt_start(&config));
+    }
+
+    #[test]
+    fn drain_timeout_forces_managed_app_server_restart_attempt() {
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .drain_timeout_seconds = 1;
+        config
+            .session_inventory
+            .managed_app_server
+            .restart_backoff_seconds = 60;
+        let mut manager = AppServerManager::new(&config);
+        manager.begin_turn();
+        manager.pending_restart = Some(super::PendingAppServerRestart {
+            reason: AppServerRestartReason::UpgradeMarker,
+            requested_at: Instant::now() - Duration::from_secs(2),
+        });
+
+        let runtime = manager.runtime_config(&config);
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.pending_restart, None);
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.last_error.as_deref(),
+            Some("No such file or directory (os error 2)")
+        );
     }
 
     #[test]
@@ -1006,6 +1331,9 @@ mod tests {
                     extra_args: Vec::new(),
                     startup_timeout_seconds: 1,
                     restart_backoff_seconds: 1,
+                    drain_timeout_seconds: 300,
+                    scheduled_restart_interval_seconds: 0,
+                    upgrade_marker_file: None,
                 },
                 ..SessionInventoryConfig::default()
             },
