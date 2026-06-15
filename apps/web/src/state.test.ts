@@ -16,6 +16,7 @@ import {
   commandExecutionModeForRequest,
   commandModeLabel,
   commandTypeForMode,
+  defaultCommandMode,
   historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
@@ -396,6 +397,24 @@ test("managedAppServerCommandAvailable requires an attached app-server session a
   );
 });
 
+test("defaultCommandMode prefers managed app-server when it is available", () => {
+  const attachedSession = {
+    ...hostSession("session-app-server"),
+    connector_id: "connector-a",
+    attached_thread_id: "thread-api",
+    app_server_present: true
+  };
+  const data = payload({
+    connectors: [connector("connector-a", ["codex_app_server_exec"])],
+    threads: [thread("thread-api", "workspace-api")],
+    host_sessions: [attachedSession]
+  });
+
+  assert.equal(defaultCommandMode(data, "thread-api"), "app_server");
+  assert.equal(defaultCommandMode(data, "missing-thread"), "placeholder");
+  assert.equal(defaultCommandMode(undefined, "thread-api"), "placeholder");
+});
+
 test("codexCliFallbackAvailable is scoped to online workspace connectors", () => {
   const data = payload({
     connectors: [
@@ -431,6 +450,65 @@ test("normaliseCommandMode drops unavailable app-server and hidden CLI fallback 
   assert.equal(
     normaliseCommandMode("codex_cli_fallback", data, "thread-api", { showCliFallback: true }),
     "codex_cli_fallback"
+  );
+});
+
+test("normaliseCommandMode promotes placeholder only for implicit managed app-server defaults", () => {
+  const attachedSession = {
+    ...hostSession("session-app-server"),
+    connector_id: "connector-a",
+    attached_thread_id: "thread-api",
+    app_server_present: true
+  };
+  const data = payload({
+    connectors: [connector("connector-a", ["codex_app_server_exec"])],
+    threads: [thread("thread-api", "workspace-api")],
+    host_sessions: [attachedSession]
+  });
+
+  assert.equal(
+    normaliseCommandMode("placeholder", data, "thread-api", {
+      showCliFallback: false,
+      preferManagedAppServer: true
+    }),
+    "app_server"
+  );
+  assert.equal(
+    normaliseCommandMode("placeholder", data, "thread-api", {
+      showCliFallback: false,
+      preferManagedAppServer: false
+    }),
+    "placeholder"
+  );
+  assert.equal(
+    normaliseCommandMode("codex_cli_fallback", data, "thread-api", {
+      showCliFallback: false,
+      preferManagedAppServer: true
+    }),
+    "app_server"
+  );
+  assert.equal(
+    normaliseCommandMode("codex_cli_fallback", data, "thread-api", {
+      showCliFallback: true,
+      preferManagedAppServer: true
+    }),
+    "app_server"
+  );
+  assert.equal(
+    normaliseCommandMode(
+      "codex_cli_fallback",
+      payload({
+        connectors: [connector("connector-a", ["codex_exec"])],
+        workspaces: [workspace("workspace-api", ["connector-a"])],
+        threads: [thread("thread-api", "workspace-api")]
+      }),
+      "thread-api",
+      {
+        showCliFallback: true,
+        preferManagedAppServer: true
+      }
+    ),
+    "placeholder"
   );
 });
 

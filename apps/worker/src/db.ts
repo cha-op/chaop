@@ -1440,11 +1440,21 @@ export async function createCommandInDb(
   if (request.execution_mode && commandType !== "codex") {
     throw new CommandTargetError("Command execution mode requires codex command type", 400);
   }
+  const requestedExecutionMode = commandType === "codex" ? request.execution_mode : undefined;
   const scope = await resolveCommandScope(env, request);
-  const useAttachedTarget = request.execution_mode !== "codex_cli_fallback";
+  const useAttachedTarget = requestedExecutionMode !== "codex_cli_fallback";
   const attachedTarget = useAttachedTarget ? await findAttachedCommandTarget(env, scope) : null;
-  if (request.execution_mode === "app_server" && attachedTarget?.app_server_present !== true) {
+  if (requestedExecutionMode === "app_server" && attachedTarget?.app_server_present !== true) {
     throw new CommandTargetError("App-server execution requires an attached app-server host session");
+  }
+  const executionMode =
+    commandType === "codex" && attachedTarget?.app_server_present === true
+      ? "app_server"
+      : requestedExecutionMode;
+  if (commandType === "codex" && !executionMode) {
+    throw new CommandTargetError(
+      "Codex commands require an attached app-server host session or explicit CLI fallback execution mode"
+    );
   }
   const attachedTargetForInsert = attachedTarget
     ? {
@@ -1454,7 +1464,7 @@ export async function createCommandInDb(
     }
     : undefined;
   const appServerTargetHostSessionId =
-    attachedTarget?.app_server_present === true && commandType === "codex" ? attachedTarget.session_id : null;
+    executionMode === "app_server" ? attachedTarget?.session_id ?? null : null;
   const targetConnectorId =
     request.target_connector_id
     ?? attachedTarget?.connector_id
@@ -1475,7 +1485,7 @@ export async function createCommandInDb(
 
   if (targetConnectorId) {
     await assertConnectorCanExecute(env, targetConnectorId, scope.workspaceId, commandType, {
-      requireAppServerExec: attachedTarget?.app_server_present === true && commandType === "codex"
+      requireAppServerExec: executionMode === "app_server"
     });
   }
 
@@ -1486,7 +1496,7 @@ export async function createCommandInDb(
     thread_id: scope.threadId,
     task_id: scope.taskId,
     type: commandType,
-    execution_mode: commandType === "codex" ? request.execution_mode : undefined,
+    execution_mode: commandType === "codex" ? executionMode : undefined,
     prompt: request.prompt,
     state: "pending",
     target_connector_id: targetConnectorId,
