@@ -255,6 +255,14 @@ impl AppServerManager {
             return None;
         }
         self.clear_exited_child();
+        if self.child.is_none() && self.probe_ready(config).is_some() {
+            self.set_state(
+                AppServerInstanceState::Degraded,
+                pending.reason.unowned_listener_summary(),
+                Some("Restart cannot stop the listening app-server because this connector did not start it."),
+            );
+            return None;
+        }
         if !force_restart
             && pending.reason == AppServerRestartReason::Scheduled
             && self.child.is_none()
@@ -735,6 +743,17 @@ impl AppServerRestartReason {
     fn supersedes(self, existing: Self) -> bool {
         matches!((self, existing), (Self::UpgradeMarker, Self::Scheduled))
     }
+
+    fn unowned_listener_summary(self) -> &'static str {
+        match self {
+            Self::Scheduled => {
+                "Managed app-server scheduled restart is blocked by an unowned listener."
+            }
+            Self::UpgradeMarker => {
+                "Managed app-server upgrade restart is blocked by an unowned listener."
+            }
+        }
+    }
 }
 
 fn upgrade_marker_modified(marker: Option<&std::path::PathBuf>) -> Option<SystemTime> {
@@ -848,10 +867,12 @@ mod tests {
         AgentConfig, BootstrapConfig, ExecutionConfig, ExecutionMode, ManagedAppServerConfig,
         SessionInventoryConfig,
     };
+    use std::net::TcpListener;
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+    use tungstenite::Message;
 
     static TEST_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -1385,6 +1406,48 @@ mod tests {
     }
 
     #[test]
+    fn restart_request_blocks_when_healthy_listener_is_not_owned() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let spawn_marker = tempdir.path().join("spawned");
+        let command = tempdir.path().join("codex-stub");
+        write_executable(
+            &command,
+            &format!(
+                "#!/bin/sh\nprintf spawned > '{}'\nsleep 30\n",
+                spawn_marker.display()
+            ),
+        );
+        let (listen_url, fake_app_server) = spawn_one_healthcheck_app_server();
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = command.to_string_lossy().into_owned();
+        config.session_inventory.app_server_url = Some(listen_url.clone());
+        config.session_inventory.managed_app_server.listen_url = Some(listen_url);
+        let mut manager = AppServerManager::new(&config);
+        manager.request_restart(AppServerRestartReason::UpgradeMarker);
+
+        let runtime = manager.runtime_config(&config);
+        fake_app_server.join().expect("fake app-server");
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert!(!spawn_marker.exists());
+        assert_eq!(
+            manager.pending_restart.map(|pending| pending.reason),
+            Some(AppServerRestartReason::UpgradeMarker)
+        );
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Managed app-server upgrade restart is blocked by an unowned listener.")
+        );
+        assert_eq!(
+            manager.last_error.as_deref(),
+            Some(
+                "Restart cannot stop the listening app-server because this connector did not start it."
+            )
+        );
+    }
+
+    #[test]
     fn drain_timeout_forces_managed_app_server_restart_attempt() {
         let mut config = config_with_managed(true);
         config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
@@ -1810,6 +1873,53 @@ mod tests {
             "timed out waiting for matching content in {}",
             path.display()
         );
+    }
+
+    fn spawn_one_healthcheck_app_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+        let address = listener.local_addr().expect("fake app-server address");
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake app-server client");
+            let mut socket = tungstenite::accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("id").and_then(serde_json::Value::as_i64),
+                Some(0)
+            );
+            assert_eq!(
+                initialize.get("method").and_then(serde_json::Value::as_str),
+                Some("initialize")
+            );
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized
+                    .get("method")
+                    .and_then(serde_json::Value::as_str),
+                Some("initialized")
+            );
+        });
+        (format!("ws://{address}"), handle)
+    }
+
+    fn read_fake_app_server_message(
+        socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+    ) -> serde_json::Value {
+        let message = socket.read().expect("read app-server request");
+        let Message::Text(text) = message else {
+            panic!("expected app-server text message");
+        };
+        serde_json::from_str(text.as_ref()).expect("valid app-server json")
     }
 
     #[cfg(unix)]

@@ -30,6 +30,7 @@ superseded_by:
 - 强制 drain-timeout restart 完成后继续保留 operator 可见的 summary；如果强制重启后没有恢复 healthy，也会保留底层 restart error。
 - 即使 managed child 在 active turn draining 期间已经退出，forced scheduled restart timeout 也会保留 drain-timeout reporting；后续 backoff refresh 会继续保留这个 operator-visible reason，直到下一次真实 start attempt。
 - 当 managed app-server 已经 degraded、没有可停止的 child process，或 managed child 已经退出时，scheduled restart 现在会尊重 startup backoff，并且不会在 backoff window 内反复 bump instance generation 或 control-plane reports。
+- Restart request 不再通过复用 connector 不拥有的 healthy listener 来误报成功；pending restart 会保持 blocked，直到 unowned listener 被停止。
 - Restart attempt 会清空 pending drain request、重置 periodic schedule、停止 managed child，并复用现有 health-check/start path。
 - 更新部署指南里的配置示例和 operator guidance，说明 scheduled restart 与 upgrade marker 的使用方式。
 
