@@ -24,7 +24,7 @@ superseded_by:
 - Added AppServerManager state for pending restarts, scheduled restart deadlines, and upgrade marker modification tracking.
 - Added `draining` lifecycle transitions that return no app-server URL in runtime config, so `agent.ready` stops advertising app-server thread/archive/execution capabilities during drain.
 - Added a bounded app-server runtime maintenance tick while app-server commands are running, so scheduled or marker-triggered restarts can enter drain and report capability changes during long turns without doing ordinary health-check restarts.
-- App-server command completion now refreshes runtime state before final event acknowledgements, so pending drain restarts advance before post-turn background messages are handled.
+- App-server command completion now advances runtime state before final event dispatch, but delays restored readiness and host-session refresh until after final command events are acknowledged.
 - Treat first creation of the configured upgrade marker file as a restart request when the file did not exist at connector startup.
 - Upgrade marker restart requests now supersede pending scheduled restart requests, so an operator-triggered local marker cannot be hidden behind a periodic restart.
 - Preserve forced drain-timeout restart summaries after the restart attempt, including the underlying restart error when the forced restart does not become healthy.
