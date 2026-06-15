@@ -3,7 +3,7 @@ id: 20260614-9c3b2d-zh-Hans
 title: App-server 生命周期路线图
 status: active
 created: 2026-06-14
-updated: 2026-06-14
+updated: 2026-06-15
 branch: wip/web-deploy-script
 pr:
 supersedes: 20260613-e4a7c9
@@ -63,6 +63,12 @@ superseded_by:
 - 扩展 registry，使其支持 connector-wide、workspace/project-scoped 和 thread-dedicated app-server instances。
 - 默认仍保持 connector-wide placement。
 - thread-dedicated placement 作为可选 canary path，为后续 rolling-upgrade experiments 留接口。
+
+实现检查点：
+- `AppServerInstanceSummary` 和 `AgentAppServerInstance` 现在携带可选的 `workspace_id` 和 `thread_id` placement targets。
+- D1 会在 `app_server_instances` 保存 placement targets，把 placement 纳入 persisted identity 和 dedupe fingerprints，并通过 bootstrap 和 realtime updates 暴露给前端。
+- Agent app-server reports 现在校验 scope-specific placement：connector-wide reports 默认不带 target，workspace reports 需要 `workspace_id`，thread reports 需要 `thread_id`。
+- Operations/Host Sessions 里的 app-server cards 现在显示 placement labels，同时 connector-wide 仍是默认 managed path。
 
 ### PR8: Budget Board Real Metrics
 - 用 Chaop 可控来源里的真实 usage/cost signals 替换 Budget Board placeholder data。

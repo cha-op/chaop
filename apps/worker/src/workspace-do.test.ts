@@ -174,6 +174,69 @@ test("agent app-server instance report is acked and broadcast", async () => {
   assert.equal(update.payload?.app_server_instances?.[0]?.state, "healthy");
 });
 
+test("agent app-server instance report accepts workspace and thread placement targets", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      return [];
+    }
+  } as unknown as DurableObjectState;
+  const db = appServerInstanceDoDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      report_id: "report-placements",
+      instances: [
+        appServerInstancePayload("healthy", {
+          instance_key: "default",
+          scope: "workspace",
+          workspace_id: "workspace-api"
+        }),
+        appServerInstancePayload("healthy", {
+          instance_key: "default",
+          scope: "thread",
+          workspace_id: "workspace-api",
+          thread_id: "thread-123"
+        })
+      ]
+    }
+  }));
+
+  assert.equal(db.writes, 2);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as { payload?: { count?: number } };
+  assert.equal(ack.payload?.count, 2);
+  const update = JSON.parse(browserSent[0] ?? "{}") as {
+    payload?: {
+      app_server_instances?: Array<{
+        instance_key?: string;
+        workspace_id?: string;
+        thread_id?: string;
+      }>;
+    };
+  };
+  assert.deepEqual(
+    update.payload?.app_server_instances?.map((instance) => [
+      instance.instance_key,
+      instance.workspace_id,
+      instance.thread_id
+    ]),
+    [
+      ["default", "workspace-api", undefined],
+      ["default", "workspace-api", "thread-123"]
+    ]
+  );
+});
+
 test("empty app-server instance snapshot is acked and broadcast", async () => {
   const agentSent: string[] = [];
   const browserSent: string[] = [];
@@ -2017,13 +2080,17 @@ function socketGoneDb(): D1Database & {
         };
       }
 
-      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+      if (
+        /SELECT id, connector_id, instance_key/.test(sql) &&
+        /WHERE connector_id = \? AND instance_key = \?/.test(sql) &&
+        /placement_key = \?/.test(sql)
+      ) {
         return {
-          bind(connectorId: string, instanceKey: string) {
+          bind(connectorId: string, instanceKey: string, placementKey: string) {
             assert.equal(connectorId, "connector-online");
             return {
               async first() {
-                return appServerRows.get(`${connectorId}:${instanceKey}`) ?? null;
+                return appServerRows.get(`${connectorId}:${instanceKey}:${placementKey}`) ?? null;
               }
             };
           }
@@ -2037,6 +2104,9 @@ function socketGoneDb(): D1Database & {
             connectorId: string,
             instanceKey: string,
             scope: AppServerInstanceDoRow["scope"],
+            workspaceId: string | null,
+            threadId: string | null,
+            placementKey: string,
             endpointType: AppServerInstanceDoRow["endpoint_type"],
             state: AppServerInstanceDoRow["state"],
             activeTurnCount: number,
@@ -2054,11 +2124,14 @@ function socketGoneDb(): D1Database & {
             return {
               async run() {
                 counters.appServerInstanceWrites += 1;
-                appServerRows.set(`${connectorId}:${instanceKey}`, {
+                appServerRows.set(`${connectorId}:${instanceKey}:${placementKey}`, {
                   id,
                   connector_id: connectorId,
                   instance_key: instanceKey,
                   scope,
+                  workspace_id: workspaceId,
+                  thread_id: threadId,
+                  placement_key: placementKey,
                   endpoint_type: endpointType,
                   state,
                   active_turn_count: activeTurnCount,
@@ -2069,7 +2142,7 @@ function socketGoneDb(): D1Database & {
                   last_seen_at: lastSeenAt,
                   state_changed_at: stateChangedAt,
                   summary_changed_at: summaryChangedAt,
-                  created_at: appServerRows.get(`${connectorId}:${instanceKey}`)?.created_at ?? createdAt,
+                  created_at: appServerRows.get(`${connectorId}:${instanceKey}:${placementKey}`)?.created_at ?? createdAt,
                   updated_at: updatedAt
                 });
                 return { success: true, meta: { changes: 1 } };
@@ -2182,7 +2255,7 @@ function socketGoneDb(): D1Database & {
                 const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
                 assert.ok(row);
                 counters.appServerInstanceWrites += 1;
-                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                appServerRows.set(`${row.connector_id}:${row.instance_key}:${row.placement_key}`, {
                   ...row,
                   state: "stopped",
                   active_turn_count: 0,
@@ -2395,11 +2468,19 @@ function mutableSocketWithAttachment(initialAttachment: unknown, sent: string[])
 
 function appServerInstancePayload(
   state: "healthy" | "degraded" | "draining" | "restarting" | "stopped",
-  overrides: { last_error?: string } = {}
+  overrides: {
+    instance_key?: string;
+    scope?: "connector" | "workspace" | "thread";
+    workspace_id?: string;
+    thread_id?: string;
+    last_error?: string;
+  } = {}
 ) {
   return {
-    instance_key: "default",
-    scope: "connector",
+    instance_key: overrides.instance_key ?? "default",
+    scope: overrides.scope ?? "connector",
+    workspace_id: overrides.workspace_id,
+    thread_id: overrides.thread_id,
     endpoint_type: "managed",
     state,
     active_turn_count: 0,
@@ -2414,6 +2495,9 @@ type AppServerInstanceDoRow = {
   connector_id: string;
   instance_key: string;
   scope: "connector" | "workspace" | "thread";
+  workspace_id: string | null;
+  thread_id: string | null;
+  placement_key: string;
   endpoint_type: "managed" | "external";
   state: "healthy" | "degraded" | "draining" | "restarting" | "stopped";
   active_turn_count: number;
@@ -2446,12 +2530,16 @@ function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
         };
       }
 
-      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+      if (
+        /SELECT id, connector_id, instance_key/.test(sql) &&
+        /WHERE connector_id = \? AND instance_key = \?/.test(sql) &&
+        /placement_key = \?/.test(sql)
+      ) {
         return {
-          bind(connectorId: string, instanceKey: string) {
+          bind(connectorId: string, instanceKey: string, placementKey: string) {
             return {
               async first() {
-                return rows.get(`${connectorId}:${instanceKey}`) ?? null;
+                return rows.get(`${connectorId}:${instanceKey}:${placementKey}`) ?? null;
               }
             };
           }
@@ -2465,6 +2553,9 @@ function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
             connectorId: string,
             instanceKey: string,
             scope: AppServerInstanceDoRow["scope"],
+            workspaceId: string | null,
+            threadId: string | null,
+            placementKey: string,
             endpointType: AppServerInstanceDoRow["endpoint_type"],
             state: AppServerInstanceDoRow["state"],
             activeTurnCount: number,
@@ -2481,11 +2572,14 @@ function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
             return {
               async run() {
                 counters.writes += 1;
-                rows.set(`${connectorId}:${instanceKey}`, {
+                rows.set(`${connectorId}:${instanceKey}:${placementKey}`, {
                   id,
                   connector_id: connectorId,
                   instance_key: instanceKey,
                   scope,
+                  workspace_id: workspaceId,
+                  thread_id: threadId,
+                  placement_key: placementKey,
                   endpoint_type: endpointType,
                   state,
                   active_turn_count: activeTurnCount,

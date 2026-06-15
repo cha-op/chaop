@@ -16,6 +16,7 @@ import {
   recordHostSessions,
   updateConnectorCapabilities
 } from "./db.js";
+import type { AgentAppServerInstance } from "@chaop/protocol";
 import type { Env } from "./types.js";
 
 test("recordAppServerInstances inserts the first healthy report", async () => {
@@ -71,6 +72,150 @@ test("recordAppServerInstances persists degraded edges immediately", async () =>
   assert.equal(db.writes, 2);
   assert.equal(result.app_server_instances[0]?.state, "degraded");
   assert.equal(result.app_server_instances[0]?.last_error, "Health check failed");
+});
+
+test("recordAppServerInstances persists workspace and thread placement targets", async () => {
+  const db = appServerInstancesDb();
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [
+      appServerInstanceReport("healthy", {
+        instance_key: "workspace-api",
+        scope: "workspace",
+        workspace_id: "workspace-api"
+      }),
+      appServerInstanceReport("healthy", {
+        instance_key: "thread-123",
+        scope: "thread",
+        workspace_id: "workspace-api",
+        thread_id: "thread-123"
+      })
+    ]
+  }, "2026-06-14T10:00:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.deepEqual(
+    result.app_server_instances.map((instance) => [
+      instance.instance_key,
+      instance.scope,
+      instance.workspace_id,
+      instance.thread_id
+    ]),
+    [
+      ["workspace-api", "workspace", "workspace-api", undefined],
+      ["thread-123", "thread", "workspace-api", "thread-123"]
+    ]
+  );
+});
+
+test("recordAppServerInstances keeps matching instance keys under different placements", async () => {
+  const db = appServerInstancesDb();
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [
+      appServerInstanceReport("healthy", {
+        instance_key: "default",
+        scope: "workspace",
+        workspace_id: "workspace-api"
+      }),
+      appServerInstanceReport("healthy", {
+        instance_key: "default",
+        scope: "thread",
+        workspace_id: "workspace-api",
+        thread_id: "thread-123"
+      })
+    ]
+  }, "2026-06-14T10:00:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.deepEqual(
+    result.app_server_instances.map((instance) => [
+      instance.instance_key,
+      instance.scope,
+      instance.workspace_id,
+      instance.thread_id
+    ]),
+    [
+      ["default", "workspace", "workspace-api", undefined],
+      ["default", "thread", "workspace-api", "thread-123"]
+    ]
+  );
+});
+
+test("recordAppServerInstances keeps same-scope instance keys across incremental placement reports", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [
+      appServerInstanceReport("healthy", {
+        instance_key: "default",
+        scope: "thread",
+        thread_id: "thread-1"
+      })
+    ]
+  }, "2026-06-14T10:00:00.000Z");
+
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [
+      appServerInstanceReport("healthy", {
+        instance_key: "default",
+        scope: "thread",
+        thread_id: "thread-2"
+      })
+    ]
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.deepEqual(
+    db.rows().map((instance) => [
+      instance.instance_key,
+      instance.scope,
+      instance.thread_id,
+      instance.state
+    ]),
+    [
+      ["default", "thread", "thread-1", "healthy"],
+      ["default", "thread", "thread-2", "healthy"]
+    ]
+  );
+});
+
+test("recordAppServerInstances stops omitted placement targets in snapshots", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [
+      appServerInstanceReport("healthy", {
+        instance_key: "workspace-api",
+        scope: "workspace",
+        workspace_id: "workspace-old"
+      })
+    ]
+  }, "2026-06-14T10:00:00.000Z");
+
+  const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
+    instances: [
+      appServerInstanceReport("healthy", {
+        instance_key: "workspace-api",
+        scope: "workspace",
+        workspace_id: "workspace-api"
+      })
+    ]
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(db.writes, 3);
+  assert.deepEqual(
+    result.app_server_instances
+      .map((instance) => [
+      instance.workspace_id,
+      instance.state,
+      instance.status_summary
+      ])
+      .sort(([leftWorkspace], [rightWorkspace]) => String(leftWorkspace).localeCompare(String(rightWorkspace))),
+    [
+      ["workspace-api", "healthy", "Managed app-server report."],
+      ["workspace-old", "stopped", "Instance was omitted from the latest connector snapshot."]
+    ]
+  );
 });
 
 test("recordAppServerInstances refreshes unchanged degraded summaries after debounce window", async () => {
@@ -1695,14 +1840,17 @@ function connectorDisconnectedDb() {
   };
   const appServerRows = new Map<string, AppServerInstanceTestRow>([
     [
-      "connector-online:default",
-      {
-        id: "app-server-connector-online-default",
-        connector_id: "connector-online",
-        instance_key: "default",
-        scope: "connector",
-        endpoint_type: "managed",
-        state: "healthy",
+      "connector-online:default:connector",
+	      {
+	        id: "app-server-connector-online-default",
+	        connector_id: "connector-online",
+	        instance_key: "default",
+	        scope: "connector",
+	        workspace_id: null,
+	        thread_id: null,
+	        placement_key: "connector",
+	        endpoint_type: "managed",
+	        state: "healthy",
         active_turn_count: 0,
         generation: 1,
         status_summary: "Managed app-server report.",
@@ -1869,7 +2017,7 @@ function connectorDisconnectedDb() {
                 const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
                 assert.ok(row);
                 counters.appServerInstanceStops += 1;
-                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                appServerRows.set(`${row.connector_id}:${row.instance_key}:${row.placement_key}`, {
                   ...row,
                   state: "stopped",
                   active_turn_count: 0,
@@ -1973,14 +2121,17 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
   };
   const appServerRows = new Map<string, AppServerInstanceTestRow>([
     [
-      "connector-old:default",
-      {
-        id: "app-server-connector-old-default",
-        connector_id: "connector-old",
-        instance_key: "default",
-        scope: "connector",
-        endpoint_type: "managed",
-        state: "healthy",
+      "connector-old:default:connector",
+	      {
+	        id: "app-server-connector-old-default",
+	        connector_id: "connector-old",
+	        instance_key: "default",
+	        scope: "connector",
+	        workspace_id: null,
+	        thread_id: null,
+	        placement_key: "connector",
+	        endpoint_type: "managed",
+	        state: "healthy",
         active_turn_count: 0,
         generation: 1,
         status_summary: "Managed app-server report.",
@@ -2160,7 +2311,7 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
                 const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
                 assert.ok(row);
                 counters.appServerInstanceStops += 1;
-                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                appServerRows.set(`${row.connector_id}:${row.instance_key}:${row.placement_key}`, {
                   ...row,
                   state: "stopped",
                   active_turn_count: 0,
@@ -3396,15 +3547,17 @@ function appServerInstanceReport(
   state: "healthy" | "degraded" | "draining" | "restarting" | "stopped",
   overrides: {
     instance_key?: string;
+    scope?: "connector" | "workspace" | "thread";
+    workspace_id?: string;
+    thread_id?: string;
     active_turn_count?: number;
     generation?: number;
     status_summary?: string;
     last_error?: string;
   } = {}
-) {
-  return {
+): AgentAppServerInstance {
+  const base = {
     instance_key: overrides.instance_key ?? "default",
-    scope: "connector" as const,
     endpoint_type: "managed" as const,
     state,
     active_turn_count: overrides.active_turn_count ?? 0,
@@ -3412,6 +3565,16 @@ function appServerInstanceReport(
     status_summary: overrides.status_summary ?? "Managed app-server report.",
     last_error: overrides.last_error
   };
+  const scope = overrides.scope ?? "connector";
+  if (scope === "workspace") {
+    if (!overrides.workspace_id) throw new Error("workspace app-server test reports require workspace_id");
+    return { ...base, scope, workspace_id: overrides.workspace_id };
+  }
+  if (scope === "thread") {
+    if (!overrides.thread_id) throw new Error("thread app-server test reports require thread_id");
+    return { ...base, scope, workspace_id: overrides.workspace_id, thread_id: overrides.thread_id };
+  }
+  return { ...base, scope };
 }
 
 type AppServerInstanceTestRow = {
@@ -3419,6 +3582,9 @@ type AppServerInstanceTestRow = {
   connector_id: string;
   instance_key: string;
   scope: "connector" | "workspace" | "thread";
+  workspace_id: string | null;
+  thread_id: string | null;
+  placement_key: string;
   endpoint_type: "managed" | "external";
   state: "healthy" | "degraded" | "draining" | "restarting" | "stopped";
   active_turn_count: number;
@@ -3433,10 +3599,13 @@ type AppServerInstanceTestRow = {
   updated_at: string;
 };
 
-function appServerInstancesDb(): D1Database & { writes: number } {
+function appServerInstancesDb(): D1Database & { writes: number; rows(): AppServerInstanceTestRow[] } {
   const rows = new Map<string, AppServerInstanceTestRow>();
   const db = {
     writes: 0,
+    rows() {
+      return [...rows.values()];
+    },
     prepare(sql: string) {
       if (/SELECT id\s+FROM connectors/.test(sql)) {
         return {
@@ -3451,12 +3620,16 @@ function appServerInstancesDb(): D1Database & { writes: number } {
         };
       }
 
-      if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
+      if (
+        /SELECT id, connector_id, instance_key/.test(sql) &&
+        /WHERE connector_id = \? AND instance_key = \?/.test(sql) &&
+        /placement_key = \?/.test(sql)
+      ) {
         return {
-          bind(connectorId: string, instanceKey: string) {
+          bind(connectorId: string, instanceKey: string, placementKey: string) {
             return {
               async first() {
-                return rows.get(`${connectorId}:${instanceKey}`) ?? null;
+                return rows.get(`${connectorId}:${instanceKey}:${placementKey}`) ?? null;
               }
             };
           }
@@ -3470,6 +3643,9 @@ function appServerInstancesDb(): D1Database & { writes: number } {
             connectorId: string,
             instanceKey: string,
             scope: AppServerInstanceTestRow["scope"],
+            workspaceId: string | null,
+            threadId: string | null,
+            placementKey: string,
             endpointType: AppServerInstanceTestRow["endpoint_type"],
             state: AppServerInstanceTestRow["state"],
             activeTurnCount: number,
@@ -3486,11 +3662,14 @@ function appServerInstancesDb(): D1Database & { writes: number } {
             return {
               async run() {
                 db.writes += 1;
-                rows.set(`${connectorId}:${instanceKey}`, {
+                rows.set(`${connectorId}:${instanceKey}:${placementKey}`, {
                   id,
                   connector_id: connectorId,
                   instance_key: instanceKey,
                   scope,
+                  workspace_id: workspaceId,
+                  thread_id: threadId,
+                  placement_key: placementKey,
                   endpoint_type: endpointType,
                   state,
                   active_turn_count: activeTurnCount,
@@ -3559,7 +3738,7 @@ function appServerInstancesDb(): D1Database & { writes: number } {
                 db.writes += 1;
                 const row = [...rows.values()].find((candidate) => candidate.id === id);
                 assert.ok(row);
-                rows.set(`${row.connector_id}:${row.instance_key}`, {
+                rows.set(`${row.connector_id}:${row.instance_key}:${row.placement_key}`, {
                   ...row,
                   state: "stopped",
                   active_turn_count: 0,
@@ -3581,5 +3760,5 @@ function appServerInstancesDb(): D1Database & { writes: number } {
       throw new Error(`Unexpected SQL in app-server instance fake: ${sql}`);
     }
   };
-  return db as unknown as D1Database & { writes: number };
+  return db as unknown as D1Database & { writes: number; rows(): AppServerInstanceTestRow[] };
 }

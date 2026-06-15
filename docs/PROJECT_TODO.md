@@ -21,5 +21,5 @@
 - [done] PR4: Add AppServerInstance state UI in Operations and Host Sessions surfaces.
 - [done] PR5: Make managed app-server execution the default command path.
 - [done] PR6: Add drain, scheduled restart, and upgrade flow.
-- [todo] PR7: Add the multi-instance and thread placement foundation.
+- [done] PR7: Add the multi-instance and thread placement foundation.
 - [todo] PR8: Replace Budget Board placeholders with real bounded usage/cost metrics.

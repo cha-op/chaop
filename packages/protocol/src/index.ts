@@ -114,6 +114,8 @@ export type AppServerInstanceSummary = {
   connector_id: string;
   instance_key: string;
   scope: AppServerInstanceScope;
+  workspace_id?: string | undefined;
+  thread_id?: string | undefined;
   endpoint_type: AppServerEndpointType;
   state: AppServerInstanceState;
   active_turn_count: number;
@@ -125,9 +127,8 @@ export type AppServerInstanceSummary = {
   updated_at: string;
 };
 
-export type AgentAppServerInstance = {
+type AgentAppServerInstanceBase = {
   instance_key: string;
-  scope: AppServerInstanceScope;
   endpoint_type: AppServerEndpointType;
   state: AppServerInstanceState;
   active_turn_count?: number | undefined;
@@ -136,6 +137,23 @@ export type AgentAppServerInstance = {
   last_error?: string | undefined;
   reason?: "edge" | "summary" | "shutdown" | undefined;
 };
+
+export type AgentAppServerInstance =
+  | (AgentAppServerInstanceBase & {
+    scope: "connector";
+    workspace_id?: undefined;
+    thread_id?: undefined;
+  })
+  | (AgentAppServerInstanceBase & {
+    scope: "workspace";
+    workspace_id: string;
+    thread_id?: undefined;
+  })
+  | (AgentAppServerInstanceBase & {
+    scope: "thread";
+    workspace_id?: string | undefined;
+    thread_id: string;
+  });
 
 export type AgentAppServerInstancesReport = {
   report_id?: string | undefined;

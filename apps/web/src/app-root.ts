@@ -31,6 +31,8 @@ import {
   unarchiveTask
 } from "./api.js";
 import {
+  appServerInstanceForHostSession,
+  appServerInstancePlacementLabel,
   appServerInstanceStateLabel,
   appServerInstancesForDisplay,
   archiveSyncNotice,
@@ -49,7 +51,6 @@ import {
   mergeBootstrapPayload,
   mergeAppServerInstances,
   mergeConnectorSummaries,
-  primaryAppServerInstanceForConnector,
   normaliseCommandMode,
   type CommandExecutionMode
 } from "./state.js";
@@ -571,7 +572,7 @@ export class ChaopApp extends LitElement {
 
   private hostSessionRow(session: HostSessionSummary) {
     const attachedThreadId = session.attached_thread_id;
-    const instance = primaryAppServerInstanceForConnector(this.data, session.connector_id);
+    const instance = appServerInstanceForHostSession(this.data, session);
     return html`
       <article
         class=${attachedThreadId ? "session-row clickable" : "session-row"}
@@ -633,7 +634,7 @@ export class ChaopApp extends LitElement {
           <span class="chip ${instance.state}">${appServerInstanceStateLabel(instance.state)}</span>
         </header>
         <dl class="instance-facts">
-          <div><dt>Scope</dt><dd>${formatMode(instance.scope)}</dd></div>
+          <div><dt>Placement</dt><dd>${appServerInstancePlacementLabel(instance)}</dd></div>
           <div><dt>Endpoint</dt><dd>${formatMode(instance.endpoint_type)}</dd></div>
           <div><dt>Turns</dt><dd>${instance.active_turn_count}</dd></div>
           ${density === "full" ? html`<div><dt>Generation</dt><dd>${instance.generation}</dd></div>` : nothing}

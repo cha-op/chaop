@@ -1,6 +1,41 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { groupTasksByState, type TaskSummary } from "./index.js";
+import { groupTasksByState, type AgentAppServerInstance, type TaskSummary } from "./index.js";
+
+const connectorAppServerInstance = {
+  instance_key: "default",
+  scope: "connector",
+  endpoint_type: "managed",
+  state: "healthy"
+} satisfies AgentAppServerInstance;
+
+const workspaceAppServerInstance = {
+  instance_key: "workspace-api",
+  scope: "workspace",
+  workspace_id: "workspace-api",
+  endpoint_type: "external",
+  state: "degraded"
+} satisfies AgentAppServerInstance;
+
+const threadAppServerInstance = {
+  instance_key: "thread-api",
+  scope: "thread",
+  thread_id: "thread-api",
+  endpoint_type: "managed",
+  state: "draining"
+} satisfies AgentAppServerInstance;
+
+// @ts-expect-error workspace placement requires workspace_id.
+const invalidWorkspaceAppServerInstance = { instance_key: "workspace-api", scope: "workspace", endpoint_type: "managed", state: "healthy" } satisfies AgentAppServerInstance;
+
+// @ts-expect-error connector placement cannot carry placement target ids.
+const invalidConnectorAppServerInstance = { instance_key: "default", scope: "connector", workspace_id: "workspace-api", endpoint_type: "managed", state: "healthy" } satisfies AgentAppServerInstance;
+
+test("AgentAppServerInstance accepts valid placement variants", () => {
+  assert.equal(connectorAppServerInstance.scope, "connector");
+  assert.equal(workspaceAppServerInstance.workspace_id, "workspace-api");
+  assert.equal(threadAppServerInstance.thread_id, "thread-api");
+});
 
 test("groupTasksByState preserves empty swimlanes", () => {
   const grouped = groupTasksByState([]);

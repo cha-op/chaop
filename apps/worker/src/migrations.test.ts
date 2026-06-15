@@ -61,9 +61,32 @@ test("app-server instances are added by forward migration", async () => {
   assert.match(migration, /UNIQUE\(connector_id, instance_key\)/);
   assert.match(migration, /CREATE INDEX idx_app_server_instances_connector_state/);
   assert.match(migration, /CREATE INDEX idx_app_server_instances_state_updated/);
+	assert.match(migration, /CREATE INDEX idx_app_server_instances_last_seen/);
+});
+
+test("app-server instance placement targets are added by forward migration", async () => {
+  const migration = await readMigration("0011_app_server_instance_placement.sql");
+
+  assert.match(migration, /CREATE TABLE app_server_instances_next/);
+  assert.match(migration, /workspace_id TEXT/);
+  assert.match(migration, /thread_id TEXT/);
+  assert.match(migration, /placement_key TEXT NOT NULL/);
+  assert.match(migration, /scope = 'connector'\s+AND workspace_id IS NULL\s+AND thread_id IS NULL\s+AND placement_key = 'connector'/);
+  assert.match(migration, /scope = 'workspace'\s+AND workspace_id IS NOT NULL\s+AND length\(workspace_id\) > 0\s+AND thread_id IS NULL\s+AND placement_key = 'workspace:' \|\| workspace_id/);
+  assert.match(migration, /scope = 'thread'\s+AND thread_id IS NOT NULL\s+AND length\(thread_id\) > 0\s+AND \(workspace_id IS NULL OR length\(workspace_id\) > 0\)\s+AND placement_key = 'thread:' \|\| thread_id/);
+  assert.match(migration, /UNIQUE\(connector_id, instance_key, placement_key\)/);
+  assert.match(migration, /CASE WHEN scope = 'connector' THEN state ELSE 'stopped' END/);
+  assert.match(migration, /Legacy placement metadata was reset during migration/);
+  assert.match(migration, /migration-0011-legacy-placement-reset/);
+  assert.match(migration, /DROP TABLE app_server_instances/);
+  assert.match(migration, /ALTER TABLE app_server_instances_next RENAME TO app_server_instances/);
+  assert.match(migration, /CREATE INDEX idx_app_server_instances_connector_state/);
+  assert.match(migration, /CREATE INDEX idx_app_server_instances_state_updated/);
   assert.match(migration, /CREATE INDEX idx_app_server_instances_last_seen/);
+  assert.match(migration, /CREATE INDEX idx_app_server_instances_workspace_state/);
+  assert.match(migration, /CREATE INDEX idx_app_server_instances_thread_state/);
 });
 
 async function readMigration(fileName: string): Promise<string> {
-  return await readFile(new URL(fileName, migrationsDir), "utf8");
+	return await readFile(new URL(fileName, migrationsDir), "utf8");
 }

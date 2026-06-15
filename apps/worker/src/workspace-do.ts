@@ -992,9 +992,12 @@ function isAgentAppServerInstancesReport(value: unknown): value is AgentAppServe
 function isAgentAppServerInstance(value: unknown): boolean {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
-  return (
+  const scope = record.scope;
+  const hasValidBaseFields = (
     isBoundedString(record.instance_key, 128) &&
-    (record.scope === "connector" || record.scope === "workspace" || record.scope === "thread") &&
+    (scope === "connector" || scope === "workspace" || scope === "thread") &&
+    (record.workspace_id === undefined || isBoundedString(record.workspace_id, 128)) &&
+    (record.thread_id === undefined || isBoundedString(record.thread_id, 128)) &&
     (record.endpoint_type === "managed" || record.endpoint_type === "external") &&
     (
       record.state === "healthy" ||
@@ -1014,6 +1017,14 @@ function isAgentAppServerInstance(value: unknown): boolean {
       record.reason === "shutdown"
     )
   );
+  if (!hasValidBaseFields) return false;
+  if (scope === "connector") {
+    return record.workspace_id === undefined && record.thread_id === undefined;
+  }
+  if (scope === "workspace") {
+    return record.workspace_id !== undefined && record.thread_id === undefined;
+  }
+  return record.thread_id !== undefined;
 }
 
 function cacheableAppServerReportFingerprint(report: AgentAppServerInstancesReport): string | undefined {
@@ -1022,6 +1033,8 @@ function cacheableAppServerReportFingerprint(report: AgentAppServerInstancesRepo
   return JSON.stringify(report.instances.map((instance) => ({
     instance_key: instance.instance_key,
     scope: instance.scope,
+    workspace_id: instance.workspace_id ?? "",
+    thread_id: instance.thread_id ?? "",
     endpoint_type: instance.endpoint_type,
     state: instance.state,
     active_turn_count: instance.active_turn_count ?? 0,
