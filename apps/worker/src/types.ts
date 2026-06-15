@@ -11,4 +11,5 @@ export type Env = {
   CHAOP_DAILY_BUDGET_UNITS?: string;
   CHAOP_4H_SOFT_BUDGET_UNITS?: string;
   CHAOP_4H_HARD_BUDGET_UNITS?: string;
+  CHAOP_BURST_EVENTS_PER_MINUTE?: string;
 };

@@ -77,6 +77,7 @@ Implementation checkpoint:
 
 Implementation checkpoint:
 - Browser bootstrap and `/api/usage-summary` now use the same D1-backed `BudgetSummary` path when the database binding is available.
+- Accepted thread events now maintain bounded `daily`, `four_hour`, and `burst` `usage_windows` rows from the event persistence path, so normal production traffic produces the sampled windows the Budget Board reads.
 - The Worker samples only the latest `daily`, `four_hour`, and `burst` `usage_windows` rows, backed by `idx_usage_windows_type_end`, plus grouped budget-state counts for online connectors and unarchived tasks.
 - Budget Board now shows source metadata, generated time, sampled usage windows, window freshness, delayed/compacted event counts, and local spool bytes without adding high-frequency polling; live WebSocket sessions use a 60-second budget-only refresh path.
 - Review hardening keeps bootstrap from issuing duplicate connector/task budget-state aggregate queries, labels legacy unknown metric sources explicitly, preserves over-budget percentages above 100% in the API while clamping only the UI meter control, reports missing usage windows as missing samples instead of `0%`, and sorts duplicate window-end samples by `updated_at` plus `id`.

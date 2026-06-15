@@ -11,7 +11,8 @@
     "CHAOP_GUI_DOMAIN": "app.example.com",
     "CHAOP_DAILY_BUDGET_UNITS": "100",
     "CHAOP_4H_SOFT_BUDGET_UNITS": "20",
-    "CHAOP_4H_HARD_BUDGET_UNITS": "35"
+    "CHAOP_4H_HARD_BUDGET_UNITS": "35",
+    "CHAOP_BURST_EVENTS_PER_MINUTE": "600"
   },
   "d1_databases": [
     {

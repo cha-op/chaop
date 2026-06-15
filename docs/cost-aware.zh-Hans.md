@@ -11,7 +11,7 @@
 | OpenAI / Codex 用量 | 当 connector 配置 `execution.mode = "app_server"` 时，它会通过本机 Codex app-server 启动 turn。配置 private fallback `execution.mode = "codex_exec"` 时，本机 connector 会执行 `codex exec`。两者都会消耗本机 Codex 登录账号对应的 Codex 额度，或者消耗 API/project budget，具体取决于本机 Codex 配置。 | 如果本机 Codex 走 API 计费，设置 OpenAI API 月度预算和邮件阈值。如果本机 Codex 走 ChatGPT/Codex 计划额度，关注 Codex usage 或 limit 页面。 |
 | Cloudflare Workers | `chaop-api` 承载浏览器 API、agent bootstrap、agent WebSocket upgrade 和 command dispatch。`chaop-web` 承载 GUI。 | 设置账号级 billing/usage notification，并为 Worker 设置 CPU limit。重点看 requests 和 CPU time。 |
 | Durable Objects | `WorkspaceDO` 负责协调浏览器和 connector 的实时 WebSocket。 | 关注 Durable Object requests、incoming WebSocket message 量和 duration。长连接如果没有 hibernation，可能产生 duration 成本。 |
-| D1 | D1 保存 users、connectors、workspaces、tasks、commands、token hashes 和 thread events。 | 关注 rows read、rows written 和 storage。最容易增长的是 event 写入量。 |
+| D1 | D1 保存 users、connectors、workspaces、tasks、commands、token hashes、thread events，以及紧凑的 event-unit usage windows。 | 关注 rows read、rows written 和 storage。最容易增长的是 event 写入量；每个持久化 thread event 还会维护最多三条紧凑 usage-window rows。 |
 | R2 | 后续切片会用来保存 command artefacts、上传摘要和较大的日志。 | 启用 artefact capture 前先设置 R2 告警。关注 storage、Class A operations 和 Class B operations。 |
 | Workers Logs / observability | 部署和排障时会用到。 | 生产日志保持短摘要，不要在没有上限时长期打开高频 tail 或 log export。 |
 
@@ -39,7 +39,7 @@ D1 绑定可用时，Browser 里的 Budget Board 会使用 Chaop 自己控制的
 - 缺失的 usage window 会显示为 missing sample，不会显示成 `0%` usage。
 - 浏览器 WebSocket 处于 live 状态时，UI 只会每 60 秒刷新一次 `/api/usage-summary` 来更新 Budget Board 和 top-bar metrics；如果 WebSocket fallback，原有 10 秒 bootstrap polling 会提供同一份数据，并停止 budget-only polling。
 
-Worker 每种 window type 最多读取一行，再读取 grouped budget-state counts。它不会扫描完整 event table，不会调用 Cloudflare billing APIs，不会调用 OpenAI billing APIs，也不需要部署实例 secrets。请把 Budget Board 当作 operator posture view，而不是官方账单来源；上面的 Cloudflare 和 OpenAI budget alerts 仍然需要开启。
+Worker 会在持久化 thread events 的同一路径里写入这些 windows。每个 accepted thread event 记为一个 Chaop usage unit；低优先级 P2/P3 events 会增加 delayed counter，`command.output` summaries 会增加 compacted counter，已存储 summary bytes 会增加 local spool byte counter。Worker 每种 window type 最多读取一行，再读取 grouped budget-state counts。它不会扫描完整 event table，不会调用 Cloudflare billing APIs，不会调用 OpenAI billing APIs，也不需要部署实例 secrets。请把 Budget Board 当作 operator posture view，而不是官方账单来源；上面的 Cloudflare 和 OpenAI budget alerts 仍然需要开启。
 
 ## 当前防护
 

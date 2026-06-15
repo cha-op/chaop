@@ -2406,6 +2406,10 @@ function commandTargetDb(
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
       if (/UPDATE tasks/.test(sql) && /WHERE id = \? AND workspace_id = \? AND thread_id = \?/.test(sql)) {
         return {
           bind(connectorId: string, updatedAt: string, taskId: string, workspaceId: string, threadId: string) {
@@ -3643,6 +3647,10 @@ function hostSessionDetachDb(options: {
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
       if (/UPDATE host_sessions/.test(sql) && /attached_task_id = NULL/.test(sql)) {
         return {
           bind(updatedAt: string, hostSessionId: string) {
@@ -3679,4 +3687,16 @@ function hostSessionDetachDb(options: {
       return counters.eventInserts;
     }
   } as unknown as D1Database & typeof counters;
+}
+
+function usageWindowUpsertFake() {
+  return {
+    bind() {
+      return {
+        async run() {
+          return { success: true };
+        }
+      };
+    }
+  };
 }

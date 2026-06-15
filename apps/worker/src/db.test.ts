@@ -571,6 +571,44 @@ test("recordAgentEvent accepts events from the active lease owner", async () => 
   assert.equal(db.eventInserts, 1);
 });
 
+test("recordAgentEvent maintains D1 usage windows for accepted thread events", async () => {
+  const db = agentEventGuardDb({
+    leaseOwnerConnectorId: "connector-online",
+    state: "running"
+  });
+
+  const result = await recordAgentEvent(
+    {
+      DB: db,
+      CHAOP_DAILY_BUDGET_UNITS: "2",
+      CHAOP_4H_SOFT_BUDGET_UNITS: "1",
+      CHAOP_4H_HARD_BUDGET_UNITS: "2",
+      CHAOP_BURST_EVENTS_PER_MINUTE: "2"
+    } as Env,
+    "connector-online",
+    {
+      command_id: "command-1",
+      kind: "command.output",
+      priority: "P3",
+      summary: "Low priority output"
+    }
+  );
+
+  assert.equal(result.accepted, true);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.usageWindowUpserts, 3);
+  assert.deepEqual(db.usageWindowBinds.map((args) => args[1]), ["daily", "four_hour", "burst"]);
+  for (const args of db.usageWindowBinds) {
+    assert.match(args[0] as string, /^usage:/);
+    assert.match(args[2] as string, /^\d{4}-\d{2}-\d{2}T/);
+    assert.match(args[3] as string, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(args[6], 1);
+    assert.equal(args[7], 1);
+    assert.equal(args[8], 1);
+    assert.equal(args[9], new TextEncoder().encode("Low priority output").length);
+  }
+});
+
 test("recordAgentEvent accepts ordinary codex starts without an app-server lease target", async () => {
   const db = agentEventGuardDb(
     {
@@ -1383,7 +1421,9 @@ function agentEventGuardDb(command: {
   const counters = {
     commandUpdates: 0,
     taskUpdates: 0,
-    eventInserts: 0
+    eventInserts: 0,
+    usageWindowUpserts: 0,
+    usageWindowBinds: [] as unknown[][]
   };
   const db = {
     prepare(sql: string) {
@@ -1483,6 +1523,13 @@ function agentEventGuardDb(command: {
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake((args) => {
+          counters.usageWindowUpserts += 1;
+          counters.usageWindowBinds.push(args);
+        });
+      }
+
       if (/UPDATE threads/.test(sql) || /UPDATE connectors/.test(sql)) {
         return {
           bind() {
@@ -1518,10 +1565,53 @@ function agentEventGuardDb(command: {
     },
     get eventInserts() {
       return counters.eventInserts;
+    },
+    get usageWindowUpserts() {
+      return counters.usageWindowUpserts;
+    },
+    get usageWindowBinds() {
+      return counters.usageWindowBinds;
     }
   };
 
   return db as D1Database & typeof counters;
+}
+
+function usageWindowUpsertFake(onRun?: (args: unknown[]) => void) {
+  return {
+    bind(...args: unknown[]) {
+      const [
+        id,
+        windowType,
+        windowStart,
+        windowEnd,
+        budgetState,
+        usedPct,
+        eventsReceived,
+        eventsCompacted,
+        eventsDelayed,
+        localSpoolBytes,
+        updatedAt
+      ] = args;
+      assert.match(id as string, /^usage:(daily|four_hour|burst):/);
+      assert.equal(["daily", "four_hour", "burst"].includes(windowType as string), true);
+      assert.match(windowStart as string, /^\d{4}-\d{2}-\d{2}T/);
+      assert.match(windowEnd as string, /^\d{4}-\d{2}-\d{2}T/);
+      assert.equal(["normal", "conservative", "throttled", "hard_limited"].includes(budgetState as string), true);
+      assert.equal(typeof usedPct, "number");
+      assert.equal(eventsReceived, 1);
+      assert.equal(typeof eventsCompacted, "number");
+      assert.equal(typeof eventsDelayed, "number");
+      assert.equal(typeof localSpoolBytes, "number");
+      assert.match(updatedAt as string, /^\d{4}-\d{2}-\d{2}T/);
+      return {
+        async run() {
+          onRun?.(args);
+          return { success: true };
+        }
+      };
+    }
+  };
 }
 
 function appServerStartAfterDetachDb(currentTarget?: {
@@ -1771,6 +1861,10 @@ function appServerStartAfterDetachDb(currentTarget?: {
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
       if (/UPDATE connectors/.test(sql) && /last_seen_at/.test(sql)) {
         return {
           bind(lastSeenAt: string, updatedAt: string, connectorId: string) {
@@ -1967,6 +2061,10 @@ function connectorDisconnectedDb() {
             };
           }
         };
+      }
+
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
       }
 
       if (/UPDATE connectors/.test(sql) && /status = 'offline'/.test(sql)) {
@@ -2206,6 +2304,10 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
       if (/UPDATE tasks/.test(sql) && /state = 'failed'/.test(sql)) {
         return {
           bind(updatedAt: string, taskId: string) {
@@ -2245,6 +2347,10 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
             };
           }
         };
+      }
+
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
       }
 
       if (/UPDATE connectors/.test(sql) && /token_hash = CASE/.test(sql)) {
@@ -2964,6 +3070,10 @@ function staleExplicitAppServerTargetDb(options: {
             };
           }
         };
+      }
+
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
       }
 
       throw new Error(`Unexpected SQL in test fake: ${sql}`);

@@ -1699,6 +1699,10 @@ function rejectedStartedEventWithFailedResultDb(): D1Database & {
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
       if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
         return {
           bind(connectorId: string) {
@@ -2347,6 +2351,10 @@ function socketGoneDb(): D1Database & {
             };
           }
         };
+      }
+
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
       }
 
       if (/UPDATE connectors/.test(sql) && /status = 'offline'/.test(sql)) {
@@ -3351,6 +3359,10 @@ function readyGatedDispatchDb(options: {
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get capabilityUpdates() {
@@ -3384,4 +3396,16 @@ function readyGatedDispatchDb(options: {
       return counters.activityUpdates;
     }
   } as D1Database & typeof counters;
+}
+
+function usageWindowUpsertFake() {
+  return {
+    bind() {
+      return {
+        async run() {
+          return { success: true };
+        }
+      };
+    }
+  };
 }

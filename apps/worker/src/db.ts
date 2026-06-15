@@ -38,6 +38,12 @@ const DEFAULT_WORKSPACE_ID = "workspace-api";
 const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
+const DEFAULT_DAILY_BUDGET_UNITS = 100;
+const DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS = 20;
+const DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS = 35;
+const DEFAULT_BURST_EVENTS_PER_MINUTE = 600;
+const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+const ONE_MINUTE_MS = 60 * 1000;
 const BUDGET_STATE_RANK: Record<BudgetState, number> = {
   normal: 0,
   recovery: 1,
@@ -3698,7 +3704,165 @@ async function appendEvent(
       event.created_at
     )
     .run();
+  await recordUsageWindowsForEvent(env, event);
   return event;
+}
+
+async function recordUsageWindowsForEvent(env: Env, event: ThreadEvent): Promise<void> {
+  const timestamp = new Date(event.created_at);
+  if (Number.isNaN(timestamp.getTime())) return;
+
+  const metrics = usageMetricsForEvent(event);
+  for (const window of usageWindowSpecs(env, timestamp)) {
+    await upsertUsageWindow(env, window, metrics, event.created_at);
+  }
+}
+
+async function upsertUsageWindow(
+  env: Env,
+  window: UsageWindowSpec,
+  metrics: UsageEventMetrics,
+  updatedAt: string
+): Promise<void> {
+  const initialState = budgetStateForUsageCount(1, window.thresholds);
+  const initialPct = usedPctForCount(1, window.budgetUnits);
+  await env.DB!.prepare(
+    `INSERT INTO usage_windows (
+       id, window_type, window_start, window_end, budget_state, used_pct,
+       events_received, events_compacted, events_delayed, local_spool_bytes, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       budget_state = CASE
+         WHEN events_received + excluded.events_received >= ? THEN 'hard_limited'
+         WHEN events_received + excluded.events_received >= ? THEN 'throttled'
+         WHEN events_received + excluded.events_received >= ? THEN 'conservative'
+         ELSE 'normal'
+       END,
+       used_pct = ROUND(((events_received + excluded.events_received) * 1000.0) / ?) / 10.0,
+       events_received = events_received + excluded.events_received,
+       events_compacted = events_compacted + excluded.events_compacted,
+       events_delayed = events_delayed + excluded.events_delayed,
+       local_spool_bytes = local_spool_bytes + excluded.local_spool_bytes,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      window.id,
+      window.windowType,
+      window.windowStart,
+      window.windowEnd,
+      initialState,
+      initialPct,
+      1,
+      metrics.compacted,
+      metrics.delayed,
+      metrics.spoolBytes,
+      updatedAt,
+      window.thresholds.hardLimit,
+      window.thresholds.throttledAt,
+      window.thresholds.conservativeAt,
+      window.budgetUnits
+    )
+    .run();
+}
+
+function usageWindowSpecs(env: Env, timestamp: Date): UsageWindowSpec[] {
+  const dailyBudget = positiveIntegerEnv(env.CHAOP_DAILY_BUDGET_UNITS, DEFAULT_DAILY_BUDGET_UNITS);
+  const fourHourSoftBudget = positiveIntegerEnv(env.CHAOP_4H_SOFT_BUDGET_UNITS, DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS);
+  const fourHourHardBudget = Math.max(
+    positiveIntegerEnv(env.CHAOP_4H_HARD_BUDGET_UNITS, DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS),
+    fourHourSoftBudget
+  );
+  const burstBudget = positiveIntegerEnv(env.CHAOP_BURST_EVENTS_PER_MINUTE, DEFAULT_BURST_EVENTS_PER_MINUTE);
+  const dailyStart = Date.UTC(timestamp.getUTCFullYear(), timestamp.getUTCMonth(), timestamp.getUTCDate());
+  const fourHourStart = Date.UTC(
+    timestamp.getUTCFullYear(),
+    timestamp.getUTCMonth(),
+    timestamp.getUTCDate(),
+    Math.floor(timestamp.getUTCHours() / 4) * 4
+  );
+  const burstStart = Date.UTC(
+    timestamp.getUTCFullYear(),
+    timestamp.getUTCMonth(),
+    timestamp.getUTCDate(),
+    timestamp.getUTCHours(),
+    timestamp.getUTCMinutes()
+  );
+
+  return [
+    usageWindowSpec("daily", dailyStart, dailyStart + 24 * 60 * 60 * 1000, dailyBudget, thresholdSet(dailyBudget)),
+    usageWindowSpec(
+      "four_hour",
+      fourHourStart,
+      fourHourStart + FOUR_HOURS_MS,
+      fourHourHardBudget,
+      thresholdSet(fourHourHardBudget, fourHourSoftBudget)
+    ),
+    usageWindowSpec(
+      "burst",
+      burstStart,
+      burstStart + ONE_MINUTE_MS,
+      burstBudget,
+      thresholdSet(burstBudget)
+    )
+  ];
+}
+
+function usageWindowSpec(
+  windowType: BudgetWindowType,
+  windowStartMs: number,
+  windowEndMs: number,
+  budgetUnits: number,
+  thresholds: UsageWindowThresholds
+): UsageWindowSpec {
+  const windowStart = new Date(windowStartMs).toISOString();
+  return {
+    id: `usage:${windowType}:${windowStart}`,
+    windowType,
+    windowStart,
+    windowEnd: new Date(windowEndMs).toISOString(),
+    budgetUnits,
+    thresholds
+  };
+}
+
+function thresholdSet(hardLimit: number, softLimit?: number): UsageWindowThresholds {
+  const hard = Math.max(1, Math.floor(hardLimit));
+  const throttledAt = Math.min(
+    hard,
+    softLimit === undefined ? Math.max(1, Math.ceil(hard * 0.9)) : Math.max(1, Math.floor(softLimit))
+  );
+  const conservativeBase = softLimit === undefined ? hard : throttledAt;
+  const conservativeAt = Math.max(1, Math.min(throttledAt, Math.ceil(conservativeBase * 0.75)));
+  return {
+    hardLimit: hard,
+    throttledAt,
+    conservativeAt
+  };
+}
+
+function budgetStateForUsageCount(count: number, thresholds: UsageWindowThresholds): BudgetState {
+  if (count >= thresholds.hardLimit) return "hard_limited";
+  if (count >= thresholds.throttledAt) return "throttled";
+  if (count >= thresholds.conservativeAt) return "conservative";
+  return "normal";
+}
+
+function usedPctForCount(count: number, budgetUnits: number): number {
+  return Math.round((count * 1000) / budgetUnits) / 10;
+}
+
+function usageMetricsForEvent(event: ThreadEvent): UsageEventMetrics {
+  return {
+    compacted: event.kind === "command.output" ? 1 : 0,
+    delayed: event.priority === "P2" || event.priority === "P3" ? 1 : 0,
+    spoolBytes: new TextEncoder().encode(event.summary).length
+  };
+}
+
+function positiveIntegerEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 async function updateConnectorActivity(env: Env, connectorId: string): Promise<void> {
@@ -4061,6 +4225,27 @@ type UsageWindowRow = {
 type BudgetStateCountRow = {
   budget_state: string;
   count: number;
+};
+
+type UsageWindowSpec = {
+  id: string;
+  windowType: BudgetWindowType;
+  windowStart: string;
+  windowEnd: string;
+  budgetUnits: number;
+  thresholds: UsageWindowThresholds;
+};
+
+type UsageWindowThresholds = {
+  hardLimit: number;
+  throttledAt: number;
+  conservativeAt: number;
+};
+
+type UsageEventMetrics = {
+  compacted: number;
+  delayed: number;
+  spoolBytes: number;
 };
 
 type WorkspaceRow = {
