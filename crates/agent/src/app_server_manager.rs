@@ -252,6 +252,7 @@ impl AppServerManager {
             );
             return None;
         }
+        self.clear_exited_child();
         if pending.reason == AppServerRestartReason::Scheduled
             && self.child.is_none()
             && self
@@ -1213,6 +1214,52 @@ mod tests {
                 .next_scheduled_restart_at
                 .is_some_and(|deadline| deadline > Instant::now())
         );
+    }
+
+    #[test]
+    fn scheduled_restart_respects_backoff_after_child_exit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let respawn_marker = tempdir.path().join("respawned");
+        let exited_child_command = tempdir.path().join("exited-child");
+        let respawn_command = tempdir.path().join("codex-stub");
+        write_executable(&exited_child_command, "#!/bin/sh\nexit 0\n");
+        write_executable(
+            &respawn_command,
+            &format!(
+                "#!/bin/sh\nprintf respawned > '{}'\nsleep 30\n",
+                respawn_marker.display()
+            ),
+        );
+        let mut exited_child = std::process::Command::new(&exited_child_command)
+            .spawn()
+            .expect("spawn exited child");
+        exited_child.wait().expect("wait exited child");
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = respawn_command.to_string_lossy().into_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .restart_backoff_seconds = 60;
+        config
+            .session_inventory
+            .managed_app_server
+            .scheduled_restart_interval_seconds = 1;
+        let mut manager = AppServerManager::new(&config);
+        manager.child = Some(exited_child);
+        manager.next_scheduled_restart_at = Some(Instant::now() - Duration::from_secs(1));
+
+        let runtime = manager.runtime_config(&config);
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert!(!respawn_marker.exists());
+        assert!(manager.child.is_none());
+        assert_eq!(manager.pending_restart, None);
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Managed app-server restart backoff is active.")
+        );
+        assert!(!manager.can_attempt_start(&config));
     }
 
     #[test]
