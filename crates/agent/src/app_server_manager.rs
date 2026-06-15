@@ -176,6 +176,14 @@ impl AppServerManager {
             return;
         };
         if now >= next_restart_at {
+            if self.child.is_none()
+                && self
+                    .start_backoff_deadline(config)
+                    .is_some_and(|deadline| now < deadline)
+            {
+                self.next_scheduled_restart_at = self.start_backoff_deadline(config);
+                return;
+            }
             self.request_restart(AppServerRestartReason::Scheduled);
         }
     }
@@ -201,8 +209,10 @@ impl AppServerManager {
     }
 
     fn request_restart(&mut self, reason: AppServerRestartReason) {
-        if self.pending_restart.is_some() {
-            return;
+        if let Some(pending) = self.pending_restart {
+            if !reason.supersedes(pending.reason) {
+                return;
+            }
         }
         self.pending_restart = Some(PendingAppServerRestart {
             reason,
@@ -241,6 +251,16 @@ impl AppServerManager {
                 None,
             );
             return None;
+        }
+        if pending.reason == AppServerRestartReason::Scheduled
+            && self.child.is_none()
+            && self
+                .start_backoff_deadline(config)
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            self.pending_restart = None;
+            self.next_scheduled_restart_at = self.start_backoff_deadline(config);
+            return self.ensure_ready(config);
         }
 
         self.pending_restart = None;
@@ -483,19 +503,20 @@ impl AppServerManager {
     }
 
     fn can_attempt_start(&self, config: &AgentConfig) -> bool {
-        match self.last_start_failure {
-            Some(last_failure) => {
-                last_failure.elapsed()
-                    >= Duration::from_secs(
-                        config
-                            .session_inventory
-                            .managed_app_server
-                            .restart_backoff_seconds
-                            .max(1),
-                    )
-            }
-            None => true,
-        }
+        self.start_backoff_deadline(config)
+            .is_none_or(|deadline| Instant::now() >= deadline)
+    }
+
+    fn start_backoff_deadline(&self, config: &AgentConfig) -> Option<Instant> {
+        let backoff = Duration::from_secs(
+            config
+                .session_inventory
+                .managed_app_server
+                .restart_backoff_seconds
+                .max(1),
+        );
+        self.last_start_failure
+            .and_then(|last_failure| last_failure.checked_add(backoff))
     }
 
     fn record_start_failure(&mut self) {
@@ -693,6 +714,10 @@ impl AppServerRestartReason {
 
     fn overrides_start_backoff(self) -> bool {
         matches!(self, Self::UpgradeMarker)
+    }
+
+    fn supersedes(self, existing: Self) -> bool {
+        matches!((self, existing), (Self::UpgradeMarker, Self::Scheduled))
     }
 }
 
@@ -1064,6 +1089,40 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_marker_supersedes_scheduled_restart_request() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let marker = tempdir.path().join("upgrade.marker");
+        std::fs::write(&marker, "before").expect("write marker");
+        let mut config = config_with_managed(true);
+        config
+            .session_inventory
+            .managed_app_server
+            .scheduled_restart_interval_seconds = 60;
+        config
+            .session_inventory
+            .managed_app_server
+            .upgrade_marker_file = Some(marker.clone());
+        let mut manager = AppServerManager::new(&config);
+        manager.active_turn_count = 1;
+        manager.next_scheduled_restart_at = Some(Instant::now() - Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&marker, "after").expect("touch marker");
+
+        let runtime = manager.runtime_config(&config);
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.state, AppServerInstanceState::Draining);
+        assert_eq!(
+            manager.pending_restart.map(|pending| pending.reason),
+            Some(AppServerRestartReason::UpgradeMarker)
+        );
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Managed app-server upgrade restart is draining active turns.")
+        );
+    }
+
+    #[test]
     fn managed_app_server_restarts_after_active_turns_drain() {
         let mut config = config_with_managed(true);
         config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
@@ -1118,6 +1177,81 @@ mod tests {
         assert_eq!(
             manager.last_error.as_deref(),
             Some("Health check failed while restart backoff is active.")
+        );
+        assert!(!manager.can_attempt_start(&config));
+    }
+
+    #[test]
+    fn scheduled_restart_backoff_tick_keeps_instance_generation_stable() {
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .restart_backoff_seconds = 60;
+        config
+            .session_inventory
+            .managed_app_server
+            .scheduled_restart_interval_seconds = 1;
+        let mut manager = AppServerManager::new(&config);
+        manager.last_start_failure = Some(Instant::now());
+        manager.next_scheduled_restart_at = Some(Instant::now() - Duration::from_secs(1));
+
+        let first_runtime = manager.runtime_config(&config);
+        let first_generation = manager.generation;
+        let deferred_deadline = manager.next_scheduled_restart_at;
+        let second_runtime = manager.runtime_config(&config);
+
+        assert_eq!(first_runtime.session_inventory.app_server_url, None);
+        assert_eq!(second_runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.pending_restart, None);
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(manager.generation, first_generation);
+        assert_eq!(manager.next_scheduled_restart_at, deferred_deadline);
+        assert!(
+            manager
+                .next_scheduled_restart_at
+                .is_some_and(|deadline| deadline > Instant::now())
+        );
+    }
+
+    #[test]
+    fn upgrade_marker_restart_overrides_scheduled_backoff_deferral() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let marker = tempdir.path().join("upgrade.marker");
+        std::fs::write(&marker, "before").expect("write marker");
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .restart_backoff_seconds = 60;
+        config
+            .session_inventory
+            .managed_app_server
+            .scheduled_restart_interval_seconds = 1;
+        config
+            .session_inventory
+            .managed_app_server
+            .upgrade_marker_file = Some(marker.clone());
+        let mut manager = AppServerManager::new(&config);
+        manager.last_start_failure = Some(Instant::now());
+        manager.next_scheduled_restart_at = Some(Instant::now() - Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&marker, "after").expect("touch marker");
+
+        let runtime = manager.runtime_config(&config);
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.pending_restart, None);
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Failed to start managed app-server.")
+        );
+        assert_eq!(
+            manager.last_error.as_deref(),
+            Some("No such file or directory (os error 2)")
         );
         assert!(!manager.can_attempt_start(&config));
     }
