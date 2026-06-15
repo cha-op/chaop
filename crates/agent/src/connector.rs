@@ -49,6 +49,7 @@ struct AgentReadyState {
     last_sent: Option<String>,
     last_sent_at: Option<Instant>,
     last_acked: Option<String>,
+    deferred_host_sessions_refresh: bool,
 }
 
 #[derive(Debug, Default)]
@@ -172,7 +173,7 @@ fn run_connected_session(
     let mut app_server_instances_state = AppServerInstancesSendState::default();
     let mut deferred_messages = VecDeque::<String>::new();
     if send_agent_ready(&mut socket, &runtime_config, &mut agent_ready_state, true)?
-        .should_send_host_sessions(HostSessionRefreshMode::Allow)
+        .should_send_host_sessions()
     {
         send_app_server_instances(
             &mut socket,
@@ -207,7 +208,7 @@ fn run_connected_session(
                         &mut agent_ready_state,
                         false,
                     )?
-                    .should_send_host_sessions(HostSessionRefreshMode::Allow)
+                    .should_send_host_sessions()
                     {
                         send_app_server_instances(
                             &mut socket,
@@ -277,7 +278,7 @@ fn run_connected_session(
                 }
                 runtime_config = app_server.runtime_config(config);
                 if send_agent_ready(&mut socket, &runtime_config, &mut agent_ready_state, false)?
-                    .should_send_host_sessions(HostSessionRefreshMode::Allow)
+                    .should_send_host_sessions()
                 {
                     send_app_server_instances(
                         &mut socket,
@@ -359,16 +360,34 @@ enum AgentReadySend {
     SentChangedPayload,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostSessionRefreshMode {
-    Allow,
-    Defer,
+impl AgentReadySend {
+    fn changed_payload(self) -> bool {
+        matches!(self, Self::SentChangedPayload)
+    }
+
+    fn should_send_host_sessions(self) -> bool {
+        self.changed_payload()
+    }
 }
 
-impl AgentReadySend {
-    fn should_send_host_sessions(self, mode: HostSessionRefreshMode) -> bool {
-        mode == HostSessionRefreshMode::Allow && matches!(self, Self::SentChangedPayload)
+fn defer_host_sessions_refresh_after_ready_change(
+    state: &mut AgentReadyState,
+    ready_send: AgentReadySend,
+) {
+    if ready_send.changed_payload() {
+        state.deferred_host_sessions_refresh = true;
     }
+}
+
+fn should_refresh_host_sessions_after_ready(
+    state: &AgentReadyState,
+    ready_send: AgentReadySend,
+) -> bool {
+    state.deferred_host_sessions_refresh || ready_send.should_send_host_sessions()
+}
+
+fn acknowledge_deferred_host_sessions_refresh(state: &mut AgentReadyState) {
+    state.deferred_host_sessions_refresh = false;
 }
 
 fn should_send_agent_ready(
@@ -854,9 +873,9 @@ fn handle_text_message(
         )? {
             return Ok(true);
         }
-        if send_agent_ready(socket, &post_turn_runtime_config, agent_ready_state, false)?
-            .should_send_host_sessions(HostSessionRefreshMode::Allow)
-        {
+        let ready_send =
+            send_agent_ready(socket, &post_turn_runtime_config, agent_ready_state, false)?;
+        if should_refresh_host_sessions_after_ready(agent_ready_state, ready_send) {
             send_app_server_instances(
                 socket,
                 &post_turn_runtime_config,
@@ -866,6 +885,7 @@ fn handle_text_message(
                 true,
             )?;
             send_host_sessions(socket, &post_turn_runtime_config, host_sessions_state, true)?;
+            acknowledge_deferred_host_sessions_refresh(agent_ready_state);
         } else {
             send_app_server_instances(
                 socket,
@@ -1076,9 +1096,9 @@ fn maintain_app_server_runtime_during_wait(
     _host_sessions_state: &mut HostSessionsSendState,
 ) -> Result<AgentConfig, Box<dyn std::error::Error>> {
     let runtime_config = app_server.runtime_config_during_active_turn(config);
-    if send_agent_ready(socket, &runtime_config, agent_ready_state, false)?
-        .should_send_host_sessions(HostSessionRefreshMode::Defer)
-    {
+    let ready_send = send_agent_ready(socket, &runtime_config, agent_ready_state, false)?;
+    defer_host_sessions_refresh_after_ready_change(agent_ready_state, ready_send);
+    if ready_send.changed_payload() {
         send_app_server_instances(
             socket,
             &runtime_config,
@@ -1633,16 +1653,18 @@ mod tests {
     use super::{
         AckWaitAction, AgentReadyState, AppServerInstancesSendState, CommandDispatch,
         CommandPayload, CommandTargetHostSession, CommandType, Envelope, HostSessionsSendState,
-        acknowledge_agent_ready, acknowledge_app_server_instances, acknowledge_host_sessions,
-        agent_event_message, agent_ready_ack_message, agent_ready_message,
-        agent_ready_retry_interval, app_server_instance_summary_interval,
-        app_server_instances_message, app_server_instances_message_key,
-        app_server_instances_message_with_report_id, apply_agent_ready_ack_text,
-        apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
-        bounded_app_server_instance_text, classify_ack_wait_text, command_events,
+        acknowledge_agent_ready, acknowledge_app_server_instances,
+        acknowledge_deferred_host_sessions_refresh, acknowledge_host_sessions, agent_event_message,
+        agent_ready_ack_message, agent_ready_message, agent_ready_retry_interval,
+        app_server_instance_summary_interval, app_server_instances_message,
+        app_server_instances_message_key, app_server_instances_message_with_report_id,
+        apply_agent_ready_ack_text, apply_app_server_instances_ack_text,
+        apply_host_sessions_ack_text, bounded_app_server_instance_text, classify_ack_wait_text,
+        command_events, defer_host_sessions_refresh_after_ready_change,
         handle_background_ack_message, host_sessions_ack_message, host_sessions_interval,
         host_sessions_message, host_sessions_retry_interval, is_read_timeout,
-        record_agent_ready_sent, requires_app_server_execution_mode, should_send_agent_ready,
+        record_agent_ready_sent, requires_app_server_execution_mode,
+        should_refresh_host_sessions_after_ready, should_send_agent_ready,
         should_send_app_server_instances, should_send_host_sessions,
     };
     use crate::app_server_manager::AppServerManager;
@@ -2390,26 +2412,45 @@ mod tests {
 
     #[test]
     fn changed_agent_ready_payload_forces_host_session_refresh() {
-        assert!(
-            !super::AgentReadySend::NotSent
-                .should_send_host_sessions(super::HostSessionRefreshMode::Allow)
-        );
-        assert!(
-            !super::AgentReadySend::SentSamePayload
-                .should_send_host_sessions(super::HostSessionRefreshMode::Allow)
-        );
-        assert!(
-            super::AgentReadySend::SentChangedPayload
-                .should_send_host_sessions(super::HostSessionRefreshMode::Allow)
-        );
+        assert!(!super::AgentReadySend::NotSent.should_send_host_sessions());
+        assert!(!super::AgentReadySend::SentSamePayload.should_send_host_sessions());
+        assert!(super::AgentReadySend::SentChangedPayload.should_send_host_sessions());
     }
 
     #[test]
     fn active_app_server_turn_defers_host_session_refresh_after_ready_change() {
-        assert!(
-            !super::AgentReadySend::SentChangedPayload
-                .should_send_host_sessions(super::HostSessionRefreshMode::Defer)
+        let mut state = AgentReadyState::default();
+
+        defer_host_sessions_refresh_after_ready_change(
+            &mut state,
+            super::AgentReadySend::SentChangedPayload,
         );
+
+        assert!(state.deferred_host_sessions_refresh);
+    }
+
+    #[test]
+    fn deferred_agent_ready_change_refreshes_host_sessions_after_turn() {
+        let mut state = AgentReadyState::default();
+
+        defer_host_sessions_refresh_after_ready_change(
+            &mut state,
+            super::AgentReadySend::SentChangedPayload,
+        );
+
+        assert!(state.deferred_host_sessions_refresh);
+        assert!(should_refresh_host_sessions_after_ready(
+            &state,
+            super::AgentReadySend::NotSent
+        ));
+
+        acknowledge_deferred_host_sessions_refresh(&mut state);
+
+        assert!(!state.deferred_host_sessions_refresh);
+        assert!(!should_refresh_host_sessions_after_ready(
+            &state,
+            super::AgentReadySend::NotSent
+        ));
     }
 
     fn test_config() -> AgentConfig {
