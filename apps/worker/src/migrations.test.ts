@@ -71,6 +71,9 @@ test("app-server instance placement targets are added by forward migration", asy
   assert.match(migration, /workspace_id TEXT/);
   assert.match(migration, /thread_id TEXT/);
   assert.match(migration, /placement_key TEXT NOT NULL/);
+  assert.match(migration, /scope = 'connector'\s+AND workspace_id IS NULL\s+AND thread_id IS NULL\s+AND placement_key = 'connector'/);
+  assert.match(migration, /scope = 'workspace'\s+AND workspace_id IS NOT NULL\s+AND length\(workspace_id\) > 0\s+AND thread_id IS NULL\s+AND placement_key = 'workspace:' \|\| workspace_id/);
+  assert.match(migration, /scope = 'thread'\s+AND thread_id IS NOT NULL\s+AND length\(thread_id\) > 0\s+AND \(workspace_id IS NULL OR length\(workspace_id\) > 0\)\s+AND placement_key = 'thread:' \|\| thread_id/);
   assert.match(migration, /UNIQUE\(connector_id, instance_key, placement_key\)/);
   assert.match(migration, /CASE WHEN scope = 'connector' THEN state ELSE 'stopped' END/);
   assert.match(migration, /Legacy placement metadata was reset during migration/);

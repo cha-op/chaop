@@ -18,6 +18,28 @@ CREATE TABLE app_server_instances_next (
   summary_changed_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  CHECK (
+    (
+      scope = 'connector'
+      AND workspace_id IS NULL
+      AND thread_id IS NULL
+      AND placement_key = 'connector'
+    )
+    OR (
+      scope = 'workspace'
+      AND workspace_id IS NOT NULL
+      AND length(workspace_id) > 0
+      AND thread_id IS NULL
+      AND placement_key = 'workspace:' || workspace_id
+    )
+    OR (
+      scope = 'thread'
+      AND thread_id IS NOT NULL
+      AND length(thread_id) > 0
+      AND (workspace_id IS NULL OR length(workspace_id) > 0)
+      AND placement_key = 'thread:' || thread_id
+    )
+  ),
   UNIQUE(connector_id, instance_key, placement_key),
   FOREIGN KEY (connector_id) REFERENCES connectors(id) ON DELETE CASCADE
 );

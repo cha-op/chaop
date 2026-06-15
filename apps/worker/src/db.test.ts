@@ -16,6 +16,7 @@ import {
   recordHostSessions,
   updateConnectorCapabilities
 } from "./db.js";
+import type { AgentAppServerInstance } from "@chaop/protocol";
 import type { Env } from "./types.js";
 
 test("recordAppServerInstances inserts the first healthy report", async () => {
@@ -3554,12 +3555,9 @@ function appServerInstanceReport(
     status_summary?: string;
     last_error?: string;
   } = {}
-) {
-  return {
+): AgentAppServerInstance {
+  const base = {
     instance_key: overrides.instance_key ?? "default",
-    scope: overrides.scope ?? "connector",
-    workspace_id: overrides.workspace_id,
-    thread_id: overrides.thread_id,
     endpoint_type: "managed" as const,
     state,
     active_turn_count: overrides.active_turn_count ?? 0,
@@ -3567,6 +3565,16 @@ function appServerInstanceReport(
     status_summary: overrides.status_summary ?? "Managed app-server report.",
     last_error: overrides.last_error
   };
+  const scope = overrides.scope ?? "connector";
+  if (scope === "workspace") {
+    if (!overrides.workspace_id) throw new Error("workspace app-server test reports require workspace_id");
+    return { ...base, scope, workspace_id: overrides.workspace_id };
+  }
+  if (scope === "thread") {
+    if (!overrides.thread_id) throw new Error("thread app-server test reports require thread_id");
+    return { ...base, scope, workspace_id: overrides.workspace_id, thread_id: overrides.thread_id };
+  }
+  return { ...base, scope };
 }
 
 type AppServerInstanceTestRow = {
