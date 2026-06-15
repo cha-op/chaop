@@ -1,5 +1,6 @@
 import type {
   AgentBackfillEvent,
+  AgentAppServerInstance,
   AgentAppServerInstancesReport,
   AgentBootstrapRequest,
   AgentCommandEvent,
@@ -131,26 +132,27 @@ export async function recordAppServerInstances(
   if (!connector) return { app_server_instances: [], synced_at: syncedAt, snapshot: report.snapshot === true };
 
   const persisted: AppServerInstanceSummary[] = [];
-  const reportedKeys = new Set<string>();
+  const reportedIdentities = new Set<string>();
   for (const instance of report.instances) {
-    reportedKeys.add(instance.instance_key);
+    const placementKey = appServerInstancePlacementKey(instance);
+    reportedIdentities.add(appServerInstanceIdentityKey(instance.instance_key, placementKey));
     const fingerprint = appServerInstanceFingerprint(instance);
     const existing = await env.DB.prepare(
-      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id, placement_key,
               endpoint_type, state,
               active_turn_count, generation, status_summary, last_error,
               report_fingerprint, last_seen_at, state_changed_at,
               summary_changed_at, created_at, updated_at
        FROM app_server_instances
-       WHERE connector_id = ? AND instance_key = ?
+       WHERE connector_id = ? AND instance_key = ? AND placement_key = ?
        LIMIT 1`
     )
-      .bind(connectorId, instance.instance_key)
+      .bind(connectorId, instance.instance_key, placementKey)
       .first<AppServerInstanceRow>();
     const shouldPersist = shouldPersistAppServerInstance(existing, instance, fingerprint, syncedAt);
     if (!shouldPersist) continue;
 
-    const id = existing?.id ?? appServerInstanceId(connectorId, instance.instance_key);
+    const id = existing?.id ?? appServerInstanceId(connectorId, instance.instance_key, placementKey);
     const stateChangedAt = existing && existing.state === instance.state
       ? existing.state_changed_at
       : syncedAt;
@@ -160,15 +162,16 @@ export async function recordAppServerInstances(
     await env.DB.prepare(
       `INSERT INTO app_server_instances (
          id, connector_id, instance_key, scope, workspace_id, thread_id,
-         endpoint_type, state,
+         placement_key, endpoint_type, state,
          active_turn_count, generation, status_summary, last_error,
          report_fingerprint, last_seen_at, state_changed_at, summary_changed_at,
          created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(connector_id, instance_key) DO UPDATE SET
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(connector_id, instance_key, placement_key) DO UPDATE SET
          scope = excluded.scope,
          workspace_id = excluded.workspace_id,
          thread_id = excluded.thread_id,
+         placement_key = excluded.placement_key,
          endpoint_type = excluded.endpoint_type,
          state = excluded.state,
          active_turn_count = excluded.active_turn_count,
@@ -188,6 +191,7 @@ export async function recordAppServerInstances(
         instance.scope,
         instance.workspace_id ?? null,
         instance.thread_id ?? null,
+        placementKey,
         instance.endpoint_type,
         instance.state,
         instance.active_turn_count ?? 0,
@@ -204,15 +208,15 @@ export async function recordAppServerInstances(
       .run();
 
     const row = await env.DB.prepare(
-      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id, placement_key,
               endpoint_type, state,
               active_turn_count, generation, status_summary, last_error,
               last_seen_at, state_changed_at, updated_at
        FROM app_server_instances
-       WHERE connector_id = ? AND instance_key = ?
+       WHERE connector_id = ? AND instance_key = ? AND placement_key = ?
        LIMIT 1`
     )
-      .bind(connectorId, instance.instance_key)
+      .bind(connectorId, instance.instance_key, placementKey)
       .first<AppServerInstanceRow>();
     if (row) persisted.push(appServerInstanceFromRow(row));
   }
@@ -220,7 +224,7 @@ export async function recordAppServerInstances(
   if (report.snapshot === true) {
     const omitted = await allRows<AppServerInstanceRow>(
       env.DB.prepare(
-        `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+        `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id, placement_key,
                 endpoint_type, state,
                 active_turn_count, generation, status_summary, last_error,
                 report_fingerprint, last_seen_at, state_changed_at,
@@ -231,7 +235,7 @@ export async function recordAppServerInstances(
       ).bind(connectorId)
     );
     for (const row of omitted) {
-      if (reportedKeys.has(row.instance_key)) continue;
+      if (reportedIdentities.has(appServerInstanceIdentityKey(row.instance_key, row.placement_key))) continue;
       const stoppedSummary = "Instance was omitted from the latest connector snapshot.";
       const stoppedFingerprint = appServerStoppedFingerprint(row, stoppedSummary);
       await env.DB.prepare(
@@ -290,7 +294,7 @@ export async function markAppServerInstancesStoppedForConnector(
 
   const rows = await allRows<AppServerInstanceRow>(
     env.DB.prepare(
-      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id, placement_key,
               endpoint_type, state,
               active_turn_count, generation, status_summary, last_error,
               report_fingerprint, last_seen_at, state_changed_at,
@@ -3001,7 +3005,7 @@ async function listAppServerInstances(env: Env): Promise<AppServerInstanceSummar
   const rows = await allRows<AppServerInstanceRow>(
     env.DB!.prepare(
       `SELECT asi.id, asi.connector_id, asi.instance_key, asi.scope,
-              asi.workspace_id, asi.thread_id, asi.endpoint_type, asi.state,
+              asi.workspace_id, asi.thread_id, asi.placement_key, asi.endpoint_type, asi.state,
               asi.active_turn_count, asi.generation, asi.status_summary, asi.last_error,
               asi.last_seen_at, asi.state_changed_at, asi.updated_at
        FROM app_server_instances asi
@@ -3024,7 +3028,7 @@ async function listAppServerInstances(env: Env): Promise<AppServerInstanceSummar
 async function listAppServerInstancesForConnector(env: Env, connectorId: string): Promise<AppServerInstanceSummary[]> {
   const rows = await allRows<AppServerInstanceRow>(
     env.DB!.prepare(
-      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id, placement_key,
               endpoint_type, state,
               active_turn_count, generation, status_summary, last_error,
               last_seen_at, state_changed_at, updated_at
@@ -3097,6 +3101,7 @@ function appServerInstanceFingerprint(instance: AgentAppServerInstancesReport["i
   return stableFingerprint([
     instance.instance_key,
     instance.scope,
+    appServerInstancePlacementKey(instance),
     instance.workspace_id ?? "",
     instance.thread_id ?? "",
     instance.endpoint_type,
@@ -3112,6 +3117,7 @@ function appServerSummaryFingerprint(row: AppServerInstanceRow): string {
   return stableFingerprint([
     row.instance_key,
     row.scope,
+    row.placement_key,
     row.workspace_id ?? "",
     row.thread_id ?? "",
     row.endpoint_type,
@@ -3127,6 +3133,7 @@ function appServerStoppedFingerprint(row: AppServerInstanceRow, summary: string)
   return stableFingerprint([
     row.instance_key,
     row.scope,
+    row.placement_key,
     row.workspace_id ?? "",
     row.thread_id ?? "",
     row.endpoint_type,
@@ -3138,8 +3145,21 @@ function appServerStoppedFingerprint(row: AppServerInstanceRow, summary: string)
   ]);
 }
 
-function appServerInstanceId(connectorId: string, instanceKey: string): string {
-  return `app-server-${stableFingerprint([connectorId, instanceKey])}`;
+function appServerInstancePlacementKey(instance: Pick<AgentAppServerInstance, "scope" | "workspace_id" | "thread_id">): string {
+  if (instance.scope === "workspace") return `workspace:${instance.workspace_id ?? ""}`;
+  if (instance.scope === "thread") return `thread:${instance.thread_id ?? ""}`;
+  return "connector";
+}
+
+function appServerInstanceIdentityKey(instanceKey: string, placementKey: string): string {
+  return stableFingerprint([instanceKey, placementKey]);
+}
+
+function appServerInstanceId(connectorId: string, instanceKey: string, placementKey: string): string {
+  const identity = placementKey === "connector"
+    ? [connectorId, instanceKey]
+    : [connectorId, instanceKey, placementKey];
+  return `app-server-${stableFingerprint(identity)}`;
 }
 
 function parseCapabilities(value: string | null): string[] {
@@ -3855,6 +3875,7 @@ type ConnectorRow = {
 type AppServerInstanceRow = Omit<AppServerInstanceSummary, "workspace_id" | "thread_id" | "status_summary" | "last_error"> & {
   workspace_id: string | null;
   thread_id: string | null;
+  placement_key: string;
   status_summary: string | null;
   last_error: string | null;
   report_fingerprint: string;

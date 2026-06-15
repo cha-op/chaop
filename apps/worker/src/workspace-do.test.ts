@@ -198,12 +198,12 @@ test("agent app-server instance report accepts workspace and thread placement ta
       report_id: "report-placements",
       instances: [
         appServerInstancePayload("healthy", {
-          instance_key: "workspace-api",
+          instance_key: "default",
           scope: "workspace",
           workspace_id: "workspace-api"
         }),
         appServerInstancePayload("healthy", {
-          instance_key: "thread-123",
+          instance_key: "default",
           scope: "thread",
           workspace_id: "workspace-api",
           thread_id: "thread-123"
@@ -231,8 +231,8 @@ test("agent app-server instance report accepts workspace and thread placement ta
       instance.thread_id
     ]),
     [
-      ["workspace-api", "workspace-api", undefined],
-      ["thread-123", "workspace-api", "thread-123"]
+      ["default", "workspace-api", undefined],
+      ["default", "workspace-api", "thread-123"]
     ]
   );
 });
@@ -2082,11 +2082,11 @@ function socketGoneDb(): D1Database & {
 
       if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
         return {
-          bind(connectorId: string, instanceKey: string) {
+          bind(connectorId: string, instanceKey: string, placementKey: string) {
             assert.equal(connectorId, "connector-online");
             return {
               async first() {
-                return appServerRows.get(`${connectorId}:${instanceKey}`) ?? null;
+                return appServerRows.get(`${connectorId}:${instanceKey}:${placementKey}`) ?? null;
               }
             };
           }
@@ -2095,14 +2095,15 @@ function socketGoneDb(): D1Database & {
 
       if (/INSERT INTO app_server_instances/.test(sql)) {
         return {
-            bind(
-              id: string,
-              connectorId: string,
-              instanceKey: string,
-              scope: AppServerInstanceDoRow["scope"],
-              workspaceId: string | null,
-              threadId: string | null,
-              endpointType: AppServerInstanceDoRow["endpoint_type"],
+          bind(
+            id: string,
+            connectorId: string,
+            instanceKey: string,
+            scope: AppServerInstanceDoRow["scope"],
+            workspaceId: string | null,
+            threadId: string | null,
+            placementKey: string,
+            endpointType: AppServerInstanceDoRow["endpoint_type"],
             state: AppServerInstanceDoRow["state"],
             activeTurnCount: number,
             generation: number,
@@ -2119,14 +2120,15 @@ function socketGoneDb(): D1Database & {
             return {
               async run() {
                 counters.appServerInstanceWrites += 1;
-                appServerRows.set(`${connectorId}:${instanceKey}`, {
+                appServerRows.set(`${connectorId}:${instanceKey}:${placementKey}`, {
                   id,
                   connector_id: connectorId,
-                    instance_key: instanceKey,
-                    scope,
-                    workspace_id: workspaceId,
-                    thread_id: threadId,
-                    endpoint_type: endpointType,
+                  instance_key: instanceKey,
+                  scope,
+                  workspace_id: workspaceId,
+                  thread_id: threadId,
+                  placement_key: placementKey,
+                  endpoint_type: endpointType,
                   state,
                   active_turn_count: activeTurnCount,
                   generation,
@@ -2136,7 +2138,7 @@ function socketGoneDb(): D1Database & {
                   last_seen_at: lastSeenAt,
                   state_changed_at: stateChangedAt,
                   summary_changed_at: summaryChangedAt,
-                  created_at: appServerRows.get(`${connectorId}:${instanceKey}`)?.created_at ?? createdAt,
+                  created_at: appServerRows.get(`${connectorId}:${instanceKey}:${placementKey}`)?.created_at ?? createdAt,
                   updated_at: updatedAt
                 });
                 return { success: true, meta: { changes: 1 } };
@@ -2249,7 +2251,7 @@ function socketGoneDb(): D1Database & {
                 const row = [...appServerRows.values()].find((candidate) => candidate.id === id);
                 assert.ok(row);
                 counters.appServerInstanceWrites += 1;
-                appServerRows.set(`${row.connector_id}:${row.instance_key}`, {
+                appServerRows.set(`${row.connector_id}:${row.instance_key}:${row.placement_key}`, {
                   ...row,
                   state: "stopped",
                   active_turn_count: 0,
@@ -2491,6 +2493,7 @@ type AppServerInstanceDoRow = {
   scope: "connector" | "workspace" | "thread";
   workspace_id: string | null;
   thread_id: string | null;
+  placement_key: string;
   endpoint_type: "managed" | "external";
   state: "healthy" | "degraded" | "draining" | "restarting" | "stopped";
   active_turn_count: number;
@@ -2525,10 +2528,10 @@ function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
 
       if (/SELECT id, connector_id, instance_key/.test(sql) && /WHERE connector_id = \? AND instance_key = \?/.test(sql)) {
         return {
-          bind(connectorId: string, instanceKey: string) {
+          bind(connectorId: string, instanceKey: string, placementKey: string) {
             return {
               async first() {
-                return rows.get(`${connectorId}:${instanceKey}`) ?? null;
+                return rows.get(`${connectorId}:${instanceKey}:${placementKey}`) ?? null;
               }
             };
           }
@@ -2544,6 +2547,7 @@ function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
             scope: AppServerInstanceDoRow["scope"],
             workspaceId: string | null,
             threadId: string | null,
+            placementKey: string,
             endpointType: AppServerInstanceDoRow["endpoint_type"],
             state: AppServerInstanceDoRow["state"],
             activeTurnCount: number,
@@ -2560,13 +2564,14 @@ function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
             return {
               async run() {
                 counters.writes += 1;
-                rows.set(`${connectorId}:${instanceKey}`, {
+                rows.set(`${connectorId}:${instanceKey}:${placementKey}`, {
                   id,
                   connector_id: connectorId,
                   instance_key: instanceKey,
                   scope,
                   workspace_id: workspaceId,
                   thread_id: threadId,
+                  placement_key: placementKey,
                   endpoint_type: endpointType,
                   state,
                   active_turn_count: activeTurnCount,

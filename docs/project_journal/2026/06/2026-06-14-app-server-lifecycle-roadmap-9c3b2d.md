@@ -66,7 +66,7 @@ superseded_by:
 
 Implementation checkpoint:
 - `AppServerInstanceSummary` and `AgentAppServerInstance` now carry optional `workspace_id` and `thread_id` placement targets.
-- D1 stores placement targets on `app_server_instances`, includes placement in dedupe fingerprints, and exposes placement through bootstrap and realtime updates.
+- D1 stores placement targets on `app_server_instances`, includes placement in the persisted identity and dedupe fingerprints, and exposes placement through bootstrap and realtime updates.
 - Agent app-server reports validate scope-specific placement: connector-wide reports remain targetless by default, workspace reports require `workspace_id`, and thread reports require `thread_id`.
 - Operations/Host Sessions app-server cards now show placement labels, while connector-wide remains the default managed path.
 
