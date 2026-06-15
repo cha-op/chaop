@@ -61,9 +61,18 @@ test("app-server instances are added by forward migration", async () => {
   assert.match(migration, /UNIQUE\(connector_id, instance_key\)/);
   assert.match(migration, /CREATE INDEX idx_app_server_instances_connector_state/);
   assert.match(migration, /CREATE INDEX idx_app_server_instances_state_updated/);
-  assert.match(migration, /CREATE INDEX idx_app_server_instances_last_seen/);
+	assert.match(migration, /CREATE INDEX idx_app_server_instances_last_seen/);
+});
+
+test("app-server instance placement targets are added by forward migration", async () => {
+	const migration = await readMigration("0011_app_server_instance_placement.sql");
+
+	assert.match(migration, /ALTER TABLE app_server_instances ADD COLUMN workspace_id TEXT/);
+	assert.match(migration, /ALTER TABLE app_server_instances ADD COLUMN thread_id TEXT/);
+	assert.match(migration, /CREATE INDEX idx_app_server_instances_workspace_state/);
+	assert.match(migration, /CREATE INDEX idx_app_server_instances_thread_state/);
 });
 
 async function readMigration(fileName: string): Promise<string> {
-  return await readFile(new URL(fileName, migrationsDir), "utf8");
+	return await readFile(new URL(fileName, migrationsDir), "utf8");
 }

@@ -3,7 +3,7 @@ id: 20260614-9c3b2d
 title: App-server Lifecycle Roadmap
 status: active
 created: 2026-06-14
-updated: 2026-06-14
+updated: 2026-06-15
 branch: wip/web-deploy-script
 pr:
 supersedes: 20260613-e4a7c9
@@ -63,6 +63,12 @@ superseded_by:
 - Extend the registry to support connector-wide, workspace/project-scoped, and thread-dedicated app-server instances.
 - Keep connector-wide placement as the default.
 - Make thread-dedicated placement an opt-in canary path for later rolling-upgrade experiments.
+
+Implementation checkpoint:
+- `AppServerInstanceSummary` and `AgentAppServerInstance` now carry optional `workspace_id` and `thread_id` placement targets.
+- D1 stores placement targets on `app_server_instances`, includes placement in dedupe fingerprints, and exposes placement through bootstrap and realtime updates.
+- Agent app-server reports validate scope-specific placement: connector-wide reports remain targetless by default, workspace reports require `workspace_id`, and thread reports require `thread_id`.
+- Operations/Host Sessions app-server cards now show placement labels, while connector-wide remains the default managed path.
 
 ### PR8: Budget Board Real Metrics
 - Replace the Budget Board placeholder data with real usage/cost signals from Chaop-controlled sources.

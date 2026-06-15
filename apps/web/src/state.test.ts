@@ -7,6 +7,7 @@ import type {
   TaskArchiveResponse
 } from "@chaop/protocol";
 import {
+  appServerInstancePlacementLabel,
   appServerInstanceStateLabel,
   appServerInstancesForConnector,
   appServerInstancesForDisplay,
@@ -173,6 +174,26 @@ test("appServerInstancesForConnector filters and sorts operator-visible instance
 test("appServerInstanceStateLabel uses operator-facing state text", () => {
   assert.equal(appServerInstanceStateLabel("healthy"), "healthy");
   assert.equal(appServerInstanceStateLabel("restarting"), "restarting");
+});
+
+test("appServerInstancePlacementLabel shows connector, workspace, and thread placement", () => {
+  assert.equal(appServerInstancePlacementLabel(appServerInstance("app-server-connector", "healthy", "2026-06-12T10:00:00.000Z")), "Connector-wide");
+  assert.equal(
+    appServerInstancePlacementLabel({
+      ...appServerInstance("app-server-workspace", "healthy", "2026-06-12T10:00:00.000Z"),
+      scope: "workspace",
+      workspace_id: "workspace-api"
+    }),
+    "Workspace workspace-api"
+  );
+  assert.equal(
+    appServerInstancePlacementLabel({
+      ...appServerInstance("app-server-thread", "healthy", "2026-06-12T10:00:00.000Z"),
+      scope: "thread",
+      thread_id: "thread-123"
+    }),
+    "Thread thread-123"
+  );
 });
 
 test("localThreadWorkspaceId uses the selected thread workspace", () => {

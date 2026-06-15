@@ -14,7 +14,7 @@
 - The Rust connector reports lightweight local Codex session inventory, can optionally use app-server `Thread.name` values for title enrichment, and can create new local app-server threads when `session_inventory.app_server_url` is configured.
 - The Rust connector can now manage one dedicated local Codex app-server listener, health-check it before advertising app-server capabilities, and refresh connector capabilities through `agent.ready`.
 - Managed connector app-server mode now supports draining restarts for periodic maintenance and local upgrade-marker triggers: the connector reports `draining`, withdraws app-server capabilities while active turns finish, then restarts and re-advertises after a healthy app-server probe.
-- Operations Map and Host Sessions now surface AppServerInstance state, including connector identity, endpoint type, active turns, changed/seen age, and unhealthy lifecycle states.
+- Operations Map and Host Sessions now surface AppServerInstance state, including connector identity, placement, endpoint type, active turns, changed/seen age, and unhealthy lifecycle states.
 - Attached Host Sessions now request a bounded single-session history backfill from the connector, importing short rollout/history summaries without broad transcript upload.
 - Archive/unarchive actions for attached Host Session tasks update Chaop's D1 task/thread state first, then try to synchronise resolvable Codex app-server threads through connector `thread/archive` and `thread/unarchive`; sync failures are reported as warnings, and non-app-server sessions remain D1-only.
 - The next delivery workstream is the nine-PR app-server lifecycle roadmap, starting from PR0's Web deploy script and then moving execution UX toward managed app-server operation.

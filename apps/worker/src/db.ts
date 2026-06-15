@@ -136,7 +136,8 @@ export async function recordAppServerInstances(
     reportedKeys.add(instance.instance_key);
     const fingerprint = appServerInstanceFingerprint(instance);
     const existing = await env.DB.prepare(
-      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+              endpoint_type, state,
               active_turn_count, generation, status_summary, last_error,
               report_fingerprint, last_seen_at, state_changed_at,
               summary_changed_at, created_at, updated_at
@@ -158,13 +159,16 @@ export async function recordAppServerInstances(
       : syncedAt;
     await env.DB.prepare(
       `INSERT INTO app_server_instances (
-         id, connector_id, instance_key, scope, endpoint_type, state,
+         id, connector_id, instance_key, scope, workspace_id, thread_id,
+         endpoint_type, state,
          active_turn_count, generation, status_summary, last_error,
          report_fingerprint, last_seen_at, state_changed_at, summary_changed_at,
          created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(connector_id, instance_key) DO UPDATE SET
          scope = excluded.scope,
+         workspace_id = excluded.workspace_id,
+         thread_id = excluded.thread_id,
          endpoint_type = excluded.endpoint_type,
          state = excluded.state,
          active_turn_count = excluded.active_turn_count,
@@ -182,6 +186,8 @@ export async function recordAppServerInstances(
         connectorId,
         instance.instance_key,
         instance.scope,
+        instance.workspace_id ?? null,
+        instance.thread_id ?? null,
         instance.endpoint_type,
         instance.state,
         instance.active_turn_count ?? 0,
@@ -198,7 +204,8 @@ export async function recordAppServerInstances(
       .run();
 
     const row = await env.DB.prepare(
-      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+              endpoint_type, state,
               active_turn_count, generation, status_summary, last_error,
               last_seen_at, state_changed_at, updated_at
        FROM app_server_instances
@@ -213,7 +220,8 @@ export async function recordAppServerInstances(
   if (report.snapshot === true) {
     const omitted = await allRows<AppServerInstanceRow>(
       env.DB.prepare(
-        `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+        `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+                endpoint_type, state,
                 active_turn_count, generation, status_summary, last_error,
                 report_fingerprint, last_seen_at, state_changed_at,
                 summary_changed_at, created_at, updated_at
@@ -282,7 +290,8 @@ export async function markAppServerInstancesStoppedForConnector(
 
   const rows = await allRows<AppServerInstanceRow>(
     env.DB.prepare(
-      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+              endpoint_type, state,
               active_turn_count, generation, status_summary, last_error,
               report_fingerprint, last_seen_at, state_changed_at,
               summary_changed_at, created_at, updated_at
@@ -2991,7 +3000,8 @@ export async function getConnectorSummary(
 async function listAppServerInstances(env: Env): Promise<AppServerInstanceSummary[]> {
   const rows = await allRows<AppServerInstanceRow>(
     env.DB!.prepare(
-      `SELECT asi.id, asi.connector_id, asi.instance_key, asi.scope, asi.endpoint_type, asi.state,
+      `SELECT asi.id, asi.connector_id, asi.instance_key, asi.scope,
+              asi.workspace_id, asi.thread_id, asi.endpoint_type, asi.state,
               asi.active_turn_count, asi.generation, asi.status_summary, asi.last_error,
               asi.last_seen_at, asi.state_changed_at, asi.updated_at
        FROM app_server_instances asi
@@ -3014,7 +3024,8 @@ async function listAppServerInstances(env: Env): Promise<AppServerInstanceSummar
 async function listAppServerInstancesForConnector(env: Env, connectorId: string): Promise<AppServerInstanceSummary[]> {
   const rows = await allRows<AppServerInstanceRow>(
     env.DB!.prepare(
-      `SELECT id, connector_id, instance_key, scope, endpoint_type, state,
+      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id,
+              endpoint_type, state,
               active_turn_count, generation, status_summary, last_error,
               last_seen_at, state_changed_at, updated_at
        FROM app_server_instances
@@ -3047,6 +3058,8 @@ function appServerInstanceFromRow(row: AppServerInstanceRow): AppServerInstanceS
     connector_id: row.connector_id,
     instance_key: row.instance_key,
     scope: row.scope,
+    workspace_id: row.workspace_id ?? undefined,
+    thread_id: row.thread_id ?? undefined,
     endpoint_type: row.endpoint_type,
     state: row.state,
     active_turn_count: row.active_turn_count,
@@ -3069,6 +3082,8 @@ function shouldPersistAppServerInstance(
   if (existing.state !== instance.state) return true;
   if (existing.endpoint_type !== instance.endpoint_type) return true;
   if (existing.scope !== instance.scope) return true;
+  if ((existing.workspace_id ?? null) !== (instance.workspace_id ?? null)) return true;
+  if ((existing.thread_id ?? null) !== (instance.thread_id ?? null)) return true;
   if (existing.active_turn_count !== (instance.active_turn_count ?? 0)) return true;
   if (existing.generation !== (instance.generation ?? 0)) return true;
   if (existing.report_fingerprint !== fingerprint) return true;
@@ -3082,6 +3097,8 @@ function appServerInstanceFingerprint(instance: AgentAppServerInstancesReport["i
   return stableFingerprint([
     instance.instance_key,
     instance.scope,
+    instance.workspace_id ?? "",
+    instance.thread_id ?? "",
     instance.endpoint_type,
     instance.state,
     String(instance.active_turn_count ?? 0),
@@ -3095,6 +3112,8 @@ function appServerSummaryFingerprint(row: AppServerInstanceRow): string {
   return stableFingerprint([
     row.instance_key,
     row.scope,
+    row.workspace_id ?? "",
+    row.thread_id ?? "",
     row.endpoint_type,
     row.state,
     String(row.active_turn_count),
@@ -3108,6 +3127,8 @@ function appServerStoppedFingerprint(row: AppServerInstanceRow, summary: string)
   return stableFingerprint([
     row.instance_key,
     row.scope,
+    row.workspace_id ?? "",
+    row.thread_id ?? "",
     row.endpoint_type,
     "stopped",
     "0",
@@ -3831,7 +3852,9 @@ type ConnectorRow = {
   updated_at: string | null;
 };
 
-type AppServerInstanceRow = Omit<AppServerInstanceSummary, "status_summary" | "last_error"> & {
+type AppServerInstanceRow = Omit<AppServerInstanceSummary, "workspace_id" | "thread_id" | "status_summary" | "last_error"> & {
+  workspace_id: string | null;
+  thread_id: string | null;
   status_summary: string | null;
   last_error: string | null;
   report_fingerprint: string;

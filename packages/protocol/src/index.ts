@@ -114,6 +114,8 @@ export type AppServerInstanceSummary = {
   connector_id: string;
   instance_key: string;
   scope: AppServerInstanceScope;
+  workspace_id?: string | undefined;
+  thread_id?: string | undefined;
   endpoint_type: AppServerEndpointType;
   state: AppServerInstanceState;
   active_turn_count: number;
@@ -128,6 +130,8 @@ export type AppServerInstanceSummary = {
 export type AgentAppServerInstance = {
   instance_key: string;
   scope: AppServerInstanceScope;
+  workspace_id?: string | undefined;
+  thread_id?: string | undefined;
   endpoint_type: AppServerEndpointType;
   state: AppServerInstanceState;
   active_turn_count?: number | undefined;

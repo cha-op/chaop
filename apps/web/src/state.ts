@@ -49,6 +49,14 @@ export function appServerInstanceStateLabel(state: AppServerInstanceSummary["sta
   return state.replaceAll("_", " ");
 }
 
+export function appServerInstancePlacementLabel(instance: AppServerInstanceSummary): string {
+  if (instance.scope === "connector") return "Connector-wide";
+  if (instance.scope === "workspace") {
+    return instance.workspace_id ? `Workspace ${instance.workspace_id}` : "Workspace";
+  }
+  return instance.thread_id ? `Thread ${instance.thread_id}` : "Thread";
+}
+
 export function mergeBootstrapPayload(
   current: BootstrapPayload | undefined,
   incoming: BootstrapPayload

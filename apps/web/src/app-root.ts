@@ -31,6 +31,7 @@ import {
   unarchiveTask
 } from "./api.js";
 import {
+  appServerInstancePlacementLabel,
   appServerInstanceStateLabel,
   appServerInstancesForDisplay,
   archiveSyncNotice,
@@ -633,7 +634,7 @@ export class ChaopApp extends LitElement {
           <span class="chip ${instance.state}">${appServerInstanceStateLabel(instance.state)}</span>
         </header>
         <dl class="instance-facts">
-          <div><dt>Scope</dt><dd>${formatMode(instance.scope)}</dd></div>
+          <div><dt>Placement</dt><dd>${appServerInstancePlacementLabel(instance)}</dd></div>
           <div><dt>Endpoint</dt><dd>${formatMode(instance.endpoint_type)}</dd></div>
           <div><dt>Turns</dt><dd>${instance.active_turn_count}</dd></div>
           ${density === "full" ? html`<div><dt>Generation</dt><dd>${instance.generation}</dd></div>` : nothing}

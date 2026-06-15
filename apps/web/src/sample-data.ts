@@ -172,6 +172,7 @@ export function fallbackBootstrap(): BootstrapPayload {
         connector_id: "connector-buildbox",
         instance_key: "external-4545",
         scope: "workspace",
+        workspace_id: "workspace-api",
         endpoint_type: "external",
         state: "degraded",
         active_turn_count: 0,
