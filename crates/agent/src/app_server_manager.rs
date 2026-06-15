@@ -253,7 +253,8 @@ impl AppServerManager {
             return None;
         }
         self.clear_exited_child();
-        if pending.reason == AppServerRestartReason::Scheduled
+        if !force_restart
+            && pending.reason == AppServerRestartReason::Scheduled
             && self.child.is_none()
             && self
                 .start_backoff_deadline(config)
@@ -1258,6 +1259,54 @@ mod tests {
         assert_eq!(
             manager.status_summary.as_deref(),
             Some("Managed app-server restart backoff is active.")
+        );
+        assert!(!manager.can_attempt_start(&config));
+    }
+
+    #[test]
+    fn scheduled_force_restart_reports_timeout_after_child_exit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let exited_child_command = tempdir.path().join("exited-child");
+        write_executable(&exited_child_command, "#!/bin/sh\nexit 0\n");
+        let mut exited_child = std::process::Command::new(&exited_child_command)
+            .spawn()
+            .expect("spawn exited child");
+        exited_child.wait().expect("wait exited child");
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .drain_timeout_seconds = 1;
+        config
+            .session_inventory
+            .managed_app_server
+            .restart_backoff_seconds = 60;
+        let mut manager = AppServerManager::new(&config);
+        manager.child = Some(exited_child);
+        manager.active_turn_count = 1;
+        manager.pending_restart = Some(super::PendingAppServerRestart {
+            reason: AppServerRestartReason::Scheduled,
+            requested_at: Instant::now() - Duration::from_secs(2),
+        });
+
+        let runtime = manager.runtime_config(&config);
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert!(manager.child.is_none());
+        assert_eq!(manager.pending_restart, None);
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some(
+                "Managed app-server scheduled restart forced after drain timeout and did not become healthy."
+            )
+        );
+        assert_eq!(
+            manager.last_error.as_deref(),
+            Some(
+                "Drain timeout elapsed while active turns were still running. Last restart error: No such file or directory (os error 2)"
+            )
         );
         assert!(!manager.can_attempt_start(&config));
     }

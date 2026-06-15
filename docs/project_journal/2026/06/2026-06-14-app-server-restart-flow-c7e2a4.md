@@ -28,6 +28,7 @@ superseded_by:
 - Treat first creation of the configured upgrade marker file as a restart request when the file did not exist at connector startup.
 - Upgrade marker restart requests now supersede pending scheduled restart requests, so an operator-triggered local marker cannot be hidden behind a periodic restart.
 - Preserve forced drain-timeout restart summaries after the restart attempt, including the underlying restart error when the forced restart does not become healthy.
+- Forced scheduled restart timeouts keep their drain-timeout reporting even if the managed child exited while the active turn was draining.
 - Scheduled restarts now respect startup backoff when the managed app-server is already degraded, when no child process is available to stop, or when a managed child has already exited, without repeatedly bumping instance generation or control-plane reports during the backoff window.
 - Restart attempts clear the pending drain request, reset the periodic schedule, stop the managed child, and reuse the existing health-check/start path.
 - Updated deployment guide examples and operator guidance for scheduled restart and upgrade marker usage.
