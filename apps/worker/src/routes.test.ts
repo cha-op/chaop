@@ -1145,7 +1145,7 @@ test("usage summary returns bounded D1 budget windows", async () => {
   assert.equal(response.status, 200);
   assert.equal(body.source, "d1_usage_windows");
   assert.equal(body.state, "hard_limited");
-  assert.equal(body.daily_used_pct, 73.3);
+  assert.equal(body.daily_used_pct, 125.4);
   assert.equal(body.four_hour_used_pct, 88.9);
   assert.equal(body.burst_used_pct, 21);
   assert.equal(body.delayed_event_count, 8);
@@ -1155,7 +1155,7 @@ test("usage summary returns bounded D1 budget windows", async () => {
   assert.deepEqual(
     body.windows.map((window) => [window.window_type, window.used_pct, window.events_received]),
     [
-      ["daily", 73.3, 1000],
+      ["daily", 125.4, 1000],
       ["four_hour", 88.9, 240],
       ["burst", 21, 18]
     ]
@@ -1981,6 +1981,7 @@ function readOnlyBootstrapDb(): D1Database {
   return {
     prepare(sql: string) {
       assert.doesNotMatch(sql, /INSERT INTO users/);
+      assert.doesNotMatch(sql, /GROUP BY budget_state/);
       if (/FROM host_sessions hs/.test(sql)) {
         assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
         assert.match(sql, /c\.status <> 'offline'/);
@@ -2014,7 +2015,7 @@ function budgetSummaryDb(): D1Database {
       window_start: "2026-06-15T00:00:00.000Z",
       window_end: "2026-06-16T00:00:00.000Z",
       budget_state: "conservative",
-      used_pct: 73.34,
+      used_pct: 125.44,
       events_received: 1000,
       events_compacted: 55,
       events_delayed: 8,

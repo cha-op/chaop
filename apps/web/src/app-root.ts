@@ -38,6 +38,7 @@ import {
   appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
+  budgetSourceLabel,
   codexCliFallbackAvailable,
   commandExecutionModeForRequest,
   commandModeLabel,
@@ -1393,17 +1394,6 @@ function formatAge(ageMs: number): string {
   return `${Math.floor(totalHours / 24)}d`;
 }
 
-function budgetSourceLabel(budget: BudgetSummary): string {
-  const windowSampleCount = budget.window_sample_count ?? budgetWindows(budget).length;
-  if (budget.source === "d1_usage_windows") {
-    return `Live database summary from ${windowSampleCount} bounded usage windows.`;
-  }
-  if (budget.source === "sample") {
-    return "Sample data for local development.";
-  }
-  return "No usage windows recorded yet.";
-}
-
 function budgetWindowLabel(windowType: NonNullable<BudgetSummary["windows"]>[number]["window_type"]): string {
   return {
     daily: "Daily",
@@ -1547,9 +1537,14 @@ function budgetBar(label: string, value: number) {
   return html`
     <div class="budget-bar">
       <div><span>${label}</span><strong>${formatPct(value)}</strong></div>
-      <meter min="0" max="100" value=${value}></meter>
+      <meter min="0" max="100" value=${meterPct(value)}></meter>
     </div>
   `;
+}
+
+function meterPct(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(100, Math.max(0, value));
 }
 
 function formatBytes(bytes: number): string {

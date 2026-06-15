@@ -88,8 +88,7 @@ export async function loadBootstrapFromDb(
     categories,
     tasks,
     runningCommands,
-    events,
-    budgetSummary
+    events
   ] = await Promise.all([
     listConnectors(env),
     listWorkspaces(env),
@@ -100,9 +99,9 @@ export async function loadBootstrapFromDb(
     listTaskCategories(env),
     listTasks(env),
     listRecentCommands(env),
-    listRecentEvents(env),
-    loadBudgetSummaryFromDb(env)
+    listRecentEvents(env)
   ]);
+  const budgetSummary = await loadBudgetSummaryFromDb(env, undefined, { connectors, tasks });
 
   return {
     user,
@@ -123,7 +122,8 @@ export async function loadBootstrapFromDb(
 
 export async function loadBudgetSummaryFromDb(
   env: Env,
-  generatedAt = new Date().toISOString()
+  generatedAt = new Date().toISOString(),
+  snapshots: { connectors?: ConnectorSummary[] | undefined; tasks?: TaskSummary[] | undefined } = {}
 ): Promise<BudgetSummary> {
   if (!env.DB) {
     return emptyBudgetSummary(generatedAt);
@@ -133,8 +133,12 @@ export async function loadBudgetSummaryFromDb(
     latestUsageWindow(env, "daily"),
     latestUsageWindow(env, "four_hour"),
     latestUsageWindow(env, "burst"),
-    listConnectorBudgetStates(env),
-    listTaskBudgetStates(env)
+    snapshots.connectors
+      ? Promise.resolve(connectorBudgetStateCounts(snapshots.connectors))
+      : listConnectorBudgetStates(env),
+    snapshots.tasks
+      ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
+      : listTaskBudgetStates(env)
   ]);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const primaryWindow = daily ?? fourHour ?? burst;
@@ -3074,6 +3078,24 @@ async function listTaskBudgetStates(env: Env): Promise<BudgetStateCountRow[]> {
   );
 }
 
+function connectorBudgetStateCounts(connectors: ConnectorSummary[]): BudgetStateCountRow[] {
+  return budgetStateCounts(
+    connectors.filter((connector) => connector.status !== "offline").map((connector) => connector.budget_state)
+  );
+}
+
+function taskBudgetStateCounts(tasks: TaskSummary[]): BudgetStateCountRow[] {
+  return budgetStateCounts(tasks.filter((task) => task.archived_at === undefined).map((task) => task.budget_state));
+}
+
+function budgetStateCounts(states: BudgetState[]): BudgetStateCountRow[] {
+  const counts = new Map<BudgetState, number>();
+  for (const state of states) {
+    counts.set(state, (counts.get(state) ?? 0) + 1);
+  }
+  return [...counts].map(([budget_state, count]) => ({ budget_state, count }));
+}
+
 function connectorSummaryFromRow(row: ConnectorRow): ConnectorSummary {
   return {
     id: row.id,
@@ -3986,8 +4008,7 @@ function worstBudgetState(states: BudgetState[]): BudgetState {
 
 function normalisePct(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value)) return 0;
-  const clamped = Math.min(100, Math.max(0, value));
-  return Math.round(clamped * 10) / 10;
+  return Math.round(Math.max(0, value) * 10) / 10;
 }
 
 function nonNegativeInteger(value: number | undefined): number {

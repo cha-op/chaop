@@ -14,6 +14,7 @@ import {
   appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
+  budgetSourceLabel,
   codexCliFallbackAvailable,
   commandExecutionModeForRequest,
   commandModeLabel,
@@ -111,6 +112,13 @@ test("mergeBootstrapPayload keeps current app-server instances when legacy boots
   const merged = mergeBootstrapPayload(current, incoming);
 
   assert.deepEqual(merged.app_server_instances, [currentInstance]);
+});
+
+test("budgetSourceLabel reports unknown source for legacy budget payloads", () => {
+  const budget = { ...payload().budget };
+  delete (budget as Partial<typeof budget>).source;
+
+  assert.equal(budgetSourceLabel(budget), "Summary source not reported by this control plane.");
 });
 
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {
