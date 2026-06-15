@@ -27,6 +27,7 @@ superseded_by:
 - App-server command completion 现在会在 final event acknowledgements 之前刷新 runtime state，因此 pending drain restarts 会先推进，再处理 post-turn background messages。
 - 如果 connector 启动时 marker 文件尚不存在，那么配置的 upgrade marker 文件首次创建也会作为 restart request 处理。
 - 强制 drain-timeout restart 完成后继续保留 operator 可见的 summary；如果强制重启后没有恢复 healthy，也会保留底层 restart error。
+- 当 managed app-server 已经 degraded 且没有可停止的 child process 时，scheduled restart 现在会尊重 startup backoff。
 - Restart attempt 会清空 pending drain request、重置 periodic schedule、停止 managed child，并复用现有 health-check/start path。
 - 更新部署指南里的配置示例和 operator guidance，说明 scheduled restart 与 upgrade marker 的使用方式。
 

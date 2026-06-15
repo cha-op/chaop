@@ -245,7 +245,9 @@ impl AppServerManager {
 
         self.pending_restart = None;
         self.arm_next_scheduled_restart(config);
-        self.last_start_failure = None;
+        if self.child.is_some() || force_restart || pending.reason.overrides_start_backoff() {
+            self.last_start_failure = None;
+        }
         self.set_state(
             AppServerInstanceState::Restarting,
             pending.reason.restarting_summary(force_restart),
@@ -688,6 +690,10 @@ impl AppServerRestartReason {
             }
         }
     }
+
+    fn overrides_start_backoff(self) -> bool {
+        matches!(self, Self::UpgradeMarker)
+    }
 }
 
 fn upgrade_marker_modified(marker: Option<&std::path::PathBuf>) -> Option<SystemTime> {
@@ -1080,6 +1086,38 @@ mod tests {
         assert_eq!(
             manager.status_summary.as_deref(),
             Some("Failed to start managed app-server.")
+        );
+        assert!(!manager.can_attempt_start(&config));
+    }
+
+    #[test]
+    fn scheduled_restart_respects_start_backoff_after_failure() {
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .restart_backoff_seconds = 60;
+        config
+            .session_inventory
+            .managed_app_server
+            .scheduled_restart_interval_seconds = 1;
+        let mut manager = AppServerManager::new(&config);
+        manager.last_start_failure = Some(Instant::now());
+        manager.next_scheduled_restart_at = Some(Instant::now() - Duration::from_secs(1));
+
+        let runtime = manager.runtime_config(&config);
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.pending_restart, None);
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Managed app-server restart backoff is active.")
+        );
+        assert_eq!(
+            manager.last_error.as_deref(),
+            Some("Health check failed while restart backoff is active.")
         );
         assert!(!manager.can_attempt_start(&config));
     }

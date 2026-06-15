@@ -27,6 +27,7 @@ superseded_by:
 - App-server command completion now refreshes runtime state before final event acknowledgements, so pending drain restarts advance before post-turn background messages are handled.
 - Treat first creation of the configured upgrade marker file as a restart request when the file did not exist at connector startup.
 - Preserve forced drain-timeout restart summaries after the restart attempt, including the underlying restart error when the forced restart does not become healthy.
+- Scheduled restarts now respect startup backoff when the managed app-server is already degraded and no child process is available to stop.
 - Restart attempts clear the pending drain request, reset the periodic schedule, stop the managed child, and reuse the existing health-check/start path.
 - Updated deployment guide examples and operator guidance for scheduled restart and upgrade marker usage.
 
