@@ -609,6 +609,41 @@ test("recordAgentEvent maintains D1 usage windows for accepted thread events", a
   }
 });
 
+test("recordAgentEvent keeps accepted events when usage window writes fail", async () => {
+  const db = agentEventGuardDb(
+    {
+      leaseOwnerConnectorId: "connector-online",
+      state: "running"
+    },
+    { failUsageWindowUpserts: true }
+  );
+  const warnings: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args);
+  };
+
+  try {
+    const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+      command_id: "command-1",
+      kind: "command.finished",
+      priority: "P1",
+      summary: "Finished"
+    });
+
+    assert.equal(result.accepted, true);
+    assert.equal(result.event?.kind, "command.finished");
+    assert.equal(db.commandUpdates, 1);
+    assert.equal(db.taskUpdates, 1);
+    assert.equal(db.eventInserts, 1);
+    assert.equal(db.usageWindowUpserts, 1);
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0]?.[0], "Usage window update failed");
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
 test("recordAgentEvent accepts ordinary codex starts without an app-server lease target", async () => {
   const db = agentEventGuardDb(
     {
@@ -1341,6 +1376,7 @@ test("recordHostSessionBackfillEvents imports events idempotently", async () => 
   assert.equal(second.length, 0);
   assert.equal(db.eventInserts, 1);
   assert.equal(db.sequenceUpdates, 1);
+  assert.equal(db.usageWindowUpserts, 3);
 });
 
 test("recordHostSessionBackfillEvents does not return events ignored during insert", async () => {
@@ -1415,6 +1451,7 @@ function agentEventGuardDb(command: {
 }, options: {
   expectedCommandState?: string;
   expectedTaskState?: string;
+  failUsageWindowUpserts?: boolean;
 } = {}) {
   const expectedCommandState = options.expectedCommandState ?? "succeeded";
   const expectedTaskState = options.expectedTaskState ?? "done";
@@ -1527,6 +1564,9 @@ function agentEventGuardDb(command: {
         return usageWindowUpsertFake((args) => {
           counters.usageWindowUpserts += 1;
           counters.usageWindowBinds.push(args);
+          if (options.failUsageWindowUpserts) {
+            throw new Error("usage window unavailable");
+          }
         });
       }
 
@@ -3424,11 +3464,16 @@ function hostSessionsInventoryDb(options: {
 
 function hostSessionBackfillDb(
   options: { ignoreInserts?: boolean | undefined } = {}
-): D1Database & { readonly eventInserts: number; readonly sequenceUpdates: number } {
+): D1Database & {
+  readonly eventInserts: number;
+  readonly sequenceUpdates: number;
+  readonly usageWindowUpserts: number;
+} {
   const inserted = new Set<string>();
   const counters = {
     eventInserts: 0,
-    sequenceUpdates: 0
+    sequenceUpdates: 0,
+    usageWindowUpserts: 0
   };
   const db = {
     prepare(sql: string) {
@@ -3516,6 +3561,12 @@ function hostSessionBackfillDb(
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake(() => {
+          counters.usageWindowUpserts += 1;
+        });
+      }
+
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get eventInserts() {
@@ -3523,10 +3574,17 @@ function hostSessionBackfillDb(
     },
     get sequenceUpdates() {
       return counters.sequenceUpdates;
+    },
+    get usageWindowUpserts() {
+      return counters.usageWindowUpserts;
     }
   };
 
-  return db as D1Database & { readonly eventInserts: number; readonly sequenceUpdates: number };
+  return db as D1Database & {
+    readonly eventInserts: number;
+    readonly sequenceUpdates: number;
+    readonly usageWindowUpserts: number;
+  };
 }
 
 function threadEventsDb(): D1Database {

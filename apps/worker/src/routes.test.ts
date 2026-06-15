@@ -3237,6 +3237,10 @@ function hostSessionAttachBackfillDb(
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get eventInserts() {

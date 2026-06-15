@@ -1214,6 +1214,7 @@ export async function recordHostSessionBackfillEvents(
     if (insertResult.meta?.changes === 0) {
       continue;
     }
+    await recordUsageWindowsForEventBestEffort(env, stored);
     imported.push(stored);
   }
 
@@ -3704,8 +3705,19 @@ async function appendEvent(
       event.created_at
     )
     .run();
-  await recordUsageWindowsForEvent(env, event);
+  await recordUsageWindowsForEventBestEffort(env, event);
   return event;
+}
+
+async function recordUsageWindowsForEventBestEffort(env: Env, event: ThreadEvent): Promise<void> {
+  try {
+    await recordUsageWindowsForEvent(env, event);
+  } catch (error) {
+    console.warn("Usage window update failed", {
+      event_id: event.id,
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 async function recordUsageWindowsForEvent(env: Env, event: ThreadEvent): Promise<void> {
