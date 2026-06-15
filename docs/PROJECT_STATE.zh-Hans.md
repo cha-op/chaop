@@ -18,6 +18,7 @@
 - Budget Board 现在会在 database 绑定可用时读取有界 D1 usage windows 和 grouped budget-state signals，并在 Browser 里显示 source metadata 和 freshness。
 - 已 attach Host Sessions 现在会向 connector 请求单一 session 的有界 history backfill，导入简短 rollout/history 摘要，而不是上传宽泛 transcript。
 - 已 attach Host Session tasks 的 archive/unarchive 操作现在会先更新 Chaop 的 D1 task/thread 状态，再尝试通过 connector 把可解析的 Codex app-server thread 同步到 `thread/archive` 和 `thread/unarchive` 状态；同步失败会作为 warning 回传，非 app-server sessions 仍然只改 D1。
+- 通过声明 `host_session_app_server_ensure` 的 connector attach 未被使用的本机 Codex session 时，现在会先通过 app-server resume，再创建 Chaop task/thread attachment，因此 Thread Centre 可以立即使用 managed app-server command path。
 - 九个 PR 的 app-server lifecycle roadmap 已实现到 Budget Board real-metrics 切片。
 - 已完成的工作流状态记录在 `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.zh-Hans.md`。
 
@@ -33,6 +34,7 @@
 - AppServerInstance UI 来源：`docs/project_journal/2026/06/2026-06-14-app-server-instance-ui-4b6d91.zh-Hans.md`
 - 默认 app-server command path 来源：`docs/project_journal/2026/06/2026-06-14-default-app-server-command-path-a5d8c0.zh-Hans.md`
 - App-server restart flow 来源：`docs/project_journal/2026/06/2026-06-14-app-server-restart-flow-c7e2a4.zh-Hans.md`
+- App-server attach resume 来源：`docs/project_journal/2026/06/2026-06-15-app-server-attach-resume-f4c9a8.zh-Hans.md`
 - 成本治理来源：`docs/cost-aware.zh-Hans.md`
 - 本地索引：可生成 `docs/project_journal/INDEX.md`，但不要提交。
 

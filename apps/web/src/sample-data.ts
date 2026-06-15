@@ -13,7 +13,13 @@ export function fallbackBootstrap(): BootstrapPayload {
         name: "mac-studio",
         hostname: "mac-studio.local",
         status: "online",
-        capabilities: ["placeholder_commands", "app_server_threads", "app_server_archive", "codex_app_server_exec"],
+        capabilities: [
+          "placeholder_commands",
+          "app_server_threads",
+          "app_server_archive",
+          "codex_app_server_exec",
+          "host_session_app_server_ensure"
+        ],
         logical_agent_count: 6,
         active_command_count: 2,
         realtime_mode: "realtime",

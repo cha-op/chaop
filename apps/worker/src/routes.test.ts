@@ -738,6 +738,229 @@ test("host session attach skips backfill when connector lacks capability", async
   assert.equal(db.eventInserts, 0);
 });
 
+test("host session attach resumes available app-server session before attachment", async () => {
+  let internalPath = "";
+  let dispatchBody: Record<string, unknown> | undefined;
+  const db = hostSessionAttachBackfillDb({ supportsAppServer: true, supportsBackfill: false });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            dispatchBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            return new Response(
+              JSON.stringify({
+                session: {
+                  session_id: "session-1",
+                  title: "Recovered app-server title",
+                  title_source: "app_server",
+                  app_server_present: true,
+                  cwd: "/workspace/project",
+                  updated_at: "2026-06-12T10:05:00.000Z"
+                }
+              }),
+              { headers: { "content-type": "application/json; charset=utf-8" } }
+            );
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    host_session: {
+      app_server_present?: boolean;
+      title?: string;
+      title_source?: string;
+      attached_thread_id?: string;
+    };
+    events?: unknown[];
+    backfill?: unknown;
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(internalPath, "/internal/ensure-host-session-app-server");
+  assert.equal(dispatchBody?.connector_id, "connector-online");
+  assert.equal(dispatchBody?.session_id, "session-1");
+  assert.equal(dispatchBody?.title, "Existing session");
+  assert.equal(dispatchBody?.cwd, "/workspace/project");
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.host_session.app_server_present, true);
+  assert.equal(body.host_session.title, "Recovered app-server title");
+  assert.equal(body.host_session.title_source, "app_server");
+  assert.equal(body.events, undefined);
+  assert.equal(body.backfill, undefined);
+});
+
+test("host session attach reuses the app-server ensured connector when connector id is omitted", async () => {
+  const db = hostSessionAttachBackfillDb({ supportsAppServer: true, supportsBackfill: false });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({})
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => new Response(
+            JSON.stringify({
+              session: {
+                session_id: "session-1",
+                title: "Recovered app-server title",
+                title_source: "app_server",
+                app_server_present: true,
+                cwd: "/workspace/project",
+                updated_at: "2026-06-12T10:05:00.000Z"
+              }
+            }),
+            { headers: { "content-type": "application/json; charset=utf-8" } }
+          )
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+
+  assert.equal(response.status, 201);
+  assert.deepEqual(db.hostSessionLookupConnectorIds, [
+    undefined,
+    "connector-online",
+    "connector-online",
+    "connector-online"
+  ]);
+});
+
+test("host session attach falls back without the app-server ensure capability", async () => {
+  const db = hostSessionAttachBackfillDb({
+    supportsAppServer: true,
+    supportsAppServerEnsure: false,
+    supportsBackfill: false
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not receive app-server ensure requests without the ensure capability");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    host_session: {
+      app_server_present?: boolean;
+      title?: string;
+      title_source?: string;
+      attached_thread_id?: string;
+    };
+    events?: unknown[];
+    backfill?: unknown;
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.host_session.app_server_present, false);
+  assert.equal(body.host_session.title, "Existing session");
+  assert.equal(body.host_session.title_source, "metadata");
+  assert.equal(body.events, undefined);
+  assert.equal(body.backfill, undefined);
+});
+
+test("host session attach resumes app-server session when stored attachment rows are stale", async () => {
+  let internalPath = "";
+  const db = hostSessionAttachBackfillDb({
+    alreadyAttached: true,
+    missingAttachedRows: true,
+    supportsAppServer: true,
+    supportsBackfill: false
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL) => {
+            internalPath = new URL(String(input)).pathname;
+            return new Response(
+              JSON.stringify({
+                session: {
+                  session_id: "session-1",
+                  title: "Recovered app-server title",
+                  title_source: "app_server",
+                  app_server_present: true,
+                  cwd: "/workspace/project",
+                  updated_at: "2026-06-12T10:05:00.000Z"
+                }
+              }),
+              { headers: { "content-type": "application/json; charset=utf-8" } }
+            );
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    host_session: {
+      app_server_present?: boolean;
+      title?: string;
+      title_source?: string;
+      attached_thread_id?: string;
+    };
+    events?: unknown[];
+    backfill?: unknown;
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(internalPath, "/internal/ensure-host-session-app-server");
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.host_session.app_server_present, true);
+  assert.equal(body.host_session.title, "Recovered app-server title");
+  assert.equal(body.host_session.title_source, "app_server");
+  assert.equal(body.events, undefined);
+  assert.equal(body.backfill, undefined);
+});
+
 test("host session attach skips backfill when connector is degraded", async () => {
   const db = hostSessionAttachBackfillDb({ connectorStatus: "degraded" });
   const response = await handleRequest(
@@ -777,7 +1000,7 @@ test("host session attach skips backfill when connector is degraded", async () =
 });
 
 test("host session attach skips backfill when the session is already attached", async () => {
-  const db = hostSessionAttachBackfillDb({ alreadyAttached: true });
+  const db = hostSessionAttachBackfillDb({ alreadyAttached: true, supportsAppServer: true });
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/attach", {
       method: "POST",
@@ -795,7 +1018,7 @@ test("host session attach skips backfill when the session is already attached", 
         idFromName: () => ({}) as DurableObjectId,
         get: () => ({
           fetch: async () => {
-            throw new Error("DO should not receive backfill requests for existing attachments");
+            throw new Error("DO should not receive ensure or backfill requests for existing attachments");
           }
         }) as unknown as DurableObjectStub
       } as unknown as DurableObjectNamespace
@@ -3019,11 +3242,17 @@ function hostSessionAttachBackfillDb(
   options: {
     connectorStatus?: string | undefined;
     supportsBackfill?: boolean | undefined;
+    supportsAppServer?: boolean | undefined;
+    supportsAppServerEnsure?: boolean | undefined;
+    appServerPresent?: boolean | undefined;
     alreadyAttached?: boolean | undefined;
+    missingAttachedRows?: boolean | undefined;
   } = {}
-): D1Database & { readonly eventInserts: number } {
+): D1Database & { readonly eventInserts: number; readonly hostSessionLookupConnectorIds: Array<string | undefined> } {
   const connectorStatus = options.connectorStatus ?? "online";
   const supportsBackfill = options.supportsBackfill ?? true;
+  const supportsAppServer = options.supportsAppServer ?? false;
+  const supportsAppServerEnsure = options.supportsAppServerEnsure ?? supportsAppServer;
   const threadId = "thread-host-session-1-connector-online";
   const taskId = "task-host-session-1-connector-online";
   const session = {
@@ -3034,12 +3263,13 @@ function hostSessionAttachBackfillDb(
     session_id: "session-1",
     title: "Existing session",
     title_source: "metadata",
+    app_server_present: options.appServerPresent ? 1 : 0,
     cwd: "/workspace/project",
     attached_task_id: options.alreadyAttached ? taskId : null as string | null,
     attached_thread_id: options.alreadyAttached ? threadId : null as string | null,
     updated_at: "2026-06-12T10:00:00.000Z"
   };
-  let threadRow: Record<string, unknown> | undefined = options.alreadyAttached
+  let threadRow: Record<string, unknown> | undefined = options.alreadyAttached && !options.missingAttachedRows
     ? {
       id: threadId,
       workspace_id: "workspace-api",
@@ -3050,7 +3280,7 @@ function hostSessionAttachBackfillDb(
       updated_at: "2026-06-12T10:00:00.000Z"
     }
     : undefined;
-  let taskRow: Record<string, unknown> | undefined = options.alreadyAttached
+  let taskRow: Record<string, unknown> | undefined = options.alreadyAttached && !options.missingAttachedRows
     ? {
       id: taskId,
       workspace_id: "workspace-api",
@@ -3069,14 +3299,18 @@ function hostSessionAttachBackfillDb(
   let eventInsertCount = 0;
   let sequenceUpdates = 0;
   const insertedEvents = new Set<string>();
+  const hostSessionLookupConnectorIds: Array<string | undefined> = [];
 
   const db = {
     prepare(sql: string) {
       if (/SELECT hs\.id, hs\.connector_id/.test(sql) && /FROM host_sessions hs/.test(sql)) {
         return {
-          bind(sessionId: string, connectorId: string) {
+          bind(sessionId: string, connectorId?: string) {
             assert.equal(sessionId, "session-1");
-            assert.equal(connectorId, "connector-online");
+            hostSessionLookupConnectorIds.push(connectorId);
+            if (connectorId !== undefined) {
+              assert.equal(connectorId, "connector-online");
+            }
             return {
               async first() {
                 return session;
@@ -3096,9 +3330,80 @@ function hostSessionAttachBackfillDb(
                 if (connectorStatus !== "online") {
                   return null;
                 }
+                const capabilities = [
+                  ...(supportsBackfill ? ["host_session_backfill_v2"] : []),
+                  ...(supportsAppServer ? ["codex_app_server_exec"] : []),
+                  ...(supportsAppServerEnsure ? ["host_session_app_server_ensure"] : [])
+                ];
                 return {
-                  capabilities_json: JSON.stringify(supportsBackfill ? ["host_session_backfill_v2"] : [])
+                  capabilities_json: JSON.stringify(capabilities)
                 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT hostname/.test(sql) && /FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { hostname: "mac-studio.local" };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT workspace_id/.test(sql) && /FROM workspace_connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { workspace_id: "workspace-api" };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO host_sessions/.test(sql)) {
+        return {
+          bind(
+            hostSessionId: string,
+            connectorId: string,
+            hostname: string,
+            workspaceId: string,
+            sessionId: string,
+            title: string,
+            titleSource: string,
+            appServerPresent: number,
+            cwd: string | null,
+            discoveredAt: string,
+            updatedAt: string
+          ) {
+            assert.equal(hostSessionId, "host-session-session-1-connector-online");
+            assert.equal(connectorId, "connector-online");
+            assert.equal(hostname, "mac-studio.local");
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(sessionId, "session-1");
+            assert.equal(title, "Recovered app-server title");
+            assert.equal(titleSource, "app_server");
+            assert.equal(appServerPresent, 1);
+            assert.equal(cwd, "/workspace/project");
+            assert.match(discoveredAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(updatedAt, "2026-06-12T10:05:00.000Z");
+            return {
+              async run() {
+                session.title = title;
+                session.title_source = titleSource;
+                session.app_server_present = appServerPresent;
+                session.cwd = cwd ?? "/workspace/project";
+                session.updated_at = updatedAt;
+                return { success: true };
               }
             };
           }
@@ -3110,7 +3415,7 @@ function hostSessionAttachBackfillDb(
           bind(threadId: string, workspaceId: string, title: string, createdAt: string, updatedAt: string) {
             assert.equal(threadId, "thread-host-session-1-connector-online");
             assert.equal(workspaceId, "workspace-api");
-            assert.equal(title, "Existing session");
+            assert.equal(title, session.title);
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             return {
@@ -3145,7 +3450,7 @@ function hostSessionAttachBackfillDb(
             assert.equal(taskId, "task-host-session-1-connector-online");
             assert.equal(workspaceId, "workspace-api");
             assert.equal(threadId, "thread-host-session-1-connector-online");
-            assert.equal(title, "Existing session");
+            assert.equal(title, session.title);
             assert.equal(connectorId, "connector-online");
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
@@ -3281,14 +3586,48 @@ function hostSessionAttachBackfillDb(
         return usageWindowUpsertFake();
       }
 
+      if (/INSERT INTO host_session_syncs/.test(sql)) {
+        return {
+          bind(connectorId: string, syncedAt: string, reportedSessionCount: number, storedSessionCount: number) {
+            assert.equal(connectorId, "connector-online");
+            assert.match(syncedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(reportedSessionCount, 1);
+            assert.equal(storedSessionCount, 1);
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /last_seen_at/.test(sql)) {
+        return {
+          bind(lastSeenAt: string, updatedAt: string, connectorId: string) {
+            assert.match(lastSeenAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get eventInserts() {
       return eventInsertCount;
+    },
+    get hostSessionLookupConnectorIds() {
+      return hostSessionLookupConnectorIds;
     }
   };
 
-  return db as D1Database & { readonly eventInserts: number };
+  return db as D1Database & { readonly eventInserts: number; readonly hostSessionLookupConnectorIds: Array<string | undefined> };
 }
 
 function hostSessionDetachDb(options: {

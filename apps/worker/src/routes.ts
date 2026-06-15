@@ -9,6 +9,7 @@ import {
   type CreateCommandResponse,
   type CreateLocalThreadRequest,
   type DetachHostSessionRequest,
+  type HostSessionAppServerEnsureResult,
   type HostSessionSummary,
   type LocalThreadCreateResult,
   type RefreshHostSessionsResponse,
@@ -35,10 +36,13 @@ import {
   detachHostSessionInDb,
   ensureConnectorInventory,
   findAttachedHostSessionForTaskInDb,
+  hasLiveHostSessionAttachmentInDb,
   listThreadEventsInDb,
   loadBudgetSummaryFromDb,
   loadBootstrapFromDb,
+  loadHostSessionInDb,
   recordHostSessionBackfillEvents,
+  recordHostSessions,
   unarchiveTaskInDb
 } from "./db.js";
 import { budget, sampleBootstrap } from "./sample-data.js";
@@ -290,10 +294,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     try {
+      const sessionId = decodeURIComponent(attachHostSessionMatch[1] ?? "");
+      const connectorId = await ensureHostSessionAppServerIfAvailable(env, sessionId, payload.value.connector_id);
       const attachment = await attachHostSessionInDb(
         env,
-        decodeURIComponent(attachHostSessionMatch[1] ?? ""),
-        payload.value.connector_id
+        sessionId,
+        connectorId ?? payload.value.connector_id
       );
       const { attachment_created: attachmentCreated, ...response } = attachment;
       const backfill = attachmentCreated
@@ -318,6 +324,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return json(request, env, response, 201);
     } catch (error) {
       if (error instanceof NotFoundError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      if (error instanceof ConnectorRpcError) {
         return json(request, env, { error: error.message }, error.status);
       }
       throw error;
@@ -571,6 +580,74 @@ async function requestLocalThreadCreate(
   }
   if (!body.session || !isAgentHostSession(body.session)) {
     throw new ConnectorRpcError("Connector returned an invalid local thread response", 502);
+  }
+  return body.session;
+}
+
+async function ensureHostSessionAppServerIfAvailable(
+  env: Env,
+  sessionId: string,
+  connectorId?: string
+): Promise<string | undefined> {
+  if (!env.DB) return connectorId;
+  const hostSession = await loadHostSessionInDb(env, sessionId, connectorId);
+  if (!hostSession) {
+    throw new NotFoundError("Host session not found");
+  }
+  if (await hasLiveHostSessionAttachmentInDb(env, hostSession)) {
+    return hostSession.connector_id;
+  }
+  if (hostSession.app_server_present) {
+    return hostSession.connector_id;
+  }
+  if (!(await connectorHasCapability(env, hostSession.connector_id, "host_session_app_server_ensure"))) {
+    return hostSession.connector_id;
+  }
+
+  const session = await requestHostSessionAppServerEnsure(env, hostSession);
+  if (session.app_server_present !== true) {
+    throw new ConnectorRpcError("Connector did not return an app-server-backed host session", 502);
+  }
+  await recordHostSessions(
+    env,
+    hostSession.connector_id,
+    { sessions: [session], inventory_scope: "incremental", app_server_inventory_ok: true },
+    new Date().toISOString(),
+    { workspaceId: hostSession.workspace_id }
+  );
+  return hostSession.connector_id;
+}
+
+async function requestHostSessionAppServerEnsure(
+  env: Env,
+  hostSession: HostSessionSummary
+): Promise<AgentHostSession> {
+  if (!env.WORKSPACE_DO) {
+    throw new ConnectorRpcError("Workspace Durable Object binding is unavailable", 503);
+  }
+
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  const response = await stub.fetch("https://workspace-do/internal/ensure-host-session-app-server", {
+    method: "POST",
+    body: JSON.stringify({
+      connector_id: hostSession.connector_id,
+      request_id: `host-session-app-server-${cryptoRandomId().slice(0, 16)}`,
+      session_id: hostSession.session_id,
+      title: hostSession.title,
+      cwd: hostSession.cwd
+    })
+  });
+  const body = await response.json().catch(() => ({})) as Partial<HostSessionAppServerEnsureResult> & { error?: unknown };
+
+  if (!response.ok) {
+    const message = typeof body.error === "string"
+      ? body.error
+      : "Connector could not attach the host session through app-server";
+    throw new ConnectorRpcError(message, response.status);
+  }
+  if (!body.session || !isAgentHostSession(body.session)) {
+    throw new ConnectorRpcError("Connector returned an invalid app-server host session response", 502);
   }
   return body.session;
 }

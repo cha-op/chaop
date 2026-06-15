@@ -1238,6 +1238,83 @@ test("legacy agent.ready without capabilities remains dispatch-ready", async () 
   assert.equal(db.pendingDispatchQueries, 2);
 });
 
+test("ensure host session app-server dispatches to the selected agent socket and resolves the result", async () => {
+  const sent: string[] = [];
+  const agentSocket = {
+    send(message: string) {
+      sent.push(message);
+    },
+    deserializeAttachment() {
+      return { socketType: "agent", connectorId: "connector-online", connectedAt: 300, agentReady: true };
+    }
+  } as unknown as WebSocket;
+  const ctx = {
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "agent:connector-online");
+      return [agentSocket];
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, {} as Env);
+
+  const responsePromise = workspace.fetch(new Request("https://workspace-do/internal/ensure-host-session-app-server", {
+    method: "POST",
+    body: JSON.stringify({
+      connector_id: "connector-online",
+      request_id: "ensure-1",
+      session_id: "session-1",
+      title: "Existing session",
+      cwd: "/workspace/project"
+    })
+  }));
+
+  await waitFor(() => sent.length === 1);
+  assert.equal(sent.length, 1);
+  const dispatch = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { request_id?: string; session_id?: string; title?: string; cwd?: string };
+    target?: { type?: string; id?: string };
+  };
+  assert.equal(dispatch.kind, "host_session.app_server_ensure");
+  assert.equal(dispatch.payload?.request_id, "ensure-1");
+  assert.equal(dispatch.payload?.session_id, "session-1");
+  assert.equal(dispatch.payload?.title, "Existing session");
+  assert.equal(dispatch.payload?.cwd, "/workspace/project");
+  assert.deepEqual(dispatch.target, { type: "connector", id: "connector-online" });
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "host_session.app_server_ensure_result",
+    payload: {
+      request_id: "ensure-1",
+      ok: true,
+      session: {
+        session_id: "session-1",
+        title: "Recovered app-server title",
+        title_source: "app_server",
+        app_server_present: true,
+        cwd: "/workspace/project",
+        updated_at: "2026-06-12T10:05:00.000Z"
+      }
+    }
+  }));
+
+  const response = await responsePromise;
+  const body = await response.json() as {
+    session?: { session_id?: string; app_server_present?: boolean; title_source?: string };
+  };
+  assert.equal(response.status, 200);
+  assert.equal(body.session?.session_id, "session-1");
+  assert.equal(body.session?.app_server_present, true);
+  assert.equal(body.session?.title_source, "app_server");
+
+  assert.equal(sent.length, 2);
+  const ack = JSON.parse(sent[1] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; request_id?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, { kind: "host_session.app_server_ensure_result", request_id: "ensure-1" });
+});
+
 test("sync thread archive dispatches to the selected agent socket and resolves the result", async () => {
   const sent: string[] = [];
   const agentSocket = {

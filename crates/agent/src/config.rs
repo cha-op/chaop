@@ -169,6 +169,7 @@ impl AgentConfig {
             && self.session_inventory.app_server_url.is_some()
         {
             capabilities.push("codex_app_server_exec".to_owned());
+            capabilities.push("host_session_app_server_ensure".to_owned());
         }
         if self.session_inventory.app_server_url.is_some() {
             capabilities.push("app_server_threads".to_owned());
@@ -512,6 +513,11 @@ upgrade_marker_file = "/Users/you/.chaop/app-server-upgrade.marker"
                 .capabilities
                 .contains(&"codex_app_server_exec".to_owned())
         );
+        assert!(
+            request
+                .capabilities
+                .contains(&"host_session_app_server_ensure".to_owned())
+        );
     }
 
     #[test]
@@ -539,6 +545,11 @@ upgrade_marker_file = "/Users/you/.chaop/app-server-upgrade.marker"
             !request
                 .capabilities
                 .contains(&"codex_app_server_exec".to_owned())
+        );
+        assert!(
+            !request
+                .capabilities
+                .contains(&"host_session_app_server_ensure".to_owned())
         );
     }
 

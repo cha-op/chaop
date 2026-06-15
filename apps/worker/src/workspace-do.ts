@@ -2,6 +2,8 @@ import {
   createEnvelope,
   type AgentAppServerInstancesReport,
   type AgentCommandEvent,
+  type HostSessionAppServerEnsureDispatch,
+  type HostSessionAppServerEnsureResult,
   type HostSessionBackfillDispatch,
   type HostSessionBackfillResult,
   type AgentHostSessionsReport,
@@ -32,6 +34,7 @@ import {
 import type { Env } from "./types.js";
 
 const THREAD_CREATE_TIMEOUT_MS = 15_000;
+const HOST_SESSION_APP_SERVER_ENSURE_TIMEOUT_MS = 15_000;
 const HOST_SESSION_BACKFILL_TIMEOUT_MS = 15_000;
 const THREAD_ARCHIVE_SYNC_TIMEOUT_MS = 20_000;
 const APP_SERVER_REPORT_CACHE_MS = 60_000;
@@ -59,6 +62,14 @@ export class WorkspaceDO implements DurableObject {
     {
       timer: ReturnType<typeof setTimeout>;
       resolve: (result: HostSessionBackfillResult) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private readonly pendingHostSessionAppServerEnsures = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      resolve: (result: HostSessionAppServerEnsureResult) => void;
       reject: (error: Error) => void;
     }
   >();
@@ -99,6 +110,10 @@ export class WorkspaceDO implements DurableObject {
 
     if (url.pathname === "/internal/backfill-host-session") {
       return this.backfillHostSession(request);
+    }
+
+    if (url.pathname === "/internal/ensure-host-session-app-server") {
+      return this.ensureHostSessionAppServer(request);
     }
 
     if (url.pathname === "/internal/sync-thread-archive") {
@@ -337,6 +352,19 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    if (message.kind === "host_session.app_server_ensure_result" && isHostSessionAppServerEnsureResult(message.payload)) {
+      this.resolveHostSessionAppServerEnsure(message.payload);
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            kind: "host_session.app_server_ensure_result",
+            request_id: message.payload.request_id
+          })
+        )
+      );
+      return;
+    }
+
     if (message.kind === "thread.archive_sync_result" && isThreadArchiveSyncResult(message.payload)) {
       this.resolveThreadArchiveSync(message.payload);
       ws.send(
@@ -539,6 +567,43 @@ export class WorkspaceDO implements DurableObject {
     }
   }
 
+  private async ensureHostSessionAppServer(request: Request): Promise<Response> {
+    const payload = await request.json().catch(() => ({})) as Partial<HostSessionAppServerEnsureDispatch> & {
+      connector_id?: unknown;
+    };
+    const connectorId = typeof payload.connector_id === "string" ? payload.connector_id : undefined;
+    if (!connectorId) {
+      return jsonResponse({ error: "Missing connector_id" }, 400);
+    }
+    if (!isHostSessionAppServerEnsureDispatch(payload)) {
+      return jsonResponse({ error: "Invalid host session app-server ensure payload" }, 400);
+    }
+
+    const sockets = agentSocketsForConnector(this.ctx, connectorId);
+    const socket = sockets[0];
+    if (!socket) {
+      return jsonResponse({ error: "Connector is not connected" }, 404);
+    }
+
+    try {
+      const result = await this.waitForHostSessionAppServerEnsure(payload.request_id, () => {
+        socket.send(
+          JSON.stringify(
+            createEnvelope("host_session.app_server_ensure", { type: "worker", id: "workspace-do-global" }, payload, {
+              target: { type: "connector", id: connectorId }
+            })
+          )
+        );
+      });
+      if (!result.ok || !result.session) {
+        return jsonResponse({ error: result.error ?? "Connector could not attach the host session through app-server" }, 502);
+      }
+      return jsonResponse({ session: result.session });
+    } catch (error) {
+      return jsonResponse({ error: error instanceof Error ? error.message : "Connector did not respond" }, 504);
+    }
+  }
+
   private async syncThreadArchive(request: Request): Promise<Response> {
     const payload = await request.json().catch(() => ({})) as Partial<ThreadArchiveSyncDispatch> & {
       connector_id?: unknown;
@@ -633,6 +698,36 @@ export class WorkspaceDO implements DurableObject {
     }
     clearTimeout(pending.timer);
     this.pendingHostSessionBackfills.delete(result.request_id);
+    pending.resolve(result);
+  }
+
+  private async waitForHostSessionAppServerEnsure(
+    requestId: string,
+    send: () => void
+  ): Promise<HostSessionAppServerEnsureResult> {
+    return await new Promise<HostSessionAppServerEnsureResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingHostSessionAppServerEnsures.delete(requestId);
+        reject(new Error("Connector timed out while attaching the host session through app-server"));
+      }, HOST_SESSION_APP_SERVER_ENSURE_TIMEOUT_MS);
+      this.pendingHostSessionAppServerEnsures.set(requestId, { timer, resolve, reject });
+      try {
+        send();
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingHostSessionAppServerEnsures.delete(requestId);
+        reject(error instanceof Error ? error : new Error("Connector send failed"));
+      }
+    });
+  }
+
+  private resolveHostSessionAppServerEnsure(result: HostSessionAppServerEnsureResult): void {
+    const pending = this.pendingHostSessionAppServerEnsures.get(result.request_id);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingHostSessionAppServerEnsures.delete(result.request_id);
     pending.resolve(result);
   }
 
@@ -1134,6 +1229,30 @@ function isHostSessionBackfillResult(value: unknown): value is HostSessionBackfi
     (record.error === undefined || typeof record.error === "string") &&
     (record.truncated === undefined || typeof record.truncated === "boolean") &&
     (record.events === undefined || (Array.isArray(record.events) && record.events.every(isAgentBackfillEvent)))
+  );
+}
+
+function isHostSessionAppServerEnsureDispatch(value: unknown): value is HostSessionAppServerEnsureDispatch {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    record.request_id.length > 0 &&
+    typeof record.session_id === "string" &&
+    record.session_id.length > 0 &&
+    (record.title === undefined || typeof record.title === "string") &&
+    (record.cwd === undefined || typeof record.cwd === "string")
+  );
+}
+
+function isHostSessionAppServerEnsureResult(value: unknown): value is HostSessionAppServerEnsureResult {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    typeof record.ok === "boolean" &&
+    (record.error === undefined || typeof record.error === "string") &&
+    (record.session === undefined || isAgentHostSession(record.session))
   );
 }
 

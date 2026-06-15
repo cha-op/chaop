@@ -672,6 +672,34 @@ export async function attachHostSessionInDb(
   };
 }
 
+export async function loadHostSessionInDb(
+  env: Env,
+  sessionId: string,
+  connectorId?: string
+): Promise<HostSessionSummary | undefined> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for host session lookup");
+  }
+  return findHostSession(env, sessionId, connectorId);
+}
+
+export async function hasLiveHostSessionAttachmentInDb(
+  env: Env,
+  hostSession: HostSessionSummary
+): Promise<boolean> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for host session attachment lookup");
+  }
+  if (!hostSession.attached_task_id || !hostSession.attached_thread_id) {
+    return false;
+  }
+  const [task, thread] = await Promise.all([
+    loadTask(env, hostSession.attached_task_id),
+    loadThread(env, hostSession.attached_thread_id)
+  ]);
+  return Boolean(task && thread);
+}
+
 export async function detachHostSessionInDb(
   env: Env,
   sessionId: string,

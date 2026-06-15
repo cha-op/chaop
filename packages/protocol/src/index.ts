@@ -488,6 +488,20 @@ export type ThreadArchiveSyncResult = {
   error?: string | undefined;
 };
 
+export type HostSessionAppServerEnsureDispatch = {
+  request_id: string;
+  session_id: string;
+  title?: string | undefined;
+  cwd?: string | undefined;
+};
+
+export type HostSessionAppServerEnsureResult = {
+  request_id: string;
+  ok: boolean;
+  session?: AgentHostSession | undefined;
+  error?: string | undefined;
+};
+
 export type HostSessionBackfillSummary = {
   attempted: boolean;
   imported_event_count: number;
