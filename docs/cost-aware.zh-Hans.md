@@ -32,14 +32,14 @@
 
 D1 绑定可用时，Browser 里的 Budget Board 会使用 Chaop 自己控制的数据库信号，而不是静态 sample data：
 
-- 分别读取 `daily`、`four_hour` 和 `burst` 的最新一条 `usage_windows` row。
-- 从 sampled usage windows、在线 connectors 和未归档 tasks 中取当前最严重的 `budget_state`。
+- 分别读取 `daily`、`four_hour` 和 `burst` 当前仍未结束的 `usage_windows` row。
+- 从当前 sampled usage windows、在线 connectors 和未归档 tasks 中取当前最严重的 `budget_state`。
 - Delayed events、compacted events 和 local spool bytes 优先来自 daily usage window；如果没有 daily window，则使用下一个可用的 sampled window。
 - 页面会显示 source metadata，区分当前是 D1 usage windows、本地 sample data，还是空数据库。
 - 缺失的 usage window 会显示为 missing sample，不会显示成 `0%` usage。
 - 浏览器 WebSocket 处于 live 状态时，UI 只会每 60 秒刷新一次 `/api/usage-summary` 来更新 Budget Board 和 top-bar metrics；如果 WebSocket fallback，原有 10 秒 bootstrap polling 会提供同一份数据，并停止 budget-only polling。
 
-Worker 会在持久化 thread events 的同类路径里写入这些 windows，包括有界 history backfill inserts。每个持久化 thread event 记为一个 Chaop usage unit；低优先级 P2/P3 events 会增加 delayed counter，`command.output` summaries 会增加 compacted counter，已存储 summary bytes 会增加 local spool byte counter。Worker 每种 window type 最多读取一行，再读取 grouped budget-state counts。它不会扫描完整 event table，不会调用 Cloudflare billing APIs，不会调用 OpenAI billing APIs，也不需要部署实例 secrets。请把 Budget Board 当作 operator posture view，而不是官方账单来源；上面的 Cloudflare 和 OpenAI budget alerts 仍然需要开启。
+Worker 会在持久化 thread events 的同类路径里写入这些 windows，包括有界 history backfill inserts。每个持久化 thread event 记为一个 Chaop usage unit；低优先级 P2/P3 events 会增加 delayed counter，`command.output` summaries 会增加 compacted counter，已存储 summary bytes 会增加 local spool byte counter。Worker 每种 window type 最多读取一条仍未结束的 row，再读取 grouped budget-state counts。已过期的 windows 会被当作 missing samples，直到新事件写入当前 windows。它不会扫描完整 event table，不会调用 Cloudflare billing APIs，不会调用 OpenAI billing APIs，也不需要部署实例 secrets。请把 Budget Board 当作 operator posture view，而不是官方账单来源；上面的 Cloudflare 和 OpenAI budget alerts 仍然需要开启。
 
 ## 当前防护
 

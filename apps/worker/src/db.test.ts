@@ -1561,6 +1561,7 @@ function agentEventGuardDb(command: {
       }
 
       if (/INSERT INTO usage_windows/.test(sql)) {
+        assert.match(sql, /updated_at = CASE\s+WHEN updated_at > excluded\.updated_at THEN updated_at\s+ELSE excluded\.updated_at\s+END/);
         return usageWindowUpsertFake((args) => {
           counters.usageWindowUpserts += 1;
           counters.usageWindowBinds.push(args);

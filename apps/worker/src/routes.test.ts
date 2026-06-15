@@ -1194,6 +1194,36 @@ test("usage summary marks missing D1 budget windows as unsampled", async () => {
   assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct]), [["four_hour", 88.9]]);
 });
 
+test("usage summary ignores expired D1 budget windows", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/usage-summary", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] })
+    }
+  );
+  const body = (await response.json()) as {
+    source: string;
+    daily_used_pct: number | null;
+    four_hour_used_pct: number | null;
+    burst_used_pct: number | null;
+    window_sample_count: number;
+    windows: unknown[];
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.source, "empty");
+  assert.equal(body.daily_used_pct, null);
+  assert.equal(body.four_hour_used_pct, null);
+  assert.equal(body.burst_used_pct, null);
+  assert.equal(body.window_sample_count, 0);
+  assert.deepEqual(body.windows, []);
+});
+
 test("agent bootstrap rejects invalid secret", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/connector/bootstrap", { method: "POST", body: "{}" }),
@@ -2039,7 +2069,10 @@ function readOnlyBootstrapDb(): D1Database {
   } as unknown as D1Database;
 }
 
-function budgetSummaryDb(omitWindowTypes: string[] = []): D1Database {
+function budgetSummaryDb(
+  omitWindowTypes: string[] = [],
+  options: { expiredWindowTypes?: string[] | undefined } = {}
+): D1Database {
   const windows: Record<string, Record<string, unknown>> = {
     daily: {
       id: "usage-daily",
@@ -2089,12 +2122,19 @@ function budgetSummaryDb(omitWindowTypes: string[] = []): D1Database {
     prepare(sql: string) {
       if (/FROM usage_windows/.test(sql)) {
         assert.match(sql, /WHERE window_type = \?/);
+        assert.match(sql, /window_start <= \?/);
+        assert.match(sql, /window_end > \?/);
         assert.match(sql, /ORDER BY window_end DESC, updated_at DESC, id DESC/);
         assert.match(sql, /LIMIT 1/);
         return {
-          bind(windowType: string) {
+          bind(windowType: string, windowStartAt: string, windowEndAt: string) {
+            assert.match(windowStartAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(windowEndAt, windowStartAt);
             return {
               async first() {
+                if (options.expiredWindowTypes?.includes(windowType)) {
+                  return undefined;
+                }
                 return windows[windowType];
               }
             };

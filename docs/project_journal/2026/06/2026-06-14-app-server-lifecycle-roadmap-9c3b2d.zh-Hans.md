@@ -78,9 +78,9 @@ superseded_by:
 实现检查点：
 - Browser bootstrap 和 `/api/usage-summary` 在有 database binding 时，现在会共用 D1-backed `BudgetSummary` 路径。
 - Persisted thread events 现在会在 event persistence paths 中维护有界的 `daily`、`four_hour` 和 `burst` `usage_windows` rows，包括有界 history backfill inserts，因此正常生产流量会产生 Budget Board 读取的 sampled windows。
-- Worker 只 sample 最新的 `daily`、`four_hour` 和 `burst` `usage_windows` rows，并通过 `idx_usage_windows_type_end` 支撑读取；同时只读取 online connectors 和未归档 tasks 的 grouped budget-state counts。
+- Worker 只 sample 当前仍未结束的 `daily`、`four_hour` 和 `burst` `usage_windows` rows，并通过 `idx_usage_windows_type_end` 支撑读取；同时只读取 online connectors 和未归档 tasks 的 grouped budget-state counts。
 - Budget Board 现在会显示 source metadata、generated time、sampled usage windows、window freshness、delayed/compacted event counts 和 local spool bytes，但不增加高频 polling；WebSocket live sessions 会使用 60 秒一次的 budget-only refresh path。
-- Review hardening 让 bootstrap 不再额外发起 connector/task budget-state aggregate queries，legacy unknown metric source 会明确显示为未知来源，API 会保留超过 100% 的 over-budget 百分比，只在 UI meter control 上单独 clamp，缺失的 usage windows 会显示为 missing samples 而不是 `0%`，并用 `updated_at` 加 `id` 排序同一 window-end 的重复 samples。
+- Review hardening 让 bootstrap 不再额外发起 connector/task budget-state aggregate queries，legacy unknown metric source 会明确显示为未知来源，API 会保留超过 100% 的 over-budget 百分比，只在 UI meter control 上单独 clamp，缺失或过期的 usage windows 会显示为 missing samples 而不是 `0%`，并用 `updated_at` 加 `id` 排序同一 window-end 的重复 samples，同时避免较旧的 backfill events 把 usage-window freshness 往回推。
 - 成本和部署文档现在说明 Budget Board 是有界的 Chaop posture view，不能替代 Cloudflare 或 OpenAI billing alerts。
 
 ## 每个 PR 的合并门禁

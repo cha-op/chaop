@@ -32,14 +32,14 @@ Configure these before leaving the connector running unattended:
 
 When D1 is bound, the Browser Budget Board uses Chaop-controlled database signals instead of static sample data:
 
-- The latest `usage_windows` row for each of `daily`, `four_hour`, and `burst`.
-- The worst current `budget_state` from sampled usage windows, online connectors, and unarchived tasks.
+- The current still-open `usage_windows` row for each of `daily`, `four_hour`, and `burst`.
+- The worst current `budget_state` from sampled current usage windows, online connectors, and unarchived tasks.
 - Delayed events, compacted events, and local spool bytes from the daily usage window when present, otherwise the next available sampled window.
 - Source metadata showing whether the board is backed by D1 usage windows, local sample data, or an empty database.
 - Missing usage windows are displayed as missing samples, not as `0%` usage.
 - While the browser WebSocket is live, the UI refreshes only `/api/usage-summary` every 60 seconds for Budget Board/top-bar metrics; when WebSocket falls back, the existing 10-second bootstrap polling supplies the same data and the budget-only poll is stopped.
 
-The Worker writes those windows from the same paths that persist thread events, including bounded history backfill inserts. Each persisted thread event counts as one Chaop usage unit; low-priority P2/P3 events increment the delayed counter, `command.output` summaries increment the compacted counter, and stored summary bytes increment the local spool byte counter. The Worker reads at most one row per window type plus grouped budget-state counts. It does not scan the full event table, call Cloudflare billing APIs, call OpenAI billing APIs, or require deployment-instance secrets. Treat the board as an operator posture view, not as the official invoice source. Keep the Cloudflare and OpenAI budget alerts above enabled.
+The Worker writes those windows from the same paths that persist thread events, including bounded history backfill inserts. Each persisted thread event counts as one Chaop usage unit; low-priority P2/P3 events increment the delayed counter, `command.output` summaries increment the compacted counter, and stored summary bytes increment the local spool byte counter. The Worker reads at most one still-open row per window type plus grouped budget-state counts. Expired windows are treated as missing samples until new events write the current windows. It does not scan the full event table, call Cloudflare billing APIs, call OpenAI billing APIs, or require deployment-instance secrets. Treat the board as an operator posture view, not as the official invoice source. Keep the Cloudflare and OpenAI budget alerts above enabled.
 
 ## Current Safeguards
 

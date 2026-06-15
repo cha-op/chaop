@@ -135,9 +135,9 @@ export async function loadBudgetSummaryFromDb(
   }
 
   const [daily, fourHour, burst, connectorStates, taskStates] = await Promise.all([
-    latestUsageWindow(env, "daily"),
-    latestUsageWindow(env, "four_hour"),
-    latestUsageWindow(env, "burst"),
+    currentUsageWindow(env, "daily", generatedAt),
+    currentUsageWindow(env, "four_hour", generatedAt),
+    currentUsageWindow(env, "burst", generatedAt),
     snapshots.connectors
       ? Promise.resolve(connectorBudgetStateCounts(snapshots.connectors))
       : listConnectorBudgetStates(env),
@@ -3048,16 +3048,20 @@ async function listAppServerInstancesForConnector(env: Env, connectorId: string)
   return rows.map(appServerInstanceFromRow);
 }
 
-async function latestUsageWindow(env: Env, windowType: BudgetWindowType): Promise<UsageWindowRow | undefined> {
+async function currentUsageWindow(
+  env: Env,
+  windowType: BudgetWindowType,
+  generatedAt: string
+): Promise<UsageWindowRow | undefined> {
   const row = await env.DB!.prepare(
     `SELECT id, window_type, window_start, window_end, budget_state, used_pct,
             events_received, events_compacted, events_delayed, local_spool_bytes, updated_at
      FROM usage_windows
-     WHERE window_type = ?
+     WHERE window_type = ? AND window_start <= ? AND window_end > ?
      ORDER BY window_end DESC, updated_at DESC, id DESC
      LIMIT 1`
   )
-    .bind(windowType)
+    .bind(windowType, generatedAt, generatedAt)
     .first<UsageWindowRow>();
   return row ?? undefined;
 }
@@ -3755,7 +3759,10 @@ async function upsertUsageWindow(
        events_compacted = events_compacted + excluded.events_compacted,
        events_delayed = events_delayed + excluded.events_delayed,
        local_spool_bytes = local_spool_bytes + excluded.local_spool_bytes,
-       updated_at = excluded.updated_at`
+       updated_at = CASE
+         WHEN updated_at > excluded.updated_at THEN updated_at
+         ELSE excluded.updated_at
+       END`
   )
     .bind(
       window.id,

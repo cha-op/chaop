@@ -717,7 +717,7 @@ export class ChaopApp extends LitElement {
               <dd title=${formatAbsoluteIso(generatedAt)}>${formatRelativeIso(generatedAt, this.clockNow)}</dd>
             </div>
             <div>
-              <dt>Latest window</dt>
+              <dt>Current window</dt>
               <dd title=${newestWindow ? formatAbsoluteIso(newestWindow) : "No usage window"}>
                 ${newestWindow ? formatRelativeIso(newestWindow, this.clockNow) : "none"}
               </dd>
