@@ -141,7 +141,44 @@ test("recordAppServerInstances keeps matching instance keys under different plac
   );
 });
 
-test("recordAppServerInstances persists placement changes inside debounce window", async () => {
+test("recordAppServerInstances keeps same-scope instance keys across incremental placement reports", async () => {
+  const db = appServerInstancesDb();
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [
+      appServerInstanceReport("healthy", {
+        instance_key: "default",
+        scope: "thread",
+        thread_id: "thread-1"
+      })
+    ]
+  }, "2026-06-14T10:00:00.000Z");
+
+  await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    instances: [
+      appServerInstanceReport("healthy", {
+        instance_key: "default",
+        scope: "thread",
+        thread_id: "thread-2"
+      })
+    ]
+  }, "2026-06-14T10:01:00.000Z");
+
+  assert.equal(db.writes, 2);
+  assert.deepEqual(
+    db.rows().map((instance) => [
+      instance.instance_key,
+      instance.scope,
+      instance.thread_id,
+      instance.state
+    ]),
+    [
+      ["default", "thread", "thread-1", "healthy"],
+      ["default", "thread", "thread-2", "healthy"]
+    ]
+  );
+});
+
+test("recordAppServerInstances stops omitted placement targets in snapshots", async () => {
   const db = appServerInstancesDb();
   await recordAppServerInstances({ DB: db } as Env, "connector-1", {
     instances: [
@@ -154,6 +191,7 @@ test("recordAppServerInstances persists placement changes inside debounce window
   }, "2026-06-14T10:00:00.000Z");
 
   const result = await recordAppServerInstances({ DB: db } as Env, "connector-1", {
+    snapshot: true,
     instances: [
       appServerInstanceReport("healthy", {
         instance_key: "workspace-api",
@@ -165,14 +203,16 @@ test("recordAppServerInstances persists placement changes inside debounce window
 
   assert.equal(db.writes, 3);
   assert.deepEqual(
-    result.app_server_instances.map((instance) => [
+    result.app_server_instances
+      .map((instance) => [
       instance.workspace_id,
       instance.state,
       instance.status_summary
-    ]),
+      ])
+      .sort(([leftWorkspace], [rightWorkspace]) => String(leftWorkspace).localeCompare(String(rightWorkspace))),
     [
       ["workspace-api", "healthy", "Managed app-server report."],
-      ["workspace-old", "stopped", "Instance placement was replaced by a newer connector report."]
+      ["workspace-old", "stopped", "Instance was omitted from the latest connector snapshot."]
     ]
   );
 });
@@ -3551,10 +3591,13 @@ type AppServerInstanceTestRow = {
   updated_at: string;
 };
 
-function appServerInstancesDb(): D1Database & { writes: number } {
+function appServerInstancesDb(): D1Database & { writes: number; rows(): AppServerInstanceTestRow[] } {
   const rows = new Map<string, AppServerInstanceTestRow>();
   const db = {
     writes: 0,
+    rows() {
+      return [...rows.values()];
+    },
     prepare(sql: string) {
       if (/SELECT id\s+FROM connectors/.test(sql)) {
         return {
@@ -3563,27 +3606,6 @@ function appServerInstancesDb(): D1Database & { writes: number } {
             return {
               async first() {
                 return { id: connectorId };
-              }
-            };
-          }
-        };
-      }
-
-      if (/SELECT id, connector_id, instance_key/.test(sql) && /placement_key <> \?/.test(sql)) {
-        return {
-          bind(connectorId: string, instanceKey: string, scope: AppServerInstanceTestRow["scope"], placementKey: string) {
-            return {
-              async all() {
-                return {
-                  results: [...rows.values()].filter(
-                    (row) =>
-                      row.connector_id === connectorId &&
-                      row.instance_key === instanceKey &&
-                      row.scope === scope &&
-                      row.placement_key !== placementKey &&
-                      row.state !== "stopped"
-                  )
-                };
               }
             };
           }
@@ -3730,5 +3752,5 @@ function appServerInstancesDb(): D1Database & { writes: number } {
       throw new Error(`Unexpected SQL in app-server instance fake: ${sql}`);
     }
   };
-  return db as unknown as D1Database & { writes: number };
+  return db as unknown as D1Database & { writes: number; rows(): AppServerInstanceTestRow[] };
 }

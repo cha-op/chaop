@@ -29,10 +29,31 @@ INSERT INTO app_server_instances_next (
   created_at, updated_at
 )
 SELECT
-  id, connector_id, instance_key, scope, NULL, NULL, 'connector',
-  endpoint_type, state, active_turn_count, generation, status_summary, last_error,
-  report_fingerprint, last_seen_at, state_changed_at, summary_changed_at,
-  created_at, updated_at
+  id,
+  connector_id,
+  instance_key,
+  'connector',
+  NULL,
+  NULL,
+  'connector',
+  endpoint_type,
+  CASE WHEN scope = 'connector' THEN state ELSE 'stopped' END,
+  CASE WHEN scope = 'connector' THEN active_turn_count ELSE 0 END,
+  generation,
+  CASE
+    WHEN scope = 'connector' THEN status_summary
+    ELSE 'Legacy placement metadata was reset during migration.'
+  END,
+  CASE WHEN scope = 'connector' THEN last_error ELSE NULL END,
+  CASE
+    WHEN scope = 'connector' THEN report_fingerprint
+    ELSE 'migration-0011-legacy-placement-reset'
+  END,
+  last_seen_at,
+  CASE WHEN scope = 'connector' THEN state_changed_at ELSE updated_at END,
+  CASE WHEN scope = 'connector' THEN summary_changed_at ELSE updated_at END,
+  created_at,
+  updated_at
 FROM app_server_instances;
 
 DROP TABLE app_server_instances;

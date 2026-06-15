@@ -150,18 +150,7 @@ export async function recordAppServerInstances(
       .bind(connectorId, instance.instance_key, placementKey)
       .first<AppServerInstanceRow>();
     const shouldPersist = shouldPersistAppServerInstance(existing, instance, fingerprint, syncedAt);
-    const displaced = await stopDisplacedAppServerInstancePlacements(
-      env,
-      connectorId,
-      instance,
-      placementKey,
-      reportedIdentities,
-      syncedAt
-    );
-    if (!shouldPersist) {
-      persisted.push(...displaced);
-      continue;
-    }
+    if (!shouldPersist) continue;
 
     const id = existing?.id ?? appServerInstanceId(connectorId, instance.instance_key, placementKey);
     const stateChangedAt = existing && existing.state === instance.state
@@ -229,10 +218,7 @@ export async function recordAppServerInstances(
     )
       .bind(connectorId, instance.instance_key, placementKey)
       .first<AppServerInstanceRow>();
-    if (row) {
-      persisted.push(appServerInstanceFromRow(row));
-      persisted.push(...displaced);
-    }
+    if (row) persisted.push(appServerInstanceFromRow(row));
   }
 
   if (report.snapshot === true) {
@@ -3034,44 +3020,6 @@ function appServerInstanceFromRow(row: AppServerInstanceRow): AppServerInstanceS
     state_changed_at: row.state_changed_at,
     updated_at: row.updated_at
   };
-}
-
-async function stopDisplacedAppServerInstancePlacements(
-  env: Env,
-  connectorId: string,
-  instance: AgentAppServerInstancesReport["instances"][number],
-  placementKey: string,
-  reportedIdentities: Set<string>,
-  syncedAt: string
-): Promise<AppServerInstanceSummary[]> {
-  const rows = await allRows<AppServerInstanceRow>(
-    env.DB!.prepare(
-      `SELECT id, connector_id, instance_key, scope, workspace_id, thread_id, placement_key,
-              endpoint_type, state,
-              active_turn_count, generation, status_summary, last_error,
-              report_fingerprint, last_seen_at, state_changed_at,
-              summary_changed_at, created_at, updated_at
-       FROM app_server_instances
-       WHERE connector_id = ?
-         AND instance_key = ?
-         AND scope = ?
-         AND placement_key <> ?
-         AND state <> 'stopped'`
-    ).bind(connectorId, instance.instance_key, instance.scope, placementKey)
-  );
-  const stopped: AppServerInstanceSummary[] = [];
-  for (const row of rows) {
-    if (reportedIdentities.has(appServerInstanceIdentityKey(row.instance_key, row.placement_key))) continue;
-    stopped.push(
-      await stopAppServerInstanceRow(
-        env,
-        row,
-        "Instance placement was replaced by a newer connector report.",
-        syncedAt
-      )
-    );
-  }
-  return stopped;
 }
 
 async function stopAppServerInstanceRow(
