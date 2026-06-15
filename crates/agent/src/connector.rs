@@ -825,19 +825,34 @@ fn handle_text_message(
             deferred_messages,
         );
         app_server.finish_turn();
-        send_app_server_instances(
-            socket,
-            config,
-            app_server,
-            app_server_instances_state,
-            true,
-            false,
-        )?;
+        let post_turn_runtime_config = app_server.runtime_config(config);
+        if send_agent_ready(socket, &post_turn_runtime_config, agent_ready_state, false)?
+            .should_send_host_sessions()
+        {
+            send_app_server_instances(
+                socket,
+                &post_turn_runtime_config,
+                app_server,
+                app_server_instances_state,
+                true,
+                true,
+            )?;
+            send_host_sessions(socket, &post_turn_runtime_config, host_sessions_state, true)?;
+        } else {
+            send_app_server_instances(
+                socket,
+                &post_turn_runtime_config,
+                app_server,
+                app_server_instances_state,
+                true,
+                false,
+            )?;
+        }
         dispatch_events(
             socket,
             &dispatch.command,
             events?,
-            config,
+            &post_turn_runtime_config,
             app_server_instances_state,
             host_sessions_state,
             deferred_messages,
