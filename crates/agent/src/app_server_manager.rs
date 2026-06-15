@@ -13,6 +13,8 @@ use tungstenite::http::Uri;
 const APP_SERVER_SPAWN_ATTEMPTS: usize = 3;
 const APP_SERVER_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(20);
 const APP_SERVER_EXTERNAL_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const APP_SERVER_DRAIN_TIMEOUT_DETAIL: &str =
+    "Drain timeout elapsed while active turns were still running.";
 
 #[derive(Debug)]
 pub struct AppServerManager {
@@ -296,17 +298,26 @@ impl AppServerManager {
             return;
         }
 
-        let detail = "Drain timeout elapsed while active turns were still running.";
         let error = self
             .last_error
             .as_deref()
-            .map(|last_error| format!("{detail} Last restart error: {last_error}"))
-            .unwrap_or_else(|| detail.to_owned());
+            .map(|last_error| {
+                format!("{APP_SERVER_DRAIN_TIMEOUT_DETAIL} Last restart error: {last_error}")
+            })
+            .unwrap_or_else(|| APP_SERVER_DRAIN_TIMEOUT_DETAIL.to_owned());
         self.set_state(
             AppServerInstanceState::Degraded,
             reason.forced_degraded_summary(),
             Some(&error),
         );
+    }
+
+    fn should_preserve_forced_restart_backoff_summary(&self) -> bool {
+        self.state == AppServerInstanceState::Degraded
+            && self
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with(APP_SERVER_DRAIN_TIMEOUT_DETAIL))
     }
 
     fn arm_next_scheduled_restart(&mut self, config: &AgentConfig) {
@@ -391,6 +402,9 @@ impl AppServerManager {
         }
 
         if !self.can_attempt_start(config) {
+            if self.should_preserve_forced_restart_backoff_summary() {
+                return None;
+            }
             self.set_state(
                 AppServerInstanceState::Degraded,
                 "Managed app-server restart backoff is active.",
@@ -1309,6 +1323,24 @@ mod tests {
             )
         );
         assert!(!manager.can_attempt_start(&config));
+
+        manager.finish_turn();
+        let post_turn_runtime = manager.runtime_config(&config);
+
+        assert_eq!(post_turn_runtime.session_inventory.app_server_url, None);
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some(
+                "Managed app-server scheduled restart forced after drain timeout and did not become healthy."
+            )
+        );
+        assert_eq!(
+            manager.last_error.as_deref(),
+            Some(
+                "Drain timeout elapsed while active turns were still running. Last restart error: No such file or directory (os error 2)"
+            )
+        );
     }
 
     #[test]
