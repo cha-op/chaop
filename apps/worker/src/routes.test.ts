@@ -2089,7 +2089,7 @@ function budgetSummaryDb(omitWindowTypes: string[] = []): D1Database {
     prepare(sql: string) {
       if (/FROM usage_windows/.test(sql)) {
         assert.match(sql, /WHERE window_type = \?/);
-        assert.match(sql, /ORDER BY window_end DESC, updated_at DESC/);
+        assert.match(sql, /ORDER BY window_end DESC, updated_at DESC, id DESC/);
         assert.match(sql, /LIMIT 1/);
         return {
           bind(windowType: string) {

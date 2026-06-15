@@ -3048,7 +3048,7 @@ async function latestUsageWindow(env: Env, windowType: BudgetWindowType): Promis
             events_received, events_compacted, events_delayed, local_spool_bytes, updated_at
      FROM usage_windows
      WHERE window_type = ?
-     ORDER BY window_end DESC, updated_at DESC
+     ORDER BY window_end DESC, updated_at DESC, id DESC
      LIMIT 1`
   )
     .bind(windowType)
