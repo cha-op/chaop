@@ -256,7 +256,33 @@ impl AppServerManager {
         if url.is_some() {
             self.arm_next_scheduled_restart(config);
         }
+        if force_restart {
+            self.record_forced_restart_result(pending.reason, url.is_some());
+        }
         url
+    }
+
+    fn record_forced_restart_result(&mut self, reason: AppServerRestartReason, healthy: bool) {
+        if healthy {
+            self.set_state(
+                AppServerInstanceState::Healthy,
+                reason.forced_healthy_summary(),
+                None,
+            );
+            return;
+        }
+
+        let detail = "Drain timeout elapsed while active turns were still running.";
+        let error = self
+            .last_error
+            .as_deref()
+            .map(|last_error| format!("{detail} Last restart error: {last_error}"))
+            .unwrap_or_else(|| detail.to_owned());
+        self.set_state(
+            AppServerInstanceState::Degraded,
+            reason.forced_degraded_summary(),
+            Some(&error),
+        );
     }
 
     fn arm_next_scheduled_restart(&mut self, config: &AgentConfig) {
@@ -638,6 +664,28 @@ impl AppServerRestartReason {
             (Self::Scheduled, true) => "forced scheduled managed app-server restart",
             (Self::UpgradeMarker, false) => "upgrade marker managed app-server restart",
             (Self::UpgradeMarker, true) => "forced upgrade marker managed app-server restart",
+        }
+    }
+
+    fn forced_healthy_summary(self) -> &'static str {
+        match self {
+            Self::Scheduled => {
+                "Managed app-server scheduled restart forced after drain timeout and is healthy."
+            }
+            Self::UpgradeMarker => {
+                "Managed app-server upgrade restart forced after drain timeout and is healthy."
+            }
+        }
+    }
+
+    fn forced_degraded_summary(self) -> &'static str {
+        match self {
+            Self::Scheduled => {
+                "Managed app-server scheduled restart forced after drain timeout and did not become healthy."
+            }
+            Self::UpgradeMarker => {
+                "Managed app-server upgrade restart forced after drain timeout and did not become healthy."
+            }
         }
     }
 }
@@ -1061,8 +1109,16 @@ mod tests {
         assert_eq!(manager.pending_restart, None);
         assert_eq!(manager.state, AppServerInstanceState::Degraded);
         assert_eq!(
+            manager.status_summary.as_deref(),
+            Some(
+                "Managed app-server upgrade restart forced after drain timeout and did not become healthy."
+            )
+        );
+        assert_eq!(
             manager.last_error.as_deref(),
-            Some("No such file or directory (os error 2)")
+            Some(
+                "Drain timeout elapsed while active turns were still running. Last restart error: No such file or directory (os error 2)"
+            )
         );
     }
 

@@ -25,6 +25,7 @@ superseded_by:
 - Added `draining` lifecycle transitions that return no app-server URL in runtime config, so `agent.ready` stops advertising app-server thread/archive/execution capabilities during drain.
 - Added a bounded app-server runtime maintenance tick while app-server commands are running, so scheduled or marker-triggered restarts can enter drain and report capability changes during long turns without doing ordinary health-check restarts.
 - Treat first creation of the configured upgrade marker file as a restart request when the file did not exist at connector startup.
+- Preserve forced drain-timeout restart summaries after the restart attempt, including the underlying restart error when the forced restart does not become healthy.
 - Restart attempts clear the pending drain request, reset the periodic schedule, stop the managed child, and reuse the existing health-check/start path.
 - Updated deployment guide examples and operator guidance for scheduled restart and upgrade marker usage.
 
