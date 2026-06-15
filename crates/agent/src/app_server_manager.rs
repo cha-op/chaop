@@ -74,6 +74,16 @@ impl AppServerManager {
         self.runtime_config_with_start_policy(config, false)
     }
 
+    pub fn runtime_config_during_active_turn(&mut self, config: &AgentConfig) -> AgentConfig {
+        if !self.enabled {
+            return config.clone();
+        }
+
+        let mut runtime = config.clone();
+        runtime.session_inventory.app_server_url = self.active_turn_app_server_url(config);
+        runtime
+    }
+
     fn runtime_config_with_start_policy(
         &mut self,
         config: &AgentConfig,
@@ -132,6 +142,15 @@ impl AppServerManager {
         }
 
         self.ensure_ready(config)
+    }
+
+    fn active_turn_app_server_url(&mut self, config: &AgentConfig) -> Option<String> {
+        self.schedule_configured_restart_requests(config);
+        if self.pending_restart.is_some() {
+            return self.advance_pending_restart(config);
+        }
+
+        config.session_inventory.app_server_url.clone()
     }
 
     fn schedule_configured_restart_requests(&mut self, config: &AgentConfig) {
@@ -918,6 +937,28 @@ mod tests {
 
         assert!(first_deadline.is_some());
         assert_eq!(manager.next_scheduled_restart_at, first_deadline);
+    }
+
+    #[test]
+    fn active_turn_runtime_config_preserves_url_without_health_restart() {
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .restart_backoff_seconds = 60;
+        let mut manager = AppServerManager::new(&config);
+        manager.begin_turn();
+
+        let runtime = manager.runtime_config_during_active_turn(&config);
+
+        assert_eq!(
+            runtime.session_inventory.app_server_url.as_deref(),
+            Some("ws://127.0.0.1:65530")
+        );
+        assert_eq!(manager.state, AppServerInstanceState::Stopped);
+        assert_eq!(manager.last_error, None);
+        assert!(manager.can_attempt_start(&config));
     }
 
     #[test]

@@ -1041,7 +1041,7 @@ fn maintain_app_server_runtime_during_wait(
     agent_ready_state: &mut AgentReadyState,
     host_sessions_state: &mut HostSessionsSendState,
 ) -> Result<AgentConfig, Box<dyn std::error::Error>> {
-    let runtime_config = app_server.runtime_config(config);
+    let runtime_config = app_server.runtime_config_during_active_turn(config);
     if send_agent_ready(socket, &runtime_config, agent_ready_state, false)?
         .should_send_host_sessions()
     {
@@ -1191,18 +1191,24 @@ fn wait_for_app_server_command_events(
         }
 
         if Instant::now() >= next_runtime_maintenance_at {
-            runtime_config = maintain_app_server_runtime_during_wait(
+            match maintain_app_server_runtime_during_wait(
                 socket,
                 &runtime_config,
                 app_server,
                 app_server_instances_state,
                 agent_ready_state,
                 host_sessions_state,
-            )?;
+            ) {
+                Ok(next_runtime_config) => runtime_config = next_runtime_config,
+                Err(error) => {
+                    cancel_codex_worker(&cancel, worker.take())?;
+                    return Err(error);
+                }
+            }
             next_runtime_maintenance_at = Instant::now() + connector_read_tick();
         }
 
-        match socket.read() {
+        let socket_result: Result<(), Box<dyn std::error::Error>> = match socket.read() {
             Ok(Message::Text(text)) => {
                 if !apply_agent_ready_ack_text(text.as_ref(), agent_ready_state)? {
                     handle_background_text_message(
@@ -1214,18 +1220,26 @@ fn wait_for_app_server_command_events(
                         deferred_messages,
                     )?;
                 }
+                Ok(())
             }
-            Ok(Message::Ping(payload)) => socket.send(Message::Pong(payload))?,
+            Ok(Message::Ping(payload)) => {
+                socket.send(Message::Pong(payload))?;
+                Ok(())
+            }
             Ok(Message::Close(_)) => {
                 cancel_codex_worker(&cancel, worker.take())?;
                 return Err("connection closed while app-server command was running".into());
             }
-            Ok(_) => {}
-            Err(error) if is_read_timeout(&error) => {}
+            Ok(_) => Ok(()),
+            Err(error) if is_read_timeout(&error) => Ok(()),
             Err(error) => {
                 cancel_codex_worker(&cancel, worker.take())?;
                 return Err(error.into());
             }
+        };
+        if let Err(error) = socket_result {
+            cancel_codex_worker(&cancel, worker.take())?;
+            return Err(error);
         }
     }
 }

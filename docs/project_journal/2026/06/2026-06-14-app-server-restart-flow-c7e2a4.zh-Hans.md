@@ -23,7 +23,7 @@ superseded_by:
 - 增加 managed app-server 配置项：`drain_timeout_seconds`、`scheduled_restart_interval_seconds` 和 `upgrade_marker_file`。
 - 为 AppServerManager 增加 pending restarts、scheduled restart deadlines，以及 upgrade marker modification tracking。
 - 增加 `draining` lifecycle transitions：runtime config 在 drain 期间不返回 app-server URL，因此 `agent.ready` 不再声明 app-server thread/archive/execution capabilities。
-- 在 app-server command 运行期间增加有界的 app-server runtime maintenance tick，因此 scheduled 或 marker-triggered restart 可以在长 turn 期间进入 drain，并上报 capability 变化。
+- 在 app-server command 运行期间增加有界的 app-server runtime maintenance tick，因此 scheduled 或 marker-triggered restart 可以在长 turn 期间进入 drain、上报 capability 变化，但不会做普通 health-check restart。
 - 如果 connector 启动时 marker 文件尚不存在，那么配置的 upgrade marker 文件首次创建也会作为 restart request 处理。
 - Restart attempt 会清空 pending drain request、重置 periodic schedule、停止 managed child，并复用现有 health-check/start path。
 - 更新部署指南里的配置示例和 operator guidance，说明 scheduled restart 与 upgrade marker 的使用方式。
