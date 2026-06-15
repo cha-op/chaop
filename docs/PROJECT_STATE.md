@@ -15,10 +15,11 @@
 - The Rust connector can now manage one dedicated local Codex app-server listener, health-check it before advertising app-server capabilities, and refresh connector capabilities through `agent.ready`.
 - Managed connector app-server mode now supports draining restarts for periodic maintenance and local upgrade-marker triggers: the connector reports `draining`, withdraws app-server capabilities while active turns finish, then restarts and re-advertises after a healthy app-server probe.
 - Operations Map and Host Sessions now surface AppServerInstance state, including connector identity, placement, endpoint type, active turns, changed/seen age, and unhealthy lifecycle states.
+- Budget Board now reads bounded D1 usage windows and grouped budget-state signals when the database is bound, with source metadata and freshness displayed in the Browser.
 - Attached Host Sessions now request a bounded single-session history backfill from the connector, importing short rollout/history summaries without broad transcript upload.
 - Archive/unarchive actions for attached Host Session tasks update Chaop's D1 task/thread state first, then try to synchronise resolvable Codex app-server threads through connector `thread/archive` and `thread/unarchive`; sync failures are reported as warnings, and non-app-server sessions remain D1-only.
-- The next delivery workstream is the nine-PR app-server lifecycle roadmap, starting from PR0's Web deploy script and then moving execution UX toward managed app-server operation.
-- Active workstream state lives in `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.md`.
+- The nine-PR app-server lifecycle roadmap is implemented through the Budget Board real-metrics slice.
+- Completed workstream state lives in `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.md`.
 
 ## Recovery Pointers
 - Design source: `docs/design-starter.md`

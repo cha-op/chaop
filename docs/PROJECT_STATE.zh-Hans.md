@@ -15,10 +15,11 @@
 - Rust connector 现在可以管理一个专用的本机 Codex app-server listener，在声明 app-server capabilities 前先做健康检查，并通过 `agent.ready` 刷新 connector capabilities。
 - Managed connector app-server mode 现在支持用于周期维护和本机 upgrade-marker trigger 的 draining restart：connector 会上报 `draining`，在 active turns 结束前撤回 app-server capabilities，然后重启并在健康检查通过后重新声明 capabilities。
 - Operations Map 和 Host Sessions 现在会展示 AppServerInstance state，包括 connector identity、placement、endpoint type、active turns、changed/seen age，以及不健康 lifecycle states。
+- Budget Board 现在会在 database 绑定可用时读取有界 D1 usage windows 和 grouped budget-state signals，并在 Browser 里显示 source metadata 和 freshness。
 - 已 attach Host Sessions 现在会向 connector 请求单一 session 的有界 history backfill，导入简短 rollout/history 摘要，而不是上传宽泛 transcript。
 - 已 attach Host Session tasks 的 archive/unarchive 操作现在会先更新 Chaop 的 D1 task/thread 状态，再尝试通过 connector 把可解析的 Codex app-server thread 同步到 `thread/archive` 和 `thread/unarchive` 状态；同步失败会作为 warning 回传，非 app-server sessions 仍然只改 D1。
-- 下一轮交付工作流是九个 PR 的 app-server lifecycle roadmap，从 PR0 的 Web deploy script 开始，再把 execution UX 逐步迁移到 managed app-server operation。
-- 当前工作流状态记录在 `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.zh-Hans.md`。
+- 九个 PR 的 app-server lifecycle roadmap 已实现到 Budget Board real-metrics 切片。
+- 已完成的工作流状态记录在 `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.zh-Hans.md`。
 
 ## 恢复入口
 - 设计来源：`docs/design-starter.zh-Hans.md`

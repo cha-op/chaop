@@ -11,7 +11,7 @@ This document lists the places where Chaop can incur cost and the alerts to set 
 | OpenAI / Codex usage | A connector with `execution.mode = "app_server"` starts turns through the local Codex app-server. A connector with the private fallback `execution.mode = "codex_exec"` runs `codex exec` locally. Both consume the signed-in Codex allowance or API/project budget, depending on local Codex configuration. | Set a monthly OpenAI API budget and email threshold if the local Codex client is API-backed. Also watch the Codex usage or limit page for ChatGPT-backed local clients. |
 | Cloudflare Workers | `chaop-api` serves browser API routes, agent bootstrap, agent WebSocket upgrade, and command dispatch. `chaop-web` serves the GUI. | Set account billing notifications and a Worker CPU limit. Watch requests and CPU time. |
 | Durable Objects | `WorkspaceDO` coordinates live browser and connector WebSockets. | Watch Durable Object requests, incoming WebSocket message volume, and duration. Long-lived sockets can create duration charges unless hibernation is used. |
-| D1 | D1 stores users, connectors, workspaces, tasks, commands, token hashes, and thread events. | Watch rows read, rows written, and storage. The cost-sensitive path is event volume. |
+| D1 | D1 stores users, connectors, workspaces, tasks, commands, token hashes, thread events, and compact event-unit usage windows. | Watch rows read, rows written, and storage. The cost-sensitive path is event volume; each persisted thread event also maintains up to three compact usage-window rows. |
 | R2 | Reserved for command artefacts, uploaded summaries, and larger logs in a later slice. | Create an R2 alert before enabling artefact capture. Watch storage, Class A operations, and Class B operations. |
 | Workers Logs / observability | Useful during deploy and incident triage. | Keep production logging short and avoid leaving high-volume tailing or log export enabled without a cap. |
 
@@ -27,6 +27,19 @@ Configure these before leaving the connector running unattended:
 6. R2 storage and operation alerts for `chaop-artifacts` before artefact upload is enabled.
 7. OpenAI API monthly budget and email threshold if local Codex is API-backed.
 8. Codex usage/limit watch if local Codex is ChatGPT-plan-backed.
+
+## Budget Board Signals
+
+When D1 is bound, the Browser Budget Board uses Chaop-controlled database signals instead of static sample data:
+
+- The current still-open `usage_windows` row for each of `daily`, `four_hour`, and `burst`.
+- The worst current `budget_state` from sampled current usage windows, online connectors, and unarchived tasks.
+- Delayed events, compacted events, and local spool bytes from the daily usage window when present, otherwise the next available sampled window.
+- Source metadata showing whether the board is backed by D1 usage windows, local sample data, or an empty database.
+- Missing usage windows are displayed as missing samples, not as `0%` usage.
+- While the browser WebSocket is live, the UI refreshes only `/api/usage-summary` every 60 seconds for Budget Board/top-bar metrics; when WebSocket falls back, the existing 10-second bootstrap polling supplies the same data and the budget-only poll is stopped.
+
+The Worker writes those windows from the same paths that persist thread events, including bounded history backfill inserts. Each persisted thread event counts as one Chaop usage unit; low-priority P2/P3 events increment the delayed counter, `command.output` summaries increment the compacted counter, and stored summary bytes increment the local spool byte counter. The Worker reads at most one still-open row per window type plus grouped budget-state counts. Expired windows are treated as missing samples until new events write the current windows. It does not scan the full event table, call Cloudflare billing APIs, call OpenAI billing APIs, or require deployment-instance secrets. Treat the board as an operator posture view, not as the official invoice source. Keep the Cloudflare and OpenAI budget alerts above enabled.
 
 ## Current Safeguards
 

@@ -395,7 +395,7 @@ scheduled_restart_interval_seconds = 86400
 upgrade_marker_file = "/path/to/private/app-server-upgrade.marker"
 ```
 
-只有本机 Codex CLI 确实需要时才加入可选设置。`execution.extra_args` 只用于 `codex exec` fallback flags；`codex app-server` 可用的 flags 请放在 `session_inventory.managed_app_server.extra_args`。`scheduled_restart_interval_seconds = 0` 会关闭周期性 restart；任何正数都会让 managed restart 在该间隔后排队执行。`upgrade_marker_file` 是可选项，应指向仓库外的私有本地文件。升级本机 Codex CLI 或替换 app-server runtime assets 后，touch 这个文件即可请求 connector drain 并重启 managed listener。`app_server` 和 private `codex_exec` fallback 都可能消耗 Codex/OpenAI 额度或 API budget；让真实执行无人值守运行前，请先按 [成本模型](cost-aware.zh-Hans.md) 设置告警。
+只有本机 Codex CLI 确实需要时才加入可选设置。`execution.extra_args` 只用于 `codex exec` fallback flags；`codex app-server` 可用的 flags 请放在 `session_inventory.managed_app_server.extra_args`。`scheduled_restart_interval_seconds = 0` 会关闭周期性 restart；任何正数都会让 managed restart 在该间隔后排队执行。`upgrade_marker_file` 是可选项，应指向仓库外的私有本地文件。升级本机 Codex CLI 或替换 app-server runtime assets 后，touch 这个文件即可请求 connector drain 并重启 managed listener。`app_server` 和 private `codex_exec` fallback 都可能消耗 Codex/OpenAI 额度或 API budget；让真实执行无人值守运行前，请先按 [成本模型](cost-aware.zh-Hans.md) 设置告警。Budget Board 读取的是 Chaop 自己的有界 D1 posture signals，不能替代 Cloudflare 或 OpenAI billing alerts。
 Prompt 会通过 stdin 传给 Codex，不放在命令行参数里。除非有明确运维理由，不要放宽 timeout 和 output cap。
 由 `launchctl` 或其他 service manager 启动的常驻 connector，请使用绝对 `codex_command` 路径。这类进程不一定继承交互式 shell 的 `PATH`；如果找不到 executable，private CLI fallback command 会在使用 workspace `cwd` 之前就失败。
 

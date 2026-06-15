@@ -14,6 +14,8 @@ import {
   appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
+  budgetPctLabel,
+  budgetSourceLabel,
   codexCliFallbackAvailable,
   commandExecutionModeForRequest,
   commandModeLabel,
@@ -111,6 +113,20 @@ test("mergeBootstrapPayload keeps current app-server instances when legacy boots
   const merged = mergeBootstrapPayload(current, incoming);
 
   assert.deepEqual(merged.app_server_instances, [currentInstance]);
+});
+
+test("budgetSourceLabel reports unknown source for legacy budget payloads", () => {
+  const budget = { ...payload().budget };
+  delete (budget as Partial<typeof budget>).source;
+
+  assert.equal(budgetSourceLabel(budget), "Summary source not reported by this control plane.");
+});
+
+test("budgetPctLabel distinguishes missing samples from zero usage", () => {
+  assert.equal(budgetPctLabel(null), "missing");
+  assert.equal(budgetPctLabel(undefined), "missing");
+  assert.equal(budgetPctLabel(0), "0%");
+  assert.equal(budgetPctLabel(125.4), "125.4%");
 });
 
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {
@@ -731,7 +747,11 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
       burst_used_pct: 0,
       delayed_event_count: 0,
       compacted_event_count: 0,
-      local_spool_bytes: 0
+      local_spool_bytes: 0,
+      source: "empty",
+      generated_at: "2026-06-12T10:00:00.000Z",
+      window_sample_count: 0,
+      windows: []
     },
     server_time: "2026-06-12T10:00:00.000Z",
     ...overrides

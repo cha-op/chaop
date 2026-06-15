@@ -1117,6 +1117,113 @@ test("browser bootstrap does not write the user row when D1 is bound", async () 
   assert.equal(body.task_categories.length, 5);
 });
 
+test("usage summary returns bounded D1 budget windows", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/usage-summary", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: budgetSummaryDb()
+    }
+  );
+  const body = (await response.json()) as {
+    source: string;
+    state: string;
+    daily_used_pct: number;
+    four_hour_used_pct: number;
+    burst_used_pct: number;
+    delayed_event_count: number;
+    compacted_event_count: number;
+    local_spool_bytes: number;
+    window_sample_count: number;
+    windows: Array<{ window_type: string; used_pct: number; events_received: number }>;
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.source, "d1_usage_windows");
+  assert.equal(body.state, "hard_limited");
+  assert.equal(body.daily_used_pct, 125.4);
+  assert.equal(body.four_hour_used_pct, 88.9);
+  assert.equal(body.burst_used_pct, 21);
+  assert.equal(body.delayed_event_count, 8);
+  assert.equal(body.compacted_event_count, 55);
+  assert.equal(body.local_spool_bytes, 4096);
+  assert.equal(body.window_sample_count, 3);
+  assert.deepEqual(
+    body.windows.map((window) => [window.window_type, window.used_pct, window.events_received]),
+    [
+      ["daily", 125.4, 1000],
+      ["four_hour", 88.9, 240],
+      ["burst", 21, 18]
+    ]
+  );
+});
+
+test("usage summary marks missing D1 budget windows as unsampled", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/usage-summary", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: budgetSummaryDb(["daily", "burst"])
+    }
+  );
+  const body = (await response.json()) as {
+    source: string;
+    state: string;
+    daily_used_pct: number | null;
+    four_hour_used_pct: number | null;
+    burst_used_pct: number | null;
+    window_sample_count: number;
+    windows: Array<{ window_type: string; used_pct: number }>;
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.source, "d1_usage_windows");
+  assert.equal(body.state, "hard_limited");
+  assert.equal(body.daily_used_pct, null);
+  assert.equal(body.four_hour_used_pct, 88.9);
+  assert.equal(body.burst_used_pct, null);
+  assert.equal(body.window_sample_count, 1);
+  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct]), [["four_hour", 88.9]]);
+});
+
+test("usage summary ignores expired D1 budget windows", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/usage-summary", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] })
+    }
+  );
+  const body = (await response.json()) as {
+    source: string;
+    daily_used_pct: number | null;
+    four_hour_used_pct: number | null;
+    burst_used_pct: number | null;
+    window_sample_count: number;
+    windows: unknown[];
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.source, "empty");
+  assert.equal(body.daily_used_pct, null);
+  assert.equal(body.four_hour_used_pct, null);
+  assert.equal(body.burst_used_pct, null);
+  assert.equal(body.window_sample_count, 0);
+  assert.deepEqual(body.windows, []);
+});
+
 test("agent bootstrap rejects invalid secret", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/connector/bootstrap", { method: "POST", body: "{}" }),
@@ -1936,6 +2043,7 @@ function readOnlyBootstrapDb(): D1Database {
   return {
     prepare(sql: string) {
       assert.doesNotMatch(sql, /INSERT INTO users/);
+      assert.doesNotMatch(sql, /GROUP BY budget_state/);
       if (/FROM host_sessions hs/.test(sql)) {
         assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
         assert.match(sql, /c\.status <> 'offline'/);
@@ -1950,10 +2058,109 @@ function readOnlyBootstrapDb(): D1Database {
         bind() {
           return this;
         },
+        async first() {
+          return undefined;
+        },
         async all() {
           return { results: [] };
         }
       };
+    }
+  } as unknown as D1Database;
+}
+
+function budgetSummaryDb(
+  omitWindowTypes: string[] = [],
+  options: { expiredWindowTypes?: string[] | undefined } = {}
+): D1Database {
+  const windows: Record<string, Record<string, unknown>> = {
+    daily: {
+      id: "usage-daily",
+      window_type: "daily",
+      window_start: "2026-06-15T00:00:00.000Z",
+      window_end: "2026-06-16T00:00:00.000Z",
+      budget_state: "conservative",
+      used_pct: 125.44,
+      events_received: 1000,
+      events_compacted: 55,
+      events_delayed: 8,
+      local_spool_bytes: 4096,
+      updated_at: "2026-06-15T09:00:00.000Z"
+    },
+    four_hour: {
+      id: "usage-four-hour",
+      window_type: "four_hour",
+      window_start: "2026-06-15T08:00:00.000Z",
+      window_end: "2026-06-15T12:00:00.000Z",
+      budget_state: "hard_limited",
+      used_pct: 88.88,
+      events_received: 240,
+      events_compacted: 20,
+      events_delayed: 4,
+      local_spool_bytes: 2048,
+      updated_at: "2026-06-15T09:01:00.000Z"
+    },
+    burst: {
+      id: "usage-burst",
+      window_type: "burst",
+      window_start: "2026-06-15T09:00:00.000Z",
+      window_end: "2026-06-15T09:01:00.000Z",
+      budget_state: "normal",
+      used_pct: 21,
+      events_received: 18,
+      events_compacted: 0,
+      events_delayed: 0,
+      local_spool_bytes: 0,
+      updated_at: "2026-06-15T09:01:00.000Z"
+    }
+  };
+  for (const windowType of omitWindowTypes) {
+    delete windows[windowType];
+  }
+
+  return {
+    prepare(sql: string) {
+      if (/FROM usage_windows/.test(sql)) {
+        assert.match(sql, /WHERE window_type = \?/);
+        assert.match(sql, /window_start <= \?/);
+        assert.match(sql, /window_end > \?/);
+        assert.match(sql, /ORDER BY window_end DESC, updated_at DESC, id DESC/);
+        assert.match(sql, /LIMIT 1/);
+        return {
+          bind(windowType: string, windowStartAt: string, windowEndAt: string) {
+            assert.match(windowStartAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(windowEndAt, windowStartAt);
+            return {
+              async first() {
+                if (options.expiredWindowTypes?.includes(windowType)) {
+                  return undefined;
+                }
+                return windows[windowType];
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM connectors/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        assert.match(sql, /status <> 'offline'/);
+        return {
+          async all() {
+            return { results: [{ budget_state: "throttled", count: 1 }] };
+          }
+        };
+      }
+
+      if (/FROM tasks/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        assert.match(sql, /archived_at IS NULL/);
+        return {
+          async all() {
+            return { results: [{ budget_state: "conservative", count: 2 }] };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in budget summary fake: ${sql}`);
     }
   } as unknown as D1Database;
 }
@@ -2237,6 +2444,10 @@ function commandTargetDb(
             };
           }
         };
+      }
+
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
       }
 
       if (/UPDATE tasks/.test(sql) && /WHERE id = \? AND workspace_id = \? AND thread_id = \?/.test(sql)) {
@@ -3066,6 +3277,10 @@ function hostSessionAttachBackfillDb(
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get eventInserts() {
@@ -3476,6 +3691,10 @@ function hostSessionDetachDb(options: {
         };
       }
 
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
       if (/UPDATE host_sessions/.test(sql) && /attached_task_id = NULL/.test(sql)) {
         return {
           bind(updatedAt: string, hostSessionId: string) {
@@ -3512,4 +3731,16 @@ function hostSessionDetachDb(options: {
       return counters.eventInserts;
     }
   } as unknown as D1Database & typeof counters;
+}
+
+function usageWindowUpsertFake() {
+  return {
+    bind() {
+      return {
+        async run() {
+          return { success: true };
+        }
+      };
+    }
+  };
 }

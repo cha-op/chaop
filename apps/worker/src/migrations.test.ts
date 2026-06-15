@@ -87,6 +87,15 @@ test("app-server instance placement targets are added by forward migration", asy
   assert.match(migration, /CREATE INDEX idx_app_server_instances_thread_state/);
 });
 
+test("usage window latest index is added by forward migration", async () => {
+  const migration = await readMigration("0012_usage_window_latest_index.sql");
+
+  assert.match(
+    migration,
+    /CREATE INDEX idx_usage_windows_type_end ON usage_windows\(window_type, window_end DESC, updated_at DESC, id DESC\)/
+  );
+});
+
 async function readMigration(fileName: string): Promise<string> {
 	return await readFile(new URL(fileName, migrationsDir), "utf8");
 }

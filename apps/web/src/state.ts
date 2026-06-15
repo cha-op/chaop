@@ -1,6 +1,7 @@
 import type {
   AppServerInstanceSummary,
   BootstrapPayload,
+  BudgetSummary,
   CommandSummary,
   CreateCommandRequest,
   ConnectorSummary,
@@ -22,6 +23,30 @@ const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], 
   draining: 3,
   healthy: 4
 };
+
+export function budgetSourceLabel(budget: BudgetSummary): string {
+  const windowSampleCount = budget.window_sample_count ?? (budget.windows ?? []).length;
+  if (budget.source === "d1_usage_windows") {
+    return `Live database summary from ${windowSampleCount} bounded usage windows.`;
+  }
+  if (budget.source === "sample") {
+    return "Sample data for local development.";
+  }
+  if (budget.source === undefined) {
+    return "Summary source not reported by this control plane.";
+  }
+  return "No usage windows recorded yet.";
+}
+
+export function budgetPctLabel(value: number | null | undefined): string {
+  if (value === null || value === undefined) {
+    return "missing";
+  }
+  if (!Number.isFinite(value)) {
+    return "unknown";
+  }
+  return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}%`;
+}
 
 export function appServerInstancesForConnector(
   data: BootstrapPayload | undefined,

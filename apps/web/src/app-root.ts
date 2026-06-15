@@ -6,6 +6,7 @@ import {
   type AppServerInstanceSummary,
   type AppServerInstancesUpdatePayload,
   type BootstrapPayload,
+  type BudgetSummary,
   type CommandSummary,
   type ConnectorSummary,
   type ConnectorsUpdatePayload,
@@ -26,6 +27,7 @@ import {
   createLocalThread,
   detachHostSession,
   loadBootstrap,
+  loadUsageSummary,
   loadThreadEvents,
   refreshHostSessions,
   unarchiveTask
@@ -37,6 +39,8 @@ import {
   appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
+  budgetPctLabel,
+  budgetSourceLabel,
   codexCliFallbackAvailable,
   commandExecutionModeForRequest,
   commandModeLabel,
@@ -66,6 +70,7 @@ type RealtimeHostSessionsPayload = HostSessionsUpdatePayload;
 type RealtimeAppServerInstancesPayload = AppServerInstancesUpdatePayload;
 
 const FALLBACK_POLL_MS = 10_000;
+const BUDGET_REFRESH_MS = 60_000;
 const SOCKET_RECONNECT_MS = 3_000;
 const SHOW_CODEX_CLI_FALLBACK = import.meta.env.VITE_CHAOP_SHOW_CODEX_CLI_FALLBACK === "true";
 
@@ -136,6 +141,8 @@ export class ChaopApp extends LitElement {
 
   private pollTimer: number | undefined;
 
+  private budgetTimer: number | undefined;
+
   private reconnectTimer: number | undefined;
 
   private clockTimer: number | undefined;
@@ -164,6 +171,7 @@ export class ChaopApp extends LitElement {
     window.removeEventListener("hashchange", this.onHashChange);
     window.clearInterval(this.clockTimer);
     this.disconnectRealtime();
+    this.stopBudgetPolling();
     super.disconnectedCallback();
   }
 
@@ -254,8 +262,8 @@ export class ChaopApp extends LitElement {
         </div>
         <div class="topbar-status">
           <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
-          <span class="chip ${budget.state}">4h ${budget.four_hour_used_pct}%</span>
-          <span class="chip ${budget.state}">Day ${budget.daily_used_pct}%</span>
+          <span class="chip ${budget.state}">4h ${budgetPctLabel(budget.four_hour_used_pct)}</span>
+          <span class="chip ${budget.state}">Day ${budgetPctLabel(budget.daily_used_pct)}</span>
           <span class="identity">${this.data!.user.email}</span>
         </div>
       </header>
@@ -663,6 +671,10 @@ export class ChaopApp extends LitElement {
 
   private renderBudgetBoard() {
     const budget = this.data!.budget;
+    const windows = budgetWindows(budget);
+    const newestWindow = newestBudgetWindowUpdatedAt(budget);
+    const generatedAt = budget.generated_at ?? this.data!.server_time;
+    const windowSampleCount = budget.window_sample_count ?? windows.length;
     return html`
       <section class="page-grid budget-grid">
         <section class="panel primary">
@@ -670,21 +682,46 @@ export class ChaopApp extends LitElement {
             <h2>Cost posture</h2>
             <span class="chip ${budget.state}">${budget.state.replace("_", " ")}</span>
           </div>
+          <p class="panel-subtle">${budgetSourceLabel(budget)}</p>
           <div class="budget-bars">
             ${budgetBar("4-hour window", budget.four_hour_used_pct)}
             ${budgetBar("Daily budget", budget.daily_used_pct)}
             ${budgetBar("Burst window", budget.burst_used_pct)}
           </div>
+          <div class="budget-windows" aria-label="Sampled usage windows">
+            ${windows.map(
+              (window) => html`
+                <div>
+                  <span>${budgetWindowLabel(window.window_type)}</span>
+                  <strong>${budgetPctLabel(window.used_pct)}</strong>
+                  <small title=${formatAbsoluteIso(window.updated_at)}>
+                    ${window.events_received.toLocaleString("en-GB")} events, updated
+                    ${formatRelativeIso(window.updated_at, this.clockNow)}
+                  </small>
+                </div>
+              `
+            )}
+          </div>
         </section>
         <aside class="panel">
           <div class="section-heading">
             <h2>Reliability</h2>
-            <span>P0/P1 intact</span>
+            <span>${windowSampleCount} windows</span>
           </div>
           <dl class="facts">
             <div><dt>Delayed events</dt><dd>${budget.delayed_event_count}</dd></div>
             <div><dt>Compacted events</dt><dd>${budget.compacted_event_count}</dd></div>
             <div><dt>Local spool</dt><dd>${formatBytes(budget.local_spool_bytes)}</dd></div>
+            <div>
+              <dt>Generated</dt>
+              <dd title=${formatAbsoluteIso(generatedAt)}>${formatRelativeIso(generatedAt, this.clockNow)}</dd>
+            </div>
+            <div>
+              <dt>Current window</dt>
+              <dd title=${newestWindow ? formatAbsoluteIso(newestWindow) : "No usage window"}>
+                ${newestWindow ? formatRelativeIso(newestWindow, this.clockNow) : "none"}
+              </dd>
+            </div>
           </dl>
         </aside>
       </section>
@@ -1074,6 +1111,7 @@ export class ChaopApp extends LitElement {
         if (this.socket !== socket) return;
         this.realtimeState = "live";
         this.stopFallbackPolling();
+        this.startBudgetPolling();
       });
       socket.addEventListener("message", (event) => this.handleRealtimeMessage(event));
       socket.addEventListener("close", () => this.handleRealtimeDisconnect(socket));
@@ -1087,6 +1125,7 @@ export class ChaopApp extends LitElement {
   private disconnectRealtime(): void {
     window.clearTimeout(this.reconnectTimer);
     this.stopFallbackPolling();
+    this.stopBudgetPolling();
     const socket = this.socket;
     this.socket = undefined;
     socket?.close();
@@ -1126,6 +1165,7 @@ export class ChaopApp extends LitElement {
 
   private startFallbackPolling(): void {
     this.realtimeState = "polling";
+    this.stopBudgetPolling();
     if (this.pollTimer !== undefined) return;
     void this.load();
     this.pollTimer = window.setInterval(() => void this.load(), FALLBACK_POLL_MS);
@@ -1135,6 +1175,35 @@ export class ChaopApp extends LitElement {
     if (this.pollTimer === undefined) return;
     window.clearInterval(this.pollTimer);
     this.pollTimer = undefined;
+  }
+
+  private startBudgetPolling(): void {
+    if (this.budgetTimer !== undefined) return;
+    this.budgetTimer = window.setInterval(() => void this.refreshBudgetSummary(), BUDGET_REFRESH_MS);
+  }
+
+  private stopBudgetPolling(): void {
+    if (this.budgetTimer === undefined) return;
+    window.clearInterval(this.budgetTimer);
+    this.budgetTimer = undefined;
+  }
+
+  private async refreshBudgetSummary(): Promise<void> {
+    if (!this.data) return;
+    try {
+      const budget = await loadUsageSummary();
+      this.data = {
+        ...this.data,
+        budget
+      };
+      if (this.actionError?.startsWith("Budget refresh failed:")) {
+        this.actionError = undefined;
+      }
+    } catch (error) {
+      if (this.view === "budget-board") {
+        this.actionError = actionErrorMessage("Budget refresh failed", error);
+      }
+    }
   }
 
   private applyThreadEvent(event: ThreadEvent): void {
@@ -1363,6 +1432,24 @@ function formatAge(ageMs: number): string {
   return `${Math.floor(totalHours / 24)}d`;
 }
 
+function budgetWindowLabel(windowType: NonNullable<BudgetSummary["windows"]>[number]["window_type"]): string {
+  return {
+    daily: "Daily",
+    four_hour: "4-hour",
+    burst: "Burst"
+  }[windowType];
+}
+
+function newestBudgetWindowUpdatedAt(budget: BudgetSummary): string | undefined {
+  return budgetWindows(budget).reduce<string | undefined>((newest, window) => {
+    return newest && newest > window.updated_at ? newest : window.updated_at;
+  }, undefined);
+}
+
+function budgetWindows(budget: BudgetSummary): BudgetWindow[] {
+  return budget.windows ?? [];
+}
+
 function newerIso(current: string | undefined, incoming: string): string {
   return current && current > incoming ? current : incoming;
 }
@@ -1479,16 +1566,23 @@ function isRealtimeAppServerInstancesPayload(value: unknown): value is RealtimeA
   );
 }
 
-function budgetBar(label: string, value: number) {
+function budgetBar(label: string, value: number | null | undefined) {
   return html`
     <div class="budget-bar">
-      <div><span>${label}</span><strong>${value}%</strong></div>
-      <meter min="0" max="100" value=${value}></meter>
+      <div><span>${label}</span><strong>${budgetPctLabel(value)}</strong></div>
+      <meter min="0" max="100" value=${meterPct(value)}></meter>
     </div>
   `;
+}
+
+function meterPct(value: number | null | undefined): number {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 0;
+  return Math.min(100, Math.max(0, value));
 }
 
 function formatBytes(bytes: number): string {
   const mib = bytes / 1024 / 1024;
   return `${mib.toFixed(0)} MiB`;
 }
+
+type BudgetWindow = NonNullable<BudgetSummary["windows"]>[number];

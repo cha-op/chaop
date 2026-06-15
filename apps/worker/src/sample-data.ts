@@ -203,7 +203,48 @@ export const budget: BudgetSummary = {
   burst_used_pct: 18,
   delayed_event_count: 42,
   compacted_event_count: 318,
-  local_spool_bytes: 134217728
+  local_spool_bytes: 134217728,
+  source: "sample",
+  generated_at: "2026-06-09T21:58:05.000Z",
+  window_sample_count: 3,
+  windows: [
+    {
+      window_type: "daily",
+      window_start: "2026-06-09T00:00:00.000Z",
+      window_end: "2026-06-10T00:00:00.000Z",
+      budget_state: "conservative",
+      used_pct: 75,
+      events_received: 1420,
+      events_compacted: 318,
+      events_delayed: 42,
+      local_spool_bytes: 134217728,
+      updated_at: "2026-06-09T21:58:05.000Z"
+    },
+    {
+      window_type: "four_hour",
+      window_start: "2026-06-09T18:00:00.000Z",
+      window_end: "2026-06-09T22:00:00.000Z",
+      budget_state: "conservative",
+      used_pct: 62,
+      events_received: 410,
+      events_compacted: 92,
+      events_delayed: 18,
+      local_spool_bytes: 67108864,
+      updated_at: "2026-06-09T21:58:05.000Z"
+    },
+    {
+      window_type: "burst",
+      window_start: "2026-06-09T21:57:00.000Z",
+      window_end: "2026-06-09T21:58:00.000Z",
+      budget_state: "normal",
+      used_pct: 18,
+      events_received: 24,
+      events_compacted: 4,
+      events_delayed: 0,
+      local_spool_bytes: 0,
+      updated_at: "2026-06-09T21:58:05.000Z"
+    }
+  ]
 };
 
 export const events: ThreadEvent[] = [
