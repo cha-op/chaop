@@ -27,6 +27,7 @@ import {
   createLocalThread,
   detachHostSession,
   loadBootstrap,
+  loadUsageSummary,
   loadThreadEvents,
   refreshHostSessions,
   unarchiveTask
@@ -69,6 +70,7 @@ type RealtimeHostSessionsPayload = HostSessionsUpdatePayload;
 type RealtimeAppServerInstancesPayload = AppServerInstancesUpdatePayload;
 
 const FALLBACK_POLL_MS = 10_000;
+const BUDGET_REFRESH_MS = 60_000;
 const SOCKET_RECONNECT_MS = 3_000;
 const SHOW_CODEX_CLI_FALLBACK = import.meta.env.VITE_CHAOP_SHOW_CODEX_CLI_FALLBACK === "true";
 
@@ -139,6 +141,8 @@ export class ChaopApp extends LitElement {
 
   private pollTimer: number | undefined;
 
+  private budgetTimer: number | undefined;
+
   private reconnectTimer: number | undefined;
 
   private clockTimer: number | undefined;
@@ -167,6 +171,7 @@ export class ChaopApp extends LitElement {
     window.removeEventListener("hashchange", this.onHashChange);
     window.clearInterval(this.clockTimer);
     this.disconnectRealtime();
+    this.stopBudgetPolling();
     super.disconnectedCallback();
   }
 
@@ -1106,6 +1111,7 @@ export class ChaopApp extends LitElement {
         if (this.socket !== socket) return;
         this.realtimeState = "live";
         this.stopFallbackPolling();
+        this.startBudgetPolling();
       });
       socket.addEventListener("message", (event) => this.handleRealtimeMessage(event));
       socket.addEventListener("close", () => this.handleRealtimeDisconnect(socket));
@@ -1119,6 +1125,7 @@ export class ChaopApp extends LitElement {
   private disconnectRealtime(): void {
     window.clearTimeout(this.reconnectTimer);
     this.stopFallbackPolling();
+    this.stopBudgetPolling();
     const socket = this.socket;
     this.socket = undefined;
     socket?.close();
@@ -1158,6 +1165,7 @@ export class ChaopApp extends LitElement {
 
   private startFallbackPolling(): void {
     this.realtimeState = "polling";
+    this.stopBudgetPolling();
     if (this.pollTimer !== undefined) return;
     void this.load();
     this.pollTimer = window.setInterval(() => void this.load(), FALLBACK_POLL_MS);
@@ -1167,6 +1175,35 @@ export class ChaopApp extends LitElement {
     if (this.pollTimer === undefined) return;
     window.clearInterval(this.pollTimer);
     this.pollTimer = undefined;
+  }
+
+  private startBudgetPolling(): void {
+    if (this.budgetTimer !== undefined) return;
+    this.budgetTimer = window.setInterval(() => void this.refreshBudgetSummary(), BUDGET_REFRESH_MS);
+  }
+
+  private stopBudgetPolling(): void {
+    if (this.budgetTimer === undefined) return;
+    window.clearInterval(this.budgetTimer);
+    this.budgetTimer = undefined;
+  }
+
+  private async refreshBudgetSummary(): Promise<void> {
+    if (!this.data) return;
+    try {
+      const budget = await loadUsageSummary();
+      this.data = {
+        ...this.data,
+        budget
+      };
+      if (this.actionError?.startsWith("Budget refresh failed:")) {
+        this.actionError = undefined;
+      }
+    } catch (error) {
+      if (this.view === "budget-board") {
+        this.actionError = actionErrorMessage("Budget refresh failed", error);
+      }
+    }
   }
 
   private applyThreadEvent(event: ThreadEvent): void {

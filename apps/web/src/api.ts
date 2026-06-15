@@ -2,6 +2,7 @@ import type {
   AttachHostSessionRequest,
   AttachHostSessionResponse,
   BootstrapPayload,
+  BudgetSummary,
   CreateCommandRequest,
   CreateCommandResponse,
   CreateLocalThreadRequest,
@@ -37,6 +38,24 @@ export async function loadBootstrap(): Promise<BootstrapPayload> {
   } catch (error) {
     if (import.meta.env.DEV) {
       return fallbackBootstrap();
+    }
+    throw error;
+  }
+}
+
+export async function loadUsageSummary(): Promise<BudgetSummary> {
+  try {
+    const response = await fetch(apiUrl("/api/usage-summary"), {
+      credentials: "include",
+      headers: devHeaders()
+    });
+    if (!response.ok) {
+      throw await responseError(response, "Usage summary failed");
+    }
+    return (await response.json()) as BudgetSummary;
+  } catch (error) {
+    if (import.meta.env.DEV) {
+      return fallbackBootstrap().budget;
     }
     throw error;
   }

@@ -37,6 +37,7 @@ When D1 is bound, the Browser Budget Board uses Chaop-controlled database signal
 - Delayed events, compacted events, and local spool bytes from the daily usage window when present, otherwise the next available sampled window.
 - Source metadata showing whether the board is backed by D1 usage windows, local sample data, or an empty database.
 - Missing usage windows are displayed as missing samples, not as `0%` usage.
+- While the browser WebSocket is live, the UI refreshes only `/api/usage-summary` every 60 seconds for Budget Board/top-bar metrics; when WebSocket falls back, the existing 10-second bootstrap polling supplies the same data and the budget-only poll is stopped.
 
 The Worker reads at most one row per window type plus grouped budget-state counts. It does not scan the full event table, call Cloudflare billing APIs, call OpenAI billing APIs, or require deployment-instance secrets. Treat the board as an operator posture view, not as the official invoice source. Keep the Cloudflare and OpenAI budget alerts above enabled.
 

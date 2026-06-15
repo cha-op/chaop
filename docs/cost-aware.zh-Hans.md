@@ -37,6 +37,7 @@ D1 绑定可用时，Browser 里的 Budget Board 会使用 Chaop 自己控制的
 - Delayed events、compacted events 和 local spool bytes 优先来自 daily usage window；如果没有 daily window，则使用下一个可用的 sampled window。
 - 页面会显示 source metadata，区分当前是 D1 usage windows、本地 sample data，还是空数据库。
 - 缺失的 usage window 会显示为 missing sample，不会显示成 `0%` usage。
+- 浏览器 WebSocket 处于 live 状态时，UI 只会每 60 秒刷新一次 `/api/usage-summary` 来更新 Budget Board 和 top-bar metrics；如果 WebSocket fallback，原有 10 秒 bootstrap polling 会提供同一份数据，并停止 budget-only polling。
 
 Worker 每种 window type 最多读取一行，再读取 grouped budget-state counts。它不会扫描完整 event table，不会调用 Cloudflare billing APIs，不会调用 OpenAI billing APIs，也不需要部署实例 secrets。请把 Budget Board 当作 operator posture view，而不是官方账单来源；上面的 Cloudflare 和 OpenAI budget alerts 仍然需要开启。
 
