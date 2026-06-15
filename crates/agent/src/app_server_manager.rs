@@ -255,12 +255,7 @@ impl AppServerManager {
             return None;
         }
         self.clear_exited_child();
-        if self.child.is_none() && self.probe_ready(config).is_some() {
-            self.set_state(
-                AppServerInstanceState::Degraded,
-                pending.reason.unowned_listener_summary(),
-                Some("Restart cannot stop the listening app-server because this connector did not start it."),
-            );
+        if self.block_unowned_listener_restart(config, pending.reason) {
             return None;
         }
         if !force_restart
@@ -286,6 +281,10 @@ impl AppServerManager {
             force_restart.then_some("Drain timeout elapsed while active turns were still running."),
         );
         self.stop_child(pending.reason.stop_reason(force_restart));
+        if self.block_unowned_listener_restart(config, pending.reason) {
+            self.pending_restart = Some(pending);
+            return None;
+        }
         let url = self.ensure_ready(config);
         if url.is_some() {
             self.arm_next_scheduled_restart(config);
@@ -294,6 +293,23 @@ impl AppServerManager {
             self.record_forced_restart_result(pending.reason, url.is_some());
         }
         url
+    }
+
+    fn block_unowned_listener_restart(
+        &mut self,
+        config: &AgentConfig,
+        reason: AppServerRestartReason,
+    ) -> bool {
+        if self.child.is_some() || self.probe_ready(config).is_none() {
+            return false;
+        }
+
+        self.set_state(
+            AppServerInstanceState::Degraded,
+            reason.unowned_listener_summary(),
+            Some("Restart cannot stop the listening app-server because this connector did not start it."),
+        );
+        true
     }
 
     fn record_forced_restart_result(&mut self, reason: AppServerRestartReason, healthy: bool) {
@@ -1438,6 +1454,59 @@ mod tests {
         assert_eq!(
             manager.status_summary.as_deref(),
             Some("Managed app-server upgrade restart is blocked by an unowned listener.")
+        );
+        assert_eq!(
+            manager.last_error.as_deref(),
+            Some(
+                "Restart cannot stop the listening app-server because this connector did not start it."
+            )
+        );
+    }
+
+    #[test]
+    fn restart_request_blocks_when_stopped_child_leaves_unowned_listener() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let spawn_marker = tempdir.path().join("spawned");
+        let command = tempdir.path().join("codex-stub");
+        write_executable(
+            &command,
+            &format!(
+                "#!/bin/sh\nprintf spawned > '{}'\nsleep 30\n",
+                spawn_marker.display()
+            ),
+        );
+        let mut owned_child_command = std::process::Command::new("sh");
+        owned_child_command.arg("-c").arg("sleep 30");
+        #[cfg(unix)]
+        {
+            owned_child_command.process_group(0);
+        }
+        let owned_child = owned_child_command
+            .spawn()
+            .expect("spawn owned child placeholder");
+        let (listen_url, fake_app_server) = spawn_one_healthcheck_app_server();
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = command.to_string_lossy().into_owned();
+        config.session_inventory.app_server_url = Some(listen_url.clone());
+        config.session_inventory.managed_app_server.listen_url = Some(listen_url);
+        let mut manager = AppServerManager::new(&config);
+        manager.child = Some(owned_child);
+        manager.request_restart(AppServerRestartReason::Scheduled);
+
+        let runtime = manager.runtime_config(&config);
+        fake_app_server.join().expect("fake app-server");
+
+        assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert!(!spawn_marker.exists());
+        assert!(manager.child.is_none());
+        assert_eq!(
+            manager.pending_restart.map(|pending| pending.reason),
+            Some(AppServerRestartReason::Scheduled)
+        );
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.status_summary.as_deref(),
+            Some("Managed app-server scheduled restart is blocked by an unowned listener.")
         );
         assert_eq!(
             manager.last_error.as_deref(),
