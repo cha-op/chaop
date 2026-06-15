@@ -237,6 +237,7 @@ impl AppServerManager {
 
     fn advance_pending_restart(&mut self, config: &AgentConfig) -> Option<String> {
         let pending = self.pending_restart?;
+        self.clear_exited_child();
         let drain_timeout = Duration::from_secs(
             config
                 .session_inventory
@@ -246,6 +247,18 @@ impl AppServerManager {
         );
         let force_restart =
             self.active_turn_count > 0 && pending.requested_at.elapsed() >= drain_timeout;
+        let scheduled_backoff_deadline = self.scheduled_restart_backoff_deadline(config, pending);
+        if self.active_turn_count > 0 {
+            if let Some(deadline) = scheduled_backoff_deadline {
+                self.next_scheduled_restart_at = Some(deadline);
+                self.set_state(
+                    AppServerInstanceState::Draining,
+                    pending.reason.draining_summary(),
+                    None,
+                );
+                return None;
+            }
+        }
         if self.active_turn_count > 0 && !force_restart {
             self.set_state(
                 AppServerInstanceState::Draining,
@@ -254,19 +267,12 @@ impl AppServerManager {
             );
             return None;
         }
-        self.clear_exited_child();
         if self.block_unowned_listener_restart(config, pending.reason) {
             return None;
         }
-        if !force_restart
-            && pending.reason == AppServerRestartReason::Scheduled
-            && self.child.is_none()
-            && self
-                .start_backoff_deadline(config)
-                .is_some_and(|deadline| Instant::now() < deadline)
-        {
+        if let Some(deadline) = scheduled_backoff_deadline {
             self.pending_restart = None;
-            self.next_scheduled_restart_at = self.start_backoff_deadline(config);
+            self.next_scheduled_restart_at = Some(deadline);
             return self.ensure_ready(config);
         }
 
@@ -293,6 +299,18 @@ impl AppServerManager {
             self.record_forced_restart_result(pending.reason, url.is_some());
         }
         url
+    }
+
+    fn scheduled_restart_backoff_deadline(
+        &self,
+        config: &AgentConfig,
+        pending: PendingAppServerRestart,
+    ) -> Option<Instant> {
+        if pending.reason != AppServerRestartReason::Scheduled || self.child.is_some() {
+            return None;
+        }
+        let deadline = self.start_backoff_deadline(config)?;
+        (Instant::now() < deadline).then_some(deadline)
     }
 
     fn block_unowned_listener_restart(
@@ -1315,16 +1333,25 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_force_restart_reports_timeout_after_child_exit() {
+    fn scheduled_active_turn_restart_respects_backoff_after_child_exit() {
         let tempdir = tempfile::tempdir().expect("tempdir");
+        let respawn_marker = tempdir.path().join("respawned");
         let exited_child_command = tempdir.path().join("exited-child");
+        let respawn_command = tempdir.path().join("codex-stub");
         write_executable(&exited_child_command, "#!/bin/sh\nexit 0\n");
+        write_executable(
+            &respawn_command,
+            &format!(
+                "#!/bin/sh\nprintf respawned > '{}'\nsleep 30\n",
+                respawn_marker.display()
+            ),
+        );
         let mut exited_child = std::process::Command::new(&exited_child_command)
             .spawn()
             .expect("spawn exited child");
         exited_child.wait().expect("wait exited child");
         let mut config = config_with_managed(true);
-        config.execution.codex_command = "/path/that/does/not/exist/codex".to_owned();
+        config.execution.codex_command = respawn_command.to_string_lossy().into_owned();
         config
             .session_inventory
             .managed_app_server
@@ -1344,39 +1371,33 @@ mod tests {
         let runtime = manager.runtime_config(&config);
 
         assert_eq!(runtime.session_inventory.app_server_url, None);
+        assert!(!respawn_marker.exists());
         assert!(manager.child.is_none());
-        assert_eq!(manager.pending_restart, None);
-        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.pending_restart.map(|pending| pending.reason),
+            Some(AppServerRestartReason::Scheduled)
+        );
+        assert_eq!(manager.state, AppServerInstanceState::Draining);
         assert_eq!(
             manager.status_summary.as_deref(),
-            Some(
-                "Managed app-server scheduled restart forced after drain timeout and did not become healthy."
-            )
+            Some("Managed app-server scheduled restart is draining active turns.")
         );
-        assert_eq!(
-            manager.last_error.as_deref(),
-            Some(
-                "Drain timeout elapsed while active turns were still running. Last restart error: No such file or directory (os error 2)"
-            )
-        );
+        assert_eq!(manager.last_error, None);
         assert!(!manager.can_attempt_start(&config));
 
         manager.finish_turn();
         let post_turn_runtime = manager.runtime_config(&config);
 
         assert_eq!(post_turn_runtime.session_inventory.app_server_url, None);
+        assert!(!respawn_marker.exists());
         assert_eq!(manager.state, AppServerInstanceState::Degraded);
         assert_eq!(
             manager.status_summary.as_deref(),
-            Some(
-                "Managed app-server scheduled restart forced after drain timeout and did not become healthy."
-            )
+            Some("Managed app-server restart backoff is active.")
         );
         assert_eq!(
             manager.last_error.as_deref(),
-            Some(
-                "Drain timeout elapsed while active turns were still running. Last restart error: No such file or directory (os error 2)"
-            )
+            Some("Health check failed while restart backoff is active.")
         );
     }
 
