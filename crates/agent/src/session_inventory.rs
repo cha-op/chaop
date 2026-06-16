@@ -1976,7 +1976,7 @@ fn set_app_server_thread_archived_at(
         return Ok(true);
     };
     for resolved_thread_id in resolved_thread_ids {
-        ensure_app_server_archive_budget(deadline)?;
+        ensure_app_server_local_budget(deadline)?;
         let _ = send_app_server_request_before_deadline(
             &mut socket,
             request_id,
@@ -2082,7 +2082,7 @@ fn find_app_server_thread_ids_in_pages(
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     for _ in 0..APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE {
-        ensure_app_server_archive_budget(deadline)?;
+        ensure_app_server_local_budget(deadline)?;
         let response = send_app_server_thread_list_request(
             socket,
             *next_request_id,
@@ -2140,9 +2140,9 @@ fn find_app_server_thread_ids_in_pages(
     Ok(AppServerArchivePageScan::Exhausted { session_thread_ids })
 }
 
-fn ensure_app_server_archive_budget(deadline: Instant) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_app_server_local_budget(deadline: Instant) -> Result<(), Box<dyn std::error::Error>> {
     if Instant::now() >= deadline {
-        return Err("app-server archive sync exceeded local time budget".into());
+        return Err("app-server request exceeded local time budget".into());
     }
     Ok(())
 }
@@ -2164,9 +2164,9 @@ fn ensure_app_server_host_session_at(
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
     let mut socket = connect_app_server(url, timeout)?;
-    initialize_app_server_connection(&mut socket)?;
-    let mut request_id = 1;
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
+    initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
+    let mut request_id = 1;
     let resolved_thread = resolve_app_server_thread_for_ensure(
         &mut socket,
         session_id,
@@ -2174,22 +2174,27 @@ fn ensure_app_server_host_session_at(
         timeout,
         deadline,
     )?;
-    let thread_id = resolved_thread
-        .as_ref()
-        .map(|thread| thread.thread_id.clone())
-        .unwrap_or_else(|| session_id.to_owned());
-    if matches!(resolved_thread.as_ref(), Some(thread) if thread.archived) {
-        let _ = send_app_server_request(
+    let Some(resolved_thread) = resolved_thread else {
+        return Err(format!(
+            "app-server host session attach could not find session {session_id} in app-server thread list"
+        )
+        .into());
+    };
+    let thread_id = resolved_thread.thread_id;
+    if resolved_thread.archived {
+        let _ = send_app_server_request_before_deadline(
             &mut socket,
             request_id,
             "thread/unarchive",
             serde_json::json!({
                 "threadId": thread_id.clone()
             }),
+            timeout,
+            deadline,
         )?;
         request_id += 1;
     }
-    let response = send_app_server_request(
+    let response = send_app_server_request_before_deadline(
         &mut socket,
         request_id,
         "thread/resume",
@@ -2199,6 +2204,8 @@ fn ensure_app_server_host_session_at(
             "runtimeWorkspaceRoots": [cwd],
             "excludeTurns": true
         }),
+        timeout,
+        deadline,
     )?;
     let resumed = app_server_thread_from_response(&response)?;
     let cwd = resumed.cwd.or_else(|| Some(cwd.to_owned()));
@@ -2428,14 +2435,23 @@ fn send_app_server_request_inner(
 
     loop {
         if let Some((timeout, deadline)) = archive_budget {
-            ensure_app_server_archive_budget(deadline)?;
+            ensure_app_server_local_budget(deadline)?;
             configure_socket_timeout(
                 socket,
                 remaining_app_server_archive_timeout(timeout, deadline),
             )?;
         }
-        match socket.read()? {
-            Message::Text(text) => {
+        match socket.read() {
+            Err(tungstenite::Error::Io(error))
+                if archive_budget.is_some()
+                    && matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+            {
+                return Err(
+                    format!("app-server {method} timed out before matching response").into(),
+                );
+            }
+            Err(error) => return Err(error.into()),
+            Ok(Message::Text(text)) => {
                 let value = serde_json::from_str::<Value>(text.as_ref())?;
                 if value.get("id").and_then(Value::as_i64) != Some(id) {
                     continue;
@@ -2445,10 +2461,10 @@ fn send_app_server_request_inner(
                 }
                 return Ok(value);
             }
-            Message::Close(_) => {
+            Ok(Message::Close(_)) => {
                 return Err(format!("app-server closed before {method} completed").into());
             }
-            _ => {}
+            Ok(_) => {}
         }
     }
 }
@@ -2461,7 +2477,7 @@ fn send_app_server_request_before_deadline(
     timeout: Duration,
     deadline: Instant,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    ensure_app_server_archive_budget(deadline)?;
+    ensure_app_server_local_budget(deadline)?;
     configure_socket_timeout(
         socket,
         remaining_app_server_archive_timeout(timeout, deadline),
@@ -3538,6 +3554,104 @@ mod tests {
             Some("cursor-page-2")
         );
         assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn ensure_host_session_errors_without_resolved_app_server_thread_id() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": []
+                }
+            }),
+        ]);
+
+        let error = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            1,
+        )
+        .expect_err("missing app-server thread should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("could not find session session-1 in app-server thread list")
+        );
+        let active_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("active thread/list request");
+        let archived_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("archived thread/list request");
+
+        assert_eq!(
+            active_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            archived_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn ensure_host_session_resume_is_bounded_by_local_deadline() {
+        let (url, requests) = run_fake_app_server_with_unmatched_resume_messages();
+
+        let error = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            1,
+        )
+        .expect_err("unmatched resume response should fail by deadline");
+        let message = error.to_string();
+        assert!(
+            message.contains("app-server thread/resume timed out before matching response"),
+            "{message}"
+        );
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+
+        assert_eq!(
+            list_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            resume_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-live-1")
+        );
     }
 
     #[test]
@@ -5664,6 +5778,96 @@ mod tests {
                         .send(Message::Text(response.to_string().into()))
                         .expect("send app-server response");
                 }
+            }
+        });
+        (format!("ws://{address}"), requests_rx)
+    }
+
+    fn run_fake_app_server_with_unmatched_resume_messages() -> (String, Receiver<serde_json::Value>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+        let address = listener.local_addr().expect("fake app-server address");
+        let (requests_tx, requests_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("id").and_then(serde_json::Value::as_i64),
+                Some(0)
+            );
+            assert_eq!(
+                initialize.get("method").and_then(serde_json::Value::as_str),
+                Some("initialize")
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {
+                            "userAgent": "codex-test",
+                            "codexHome": "/tmp/codex",
+                            "platformFamily": "unix",
+                            "platformOs": "macos"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized
+                    .get("method")
+                    .and_then(serde_json::Value::as_str),
+                Some("initialized")
+            );
+
+            let list_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(list_request);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "data": [
+                                {
+                                    "id": "thread-live-1",
+                                    "sessionId": "session-1",
+                                    "name": "Recovered title",
+                                    "cwd": "/tmp/project",
+                                    "updatedAt": 1781263443
+                                }
+                            ]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send thread/list response");
+
+            let resume_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(resume_request);
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(2) {
+                if socket
+                    .send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "thread/background",
+                            "params": {}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
             }
         });
         (format!("ws://{address}"), requests_rx)

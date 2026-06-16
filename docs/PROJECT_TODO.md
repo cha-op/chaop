@@ -14,6 +14,7 @@
 - [done] Add old-session history backfill for attached Host Sessions without uploading broad local transcripts by default.
 - [done] Sync Chaop archive/unarchive actions to local Codex app-server archive state through the connector, while keeping local history files read-only.
 - [done] Add real Codex app-server protocol execution for Chaop threads attached to local app-server Host Sessions.
+- [todo] Confirm the official Codex app-server resume-by-session-id protocol for historical rollout sessions that are absent from `thread/list`; keep Chaop attach limited to resolved app-server threads until then.
 - [done] PR0: Merge the tracked Web deploy script with full tests, three review lanes, and resolved GitHub conversations.
 - [done] PR1: Clean up execution UX and capability wording so `codex_exec` is private fallback only.
 - [done] PR2: Add connector-managed single app-server lifecycle.

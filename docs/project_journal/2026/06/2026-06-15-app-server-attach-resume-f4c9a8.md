@@ -3,9 +3,9 @@ id: 20260615-f4c9a8
 title: App-server Attach Resume
 status: completed
 created: 2026-06-15
-updated: 2026-06-15
+updated: 2026-06-16
 branch: wip/app-server-attach-resume
-pr:
+pr: 18
 supersedes:
 superseded_by:
 ---
@@ -26,12 +26,19 @@ superseded_by:
 - Connectors without the dedicated ensure capability keep the existing D1-only attach behaviour, even if they support older app-server command execution.
 - Review follow-up added `host_session_app_server_ensure` as a dedicated capability so deploying the Worker before restarting older connectors does not turn attach into a 15 second timeout on an unknown control envelope.
 - Review follow-up also made explicit Host Session attach fail when app-server `thread/list` resolution exhausts the bounded page budget, instead of falling back to the local session id as a guessed app-server `threadId`.
+- Regression follow-up on 2026-06-16 bounds initialize, unarchive, and resume through one local app-server deadline, maps local read timeouts to a clear app-server method timeout, and stops guessing `threadId` from the local session id when `thread/list` has no matching thread.
+- Budget summary now reports a zero baseline when D1 is bound but no current usage windows exist, so Cost posture no longer renders all three headline percentages as missing on a quiet deployment.
+- Limitation: historical rollout/session ids that are absent from app-server `thread/list` are not promoted to app-server-backed attachments until the Codex app-server protocol has an official resume-by-session-id path.
 
 ## Validation
 - `pnpm --filter @chaop/worker test`
 - `cargo test -p chaop-agent`
+- `cargo test -p chaop-agent session_inventory -- --nocapture`
+- `pnpm --dir apps/web test`
+- `pnpm --dir apps/worker test -- routes.test.ts`
 - `pnpm test`
 - `pnpm build`
+- `git diff --check`
 
 ## Next Steps
 - Deploy the updated Worker and restart the local connector with the rebuilt agent before live E2E validation.
