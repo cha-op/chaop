@@ -1417,7 +1417,7 @@ test("usage summary marks missing D1 budget windows as unsampled", async () => {
   assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct]), [["four_hour", 88.9]]);
 });
 
-test("usage summary reports zero baseline when no current D1 budget windows exist", async () => {
+test("usage summary reports missing percentages when no current D1 budget windows exist", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/usage-summary", {
       headers: {
@@ -1440,9 +1440,9 @@ test("usage summary reports zero baseline when no current D1 budget windows exis
 
   assert.equal(response.status, 200);
   assert.equal(body.source, "empty");
-  assert.equal(body.daily_used_pct, 0);
-  assert.equal(body.four_hour_used_pct, 0);
-  assert.equal(body.burst_used_pct, 0);
+  assert.equal(body.daily_used_pct, null);
+  assert.equal(body.four_hour_used_pct, null);
+  assert.equal(body.burst_used_pct, null);
   assert.equal(body.window_sample_count, 0);
   assert.deepEqual(body.windows, []);
 });

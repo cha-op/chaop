@@ -1144,11 +1144,18 @@ pub fn ensure_app_server_host_session(
             "session_inventory.app_server_url is required for app-server host session attach",
         )?;
     let cwd = app_server_command_cwd(config, cwd);
+    let codex_home = config
+        .session_inventory
+        .codex_home
+        .clone()
+        .unwrap_or_else(default_codex_home);
     ensure_app_server_host_session_at(
         url,
         session_id,
         title,
         &cwd,
+        None,
+        Some((&codex_home, config.session_inventory.max_sessions)),
         config.session_inventory.app_server_timeout_seconds,
     )
 }
@@ -2160,6 +2167,8 @@ fn ensure_app_server_host_session_at(
     session_id: &str,
     title: Option<&str>,
     cwd: &str,
+    rollout_path: Option<&Path>,
+    rollout_lookup: Option<(&Path, usize)>,
     timeout_seconds: u64,
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
@@ -2174,36 +2183,55 @@ fn ensure_app_server_host_session_at(
         timeout,
         deadline,
     )?;
-    let Some(resolved_thread) = resolved_thread else {
-        return Err(format!(
-            "app-server host session attach could not find session {session_id} in app-server thread list"
-        )
-        .into());
-    };
-    let thread_id = resolved_thread.thread_id;
-    if resolved_thread.archived {
-        let _ = send_app_server_request_before_deadline(
-            &mut socket,
-            request_id,
-            "thread/unarchive",
-            serde_json::json!({
-                "threadId": thread_id.clone()
-            }),
-            timeout,
-            deadline,
-        )?;
-        request_id += 1;
-    }
-    let response = send_app_server_request_before_deadline(
-        &mut socket,
-        request_id,
-        "thread/resume",
+    let resume_params = if let Some(resolved_thread) = resolved_thread {
+        let thread_id = resolved_thread.thread_id;
+        if resolved_thread.archived {
+            let _ = send_app_server_request_before_deadline(
+                &mut socket,
+                request_id,
+                "thread/unarchive",
+                serde_json::json!({
+                    "threadId": thread_id.clone()
+                }),
+                timeout,
+                deadline,
+            )?;
+            request_id += 1;
+        }
         serde_json::json!({
             "threadId": thread_id,
             "cwd": cwd,
             "runtimeWorkspaceRoots": [cwd],
             "excludeTurns": true
-        }),
+        })
+    } else {
+        let rollout_path_text = if let Some(rollout_path) = rollout_path {
+            Some(rollout_path.to_string_lossy().into_owned())
+        } else if let Some((codex_home, max_sessions)) = rollout_lookup {
+            find_rollout_path(codex_home, session_id, max_sessions)?
+                .map(|path| path.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        let Some(rollout_path_text) = rollout_path_text else {
+            return Err(format!(
+                "app-server host session attach could not find local rollout for session {session_id}"
+            )
+            .into());
+        };
+        serde_json::json!({
+            "threadId": session_id,
+            "path": rollout_path_text,
+            "cwd": cwd,
+            "runtimeWorkspaceRoots": [cwd],
+            "excludeTurns": true
+        })
+    };
+    let response = send_app_server_request_before_deadline(
+        &mut socket,
+        request_id,
+        "thread/resume",
+        resume_params,
         timeout,
         deadline,
     )?;
@@ -2744,6 +2772,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::net::{TcpListener, TcpStream};
+    use std::path::Path;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -3349,6 +3378,8 @@ mod tests {
             "session-1",
             Some("Fallback"),
             "/tmp/project",
+            None,
+            None,
             1,
         )
         .expect("resumed host session");
@@ -3444,6 +3475,8 @@ mod tests {
             "session-1",
             Some("Fallback"),
             "/tmp/project",
+            None,
+            None,
             1,
         )
         .expect("resumed archived host session");
@@ -3530,6 +3563,8 @@ mod tests {
             "session-1",
             Some("Fallback"),
             "/tmp/project",
+            None,
+            None,
             1,
         )
         .expect_err("page budget exhaustion should fail");
@@ -3557,7 +3592,102 @@ mod tests {
     }
 
     #[test]
-    fn ensure_host_session_errors_without_resolved_app_server_thread_id() {
+    fn resumes_unlisted_host_session_from_rollout_path() {
+        let rollout_path = Path::new("/tmp/codex/sessions/2026/06/16/rollout-session-1.jsonl");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-1",
+                        "name": "Recovered from path",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let session = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            Some(rollout_path),
+            None,
+            1,
+        )
+        .expect("path-based resume should attach the host session");
+        let active_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("active thread/list request");
+        let archived_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("archived thread/list request");
+
+        assert_eq!(
+            active_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            archived_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        assert_eq!(
+            resume_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/codex/sessions/2026/06/16/rollout-session-1.jsonl")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/excludeTurns")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.title, "Recovered from path");
+        assert!(session.app_server_present);
+    }
+
+    #[test]
+    fn ensure_host_session_errors_without_resolved_thread_or_rollout_path() {
         let (url, requests) = run_fake_app_server_with_requests(vec![
             json!({
                 "jsonrpc": "2.0",
@@ -3580,13 +3710,15 @@ mod tests {
             "session-1",
             Some("Fallback"),
             "/tmp/project",
+            None,
+            None,
             1,
         )
-        .expect_err("missing app-server thread should fail");
+        .expect_err("missing app-server thread and rollout path should fail");
         assert!(
             error
                 .to_string()
-                .contains("could not find session session-1 in app-server thread list")
+                .contains("could not find local rollout for session session-1")
         );
         let active_request = requests
             .recv_timeout(Duration::from_secs(1))
@@ -3619,6 +3751,8 @@ mod tests {
             "session-1",
             Some("Fallback"),
             "/tmp/project",
+            None,
+            None,
             1,
         )
         .expect_err("unmatched resume response should fail by deadline");

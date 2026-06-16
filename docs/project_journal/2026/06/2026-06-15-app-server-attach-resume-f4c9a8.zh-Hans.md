@@ -27,8 +27,8 @@ superseded_by:
 - Review follow-up 增加了 `host_session_app_server_ensure` 这个专用 capability，因此先部署 Worker、后重启旧 connector 时，attach 不会因为未知 control envelope 变成 15 秒 timeout。
 - Review follow-up 也让显式 Host Session attach 在 app-server `thread/list` 解析耗尽有界 page budget 时直接失败，而不是 fallback 到本机 session id 并把它猜作 app-server `threadId`。
 - 2026-06-16 的 regression follow-up 将 initialize、unarchive 和 resume 统一收敛到同一个本机 app-server deadline 内，把本机 read timeout 映射成清晰的 app-server method timeout，并且在 `thread/list` 找不到匹配 thread 时不再把本机 session id 猜作 `threadId`。
-- 当 D1 已绑定但当前没有 usage windows 时，Budget summary 现在会返回 0 baseline，因此空闲部署里的 Cost posture 不会再把三个核心百分比全部显示为 missing。
-- 限制：如果历史 rollout/session id 不在 app-server `thread/list` 中，在 Codex app-server protocol 提供正式的 resume-by-session-id 路径之前，Chaop 不会把它提升成 app-server-backed attachment。
+- 当历史 rollout/session id 不在 app-server `thread/list` 中时，connector 现在会从 Codex history 解析本机 rollout 文件路径，并用这个 path 调用 app-server `thread/resume`，而不是猜测 `threadId`。
+- 当 D1 当前没有 usage windows 时，Budget summary 会把核心百分比保持为 `missing`，避免用误导性的 0 baseline 表示未知用量。
 
 ## 验证
 - `pnpm --filter @chaop/worker test`

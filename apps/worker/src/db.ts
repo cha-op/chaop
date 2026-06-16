@@ -147,7 +147,6 @@ export async function loadBudgetSummaryFromDb(
   ]);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const primaryWindow = daily ?? fourHour ?? burst;
-  const hasCurrentWindow = windows.length > 0;
   const states = [
     ...windows.map((window) => budgetStateFromString(window.budget_state)),
     ...connectorStates.map((row) => budgetStateFromString(row.budget_state)),
@@ -156,13 +155,13 @@ export async function loadBudgetSummaryFromDb(
 
   return {
     state: worstBudgetState(states),
-    daily_used_pct: hasCurrentWindow ? windowPct(daily) : 0,
-    four_hour_used_pct: hasCurrentWindow ? windowPct(fourHour) : 0,
-    burst_used_pct: hasCurrentWindow ? windowPct(burst) : 0,
+    daily_used_pct: windowPct(daily),
+    four_hour_used_pct: windowPct(fourHour),
+    burst_used_pct: windowPct(burst),
     delayed_event_count: nonNegativeInteger(primaryWindow?.events_delayed),
     compacted_event_count: nonNegativeInteger(primaryWindow?.events_compacted),
     local_spool_bytes: nonNegativeInteger(primaryWindow?.local_spool_bytes),
-    source: hasCurrentWindow ? "d1_usage_windows" : "empty",
+    source: windows.length > 0 ? "d1_usage_windows" : "empty",
     generated_at: generatedAt,
     window_sample_count: windows.length,
     windows: windows.map(budgetWindowSignalFromRow)

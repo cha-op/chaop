@@ -27,8 +27,8 @@ superseded_by:
 - Review follow-up added `host_session_app_server_ensure` as a dedicated capability so deploying the Worker before restarting older connectors does not turn attach into a 15 second timeout on an unknown control envelope.
 - Review follow-up also made explicit Host Session attach fail when app-server `thread/list` resolution exhausts the bounded page budget, instead of falling back to the local session id as a guessed app-server `threadId`.
 - Regression follow-up on 2026-06-16 bounds initialize, unarchive, and resume through one local app-server deadline, maps local read timeouts to a clear app-server method timeout, and stops guessing `threadId` from the local session id when `thread/list` has no matching thread.
-- Budget summary now reports a zero baseline when D1 is bound but no current usage windows exist, so Cost posture no longer renders all three headline percentages as missing on a quiet deployment.
-- Limitation: historical rollout/session ids that are absent from app-server `thread/list` are not promoted to app-server-backed attachments until the Codex app-server protocol has an official resume-by-session-id path.
+- When a historical rollout/session id is absent from app-server `thread/list`, the connector now resolves the local rollout file path from Codex history and calls app-server `thread/resume` with that path instead of guessing a `threadId`.
+- Budget summary keeps headline percentages as `missing` when D1 has no current usage windows, instead of reporting a misleading zero baseline.
 
 ## Validation
 - `pnpm --filter @chaop/worker test`
