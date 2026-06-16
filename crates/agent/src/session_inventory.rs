@@ -1257,7 +1257,7 @@ fn run_app_server_command(
 
     let cwd = app_server_command_cwd(config, cwd);
     let mut request_id = 1;
-    let thread_id = resolve_app_server_thread_id_for_command(
+    let resolved_thread_id = resolve_app_server_thread_id_for_command(
         &mut socket,
         session_id,
         &mut request_id,
@@ -1265,29 +1265,70 @@ fn run_app_server_command(
         deadline,
         timeout_seconds,
         &cancel,
-    )?
-    .ok_or_else(|| {
-        AppServerCommandError::Other(format!(
-            "active app-server thread {session_id} was not found"
-        ))
-    })?;
+    )?;
+    let (resume_params, fallback_thread_id, require_resumed_thread_id) = if let Some(thread_id) =
+        resolved_thread_id
+    {
+        (
+            serde_json::json!({
+                "threadId": thread_id.clone(),
+                "cwd": cwd.clone(),
+                "runtimeWorkspaceRoots": [cwd.clone()],
+                "excludeTurns": true
+            }),
+            thread_id,
+            false,
+        )
+    } else {
+        let codex_home = config
+            .session_inventory
+            .codex_home
+            .clone()
+            .unwrap_or_else(default_codex_home);
+        let rollout_path = find_rollout_path(
+            &codex_home,
+            session_id,
+            config.session_inventory.max_sessions,
+        )
+        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+        let Some(rollout_path) = rollout_path else {
+            return Err(AppServerCommandError::Other(format!(
+                "active app-server thread {session_id} was not found and no local rollout was available"
+            )));
+        };
+        (
+            serde_json::json!({
+                "threadId": session_id,
+                "path": rollout_path.to_string_lossy(),
+                "cwd": cwd.clone(),
+                "runtimeWorkspaceRoots": [cwd.clone()],
+                "excludeTurns": true
+            }),
+            session_id.to_owned(),
+            true,
+        )
+    };
     let resume_response = send_app_server_request_for_command(
         &mut socket,
         request_id,
         "thread/resume",
-        serde_json::json!({
-            "threadId": thread_id,
-            "cwd": cwd.clone(),
-            "runtimeWorkspaceRoots": [cwd.clone()],
-            "excludeTurns": true
-        }),
+        resume_params,
         socket_timeout,
         deadline,
         timeout_seconds,
         &cancel,
     )?;
     request_id += 1;
-    let thread_id = response_thread_id(&resume_response).unwrap_or(thread_id);
+    let thread_id = match response_thread_id(&resume_response) {
+        Some(thread_id) => thread_id,
+        None if require_resumed_thread_id => {
+            return Err(AppServerCommandError::Other(
+                "app-server thread/resume response did not include thread.id for rollout path resume"
+                    .to_owned(),
+            ));
+        }
+        None => fallback_thread_id,
+    };
 
     let turn_response = send_app_server_turn_start_for_command(
         &mut socket,
@@ -5236,6 +5277,194 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("Say exactly: chaop-smoke")
         );
+    }
+
+    #[test]
+    fn app_server_command_resumes_unlisted_session_from_rollout_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-tree-1",
+                        "turns": []
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "turn": completed_turn("turn-1", "path command")
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                codex_home: Some(codex_home.into()),
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            Some("/tmp/attached-project"),
+            "command-1",
+            "Use the recovered thread",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].summary, "Codex: path command");
+        assert_eq!(events[1].kind, "command.finished");
+
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let turn_start_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("turn/start request");
+
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("session-tree-1")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-from-path")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/clientUserMessageId")
+                .and_then(serde_json::Value::as_str),
+            Some("command-1")
+        );
+    }
+
+    #[test]
+    fn app_server_command_requires_thread_id_after_rollout_path_resume() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "sessionId": "session-tree-1",
+                        "turns": []
+                    }
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                codex_home: Some(codex_home.into()),
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            Some("/tmp/attached-project"),
+            "command-1",
+            "Use the recovered thread",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "command.failed");
+        assert_eq!(
+            events[0].summary,
+            "Codex app-server turn could not start: app-server thread/resume response did not include thread.id for rollout path resume."
+        );
+
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
     #[test]

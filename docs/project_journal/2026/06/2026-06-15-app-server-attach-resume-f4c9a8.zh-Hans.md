@@ -28,6 +28,7 @@ superseded_by:
 - Review follow-up 也让显式 Host Session attach 在 app-server `thread/list` 解析耗尽有界 page budget 时直接失败，而不是 fallback 到本机 session id 并把它猜作 app-server `threadId`。
 - 2026-06-16 的 regression follow-up 将 initialize、unarchive 和 resume 统一收敛到同一个本机 app-server deadline 内，把本机 read timeout 映射成清晰的 app-server method timeout，并且在 `thread/list` 找不到匹配 thread 时不再把本机 session id 猜作 `threadId`。
 - 当历史 rollout/session id 不在 app-server `thread/list` 中时，connector 现在会从 Codex history 解析本机 rollout 文件路径，并用这个 path 调用 app-server `thread/resume`，而不是猜测 `threadId`。
+- Managed app-server command execution 在 active `thread/list` miss 后也会使用同一个 rollout path fallback，然后用 app-server resume 返回的真实 `thread.id` 启动 turn。
 - 当 D1 当前没有 usage windows 时，Budget summary 会把核心百分比保持为 `missing`，避免用误导性的 0 baseline 表示未知用量。
 
 ## 验证

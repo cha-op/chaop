@@ -28,6 +28,7 @@ superseded_by:
 - Review follow-up also made explicit Host Session attach fail when app-server `thread/list` resolution exhausts the bounded page budget, instead of falling back to the local session id as a guessed app-server `threadId`.
 - Regression follow-up on 2026-06-16 bounds initialize, unarchive, and resume through one local app-server deadline, maps local read timeouts to a clear app-server method timeout, and stops guessing `threadId` from the local session id when `thread/list` has no matching thread.
 - When a historical rollout/session id is absent from app-server `thread/list`, the connector now resolves the local rollout file path from Codex history and calls app-server `thread/resume` with that path instead of guessing a `threadId`.
+- Managed app-server command execution uses the same rollout path fallback after an active `thread/list` miss, then starts the turn on the real `thread.id` returned by app-server resume.
 - Budget summary keeps headline percentages as `missing` when D1 has no current usage windows, instead of reporting a misleading zero baseline.
 
 ## Validation
