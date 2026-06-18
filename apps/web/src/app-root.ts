@@ -722,6 +722,14 @@ export class ChaopApp extends LitElement {
                 ${newestWindow ? formatRelativeIso(newestWindow, this.clockNow) : "none"}
               </dd>
             </div>
+            ${budget.d1_write_model
+              ? html`
+                  <div><dt>D1 rows/event</dt><dd>${budget.d1_write_model.budgeted_rows_written_per_event}</dd></div>
+                  <div><dt>D1 free rows/day</dt><dd>${budget.d1_write_model.free_rows_written_per_day.toLocaleString("en-GB")}</dd></div>
+                  <div><dt>Command event</dt><dd>${budget.d1_write_model.command_lifecycle_with_task_rows_written} rows</dd></div>
+                  <div><dt>Backfill floor</dt><dd>${budget.d1_write_model.backfill_rows_written_per_event} rows/event</dd></div>
+                `
+              : nothing}
           </dl>
         </aside>
       </section>
@@ -1457,7 +1465,7 @@ function budgetWindowDetail(window: BudgetWindow): string {
     : ` / ${window.budget_units.toLocaleString("en-GB")} units`;
   const estimatedRows = window.estimated_d1_rows_written === undefined
     ? ""
-    : `, ~${window.estimated_d1_rows_written.toLocaleString("en-GB")} D1 rows written`;
+    : `, ${window.estimated_d1_rows_written.toLocaleString("en-GB")} modelled D1 rows`;
   return `${events}${budget}${estimatedRows}`;
 }
 

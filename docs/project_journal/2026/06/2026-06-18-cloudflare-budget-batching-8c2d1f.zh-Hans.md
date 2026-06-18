@@ -19,7 +19,7 @@ superseded_by:
 - Usage-window 记账会先按 window 聚合 events 再写入 D1，因此有界 backfill 每批只会让每个 active window 更新一次。
 
 ## 当前状态
-- 默认 daily budget units 来源于 Cloudflare D1 免费 rows-written 额度，并保守估算每个持久化 Chaop event 会产生五个 D1 written rows。
+- 已被后续细节取代：原先的 five-row D1 write estimate 已由 `2026-06-18-d1-write-budget-model-9f6a2b.md` 中的 schema-derived model 取代。
 - 默认 four-hour hard budget 是 daily event budget 的六分之一，soft budget 约为这个 four-hour hard budget 的百分之七十五。
 - Budget summary 在读取 D1 rows 时，会根据当前环境配置重新计算 `used_pct` 和 `budget_state`，因此修改预算后仍未结束的 windows 会立即使用新阈值。
 - Budget window payload 会向 Browser Budget Board 暴露 `budget_units` 和 `estimated_d1_rows_written`。

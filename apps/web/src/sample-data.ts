@@ -323,6 +323,25 @@ export function fallbackBootstrap(): BootstrapPayload {
       source: "sample",
       generated_at: "2026-06-09T21:58:05.000Z",
       window_sample_count: 3,
+      d1_write_model: {
+        source: "schema_derived",
+        free_rows_written_per_day: 100000,
+        free_worker_requests_per_day: 100000,
+        budgeted_rows_written_per_event: 12,
+        daily_budget_units: 8333,
+        four_hour_soft_budget_units: 1041,
+        four_hour_hard_budget_units: 1388,
+        burst_budget_units: 833,
+        steady_persisted_event_rows_written: 12,
+        first_event_in_minute_rows_written: 14,
+        first_event_in_four_hour_rows_written: 16,
+        first_event_in_day_rows_written: 18,
+        backfill_rows_written_per_event: 6,
+        backfill_same_minute_fixed_rows_written: 6,
+        command_lifecycle_without_task_rows_written: 16,
+        command_lifecycle_with_task_rows_written: 20,
+        components: []
+      },
       windows: [
         {
           window_type: "daily",
@@ -330,8 +349,8 @@ export function fallbackBootstrap(): BootstrapPayload {
           window_end: "2026-06-10T00:00:00.000Z",
           budget_state: "conservative",
           used_pct: 75,
-          budget_units: 20000,
-          events_received: 15000,
+          budget_units: 8333,
+          events_received: 6250,
           events_compacted: 318,
           events_delayed: 42,
           local_spool_bytes: 134217728,
@@ -344,12 +363,12 @@ export function fallbackBootstrap(): BootstrapPayload {
           window_end: "2026-06-09T22:00:00.000Z",
           budget_state: "conservative",
           used_pct: 62,
-          budget_units: 3333,
-          events_received: 2066,
+          budget_units: 1388,
+          events_received: 861,
           events_compacted: 92,
           events_delayed: 18,
           local_spool_bytes: 67108864,
-          estimated_d1_rows_written: 10330,
+          estimated_d1_rows_written: 10332,
           updated_at: "2026-06-09T21:58:05.000Z"
         },
         {
@@ -358,12 +377,12 @@ export function fallbackBootstrap(): BootstrapPayload {
           window_end: "2026-06-09T21:58:00.000Z",
           budget_state: "normal",
           used_pct: 18,
-          budget_units: 1000,
-          events_received: 180,
+          budget_units: 833,
+          events_received: 150,
           events_compacted: 4,
           events_delayed: 0,
           local_spool_bytes: 0,
-          estimated_d1_rows_written: 900,
+          estimated_d1_rows_written: 1800,
           updated_at: "2026-06-09T21:58:05.000Z"
         }
       ]

@@ -127,7 +127,7 @@ test("budgetSourceLabel describes live Cloudflare-estimated windows", () => {
 
   assert.equal(
     budgetSourceLabel(budget),
-    "Live database summary from 2 bounded usage windows, scaled by Cloudflare free-quota estimates."
+    "Live database summary from 2 bounded usage windows, scaled by a schema-derived D1 rows-written model."
   );
 });
 

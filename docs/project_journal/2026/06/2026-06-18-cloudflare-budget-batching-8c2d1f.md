@@ -19,7 +19,7 @@ superseded_by:
 - Usage-window accounting aggregates events by window before writing to D1, so bounded backfills update each active window once per batch.
 
 ## Current State
-- Default daily budget units are derived from the Cloudflare D1 free rows-written quota, using a conservative estimate of five D1 written rows per persisted Chaop event.
+- Superseded detail: the original five-row D1 write estimate was replaced by the schema-derived model in `2026-06-18-d1-write-budget-model-9f6a2b.md`.
 - Default four-hour hard budget is one sixth of the daily event budget, with the soft budget at roughly seventy-five per cent of that four-hour hard budget.
 - Budget summary output recalculates `used_pct` and `budget_state` from the current environment settings when it reads D1 rows, so changed budgets take effect immediately for still-open windows.
 - Budget window payloads expose `budget_units` and `estimated_d1_rows_written` for the Browser Budget Board.

@@ -47,6 +47,34 @@ export type BudgetWindowSignal = {
   updated_at: string;
 };
 
+export type BudgetD1WriteModelComponent = {
+  id: string;
+  label: string;
+  rows_written: number;
+  frequency: string;
+  detail: string;
+};
+
+export type BudgetD1WriteModel = {
+  source: "schema_derived";
+  free_rows_written_per_day: number;
+  free_worker_requests_per_day: number;
+  budgeted_rows_written_per_event: number;
+  daily_budget_units: number;
+  four_hour_soft_budget_units: number;
+  four_hour_hard_budget_units: number;
+  burst_budget_units: number;
+  steady_persisted_event_rows_written: number;
+  first_event_in_minute_rows_written: number;
+  first_event_in_four_hour_rows_written: number;
+  first_event_in_day_rows_written: number;
+  backfill_rows_written_per_event: number;
+  backfill_same_minute_fixed_rows_written: number;
+  command_lifecycle_without_task_rows_written: number;
+  command_lifecycle_with_task_rows_written: number;
+  components: BudgetD1WriteModelComponent[];
+};
+
 export type RealtimeMode =
   | "realtime"
   | "summary"
@@ -350,6 +378,7 @@ export type BudgetSummary = {
   generated_at?: string | undefined;
   window_sample_count?: number | undefined;
   windows?: BudgetWindowSignal[] | undefined;
+  d1_write_model?: BudgetD1WriteModel | undefined;
 };
 
 export type BootstrapPayload = {

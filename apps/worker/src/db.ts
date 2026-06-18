@@ -8,6 +8,7 @@ import type {
   AppServerInstanceSummary,
   AttachHostSessionResponse,
   BootstrapPayload,
+  BudgetD1WriteModel,
   BudgetState,
   BudgetSummary,
   BudgetWindowSignal,
@@ -40,13 +41,42 @@ const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
 const CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY = 100_000;
 const CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY = 100_000;
-const ESTIMATED_D1_ROWS_WRITTEN_PER_EVENT = 5;
-const DEFAULT_DAILY_BUDGET_UNITS = Math.floor(
-  Math.min(CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY, CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY / ESTIMATED_D1_ROWS_WRITTEN_PER_EVENT)
-);
+const D1_THREAD_SEQUENCE_UPDATE_ROWS = 2;
+const D1_EVENT_INSERT_ROWS = 4;
+const D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS = 2;
+const D1_USAGE_WINDOW_NEW_INSERT_ROWS = 4;
+const D1_USAGE_WINDOW_COUNT = 3;
+const D1_COMMAND_STATE_UPDATE_ROWS = 2;
+const D1_TASK_STATE_UPDATE_ROWS = 4;
+const D1_CONNECTOR_ACTIVITY_UPDATE_ROWS = 2;
+const D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN =
+  D1_THREAD_SEQUENCE_UPDATE_ROWS + D1_EVENT_INSERT_ROWS + D1_USAGE_WINDOW_COUNT * D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS;
+const D1_FIRST_EVENT_IN_MINUTE_ROWS_WRITTEN =
+  D1_THREAD_SEQUENCE_UPDATE_ROWS
+  + D1_EVENT_INSERT_ROWS
+  + (D1_USAGE_WINDOW_COUNT - 1) * D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS
+  + D1_USAGE_WINDOW_NEW_INSERT_ROWS;
+const D1_FIRST_EVENT_IN_FOUR_HOUR_ROWS_WRITTEN =
+  D1_THREAD_SEQUENCE_UPDATE_ROWS
+  + D1_EVENT_INSERT_ROWS
+  + D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS
+  + 2 * D1_USAGE_WINDOW_NEW_INSERT_ROWS;
+const D1_FIRST_EVENT_IN_DAY_ROWS_WRITTEN =
+  D1_THREAD_SEQUENCE_UPDATE_ROWS + D1_EVENT_INSERT_ROWS + D1_USAGE_WINDOW_COUNT * D1_USAGE_WINDOW_NEW_INSERT_ROWS;
+const D1_BACKFILL_ROWS_WRITTEN_PER_EVENT = D1_THREAD_SEQUENCE_UPDATE_ROWS + D1_EVENT_INSERT_ROWS;
+const D1_BACKFILL_SAME_MINUTE_FIXED_ROWS_WRITTEN = D1_USAGE_WINDOW_COUNT * D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS;
+const D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN =
+  D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN + D1_COMMAND_STATE_UPDATE_ROWS + D1_CONNECTOR_ACTIVITY_UPDATE_ROWS;
+const D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN =
+  D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN + D1_TASK_STATE_UPDATE_ROWS;
+const D1_BUDGETED_ROWS_WRITTEN_PER_EVENT = D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN;
+const DEFAULT_DAILY_BUDGET_UNITS = Math.floor(CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY / D1_BUDGETED_ROWS_WRITTEN_PER_EVENT);
 const DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS = Math.max(1, Math.floor(DEFAULT_DAILY_BUDGET_UNITS / 6));
 const DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS = Math.max(1, Math.ceil(DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS * 0.75));
-const DEFAULT_BURST_EVENTS_PER_MINUTE = 1_000;
+const DEFAULT_BURST_EVENTS_PER_MINUTE = Math.max(
+  1,
+  Math.floor((CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY * 0.1) / D1_BUDGETED_ROWS_WRITTEN_PER_EVENT)
+);
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const ONE_MINUTE_MS = 60 * 1000;
 const BUDGET_STATE_RANK: Record<BudgetState, number> = {
@@ -169,7 +199,8 @@ export async function loadBudgetSummaryFromDb(
     source: windows.length > 0 ? "d1_usage_windows" : "empty",
     generated_at: generatedAt,
     window_sample_count: windows.length,
-    windows: windows.map((window) => budgetWindowSignalFromRow(env, window))
+    windows: windows.map((window) => budgetWindowSignalFromRow(env, window)),
+    d1_write_model: budgetD1WriteModel(env)
   };
 }
 
@@ -4215,7 +4246,8 @@ function emptyBudgetSummary(generatedAt: string): BudgetSummary {
     source: "empty",
     generated_at: generatedAt,
     window_sample_count: 0,
-    windows: []
+    windows: [],
+    d1_write_model: budgetD1WriteModel({})
   };
 }
 
@@ -4233,8 +4265,73 @@ function budgetWindowSignalFromRow(env: Env, row: UsageWindowRow): BudgetWindowS
     events_compacted: nonNegativeInteger(row.events_compacted),
     events_delayed: nonNegativeInteger(row.events_delayed),
     local_spool_bytes: nonNegativeInteger(row.local_spool_bytes),
-    estimated_d1_rows_written: eventsReceived * ESTIMATED_D1_ROWS_WRITTEN_PER_EVENT,
+    estimated_d1_rows_written: eventsReceived * D1_BUDGETED_ROWS_WRITTEN_PER_EVENT,
     updated_at: row.updated_at
+  };
+}
+
+function budgetD1WriteModel(env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">): BudgetD1WriteModel {
+  const dailyBudget = positiveIntegerEnv(env.CHAOP_DAILY_BUDGET_UNITS, DEFAULT_DAILY_BUDGET_UNITS);
+  const fourHourSoftBudget = positiveIntegerEnv(env.CHAOP_4H_SOFT_BUDGET_UNITS, DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS);
+  const fourHourHardBudget = Math.max(
+    positiveIntegerEnv(env.CHAOP_4H_HARD_BUDGET_UNITS, DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS),
+    fourHourSoftBudget
+  );
+  const burstBudget = positiveIntegerEnv(env.CHAOP_BURST_EVENTS_PER_MINUTE, DEFAULT_BURST_EVENTS_PER_MINUTE);
+  return {
+    source: "schema_derived",
+    free_rows_written_per_day: CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY,
+    free_worker_requests_per_day: CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY,
+    budgeted_rows_written_per_event: D1_BUDGETED_ROWS_WRITTEN_PER_EVENT,
+    daily_budget_units: dailyBudget,
+    four_hour_soft_budget_units: fourHourSoftBudget,
+    four_hour_hard_budget_units: fourHourHardBudget,
+    burst_budget_units: burstBudget,
+    steady_persisted_event_rows_written: D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN,
+    first_event_in_minute_rows_written: D1_FIRST_EVENT_IN_MINUTE_ROWS_WRITTEN,
+    first_event_in_four_hour_rows_written: D1_FIRST_EVENT_IN_FOUR_HOUR_ROWS_WRITTEN,
+    first_event_in_day_rows_written: D1_FIRST_EVENT_IN_DAY_ROWS_WRITTEN,
+    backfill_rows_written_per_event: D1_BACKFILL_ROWS_WRITTEN_PER_EVENT,
+    backfill_same_minute_fixed_rows_written: D1_BACKFILL_SAME_MINUTE_FIXED_ROWS_WRITTEN,
+    command_lifecycle_without_task_rows_written: D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN,
+    command_lifecycle_with_task_rows_written: D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN,
+    components: [
+      {
+        id: "thread_sequence",
+        label: "Thread sequence update",
+        rows_written: D1_THREAD_SEQUENCE_UPDATE_ROWS,
+        frequency: "per persisted thread event",
+        detail: "Updates the threads row and idx_threads_workspace_updated."
+      },
+      {
+        id: "event_insert",
+        label: "Event insert",
+        rows_written: D1_EVENT_INSERT_ROWS,
+        frequency: "per persisted thread event",
+        detail: "Writes the events row, primary-key index, unique thread sequence index, and explicit thread sequence index."
+      },
+      {
+        id: "usage_windows",
+        label: "Usage-window accounting",
+        rows_written: D1_USAGE_WINDOW_COUNT * D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS,
+        frequency: "per realtime event after current windows exist",
+        detail: "Updates daily, four-hour, and burst rows plus the latest-window index."
+      },
+      {
+        id: "command_lifecycle",
+        label: "Command lifecycle overhead",
+        rows_written: D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN - D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN,
+        frequency: "per command event with an attached task",
+        detail: "Updates command state, task state, and connector activity in addition to the persisted event."
+      },
+      {
+        id: "backfill_batch",
+        label: "Backfill batch floor",
+        rows_written: D1_BACKFILL_ROWS_WRITTEN_PER_EVENT,
+        frequency: "per imported backfill event before fixed window updates",
+        detail: "Backfills update thread sequence and insert events per row, then update active usage windows once per batch."
+      }
+    ]
   };
 }
 
