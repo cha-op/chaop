@@ -27,7 +27,12 @@ const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], 
 export function budgetSourceLabel(budget: BudgetSummary): string {
   const windowSampleCount = budget.window_sample_count ?? (budget.windows ?? []).length;
   if (budget.source === "d1_usage_windows") {
-    return `Live database summary from ${windowSampleCount} bounded usage windows, scaled by a schema-derived D1 rows-written model.`;
+    if (!budget.constraints) {
+      return `Live database summary from ${windowSampleCount} bounded usage windows; detailed constraints are not reported by this control plane.`;
+    }
+    const constraintSampleCount = budget.constraint_sample_count ?? budget.constraints.filter((constraint) => constraint.sampled).length;
+    const constraintCount = budget.constraints.length;
+    return `Live database summary from ${windowSampleCount} bounded usage windows and ${constraintSampleCount}/${constraintCount} sampled budget constraints.`;
   }
   if (budget.source === "sample") {
     return "Sample data for local development.";

@@ -6,6 +6,7 @@ import {
   type AppServerInstanceSummary,
   type AppServerInstancesUpdatePayload,
   type BootstrapPayload,
+  type BudgetConstraint,
   type BudgetSummary,
   type CommandSummary,
   type ConnectorSummary,
@@ -254,6 +255,8 @@ export class ChaopApp extends LitElement {
 
   private renderTopBar() {
     const budget = this.data!.budget;
+    const bottleneck = budgetBottleneckConstraint(budget);
+    const budgetChipState = budgetCompactState(budget, bottleneck);
     return html`
       <header class="topbar">
         <div>
@@ -262,8 +265,7 @@ export class ChaopApp extends LitElement {
         </div>
         <div class="topbar-status">
           <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
-          <span class="chip ${budget.state}">4h ${budgetPctLabel(budget.four_hour_used_pct)}</span>
-          <span class="chip ${budget.state}">Day ${budgetPctLabel(budget.daily_used_pct)}</span>
+          <span class="chip ${budgetChipState}">${budgetCompactLabel(bottleneck)}</span>
           <span class="identity">${this.data!.user.email}</span>
         </div>
       </header>
@@ -672,9 +674,12 @@ export class ChaopApp extends LitElement {
   private renderBudgetBoard() {
     const budget = this.data!.budget;
     const windows = budgetWindows(budget);
+    const constraints = budgetConstraints(budget);
+    const bottleneck = budgetBottleneckConstraint(budget);
     const newestWindow = newestBudgetWindowUpdatedAt(budget);
     const generatedAt = budget.generated_at ?? this.data!.server_time;
     const windowSampleCount = budget.window_sample_count ?? windows.length;
+    const constraintSampleCount = budget.constraint_sample_count ?? constraints.filter((constraint) => constraint.sampled).length;
     return html`
       <section class="page-grid budget-grid">
         <section class="panel primary">
@@ -683,12 +688,46 @@ export class ChaopApp extends LitElement {
             <span class="chip ${budget.state}">${budget.state.replace("_", " ")}</span>
           </div>
           <p class="panel-subtle">${budgetSourceLabel(budget)}</p>
+          ${bottleneck
+            ? html`
+                <article class="budget-bottleneck">
+                  <div>
+                    <span>Current bottleneck</span>
+                    <strong>${bottleneck.label}</strong>
+                  </div>
+                  <div>
+                    <span>Remaining</span>
+                    <strong>${budgetRemainingLabel(bottleneck)}</strong>
+                  </div>
+                  <small>${bottleneck.detail}</small>
+                </article>
+              `
+            : html`
+                <article class="budget-bottleneck missing">
+                  <div>
+                    <span>Current bottleneck</span>
+                    <strong>missing</strong>
+                  </div>
+                  <small>No sampled hard budget constraint is available yet.</small>
+                </article>
+              `}
           <div class="budget-bars">
-            ${budgetBar("4-hour window", budget.four_hour_used_pct)}
-            ${budgetBar("Daily budget", budget.daily_used_pct)}
-            ${budgetBar("Burst window", budget.burst_used_pct)}
+            ${constraints.map((constraint) => budgetConstraintBar(constraint))}
           </div>
-          <div class="budget-windows" aria-label="Sampled usage windows">
+          <div class="budget-windows" aria-label="Sampled budget constraints">
+            ${constraints.map(
+              (constraint) => html`
+                <div class=${constraint.sampled ? "" : "missing"}>
+                  <span>${constraint.label}</span>
+                  <strong>${budgetPctLabel(constraint.used_pct)}</strong>
+                  <small title=${constraint.updated_at ? formatAbsoluteIso(constraint.updated_at) : constraint.detail}>
+                    ${budgetConstraintDetail(constraint)}
+                  </small>
+                </div>
+              `
+            )}
+          </div>
+          <div class="budget-windows secondary" aria-label="Sampled usage windows">
             ${windows.map(
               (window) => html`
                 <div>
@@ -706,12 +745,13 @@ export class ChaopApp extends LitElement {
         <aside class="panel">
           <div class="section-heading">
             <h2>Reliability</h2>
-            <span>${windowSampleCount} windows</span>
+            <span>${budgetConstraintSampleLabel(constraintSampleCount, constraints.length)}</span>
           </div>
           <dl class="facts">
             <div><dt>Delayed events</dt><dd>${budget.delayed_event_count}</dd></div>
             <div><dt>Compacted events</dt><dd>${budget.compacted_event_count}</dd></div>
             <div><dt>Local spool</dt><dd>${formatBytes(budget.local_spool_bytes)}</dd></div>
+            <div><dt>Usage windows</dt><dd>${windowSampleCount}</dd></div>
             <div>
               <dt>Generated</dt>
               <dd title=${formatAbsoluteIso(generatedAt)}>${formatRelativeIso(generatedAt, this.clockNow)}</dd>
@@ -1454,6 +1494,99 @@ function newestBudgetWindowUpdatedAt(budget: BudgetSummary): string | undefined 
   }, undefined);
 }
 
+function budgetConstraints(budget: BudgetSummary): BudgetConstraint[] {
+  if (budget.constraints) return budget.constraints;
+  const windowsByType = new Map(budgetWindows(budget).map((window) => [window.window_type, window]));
+  return [
+    legacyBudgetConstraint(
+      "legacy_daily",
+      "Daily budget",
+      "Legacy daily usage percentage from a control plane that does not report detailed constraints.",
+      "daily",
+      budget.daily_used_pct,
+      windowsByType.get("daily"),
+      budget.state
+    ),
+    legacyBudgetConstraint(
+      "legacy_four_hour",
+      "4-hour window",
+      "Legacy four-hour usage percentage from a control plane that does not report detailed constraints.",
+      "four_hour",
+      budget.four_hour_used_pct,
+      windowsByType.get("four_hour"),
+      budget.state
+    ),
+    legacyBudgetConstraint(
+      "legacy_burst",
+      "Burst window",
+      "Legacy burst usage percentage from a control plane that does not report detailed constraints.",
+      "burst",
+      budget.burst_used_pct,
+      windowsByType.get("burst"),
+      budget.state
+    )
+  ];
+}
+
+function legacyBudgetConstraint(
+  id: string,
+  label: string,
+  detail: string,
+  windowType: BudgetConstraint["window_type"],
+  usedPct: number | null | undefined,
+  window: BudgetWindow | undefined,
+  summaryState: BudgetSummary["state"]
+): BudgetConstraint {
+  const limitUnits = window?.budget_units ?? null;
+  const usedUnits = window?.events_received ?? null;
+  const remainingUnits = limitUnits === null || usedUnits === null ? null : Math.max(0, limitUnits - usedUnits);
+  const remainingRatio = usedPct === null || usedPct === undefined || !Number.isFinite(usedPct)
+    ? null
+    : Math.max(0, Math.round((1 - usedPct / 100) * 1000) / 1000);
+  return {
+    id,
+    label,
+    detail,
+    window_type: windowType,
+    unit: "event",
+    hard: true,
+    sampled: usedPct !== null && usedPct !== undefined,
+    state: window?.budget_state ?? (usedPct === null || usedPct === undefined ? "missing" : summaryState),
+    source: usedPct === null || usedPct === undefined ? "missing" : "d1_usage_windows",
+    limit_units: limitUnits,
+    used_units: usedUnits,
+    used_pct: usedPct ?? null,
+    remaining_units: remainingUnits,
+    remaining_ratio: remainingRatio,
+    per_event_units: 1,
+    remaining_event_capacity: remainingUnits,
+    window_start: window?.window_start,
+    window_end: window?.window_end,
+    updated_at: window?.updated_at
+  };
+}
+
+function budgetBottleneckConstraint(budget: BudgetSummary): BudgetConstraint | undefined {
+  return budget.bottleneck_constraint ?? budgetConstraints(budget)
+    .filter((constraint) =>
+      constraint.hard
+      && constraint.sampled
+      && constraint.remaining_ratio !== null
+      && constraint.state !== "missing"
+    )
+    .sort(compareBudgetConstraintsByRemainingRatio)[0];
+}
+
+function compareBudgetConstraintsByRemainingRatio(left: BudgetConstraint, right: BudgetConstraint): number {
+  const ratioDelta = (left.remaining_ratio ?? Number.POSITIVE_INFINITY) - (right.remaining_ratio ?? Number.POSITIVE_INFINITY);
+  if (ratioDelta !== 0) return ratioDelta;
+  const capacityDelta =
+    (left.remaining_event_capacity ?? Number.POSITIVE_INFINITY)
+    - (right.remaining_event_capacity ?? Number.POSITIVE_INFINITY);
+  if (capacityDelta !== 0) return capacityDelta;
+  return left.id.localeCompare(right.id);
+}
+
 function budgetWindows(budget: BudgetSummary): BudgetWindow[] {
   return budget.windows ?? [];
 }
@@ -1467,6 +1600,59 @@ function budgetWindowDetail(window: BudgetWindow): string {
     ? ""
     : `, ${window.estimated_d1_rows_written.toLocaleString("en-GB")} modelled D1 rows`;
   return `${events}${budget}${estimatedRows}`;
+}
+
+function budgetConstraintDetail(constraint: BudgetConstraint): string {
+  if (!constraint.sampled) {
+    const limit = constraint.limit_units === null ? "unknown limit" : `${formatCount(constraint.limit_units)} ${budgetConstraintUnitLabel(constraint.unit)}`;
+    return `${limit}; usage sample missing`;
+  }
+  const used = constraint.used_units === null ? "missing" : formatCount(constraint.used_units);
+  const limit = constraint.limit_units === null ? "unknown" : formatCount(constraint.limit_units);
+  const remaining = constraint.remaining_units === null ? "missing" : formatCount(constraint.remaining_units);
+  const capacity = constraint.remaining_event_capacity === null
+    ? ""
+    : `, ${formatCount(constraint.remaining_event_capacity)} events left`;
+  return `${used} / ${limit} ${budgetConstraintUnitLabel(constraint.unit)}, ${remaining} remaining${capacity}`;
+}
+
+function budgetConstraintSampleLabel(sampled: number, total: number): string {
+  return total === 0 ? "no constraints" : `${sampled}/${total} constraints`;
+}
+
+function budgetRemainingLabel(constraint: BudgetConstraint): string {
+  if (constraint.remaining_ratio === null) return "missing";
+  const percent = budgetPctLabel(constraint.remaining_ratio * 100);
+  const capacity = constraint.remaining_event_capacity === null
+    ? ""
+    : `, ${formatCount(constraint.remaining_event_capacity)} events`;
+  return `${percent}${capacity}`;
+}
+
+function budgetCompactLabel(constraint: BudgetConstraint | undefined): string {
+  if (!constraint || constraint.remaining_ratio === null) return "Budget missing";
+  return `Budget ${budgetPctLabel(constraint.remaining_ratio * 100)} left`;
+}
+
+function budgetCompactState(budget: BudgetSummary, constraint: BudgetConstraint | undefined): BudgetSummary["state"] | "missing" {
+  if (constraint || budget.state !== "normal") return budget.state;
+  return "missing";
+}
+
+function budgetConstraintUnitLabel(unit: BudgetConstraint["unit"]): string {
+  return {
+    event: "events",
+    d1_row: "D1 rows written",
+    d1_row_read: "D1 rows read",
+    worker_request: "Worker requests",
+    durable_object_request: "DO requests",
+    byte: "bytes",
+    operation: "operations"
+  }[unit];
+}
+
+function formatCount(value: number): string {
+  return value.toLocaleString("en-GB");
 }
 
 function newerIso(current: string | undefined, incoming: string): string {
@@ -1585,11 +1771,14 @@ function isRealtimeAppServerInstancesPayload(value: unknown): value is RealtimeA
   );
 }
 
-function budgetBar(label: string, value: number | null | undefined) {
+function budgetConstraintBar(constraint: BudgetConstraint) {
   return html`
-    <div class="budget-bar">
-      <div><span>${label}</span><strong>${budgetPctLabel(value)}</strong></div>
-      <meter min="0" max="100" value=${meterPct(value)}></meter>
+    <div class="budget-bar ${constraint.sampled ? "" : "missing"}">
+      <div>
+        <span>${constraint.label}</span>
+        <strong>${constraint.sampled ? budgetPctLabel(constraint.used_pct) : "missing"}</strong>
+      </div>
+      <meter min="0" max="100" value=${meterPct(constraint.used_pct)}></meter>
     </div>
   `;
 }

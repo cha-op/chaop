@@ -122,12 +122,35 @@ test("budgetSourceLabel reports unknown source for legacy budget payloads", () =
   assert.equal(budgetSourceLabel(budget), "Summary source not reported by this control plane.");
 });
 
-test("budgetSourceLabel describes live Cloudflare-estimated windows", () => {
-  const budget = { ...payload().budget, source: "d1_usage_windows" as const, window_sample_count: 2 };
+test("budgetSourceLabel describes live sampled budget constraints", () => {
+  const budget = {
+    ...payload().budget,
+    source: "d1_usage_windows" as const,
+    window_sample_count: 2,
+    constraint_sample_count: 3,
+    constraints: Array.from({ length: 6 }, (_, index) => ({
+      id: `constraint-${index}`,
+      label: `Constraint ${index}`,
+      detail: "Test constraint",
+      window_type: "daily" as const,
+      unit: "d1_row" as const,
+      hard: true,
+      sampled: index < 3,
+      state: index < 3 ? "normal" as const : "missing" as const,
+      source: index < 3 ? "d1_usage_windows" as const : "missing" as const,
+      limit_units: 100,
+      used_units: index < 3 ? 10 : null,
+      used_pct: index < 3 ? 10 : null,
+      remaining_units: index < 3 ? 90 : null,
+      remaining_ratio: index < 3 ? 0.9 : null,
+      per_event_units: index < 3 ? 10 : null,
+      remaining_event_capacity: index < 3 ? 9 : null
+    }))
+  };
 
   assert.equal(
     budgetSourceLabel(budget),
-    "Live database summary from 2 bounded usage windows, scaled by a schema-derived D1 rows-written model."
+    "Live database summary from 2 bounded usage windows and 3/6 sampled budget constraints."
   );
 });
 

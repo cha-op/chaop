@@ -1369,6 +1369,21 @@ test("usage summary returns bounded D1 budget windows", async () => {
       burst_budget_units: number;
       command_lifecycle_with_task_rows_written: number;
     };
+    constraint_sample_count: number;
+    bottleneck_constraint: {
+      id: string;
+      used_pct: number;
+      remaining_ratio: number;
+      remaining_event_capacity: number;
+    };
+    constraints: Array<{
+      id: string;
+      sampled: boolean;
+      state: string;
+      used_pct: number | null;
+      remaining_ratio: number | null;
+      remaining_event_capacity: number | null;
+    }>;
     windows: Array<{
       window_type: string;
       used_pct: number;
@@ -1389,6 +1404,7 @@ test("usage summary returns bounded D1 budget windows", async () => {
   assert.equal(body.compacted_event_count, 55);
   assert.equal(body.local_spool_bytes, 4096);
   assert.equal(body.window_sample_count, 3);
+  assert.equal(body.constraint_sample_count, 3);
   assert.deepEqual(
     [
       body.d1_write_model.budgeted_rows_written_per_event,
@@ -1398,6 +1414,33 @@ test("usage summary returns bounded D1 budget windows", async () => {
       body.d1_write_model.command_lifecycle_with_task_rows_written
     ],
     [12, 8333, 1388, 833, 20]
+  );
+  assert.deepEqual(
+    [
+      body.bottleneck_constraint.id,
+      body.bottleneck_constraint.used_pct,
+      body.bottleneck_constraint.remaining_ratio,
+      body.bottleneck_constraint.remaining_event_capacity
+    ],
+    ["d1_rows_written_four_hour", 17.3, 0.827, 1148]
+  );
+  assert.deepEqual(
+    body.constraints.map((constraint) => [
+      constraint.id,
+      constraint.sampled,
+      constraint.state,
+      constraint.used_pct,
+      constraint.remaining_ratio,
+      constraint.remaining_event_capacity
+    ]),
+    [
+      ["d1_rows_written_daily", true, "normal", 12, 0.88, 7333],
+      ["d1_rows_written_four_hour", true, "normal", 17.3, 0.827, 1148],
+      ["d1_rows_written_burst", true, "normal", 2.2, 0.978, 815],
+      ["worker_requests_daily", false, "missing", null, null, null],
+      ["durable_object_requests_daily", false, "missing", null, null, null],
+      ["d1_rows_read_daily", false, "missing", null, null, null]
+    ]
   );
   assert.deepEqual(
     body.windows.map((window) => [
@@ -1435,6 +1478,9 @@ test("usage summary marks missing D1 budget windows as unsampled", async () => {
     four_hour_used_pct: number | null;
     burst_used_pct: number | null;
     window_sample_count: number;
+    constraint_sample_count: number;
+    bottleneck_constraint: { id: string; remaining_ratio: number };
+    constraints: Array<{ id: string; sampled: boolean }>;
     windows: Array<{ window_type: string; used_pct: number; budget_units: number }>;
   };
 
@@ -1445,6 +1491,22 @@ test("usage summary marks missing D1 budget windows as unsampled", async () => {
   assert.equal(body.four_hour_used_pct, 17.3);
   assert.equal(body.burst_used_pct, null);
   assert.equal(body.window_sample_count, 1);
+  assert.equal(body.constraint_sample_count, 1);
+  assert.deepEqual(
+    [body.bottleneck_constraint.id, body.bottleneck_constraint.remaining_ratio],
+    ["d1_rows_written_four_hour", 0.827]
+  );
+  assert.deepEqual(
+    body.constraints.map((constraint) => [constraint.id, constraint.sampled]),
+    [
+      ["d1_rows_written_daily", false],
+      ["d1_rows_written_four_hour", true],
+      ["d1_rows_written_burst", false],
+      ["worker_requests_daily", false],
+      ["durable_object_requests_daily", false],
+      ["d1_rows_read_daily", false]
+    ]
+  );
   assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct, window.budget_units]), [["four_hour", 17.3, 1388]]);
 });
 
@@ -1466,6 +1528,9 @@ test("usage summary reports missing percentages when no current D1 budget window
     four_hour_used_pct: number | null;
     burst_used_pct: number | null;
     window_sample_count: number;
+    constraint_sample_count: number;
+    bottleneck_constraint?: unknown;
+    constraints: Array<{ id: string; sampled: boolean; used_pct: number | null }>;
     windows: unknown[];
   };
 
@@ -1475,6 +1540,19 @@ test("usage summary reports missing percentages when no current D1 budget window
   assert.equal(body.four_hour_used_pct, null);
   assert.equal(body.burst_used_pct, null);
   assert.equal(body.window_sample_count, 0);
+  assert.equal(body.constraint_sample_count, 0);
+  assert.equal(body.bottleneck_constraint, undefined);
+  assert.deepEqual(
+    body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.used_pct]),
+    [
+      ["d1_rows_written_daily", false, null],
+      ["d1_rows_written_four_hour", false, null],
+      ["d1_rows_written_burst", false, null],
+      ["worker_requests_daily", false, null],
+      ["durable_object_requests_daily", false, null],
+      ["d1_rows_read_daily", false, null]
+    ]
+  );
   assert.deepEqual(body.windows, []);
 });
 

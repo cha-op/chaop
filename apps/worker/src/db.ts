@@ -8,6 +8,7 @@ import type {
   AppServerInstanceSummary,
   AttachHostSessionResponse,
   BootstrapPayload,
+  BudgetConstraint,
   BudgetD1WriteModel,
   BudgetState,
   BudgetSummary,
@@ -41,6 +42,8 @@ const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
 const CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY = 100_000;
 const CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY = 100_000;
+const CLOUDFLARE_FREE_D1_ROWS_READ_PER_DAY = 5_000_000;
+const CLOUDFLARE_FREE_DURABLE_OBJECT_REQUESTS_PER_DAY = 100_000;
 const D1_THREAD_SEQUENCE_UPDATE_ROWS = 2;
 const D1_EVENT_INSERT_ROWS = 4;
 const D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS = 2;
@@ -182,8 +185,14 @@ export async function loadBudgetSummaryFromDb(
   ]);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const primaryWindow = daily ?? fourHour ?? burst;
+  const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
+  const constraints = budgetConstraints(env, windowSignals);
+  const bottleneckConstraint = budgetBottleneckConstraint(constraints);
+  const constraintStates = constraints
+    .filter((constraint) => constraint.sampled && constraint.hard && constraint.state !== "missing")
+    .map((constraint) => constraint.state as BudgetState);
   const states = [
-    ...windows.map((window) => budgetStateForUsageWindow(env, window)),
+    ...constraintStates,
     ...connectorStates.map((row) => budgetStateFromString(row.budget_state)),
     ...taskStates.map((row) => budgetStateFromString(row.budget_state))
   ];
@@ -199,7 +208,10 @@ export async function loadBudgetSummaryFromDb(
     source: windows.length > 0 ? "d1_usage_windows" : "empty",
     generated_at: generatedAt,
     window_sample_count: windows.length,
-    windows: windows.map((window) => budgetWindowSignalFromRow(env, window)),
+    constraint_sample_count: constraints.filter((constraint) => constraint.sampled).length,
+    windows: windowSignals,
+    constraints,
+    bottleneck_constraint: bottleneckConstraint,
     d1_write_model: budgetD1WriteModel(env)
   };
 }
@@ -4235,6 +4247,7 @@ function slugPart(value: string): string {
 }
 
 function emptyBudgetSummary(generatedAt: string): BudgetSummary {
+  const constraints = budgetConstraints({}, []);
   return {
     state: "normal",
     daily_used_pct: null,
@@ -4246,7 +4259,10 @@ function emptyBudgetSummary(generatedAt: string): BudgetSummary {
     source: "empty",
     generated_at: generatedAt,
     window_sample_count: 0,
+    constraint_sample_count: 0,
     windows: [],
+    constraints,
+    bottleneck_constraint: undefined,
     d1_write_model: budgetD1WriteModel({})
   };
 }
@@ -4268,6 +4284,199 @@ function budgetWindowSignalFromRow(env: Env, row: UsageWindowRow): BudgetWindowS
     estimated_d1_rows_written: eventsReceived * D1_BUDGETED_ROWS_WRITTEN_PER_EVENT,
     updated_at: row.updated_at
   };
+}
+
+function budgetConstraints(
+  env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
+  windows: BudgetWindowSignal[]
+): BudgetConstraint[] {
+  const model = budgetD1WriteModel(env);
+  const windowsByType = new Map(windows.map((window) => [window.window_type, window]));
+  return [
+    d1WriteConstraint(
+      "d1_rows_written_daily",
+      "D1 rows written / day",
+      "Cloudflare Free D1 rows-written limit, converted to Chaop event capacity with the current schema-derived write model.",
+      "daily",
+      model.daily_budget_units,
+      windowsByType.get("daily"),
+      model.budgeted_rows_written_per_event
+    ),
+    d1WriteConstraint(
+      "d1_rows_written_four_hour",
+      "D1 rows written / 4h",
+      "Chaop local four-hour guardrail that prevents one busy period from consuming the full daily D1 rows-written posture.",
+      "four_hour",
+      model.four_hour_hard_budget_units,
+      windowsByType.get("four_hour"),
+      model.budgeted_rows_written_per_event
+    ),
+    d1WriteConstraint(
+      "d1_rows_written_burst",
+      "D1 rows written / minute",
+      "Chaop burst guardrail for short spikes, modelled from D1 rows written per persisted event.",
+      "burst",
+      model.burst_budget_units,
+      windowsByType.get("burst"),
+      model.budgeted_rows_written_per_event
+    ),
+    missingConstraint(
+      "worker_requests_daily",
+      "Worker requests / day",
+      "Cloudflare Worker request usage is not sampled by Chaop yet; keep Cloudflare budget alerts enabled.",
+      "daily",
+      "worker_request",
+      model.free_worker_requests_per_day
+    ),
+    missingConstraint(
+      "durable_object_requests_daily",
+      "Durable Object requests / day",
+      "Durable Object request usage, including incoming WebSocket message billing at Cloudflare's 20:1 compute-request ratio, is not sampled by Chaop yet.",
+      "daily",
+      "durable_object_request",
+      CLOUDFLARE_FREE_DURABLE_OBJECT_REQUESTS_PER_DAY
+    ),
+    missingConstraint(
+      "d1_rows_read_daily",
+      "D1 rows read / day",
+      "Cloudflare D1 rows-read usage is not sampled by Chaop yet.",
+      "daily",
+      "d1_row_read",
+      CLOUDFLARE_FREE_D1_ROWS_READ_PER_DAY
+    )
+  ];
+}
+
+function d1WriteConstraint(
+  id: string,
+  label: string,
+  detail: string,
+  windowType: BudgetWindowType,
+  eventBudget: number,
+  window: BudgetWindowSignal | undefined,
+  rowsPerEvent: number
+): BudgetConstraint {
+  const limitUnits = eventBudget * rowsPerEvent;
+  const usedUnits = window ? window.events_received * rowsPerEvent : null;
+  return sampledConstraint({
+    id,
+    label,
+    detail,
+    windowType,
+    unit: "d1_row",
+    limitUnits,
+    usedUnits,
+    perEventUnits: rowsPerEvent,
+    state: window?.budget_state ?? "missing",
+    window
+  });
+}
+
+function sampledConstraint({
+  id,
+  label,
+  detail,
+  windowType,
+  unit,
+  limitUnits,
+  usedUnits,
+  perEventUnits,
+  state,
+  window
+}: {
+  id: string;
+  label: string;
+  detail: string;
+  windowType: BudgetWindowType;
+  unit: BudgetConstraint["unit"];
+  limitUnits: number;
+  usedUnits: number | null;
+  perEventUnits: number;
+  state: BudgetConstraint["state"];
+  window: BudgetWindowSignal | undefined;
+}): BudgetConstraint {
+  const remainingUnits = usedUnits === null ? null : Math.max(0, limitUnits - usedUnits);
+  const remainingRatio = remainingUnits === null ? null : ratio(remainingUnits, limitUnits);
+  return {
+    id,
+    label,
+    detail,
+    window_type: windowType,
+    unit,
+    hard: true,
+    sampled: usedUnits !== null,
+    state,
+    source: usedUnits === null ? "missing" : "d1_usage_windows",
+    limit_units: limitUnits,
+    used_units: usedUnits,
+    used_pct: usedUnits === null ? null : usedPctForUnits(usedUnits, limitUnits),
+    remaining_units: remainingUnits,
+    remaining_ratio: remainingRatio,
+    per_event_units: perEventUnits,
+    remaining_event_capacity: remainingUnits === null ? null : Math.floor(remainingUnits / perEventUnits),
+    window_start: window?.window_start,
+    window_end: window?.window_end,
+    updated_at: window?.updated_at
+  };
+}
+
+function missingConstraint(
+  id: string,
+  label: string,
+  detail: string,
+  windowType: BudgetConstraint["window_type"],
+  unit: BudgetConstraint["unit"],
+  limitUnits: number
+): BudgetConstraint {
+  return {
+    id,
+    label,
+    detail,
+    window_type: windowType,
+    unit,
+    hard: false,
+    sampled: false,
+    state: "missing",
+    source: "missing",
+    limit_units: limitUnits,
+    used_units: null,
+    used_pct: null,
+    remaining_units: null,
+    remaining_ratio: null,
+    per_event_units: null,
+    remaining_event_capacity: null
+  };
+}
+
+function budgetBottleneckConstraint(constraints: BudgetConstraint[]): BudgetConstraint | undefined {
+  return constraints
+    .filter((constraint) =>
+      constraint.hard
+      && constraint.sampled
+      && constraint.remaining_ratio !== null
+      && constraint.state !== "missing"
+    )
+    .sort(compareBudgetConstraintsByRemainingRatio)[0];
+}
+
+function compareBudgetConstraintsByRemainingRatio(left: BudgetConstraint, right: BudgetConstraint): number {
+  const ratioDelta = (left.remaining_ratio ?? Number.POSITIVE_INFINITY) - (right.remaining_ratio ?? Number.POSITIVE_INFINITY);
+  if (ratioDelta !== 0) return ratioDelta;
+  const capacityDelta =
+    (left.remaining_event_capacity ?? Number.POSITIVE_INFINITY)
+    - (right.remaining_event_capacity ?? Number.POSITIVE_INFINITY);
+  if (capacityDelta !== 0) return capacityDelta;
+  return left.id.localeCompare(right.id);
+}
+
+function ratio(numerator: number, denominator: number): number {
+  if (denominator <= 0) return 0;
+  return Math.round((numerator / denominator) * 1000) / 1000;
+}
+
+function usedPctForUnits(usedUnits: number, limitUnits: number): number {
+  if (limitUnits <= 0) return 0;
+  return Math.round((usedUnits * 1000) / limitUnits) / 10;
 }
 
 function budgetD1WriteModel(env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">): BudgetD1WriteModel {

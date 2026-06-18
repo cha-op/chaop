@@ -32,6 +32,41 @@ export type BudgetMetricSource = "sample" | "d1_usage_windows" | "empty";
 
 export type BudgetWindowType = "daily" | "four_hour" | "burst";
 
+export type BudgetConstraintWindow = BudgetWindowType | "monthly";
+
+export type BudgetConstraintUnit =
+  | "event"
+  | "d1_row"
+  | "d1_row_read"
+  | "worker_request"
+  | "durable_object_request"
+  | "byte"
+  | "operation";
+
+export type BudgetConstraintState = BudgetState | "missing";
+
+export type BudgetConstraint = {
+  id: string;
+  label: string;
+  detail: string;
+  window_type: BudgetConstraintWindow;
+  unit: BudgetConstraintUnit;
+  hard: boolean;
+  sampled: boolean;
+  state: BudgetConstraintState;
+  source: "sample" | "d1_usage_windows" | "schema_model" | "cloudflare_limit" | "missing";
+  limit_units: number | null;
+  used_units: number | null;
+  used_pct: number | null;
+  remaining_units: number | null;
+  remaining_ratio: number | null;
+  per_event_units: number | null;
+  remaining_event_capacity: number | null;
+  window_start?: string | undefined;
+  window_end?: string | undefined;
+  updated_at?: string | undefined;
+};
+
 export type BudgetWindowSignal = {
   window_type: BudgetWindowType;
   window_start: string;
@@ -377,7 +412,10 @@ export type BudgetSummary = {
   source?: BudgetMetricSource | undefined;
   generated_at?: string | undefined;
   window_sample_count?: number | undefined;
+  constraint_sample_count?: number | undefined;
   windows?: BudgetWindowSignal[] | undefined;
+  constraints?: BudgetConstraint[] | undefined;
+  bottleneck_constraint?: BudgetConstraint | undefined;
   d1_write_model?: BudgetD1WriteModel | undefined;
 };
 

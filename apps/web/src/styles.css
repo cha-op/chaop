@@ -285,6 +285,11 @@ h2 {
   color: #92400e;
 }
 
+.chip.missing {
+  background: #e2e8f0;
+  color: #475569;
+}
+
 .status.offline,
 .chip.throttled,
 .chip.hard_limited,
@@ -754,10 +759,48 @@ textarea {
   max-width: 720px;
 }
 
+.budget-bottleneck {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto;
+  gap: 8px 20px;
+  border-top: 1px solid #dbe5ef;
+  border-bottom: 1px solid #dbe5ef;
+  margin: 20px 0;
+  padding: 16px 0;
+  max-width: 720px;
+}
+
+.budget-bottleneck div {
+  display: grid;
+  gap: 4px;
+}
+
+.budget-bottleneck span,
+.budget-bottleneck small {
+  color: #64748b;
+}
+
+.budget-bottleneck strong {
+  font-size: 1rem;
+}
+
+.budget-bottleneck small {
+  grid-column: 1 / -1;
+}
+
+.budget-bottleneck.missing strong {
+  color: #64748b;
+}
+
 .budget-bar div {
   display: flex;
   justify-content: space-between;
   margin-bottom: 8px;
+}
+
+.budget-bar.missing span,
+.budget-bar.missing strong {
+  color: #64748b;
 }
 
 .budget-windows {
@@ -767,12 +810,21 @@ textarea {
   max-width: 720px;
 }
 
+.budget-windows.secondary {
+  margin-top: 18px;
+}
+
 .budget-windows div {
   display: grid;
   grid-template-columns: minmax(120px, 1fr) auto;
   gap: 4px 16px;
   border-top: 1px solid #e5e7eb;
   padding-top: 10px;
+}
+
+.budget-windows div.missing span,
+.budget-windows div.missing strong {
+  color: #64748b;
 }
 
 .budget-windows small {
