@@ -3,7 +3,7 @@ id: 20260615-f4c9a8-zh-Hans
 title: App-server Attach Resume
 status: completed
 created: 2026-06-15
-updated: 2026-06-16
+updated: 2026-06-18
 branch: wip/app-server-attach-resume
 pr: 18
 supersedes:
@@ -29,6 +29,7 @@ superseded_by:
 - 2026-06-16 的 regression follow-up 将 initialize、unarchive 和 resume 统一收敛到同一个本机 app-server deadline 内，把本机 read timeout 映射成清晰的 app-server method timeout，并且在 `thread/list` 找不到匹配 thread 时不再把本机 session id 猜作 `threadId`。
 - 当历史 rollout/session id 不在 app-server `thread/list` 中时，connector 现在会从 Codex history 解析本机 rollout 文件路径，并用这个 path 调用 app-server `thread/resume`，而不是猜测 `threadId`。
 - Managed app-server command execution 在 active `thread/list` miss 后也会使用同一个 rollout path fallback，然后用 app-server resume 返回的真实 `thread.id` 启动 turn。
+- Archive/unarchive sync 在 source 和 target `thread/list` 都 miss 后也会使用 rollout path resume，然后对 resume 返回的真实 app-server `thread.id` 执行 archive/unarchive。
 - 当 D1 当前没有 usage windows 时，Budget summary 会把核心百分比保持为 `missing`，避免用误导性的 0 baseline 表示未知用量。
 
 ## 验证

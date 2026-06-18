@@ -3,7 +3,7 @@ id: 20260615-f4c9a8
 title: App-server Attach Resume
 status: completed
 created: 2026-06-15
-updated: 2026-06-16
+updated: 2026-06-18
 branch: wip/app-server-attach-resume
 pr: 18
 supersedes:
@@ -29,6 +29,7 @@ superseded_by:
 - Regression follow-up on 2026-06-16 bounds initialize, unarchive, and resume through one local app-server deadline, maps local read timeouts to a clear app-server method timeout, and stops guessing `threadId` from the local session id when `thread/list` has no matching thread.
 - When a historical rollout/session id is absent from app-server `thread/list`, the connector now resolves the local rollout file path from Codex history and calls app-server `thread/resume` with that path instead of guessing a `threadId`.
 - Managed app-server command execution uses the same rollout path fallback after an active `thread/list` miss, then starts the turn on the real `thread.id` returned by app-server resume.
+- Archive/unarchive sync now uses rollout path resume after source and target `thread/list` misses, then mutates the real app-server `thread.id` returned by resume.
 - Budget summary keeps headline percentages as `missing` when D1 has no current usage windows, instead of reporting a misleading zero baseline.
 
 ## Validation
