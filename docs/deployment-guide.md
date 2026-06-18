@@ -234,6 +234,20 @@ ARTIFACTS -> chaop-artifacts
 WorkspaceDO -> Durable Object namespace
 ```
 
+### Deploy the API Worker from env files
+
+Use the checked-in API deployment script once the private deployment env files contain the required values:
+
+```bash
+CHAOP_DEPLOY_ENV_FILE=/path/to/chaop.env \
+CHAOP_DEPLOY_SECRET_ENV_FILE=/path/to/deploy.env \
+pnpm deploy:api
+```
+
+The first file should contain deployment-instance values such as domains, resource names, D1/R2 bindings, and Access configuration. The second file should contain secrets such as `CLOUDFLARE_API_TOKEN`. The script writes a temporary Wrangler config under `.codex-tmp/deploy/api/`, applies remote D1 migrations, then deploys the API Worker.
+
+The generated Worker runtime vars include `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. They are required because the Worker verifies Cloudflare Access JWTs after Access forwards an authenticated browser or service-token request.
+
 ### Configure split domains
 
 Use two hostnames:

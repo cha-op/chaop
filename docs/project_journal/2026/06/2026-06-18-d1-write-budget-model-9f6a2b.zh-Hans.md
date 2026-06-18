@@ -17,6 +17,7 @@ superseded_by:
 ## 摘要
 - 把原先粗略的 five-row D1 event estimate 改成从当前 schema 推导的 rows-written budget model。
 - Budget Summary payload 会暴露这个 model，因此 Browser Budget Board 可以显示预算来源。
+- 增加已提交的 API 部署脚本，读取私有 env 文件，并保留 Access JWT verification bindings。
 
 ## 当前状态
 - 一个 steady realtime persisted event 按 12 D1 rows written 预算。
@@ -27,9 +28,14 @@ superseded_by:
 ## 验证
 - `pnpm test`
 - `pnpm build`
+- `node --check scripts/deploy-api.mjs`
+- 使用 Mahane 私有 env 文件执行 `pnpm deploy:api`
+- 线上 smoke：`/api/usage-summary` 返回 `d1_write_model.budgeted_rows_written_per_event = 12` 和 `daily_budget_units = 8333`
+- 线上 smoke：Browser GUI 返回 `assets/index-DIUBOg07.js`
 - Project journal validator, `validate --repo .`
 - `git diff --check`
 - Helper-backed `codex-readonly` review：`LGTM`
+- Helper-backed `codex-review` follow-up 发现 `deploy:api` 缺少 API build step；已通过在 migration 和 deploy 前构建 `@chaop/worker` 修复。
 
 ## 下一步
-- 使用 Mahane operations env 部署，并验证 Budget Board 显示新的 `8,333` daily event budget。
+- 推送部署脚本 follow-up commit 后，为当前分支开 PR。

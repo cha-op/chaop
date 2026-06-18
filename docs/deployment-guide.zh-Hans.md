@@ -234,6 +234,20 @@ ARTIFACTS -> chaop-artifacts
 WorkspaceDO -> Durable Object namespace
 ```
 
+### 通过 env 文件部署 API Worker
+
+私有部署 env 文件写好后，用仓库内的 API 部署脚本：
+
+```bash
+CHAOP_DEPLOY_ENV_FILE=/path/to/chaop.env \
+CHAOP_DEPLOY_SECRET_ENV_FILE=/path/to/deploy.env \
+pnpm deploy:api
+```
+
+第一个文件保存部署实例值，例如域名、资源名、D1/R2 绑定，以及 Access 配置。第二个文件保存 secret，例如 `CLOUDFLARE_API_TOKEN`。脚本会在 `.codex-tmp/deploy/api/` 下写入临时 Wrangler 配置，执行远端 D1 migration，然后部署 API Worker。
+
+生成的 Worker runtime vars 会包含 `ACCESS_TEAM_DOMAIN` 和 `ACCESS_AUD`。Worker 在 Cloudflare Access 放行 browser 或 service-token 请求之后，还需要用它们校验 Access JWT。
+
 ### 配置分离域名
 
 使用两个主机名：
