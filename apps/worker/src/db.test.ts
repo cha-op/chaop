@@ -1365,18 +1365,29 @@ test("recordHostSessionBackfillEvents imports events idempotently", async () => 
       summary: "2026-06-12 10:00 - User: Inspect failure",
       idempotency_key: "rollout:session-1:1",
       created_at: "2026-06-12T10:00:00.000Z"
+    },
+    {
+      kind: "command.output" as const,
+      priority: "P3" as const,
+      summary: "2026-06-12 10:00 - Assistant: Found fix",
+      idempotency_key: "rollout:session-1:2",
+      created_at: "2026-06-12T10:00:30.000Z"
     }
   ];
 
   const first = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events);
   const second = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events);
 
-  assert.equal(first.length, 1);
+  assert.equal(first.length, 2);
   assert.equal(first[0]?.seq, 1);
+  assert.equal(first[1]?.seq, 2);
   assert.equal(second.length, 0);
-  assert.equal(db.eventInserts, 1);
-  assert.equal(db.sequenceUpdates, 1);
+  assert.equal(db.eventInserts, 2);
+  assert.equal(db.sequenceUpdates, 2);
   assert.equal(db.usageWindowUpserts, 3);
+  assert.deepEqual(db.usageWindowBinds.map((args) => args[6]), [2, 2, 2]);
+  assert.deepEqual(db.usageWindowBinds.map((args) => args[7]), [2, 2, 2]);
+  assert.deepEqual(db.usageWindowBinds.map((args) => args[8]), [2, 2, 2]);
 });
 
 test("recordHostSessionBackfillEvents does not return events ignored during insert", async () => {
@@ -1640,7 +1651,8 @@ function usageWindowUpsertFake(onRun?: (args: unknown[]) => void) {
       assert.match(windowEnd as string, /^\d{4}-\d{2}-\d{2}T/);
       assert.equal(["normal", "conservative", "throttled", "hard_limited"].includes(budgetState as string), true);
       assert.equal(typeof usedPct, "number");
-      assert.equal(eventsReceived, 1);
+      assert.equal(typeof eventsReceived, "number");
+      assert.equal((eventsReceived as number) >= 1, true);
       assert.equal(typeof eventsCompacted, "number");
       assert.equal(typeof eventsDelayed, "number");
       assert.equal(typeof localSpoolBytes, "number");
@@ -3469,12 +3481,14 @@ function hostSessionBackfillDb(
   readonly eventInserts: number;
   readonly sequenceUpdates: number;
   readonly usageWindowUpserts: number;
+  readonly usageWindowBinds: unknown[][];
 } {
   const inserted = new Set<string>();
   const counters = {
     eventInserts: 0,
     sequenceUpdates: 0,
-    usageWindowUpserts: 0
+    usageWindowUpserts: 0,
+    usageWindowBinds: [] as unknown[][]
   };
   const db = {
     prepare(sql: string) {
@@ -3542,12 +3556,12 @@ function hostSessionBackfillDb(
             assert.match(eventId, /^event-backfill-session-1-/);
             assert.equal(workspaceId, "workspace-api");
             assert.equal(threadId, "thread-1");
-            assert.equal(seq, 1);
+            assert.equal(seq, counters.sequenceUpdates);
             assert.equal(kind, "command.output");
             assert.equal(priority, "P3");
-            assert.equal(summary, "2026-06-12 10:00 - User: Inspect failure");
-            assert.equal(idempotencyKey, "rollout:session-1:1");
-            assert.equal(createdAt, "2026-06-12T10:00:00.000Z");
+            assert.match(summary, /^2026-06-12 10:00 - /);
+            assert.match(idempotencyKey, /^rollout:session-1:[12]$/);
+            assert.match(createdAt, /^2026-06-12T10:00:(00|30)\.000Z$/);
             return {
               async run() {
                 if (options.ignoreInserts) {
@@ -3563,8 +3577,9 @@ function hostSessionBackfillDb(
       }
 
       if (/INSERT INTO usage_windows/.test(sql)) {
-        return usageWindowUpsertFake(() => {
+        return usageWindowUpsertFake((args) => {
           counters.usageWindowUpserts += 1;
+          counters.usageWindowBinds.push(args);
         });
       }
 
@@ -3578,6 +3593,9 @@ function hostSessionBackfillDb(
     },
     get usageWindowUpserts() {
       return counters.usageWindowUpserts;
+    },
+    get usageWindowBinds() {
+      return counters.usageWindowBinds;
     }
   };
 
@@ -3585,6 +3603,7 @@ function hostSessionBackfillDb(
     readonly eventInserts: number;
     readonly sequenceUpdates: number;
     readonly usageWindowUpserts: number;
+    readonly usageWindowBinds: unknown[][];
   };
 }
 

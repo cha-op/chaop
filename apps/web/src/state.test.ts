@@ -122,6 +122,15 @@ test("budgetSourceLabel reports unknown source for legacy budget payloads", () =
   assert.equal(budgetSourceLabel(budget), "Summary source not reported by this control plane.");
 });
 
+test("budgetSourceLabel describes live Cloudflare-estimated windows", () => {
+  const budget = { ...payload().budget, source: "d1_usage_windows" as const, window_sample_count: 2 };
+
+  assert.equal(
+    budgetSourceLabel(budget),
+    "Live database summary from 2 bounded usage windows, scaled by Cloudflare free-quota estimates."
+  );
+});
+
 test("budgetPctLabel distinguishes missing samples from zero usage", () => {
   assert.equal(budgetPctLabel(null), "missing");
   assert.equal(budgetPctLabel(undefined), "missing");

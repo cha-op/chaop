@@ -1362,25 +1362,39 @@ test("usage summary returns bounded D1 budget windows", async () => {
     compacted_event_count: number;
     local_spool_bytes: number;
     window_sample_count: number;
-    windows: Array<{ window_type: string; used_pct: number; events_received: number }>;
+    windows: Array<{
+      window_type: string;
+      used_pct: number;
+      budget_units: number;
+      events_received: number;
+      estimated_d1_rows_written: number;
+      budget_state: string;
+    }>;
   };
 
   assert.equal(response.status, 200);
   assert.equal(body.source, "d1_usage_windows");
-  assert.equal(body.state, "hard_limited");
-  assert.equal(body.daily_used_pct, 125.4);
-  assert.equal(body.four_hour_used_pct, 88.9);
-  assert.equal(body.burst_used_pct, 21);
+  assert.equal(body.state, "throttled");
+  assert.equal(body.daily_used_pct, 5);
+  assert.equal(body.four_hour_used_pct, 7.2);
+  assert.equal(body.burst_used_pct, 1.8);
   assert.equal(body.delayed_event_count, 8);
   assert.equal(body.compacted_event_count, 55);
   assert.equal(body.local_spool_bytes, 4096);
   assert.equal(body.window_sample_count, 3);
   assert.deepEqual(
-    body.windows.map((window) => [window.window_type, window.used_pct, window.events_received]),
+    body.windows.map((window) => [
+      window.window_type,
+      window.used_pct,
+      window.budget_units,
+      window.events_received,
+      window.estimated_d1_rows_written,
+      window.budget_state
+    ]),
     [
-      ["daily", 125.4, 1000],
-      ["four_hour", 88.9, 240],
-      ["burst", 21, 18]
+      ["daily", 5, 20000, 1000, 5000, "normal"],
+      ["four_hour", 7.2, 3333, 240, 1200, "normal"],
+      ["burst", 1.8, 1000, 18, 90, "normal"]
     ]
   );
 });
@@ -1404,17 +1418,17 @@ test("usage summary marks missing D1 budget windows as unsampled", async () => {
     four_hour_used_pct: number | null;
     burst_used_pct: number | null;
     window_sample_count: number;
-    windows: Array<{ window_type: string; used_pct: number }>;
+    windows: Array<{ window_type: string; used_pct: number; budget_units: number }>;
   };
 
   assert.equal(response.status, 200);
   assert.equal(body.source, "d1_usage_windows");
-  assert.equal(body.state, "hard_limited");
+  assert.equal(body.state, "throttled");
   assert.equal(body.daily_used_pct, null);
-  assert.equal(body.four_hour_used_pct, 88.9);
+  assert.equal(body.four_hour_used_pct, 7.2);
   assert.equal(body.burst_used_pct, null);
   assert.equal(body.window_sample_count, 1);
-  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct]), [["four_hour", 88.9]]);
+  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct, window.budget_units]), [["four_hour", 7.2, 3333]]);
 });
 
 test("usage summary reports missing percentages when no current D1 budget windows exist", async () => {

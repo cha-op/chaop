@@ -27,7 +27,7 @@ const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], 
 export function budgetSourceLabel(budget: BudgetSummary): string {
   const windowSampleCount = budget.window_sample_count ?? (budget.windows ?? []).length;
   if (budget.source === "d1_usage_windows") {
-    return `Live database summary from ${windowSampleCount} bounded usage windows.`;
+    return `Live database summary from ${windowSampleCount} bounded usage windows, scaled by Cloudflare free-quota estimates.`;
   }
   if (budget.source === "sample") {
     return "Sample data for local development.";

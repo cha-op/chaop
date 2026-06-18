@@ -38,10 +38,15 @@ const DEFAULT_WORKSPACE_ID = "workspace-api";
 const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
-const DEFAULT_DAILY_BUDGET_UNITS = 100;
-const DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS = 20;
-const DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS = 35;
-const DEFAULT_BURST_EVENTS_PER_MINUTE = 600;
+const CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY = 100_000;
+const CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY = 100_000;
+const ESTIMATED_D1_ROWS_WRITTEN_PER_EVENT = 5;
+const DEFAULT_DAILY_BUDGET_UNITS = Math.floor(
+  Math.min(CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY, CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY / ESTIMATED_D1_ROWS_WRITTEN_PER_EVENT)
+);
+const DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS = Math.max(1, Math.floor(DEFAULT_DAILY_BUDGET_UNITS / 6));
+const DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS = Math.max(1, Math.ceil(DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS * 0.75));
+const DEFAULT_BURST_EVENTS_PER_MINUTE = 1_000;
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const ONE_MINUTE_MS = 60 * 1000;
 const BUDGET_STATE_RANK: Record<BudgetState, number> = {
@@ -148,23 +153,23 @@ export async function loadBudgetSummaryFromDb(
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const primaryWindow = daily ?? fourHour ?? burst;
   const states = [
-    ...windows.map((window) => budgetStateFromString(window.budget_state)),
+    ...windows.map((window) => budgetStateForUsageWindow(env, window)),
     ...connectorStates.map((row) => budgetStateFromString(row.budget_state)),
     ...taskStates.map((row) => budgetStateFromString(row.budget_state))
   ];
 
   return {
     state: worstBudgetState(states),
-    daily_used_pct: windowPct(daily),
-    four_hour_used_pct: windowPct(fourHour),
-    burst_used_pct: windowPct(burst),
+    daily_used_pct: windowPct(env, daily),
+    four_hour_used_pct: windowPct(env, fourHour),
+    burst_used_pct: windowPct(env, burst),
     delayed_event_count: nonNegativeInteger(primaryWindow?.events_delayed),
     compacted_event_count: nonNegativeInteger(primaryWindow?.events_compacted),
     local_spool_bytes: nonNegativeInteger(primaryWindow?.local_spool_bytes),
     source: windows.length > 0 ? "d1_usage_windows" : "empty",
     generated_at: generatedAt,
     window_sample_count: windows.length,
-    windows: windows.map(budgetWindowSignalFromRow)
+    windows: windows.map((window) => budgetWindowSignalFromRow(env, window))
   };
 }
 
@@ -1242,9 +1247,9 @@ export async function recordHostSessionBackfillEvents(
     if (insertResult.meta?.changes === 0) {
       continue;
     }
-    await recordUsageWindowsForEventBestEffort(env, stored);
     imported.push(stored);
   }
+  await recordUsageWindowsForEventsBestEffort(env, imported);
 
   return imported;
 }
@@ -3737,28 +3742,54 @@ async function appendEvent(
       event.created_at
     )
     .run();
-  await recordUsageWindowsForEventBestEffort(env, event);
+  await recordUsageWindowsForEventsBestEffort(env, [event]);
   return event;
 }
 
-async function recordUsageWindowsForEventBestEffort(env: Env, event: ThreadEvent): Promise<void> {
+async function recordUsageWindowsForEventsBestEffort(env: Env, events: ThreadEvent[]): Promise<void> {
+  if (events.length === 0) return;
   try {
-    await recordUsageWindowsForEvent(env, event);
+    await recordUsageWindowsForEvents(env, events);
   } catch (error) {
     console.warn("Usage window update failed", {
-      event_id: event.id,
+      event_count: events.length,
       message: error instanceof Error ? error.message : String(error)
     });
   }
 }
 
-async function recordUsageWindowsForEvent(env: Env, event: ThreadEvent): Promise<void> {
-  const timestamp = new Date(event.created_at);
-  if (Number.isNaN(timestamp.getTime())) return;
+async function recordUsageWindowsForEvents(env: Env, events: ThreadEvent[]): Promise<void> {
+  const aggregates = new Map<string, UsageWindowAggregate>();
+  for (const event of events) {
+    const timestamp = new Date(event.created_at);
+    if (Number.isNaN(timestamp.getTime())) continue;
 
-  const metrics = usageMetricsForEvent(event);
-  for (const window of usageWindowSpecs(env, timestamp)) {
-    await upsertUsageWindow(env, window, metrics, event.created_at);
+    const metrics = usageMetricsForEvent(event);
+    for (const window of usageWindowSpecs(env, timestamp)) {
+      const existing = aggregates.get(window.id);
+      if (existing) {
+        existing.metrics.eventsReceived += 1;
+        existing.metrics.compacted += metrics.compacted;
+        existing.metrics.delayed += metrics.delayed;
+        existing.metrics.spoolBytes += metrics.spoolBytes;
+        existing.updatedAt = newerIso(existing.updatedAt, event.created_at);
+      } else {
+        aggregates.set(window.id, {
+          window,
+          metrics: {
+            eventsReceived: 1,
+            compacted: metrics.compacted,
+            delayed: metrics.delayed,
+            spoolBytes: metrics.spoolBytes
+          },
+          updatedAt: event.created_at
+        });
+      }
+    }
+  }
+
+  for (const aggregate of aggregates.values()) {
+    await upsertUsageWindow(env, aggregate.window, aggregate.metrics, aggregate.updatedAt);
   }
 }
 
@@ -3768,8 +3799,8 @@ async function upsertUsageWindow(
   metrics: UsageEventMetrics,
   updatedAt: string
 ): Promise<void> {
-  const initialState = budgetStateForUsageCount(1, window.thresholds);
-  const initialPct = usedPctForCount(1, window.budgetUnits);
+  const initialState = budgetStateForUsageCount(metrics.eventsReceived, window.thresholds);
+  const initialPct = usedPctForCount(metrics.eventsReceived, window.budgetUnits);
   await env.DB!.prepare(
     `INSERT INTO usage_windows (
        id, window_type, window_start, window_end, budget_state, used_pct,
@@ -3799,7 +3830,7 @@ async function upsertUsageWindow(
       window.windowEnd,
       initialState,
       initialPct,
-      1,
+      metrics.eventsReceived,
       metrics.compacted,
       metrics.delayed,
       metrics.spoolBytes,
@@ -3898,7 +3929,11 @@ function usedPctForCount(count: number, budgetUnits: number): number {
   return Math.round((count * 1000) / budgetUnits) / 10;
 }
 
-function usageMetricsForEvent(event: ThreadEvent): UsageEventMetrics {
+function newerIso(current: string, incoming: string): string {
+  return current > incoming ? current : incoming;
+}
+
+function usageMetricsForEvent(event: ThreadEvent): EventUsageMetrics {
   return {
     compacted: event.kind === "command.output" ? 1 : 0,
     delayed: event.priority === "P2" || event.priority === "P3" ? 1 : 0,
@@ -4184,23 +4219,43 @@ function emptyBudgetSummary(generatedAt: string): BudgetSummary {
   };
 }
 
-function budgetWindowSignalFromRow(row: UsageWindowRow): BudgetWindowSignal {
+function budgetWindowSignalFromRow(env: Env, row: UsageWindowRow): BudgetWindowSignal {
+  const budgetUnits = budgetUnitsForUsageWindow(env, row);
+  const eventsReceived = nonNegativeInteger(row.events_received);
   return {
     window_type: budgetWindowTypeFromString(row.window_type),
     window_start: row.window_start,
     window_end: row.window_end,
-    budget_state: budgetStateFromString(row.budget_state),
-    used_pct: normalisePct(row.used_pct),
-    events_received: nonNegativeInteger(row.events_received),
+    budget_state: budgetStateForUsageWindow(env, row),
+    used_pct: usedPctForCount(eventsReceived, budgetUnits),
+    budget_units: budgetUnits,
+    events_received: eventsReceived,
     events_compacted: nonNegativeInteger(row.events_compacted),
     events_delayed: nonNegativeInteger(row.events_delayed),
     local_spool_bytes: nonNegativeInteger(row.local_spool_bytes),
+    estimated_d1_rows_written: eventsReceived * ESTIMATED_D1_ROWS_WRITTEN_PER_EVENT,
     updated_at: row.updated_at
   };
 }
 
-function windowPct(row: UsageWindowRow | undefined): number | null {
-  return row ? normalisePct(row.used_pct) : null;
+function windowPct(env: Env, row: UsageWindowRow | undefined): number | null {
+  return row ? usedPctForCount(nonNegativeInteger(row.events_received), budgetUnitsForUsageWindow(env, row)) : null;
+}
+
+function budgetStateForUsageWindow(env: Env, row: UsageWindowRow): BudgetState {
+  return budgetStateForUsageCount(nonNegativeInteger(row.events_received), usageWindowSpecForRow(env, row).thresholds);
+}
+
+function budgetUnitsForUsageWindow(env: Env, row: UsageWindowRow): number {
+  return usageWindowSpecForRow(env, row).budgetUnits;
+}
+
+function usageWindowSpecForRow(env: Env, row: UsageWindowRow): UsageWindowSpec {
+  const timestamp = new Date(row.window_start);
+  const safeTimestamp = Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
+  const windowType = budgetWindowTypeFromString(row.window_type);
+  return usageWindowSpecs(env, safeTimestamp).find((window) => window.windowType === windowType)
+    ?? usageWindowSpec(windowType, safeTimestamp.getTime(), safeTimestamp.getTime() + ONE_MINUTE_MS, 1, thresholdSet(1));
 }
 
 function budgetWindowTypeFromString(value: string): BudgetWindowType {
@@ -4218,11 +4273,6 @@ function worstBudgetState(states: BudgetState[]): BudgetState {
     (worst, state) => (BUDGET_STATE_RANK[state] > BUDGET_STATE_RANK[worst] ? state : worst),
     "normal"
   );
-}
-
-function normalisePct(value: number | undefined): number {
-  if (value === undefined || !Number.isFinite(value)) return 0;
-  return Math.round(Math.max(0, value) * 10) / 10;
 }
 
 function nonNegativeInteger(value: number | undefined): number {
@@ -4290,9 +4340,18 @@ type UsageWindowThresholds = {
 };
 
 type UsageEventMetrics = {
+  eventsReceived: number;
   compacted: number;
   delayed: number;
   spoolBytes: number;
+};
+
+type EventUsageMetrics = Omit<UsageEventMetrics, "eventsReceived">;
+
+type UsageWindowAggregate = {
+  window: UsageWindowSpec;
+  metrics: UsageEventMetrics;
+  updatedAt: string;
 };
 
 type WorkspaceRow = {

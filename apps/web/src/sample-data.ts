@@ -330,10 +330,12 @@ export function fallbackBootstrap(): BootstrapPayload {
           window_end: "2026-06-10T00:00:00.000Z",
           budget_state: "conservative",
           used_pct: 75,
-          events_received: 1420,
+          budget_units: 20000,
+          events_received: 15000,
           events_compacted: 318,
           events_delayed: 42,
           local_spool_bytes: 134217728,
+          estimated_d1_rows_written: 75000,
           updated_at: "2026-06-09T21:58:05.000Z"
         },
         {
@@ -342,10 +344,12 @@ export function fallbackBootstrap(): BootstrapPayload {
           window_end: "2026-06-09T22:00:00.000Z",
           budget_state: "conservative",
           used_pct: 62,
-          events_received: 410,
+          budget_units: 3333,
+          events_received: 2066,
           events_compacted: 92,
           events_delayed: 18,
           local_spool_bytes: 67108864,
+          estimated_d1_rows_written: 10330,
           updated_at: "2026-06-09T21:58:05.000Z"
         },
         {
@@ -354,10 +358,12 @@ export function fallbackBootstrap(): BootstrapPayload {
           window_end: "2026-06-09T21:58:00.000Z",
           budget_state: "normal",
           used_pct: 18,
-          events_received: 24,
+          budget_units: 1000,
+          events_received: 180,
           events_compacted: 4,
           events_delayed: 0,
           local_spool_bytes: 0,
+          estimated_d1_rows_written: 900,
           updated_at: "2026-06-09T21:58:05.000Z"
         }
       ]

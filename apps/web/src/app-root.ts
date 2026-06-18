@@ -695,7 +695,7 @@ export class ChaopApp extends LitElement {
                   <span>${budgetWindowLabel(window.window_type)}</span>
                   <strong>${budgetPctLabel(window.used_pct)}</strong>
                   <small title=${formatAbsoluteIso(window.updated_at)}>
-                    ${window.events_received.toLocaleString("en-GB")} events, updated
+                    ${budgetWindowDetail(window)}, updated
                     ${formatRelativeIso(window.updated_at, this.clockNow)}
                   </small>
                 </div>
@@ -1448,6 +1448,17 @@ function newestBudgetWindowUpdatedAt(budget: BudgetSummary): string | undefined 
 
 function budgetWindows(budget: BudgetSummary): BudgetWindow[] {
   return budget.windows ?? [];
+}
+
+function budgetWindowDetail(window: BudgetWindow): string {
+  const events = `${window.events_received.toLocaleString("en-GB")} events`;
+  const budget = window.budget_units === undefined
+    ? ""
+    : ` / ${window.budget_units.toLocaleString("en-GB")} units`;
+  const estimatedRows = window.estimated_d1_rows_written === undefined
+    ? ""
+    : `, ~${window.estimated_d1_rows_written.toLocaleString("en-GB")} D1 rows written`;
+  return `${events}${budget}${estimatedRows}`;
 }
 
 function newerIso(current: string | undefined, incoming: string): string {

@@ -38,10 +38,12 @@ export type BudgetWindowSignal = {
   window_end: string;
   budget_state: BudgetState;
   used_pct: number;
+  budget_units?: number | undefined;
   events_received: number;
   events_compacted: number;
   events_delayed: number;
   local_spool_bytes: number;
+  estimated_d1_rows_written?: number | undefined;
   updated_at: string;
 };
 
