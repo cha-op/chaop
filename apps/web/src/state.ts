@@ -34,6 +34,11 @@ export function budgetSourceLabel(budget: BudgetSummary): string {
     const constraintCount = budget.constraints.length;
     return `Live database summary from ${windowSampleCount} bounded usage windows and ${constraintSampleCount}/${constraintCount} sampled budget constraints.`;
   }
+  if (budget.source === "cloudflare_analytics") {
+    const constraintSampleCount = budget.constraint_sample_count ?? budget.constraints?.filter((constraint) => constraint.sampled).length ?? 0;
+    const constraintCount = budget.constraints?.length ?? 0;
+    return `Cloudflare analytics summary with ${constraintSampleCount}/${constraintCount} sampled budget constraints; no Chaop usage windows are open yet.`;
+  }
   if (budget.source === "sample") {
     return "Sample data for local development.";
   }

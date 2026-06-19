@@ -31,6 +31,8 @@ Official references:
 
 - Wrangler configuration: https://developers.cloudflare.com/workers/wrangler/configuration/
 - Wrangler environment variables: https://developers.cloudflare.com/workers/wrangler/system-environment-variables/
+- Cloudflare API token permissions: https://developers.cloudflare.com/fundamentals/api/reference/permissions/
+- Cloudflare GraphQL Analytics API: https://developers.cloudflare.com/analytics/graphql-api/
 - D1 Wrangler commands: https://developers.cloudflare.com/d1/wrangler-commands/
 - R2 Wrangler commands: https://developers.cloudflare.com/r2/reference/wrangler-commands/
 - Cloudflare Access self-hosted apps: https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/
@@ -58,6 +60,12 @@ CHAOP_DAILY_BUDGET_UNITS=8333
 CHAOP_4H_SOFT_BUDGET_UNITS=1041
 CHAOP_4H_HARD_BUDGET_UNITS=1388
 CHAOP_BURST_EVENTS_PER_MINUTE=833
+CF_TELEMETRY_ACCOUNT_ID=
+CF_TELEMETRY_API_WORKER=chaop-api
+CF_TELEMETRY_WEB_WORKER=chaop-web
+CF_TELEMETRY_D1_DATABASE_ID=
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO
+CF_TELEMETRY_CACHE_SECONDS=300
 ```
 
 Provide these secrets through a secure channel only:
@@ -67,6 +75,7 @@ CLOUDFLARE_API_TOKEN=
 AGENT_BOOTSTRAP_SECRET=
 CF_ACCESS_CLIENT_ID=
 CF_ACCESS_CLIENT_SECRET=
+CF_TELEMETRY_API_TOKEN=
 ```
 
 ### Deployment-instance values
@@ -187,6 +196,12 @@ CHAOP_DAILY_BUDGET_UNITS=8333
 CHAOP_4H_SOFT_BUDGET_UNITS=1041
 CHAOP_4H_HARD_BUDGET_UNITS=1388
 CHAOP_BURST_EVENTS_PER_MINUTE=833
+CF_TELEMETRY_ACCOUNT_ID=...
+CF_TELEMETRY_API_WORKER=chaop-api
+CF_TELEMETRY_WEB_WORKER=chaop-web
+CF_TELEMETRY_D1_DATABASE_ID=...
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO
+CF_TELEMETRY_CACHE_SECONDS=300
 ```
 
 Do not commit this file.
@@ -247,6 +262,20 @@ pnpm deploy:api
 The first file should contain deployment-instance values such as domains, resource names, D1/R2 bindings, and Access configuration. The second file should contain secrets such as `CLOUDFLARE_API_TOKEN`. The script writes a temporary Wrangler config under `.codex-tmp/deploy/api/`, applies remote D1 migrations, then deploys the API Worker.
 
 The generated Worker runtime vars include `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. They are required because the Worker verifies Cloudflare Access JWTs after Access forwards an authenticated browser or service-token request.
+
+The generated Worker runtime vars also include non-secret Cloudflare telemetry selectors when they are available:
+
+```text
+CF_TELEMETRY_ACCOUNT_ID
+CF_TELEMETRY_API_WORKER
+CF_TELEMETRY_WEB_WORKER
+CF_TELEMETRY_D1_DATABASE_ID
+CF_TELEMETRY_DO_NAMESPACE_NAME
+CF_TELEMETRY_TIMEOUT_MS
+CF_TELEMETRY_CACHE_SECONDS
+```
+
+The API deploy script defaults `CF_TELEMETRY_ACCOUNT_ID` from `CLOUDFLARE_ACCOUNT_ID`, `CF_TELEMETRY_API_WORKER` from the deployed API Worker name, and `CF_TELEMETRY_D1_DATABASE_ID` from `CHAOP_D1_DATABASE_ID`. Set `CF_TELEMETRY_WEB_WORKER` when the GUI Worker has a separate script name. Set `CF_TELEMETRY_DO_NAMESPACE_NAME` to the Durable Object analytics `name` dimension, normally `WorkspaceDO`, if you want incoming WebSocket message counts folded into Durable Object request equivalents. `CF_TELEMETRY_CACHE_SECONDS` defaults to 300 seconds, with failed queries retried after at most 60 seconds. Keep the token itself as a Worker secret, not as a Wrangler var.
 
 ### Configure split domains
 
@@ -320,6 +349,26 @@ pnpm wrangler secret put ACCESS_TEAM_DOMAIN
 ```
 
 The implementation may store non-secret config in Wrangler vars, but secrets stay in Cloudflare secret storage.
+
+Cloudflare telemetry is optional. To enable it, create a separate read-only Cloudflare API token with this account permission:
+
+```text
+Account Analytics: Read
+```
+
+Do not reuse the deployment token for runtime telemetry unless you accept that the Worker would hold deploy-capable permissions. After the first API deploy has generated `.codex-tmp/deploy/api/wrangler.jsonc`, write the telemetry token as a Worker secret:
+
+```bash
+pnpm --filter @chaop/worker exec wrangler secret put CF_TELEMETRY_API_TOKEN --config .codex-tmp/deploy/api/wrangler.jsonc
+```
+
+Then redeploy the API Worker so the runtime environment and secret revision are active:
+
+```bash
+CHAOP_DEPLOY_ENV_FILE=/path/to/chaop.env \
+CHAOP_DEPLOY_SECRET_ENV_FILE=/path/to/deploy.env \
+pnpm deploy:api
+```
 
 ### Prepare the first connector
 

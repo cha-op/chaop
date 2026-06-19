@@ -36,11 +36,18 @@ D1 绑定可用时，Browser 里的 Budget Board 会使用 Chaop 自己控制的
 - 从当前 sampled usage windows、在线 connectors 和未归档 tasks 中取当前最严重的 `budget_state`。
 - Delayed events、compacted events 和 local spool bytes 优先来自 daily usage window；如果没有 daily window，则使用下一个可用的 sampled window。
 - 页面会显示 source metadata，区分当前是 D1 usage windows、本地 sample data，还是空数据库。
+- 配好 `CF_TELEMETRY_API_TOKEN` 和非 secret telemetry selectors 后，页面可以额外读取 Cloudflare GraphQL Analytics samples，用于 Worker requests、Durable Object request-equivalent usage、D1 rows read 和 D1 rows written。
 - 缺失的 usage window 会显示为 missing sample，不会显示成 `0%` usage。
 - 详细 budget constraints 会展开 D1 rows written、Worker requests、Durable Object request-equivalent usage 和 D1 rows read。缩略 posture 和 throttle decision 会使用 sampled hard constraints 里 remaining ratio 最低的一项；missing constraints 只在详细视图展示，不参与这个 minimum。
 - 浏览器 WebSocket 处于 live 状态时，UI 只会每 60 秒刷新一次 `/api/usage-summary` 来更新 Budget Board 和 top-bar metrics；如果 WebSocket fallback，原有 10 秒 bootstrap polling 会提供同一份数据，并停止 budget-only polling。
 
-Worker 会在持久化 thread events 的同类路径里写入这些 windows，包括有界 history backfill inserts。每个持久化 thread event 记为一个 Chaop usage unit；低优先级 P2/P3 events 会增加 delayed counter，`command.output` summaries 会增加 compacted counter，已存储 summary bytes 会增加 local spool byte counter。Usage-window writes 会按 window id 聚合，因此一批导入很多 events 时，通常最多只会分别更新当前 daily、four-hour 和 burst rows 各一次。默认 budget thresholds 会按 Cloudflare Free D1 rows-written 额度缩放，并使用从当前 schema 推导出来的写入模型：一个 steady realtime event 会写入 12 行 D1 rows，包括 thread sequence update、event row 和 indexes，以及三个 usage-window updates。边界事件在需要插入新 usage-window row 时会更高：一分钟里的第一个 event 是 14 rows，四小时窗口里的第一个 event 是 16 rows，UTC 日窗口里的第一个 event 是 18 rows。带 attached task 的 command lifecycle event 在 steady case 下是 20 rows，因为它还会更新 command state、task state 和 connector activity。有界 backfill 是每个导入 event 6 rows，加上批量 usage-window updates 的固定开销；同一分钟 batch 且当前 windows 已存在时，通常再加 6 rows。Worker 当前会从 usage windows 采样 D1 rows-written constraints；其他 Cloudflare limits 会先作为 missing constraints 返回，等后续有 metric ingestion 后再参与计算。已过期的 windows 会被当作 missing samples，直到新事件写入当前 windows。它不会扫描完整 event table，不会调用 Cloudflare billing APIs，不会调用 OpenAI billing APIs，也不需要部署实例 secrets。请把 Budget Board 当作 operator posture estimate，而不是官方账单来源；上面的 Cloudflare 和 OpenAI budget alerts 仍然需要开启。
+Worker 会在持久化 thread events 的同类路径里写入这些 windows，包括有界 history backfill inserts。每个持久化 thread event 记为一个 Chaop usage unit；低优先级 P2/P3 events 会增加 delayed counter，`command.output` summaries 会增加 compacted counter，已存储 summary bytes 会增加 local spool byte counter。Usage-window writes 会按 window id 聚合，因此一批导入很多 events 时，通常最多只会分别更新当前 daily、four-hour 和 burst rows 各一次。默认 budget thresholds 会按 Cloudflare Free D1 rows-written 额度缩放，并使用从当前 schema 推导出来的写入模型：一个 steady realtime event 会写入 12 行 D1 rows，包括 thread sequence update、event row 和 indexes，以及三个 usage-window updates。边界事件在需要插入新 usage-window row 时会更高：一分钟里的第一个 event 是 14 rows，四小时窗口里的第一个 event 是 16 rows，UTC 日窗口里的第一个 event 是 18 rows。带 attached task 的 command lifecycle event 在 steady case 下是 20 rows，因为它还会更新 command state、task state 和 connector activity。有界 backfill 是每个导入 event 6 rows，加上批量 usage-window updates 的固定开销；同一分钟 batch 且当前 windows 已存在时，通常再加 6 rows。
+
+Worker 可以选择性查询 Cloudflare GraphQL Analytics API，读取当前 UTC 日的指标。这个路径会用 `workersInvocationsAdaptive` 读取 API/Web Worker requests，用 `d1AnalyticsAdaptiveGroups` 读取 D1 rows read 和 rows written，并用 Durable Object analytics 计算 request-equivalent usage。只有在 `CF_TELEMETRY_DO_NAMESPACE_NAME` 把 periodic metric 限定到 Chaop Durable Object namespace 时，Chaop 才会按 Cloudflare 的 20 条 incoming messages 折算 1 次 request 的比例折算 incoming Durable Object WebSocket messages。查询有短 timeout，per-isolate cache 默认是五分钟，并且失败退避最多 60 秒。失败时这些 constraints 会继续显示为 `missing`，不会阻塞 Browser API。
+
+Budget Board 的 `Bootstrap` 动作会写入当前 `daily`、`four_hour` 和 `burst` 的 zero-count usage windows。新部署后，或者安静一段时间没有 event 打开当前窗口时，可以用它把 D1 rows-written constraints 从 `missing` 初始化成 `0%`。它不会回填历史 events，不会扫描 event table，也不会调用 billing APIs。
+
+Budget Board 不会调用 Cloudflare billing APIs，不会调用 OpenAI billing APIs，也不会上传部署实例 secrets。Cloudflare GraphQL Analytics 是操作侧 analytics 来源，不是官方账单来源。请继续把 Budget Board 当作 operator posture estimate，并保留上面的 Cloudflare 和 OpenAI budget alerts。
 
 ## 当前防护
 
@@ -76,6 +83,8 @@ App-server execution 当前只会把 lifecycle events 和最终 assistant messag
 - Cloudflare Workers 与 Durable Objects pricing：https://developers.cloudflare.com/workers/platform/pricing/
 - Cloudflare D1 pricing：https://developers.cloudflare.com/d1/platform/pricing/
 - Cloudflare R2 pricing：https://developers.cloudflare.com/r2/pricing/
+- Cloudflare GraphQL Analytics API：https://developers.cloudflare.com/analytics/graphql-api/
+- Querying Workers Metrics with GraphQL：https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-workers-metrics/
 - Cloudflare Notifications：https://developers.cloudflare.com/notifications/
 - OpenAI API pricing 与 budget controls：https://openai.com/api/pricing/
 - Codex usage limits：https://help.openai.com/en/articles/11369540-codex-in-chatgpt

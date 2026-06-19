@@ -1556,6 +1556,277 @@ test("usage summary reports missing percentages when no current D1 budget window
   assert.deepEqual(body.windows, []);
 });
 
+test("budget bootstrap opens zero-count current usage windows", async () => {
+  const db = budgetBootstrapDb();
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/budget/bootstrap", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+  const body = (await response.json()) as {
+    source: string;
+    state: string;
+    window_sample_count: number;
+    constraint_sample_count: number;
+    bottleneck_constraint: { id: string };
+    constraints: Array<{ id: string; sampled: boolean; used_pct: number | null; used_units: number | null }>;
+    windows: Array<{ window_type: string; used_pct: number; events_received: number }>;
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(db.usageWindowUpserts, 3);
+  assert.equal(body.source, "d1_usage_windows");
+  assert.equal(body.state, "normal");
+  assert.equal(body.window_sample_count, 3);
+  assert.equal(body.constraint_sample_count, 3);
+  assert.equal(body.bottleneck_constraint.id, "d1_rows_written_burst");
+  assert.deepEqual(
+    body.windows.map((window) => [window.window_type, window.used_pct, window.events_received]),
+    [
+      ["daily", 0, 0],
+      ["four_hour", 0, 0],
+      ["burst", 0, 0]
+    ]
+  );
+  assert.deepEqual(
+    body.constraints
+      .filter((constraint) => constraint.id.startsWith("d1_rows_written_"))
+      .map((constraint) => [constraint.id, constraint.sampled, constraint.used_pct, constraint.used_units]),
+    [
+      ["d1_rows_written_daily", true, 0, 0],
+      ["d1_rows_written_four_hour", true, 0, 0],
+      ["d1_rows_written_burst", true, 0, 0]
+    ]
+  );
+});
+
+test("usage summary samples Cloudflare telemetry constraints when configured", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedBody: { variables?: Record<string, unknown> } | undefined;
+  globalThis.fetch = (async (input, init) => {
+    assert.equal(String(input), "https://api.cloudflare.com/client/v4/graphql");
+    requestedBody = JSON.parse(String(init?.body ?? "{}")) as { variables?: Record<string, unknown> };
+    assert.equal(init?.headers && typeof init.headers === "object" && "authorization" in init.headers
+      ? (init.headers as Record<string, string>).authorization
+      : undefined, "Bearer telemetry-token");
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 20 } }],
+              webWorkerInvocations: [{ sum: { requests: 5 } }],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 1234, rowsWritten: 96 } }],
+              durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 40 } }],
+              durableObjectsPeriodicGroups: [{ sum: { inboundWebsocketMsgCount: 41 } }]
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] }),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "account-1",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_WEB_WORKER: "chaop-web",
+        CF_TELEMETRY_D1_DATABASE_ID: "database-1",
+        CF_TELEMETRY_DO_NAMESPACE_NAME: "WorkspaceDO"
+      }
+    );
+    const body = (await response.json()) as {
+      source: string;
+      constraint_sample_count: number;
+      bottleneck_constraint: { id: string; source: string };
+      constraints: Array<{ id: string; sampled: boolean; source: string; used_units: number | null }>;
+    };
+
+    assert.equal(response.status, 200);
+    const variables = requestedBody?.variables ?? {};
+    assert.equal(variables.accountTag, "account-1");
+    assert.equal(variables.apiScriptName, "chaop-api");
+    assert.equal(variables.webScriptName, "chaop-web");
+    assert.equal(variables.includeWebWorker, true);
+    assert.equal(variables.databaseId, "database-1");
+    assert.equal(variables.doNamespaceName, "WorkspaceDO");
+    assert.equal(variables.includeDoPeriodic, true);
+    assert.match(String(variables.start), /^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/);
+    assert.match(String(variables.end), /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(variables.dateStart, String(variables.start).slice(0, 10));
+    assert.equal(variables.dateEnd, String(variables.start).slice(0, 10));
+    assert.deepEqual({
+      accountTag: variables.accountTag,
+      apiScriptName: variables.apiScriptName,
+      webScriptName: variables.webScriptName,
+      includeWebWorker: variables.includeWebWorker,
+      databaseId: variables.databaseId,
+      doNamespaceName: variables.doNamespaceName,
+      includeDoPeriodic: variables.includeDoPeriodic
+    }, {
+      accountTag: "account-1",
+      apiScriptName: "chaop-api",
+      webScriptName: "chaop-web",
+      includeWebWorker: true,
+      databaseId: "database-1",
+      doNamespaceName: "WorkspaceDO",
+      includeDoPeriodic: true
+    });
+    assert.equal(body.source, "cloudflare_analytics");
+    assert.equal(body.constraint_sample_count, 4);
+    assert.deepEqual([body.bottleneck_constraint.id, body.bottleneck_constraint.source], [
+      "d1_rows_written_daily",
+      "cloudflare_analytics"
+    ]);
+    assert.deepEqual(
+      body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_units]),
+      [
+        ["d1_rows_written_daily", true, "cloudflare_analytics", 96],
+        ["d1_rows_written_four_hour", false, "missing", null],
+        ["d1_rows_written_burst", false, "missing", null],
+        ["worker_requests_daily", true, "cloudflare_analytics", 25],
+        ["durable_object_requests_daily", true, "cloudflare_analytics", 43],
+        ["d1_rows_read_daily", true, "cloudflare_analytics", 1234]
+      ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("usage summary keeps Cloudflare telemetry constraints missing when the query fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  console.warn = () => undefined;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ errors: [{ message: "denied" }] }), {
+    status: 403,
+    headers: { "content-type": "application/json; charset=utf-8" }
+  })) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] }),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "account-1",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_D1_DATABASE_ID: "database-1"
+      }
+    );
+    const body = (await response.json()) as {
+      source: string;
+      constraint_sample_count: number;
+      constraints: Array<{ id: string; sampled: boolean; used_units: number | null }>;
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.source, "empty");
+    assert.equal(body.constraint_sample_count, 0);
+    assert.deepEqual(
+      body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.used_units]),
+      [
+        ["d1_rows_written_daily", false, null],
+        ["d1_rows_written_four_hour", false, null],
+        ["d1_rows_written_burst", false, null],
+        ["worker_requests_daily", false, null],
+        ["durable_object_requests_daily", false, null],
+        ["d1_rows_read_daily", false, null]
+      ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
+});
+
+test("usage summary caches Cloudflare telemetry samples within the configured TTL", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 10 } }],
+              webWorkerInvocations: [{ sum: { requests: 2 } }],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten: 24 } }],
+              durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 5 } }],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const env: Env = {
+    ...devEnv,
+    DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] }),
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "account-cache",
+    CF_TELEMETRY_API_WORKER: "chaop-api",
+    CF_TELEMETRY_WEB_WORKER: "chaop-web-cache",
+    CF_TELEMETRY_D1_DATABASE_ID: "database-cache",
+    CF_TELEMETRY_CACHE_SECONDS: "300"
+  };
+
+  try {
+    const first = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: { origin: "https://app.example.com" }
+      }),
+      env
+    );
+    const second = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: { origin: "https://app.example.com" }
+      }),
+      env
+    );
+    const firstBody = (await first.json()) as {
+      constraints: Array<{ id: string; used_units: number | null }>;
+    };
+    const secondBody = (await second.json()) as {
+      constraints: Array<{ id: string; used_units: number | null }>;
+    };
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(fetchCount, 1);
+    assert.deepEqual(firstBody.constraints, secondBody.constraints);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("agent bootstrap rejects invalid secret", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/connector/bootstrap", { method: "POST", body: "{}" }),
@@ -2495,6 +2766,80 @@ function budgetSummaryDb(
       throw new Error(`Unexpected SQL in budget summary fake: ${sql}`);
     }
   } as unknown as D1Database;
+}
+
+function budgetBootstrapDb(): D1Database & { readonly usageWindowUpserts: number } {
+  const windows = new Map<string, Record<string, unknown>>();
+  let usageWindowUpserts = 0;
+
+  return {
+    prepare(sql: string) {
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return {
+          bind(...args: unknown[]) {
+            return {
+              async run() {
+                usageWindowUpserts += 1;
+                windows.set(String(args[1]), {
+                  id: args[0],
+                  window_type: args[1],
+                  window_start: args[2],
+                  window_end: args[3],
+                  budget_state: args[4],
+                  used_pct: args[5],
+                  events_received: args[6],
+                  events_compacted: args[7],
+                  events_delayed: args[8],
+                  local_spool_bytes: args[9],
+                  updated_at: args[10]
+                });
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM usage_windows/.test(sql)) {
+        assert.match(sql, /WHERE window_type = \?/);
+        return {
+          bind(windowType: string, windowStartAt: string, windowEndAt: string) {
+            return {
+              async first() {
+                assert.equal(windowEndAt, windowStartAt);
+                const row = windows.get(windowType);
+                if (!row) return undefined;
+                assert.equal(String(row.window_start) <= windowStartAt, true);
+                assert.equal(String(row.window_end) > windowStartAt, true);
+                return row;
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM connectors/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        return {
+          async all() {
+            return { results: [] };
+          }
+        };
+      }
+
+      if (/FROM tasks/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        return {
+          async all() {
+            return { results: [] };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in budget bootstrap fake: ${sql}`);
+    },
+    get usageWindowUpserts() {
+      return usageWindowUpserts;
+    }
+  } as unknown as D1Database & { readonly usageWindowUpserts: number };
 }
 
 function commandTargetDb(

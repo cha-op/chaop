@@ -154,6 +154,38 @@ test("budgetSourceLabel describes live sampled budget constraints", () => {
   );
 });
 
+test("budgetSourceLabel describes Cloudflare analytics-only budget constraints", () => {
+  const budget = {
+    ...payload().budget,
+    source: "cloudflare_analytics" as const,
+    window_sample_count: 0,
+    constraint_sample_count: 4,
+    constraints: Array.from({ length: 6 }, (_, index) => ({
+      id: `constraint-${index}`,
+      label: `Constraint ${index}`,
+      detail: "Test constraint",
+      window_type: "daily" as const,
+      unit: "worker_request" as const,
+      hard: true,
+      sampled: index < 4,
+      state: index < 4 ? "normal" as const : "missing" as const,
+      source: index < 4 ? "cloudflare_analytics" as const : "missing" as const,
+      limit_units: 100,
+      used_units: index < 4 ? 10 : null,
+      used_pct: index < 4 ? 10 : null,
+      remaining_units: index < 4 ? 90 : null,
+      remaining_ratio: index < 4 ? 0.9 : null,
+      per_event_units: null,
+      remaining_event_capacity: null
+    }))
+  };
+
+  assert.equal(
+    budgetSourceLabel(budget),
+    "Cloudflare analytics summary with 4/6 sampled budget constraints; no Chaop usage windows are open yet."
+  );
+});
+
 test("budgetPctLabel distinguishes missing samples from zero usage", () => {
   assert.equal(budgetPctLabel(null), "missing");
   assert.equal(budgetPctLabel(undefined), "missing");

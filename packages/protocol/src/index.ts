@@ -28,7 +28,7 @@ export type BudgetState =
   | "hard_limited"
   | "recovery";
 
-export type BudgetMetricSource = "sample" | "d1_usage_windows" | "empty";
+export type BudgetMetricSource = "sample" | "d1_usage_windows" | "cloudflare_analytics" | "empty";
 
 export type BudgetWindowType = "daily" | "four_hour" | "burst";
 
@@ -54,7 +54,7 @@ export type BudgetConstraint = {
   hard: boolean;
   sampled: boolean;
   state: BudgetConstraintState;
-  source: "sample" | "d1_usage_windows" | "schema_model" | "cloudflare_limit" | "missing";
+  source: "sample" | "d1_usage_windows" | "schema_model" | "cloudflare_limit" | "cloudflare_analytics" | "missing";
   limit_units: number | null;
   used_units: number | null;
   used_pct: number | null;

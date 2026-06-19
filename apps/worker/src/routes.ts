@@ -31,6 +31,7 @@ import {
   archiveTaskInDb,
   attachCreatedLocalThreadInDb,
   attachHostSessionInDb,
+  bootstrapBudgetWindowsInDb,
   chooseConnectorForLocalThread,
   createCommandInDb,
   detachHostSessionInDb,
@@ -83,6 +84,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
     const summary = env.DB ? await loadBudgetSummaryFromDb(env) : budget;
     return json(request, env, summary);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/budget/bootstrap") {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+    const summary = await bootstrapBudgetWindowsInDb(env);
+    return json(request, env, summary, 201);
   }
 
   if (request.method === "POST" && url.pathname === "/connector/bootstrap") {

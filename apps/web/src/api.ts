@@ -61,6 +61,10 @@ export async function loadUsageSummary(): Promise<BudgetSummary> {
   }
 }
 
+export async function bootstrapBudgetSamples(): Promise<BudgetSummary> {
+  return postJson("/api/budget/bootstrap", {});
+}
+
 export async function createCommand(request: CreateCommandRequest): Promise<CreateCommandResponse> {
   const response = await fetch(apiUrl("/api/commands"), {
     method: "POST",

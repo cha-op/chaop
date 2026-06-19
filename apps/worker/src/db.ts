@@ -82,6 +82,11 @@ const DEFAULT_BURST_EVENTS_PER_MINUTE = Math.max(
 );
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const ONE_MINUTE_MS = 60 * 1000;
+const DEFAULT_CF_TELEMETRY_TIMEOUT_MS = 1_500;
+const DEFAULT_CF_TELEMETRY_CACHE_SECONDS = 300;
+const DEFAULT_CF_TELEMETRY_FAILURE_CACHE_SECONDS = 60;
+const CLOUDFLARE_GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
+const WS_INCOMING_MESSAGES_PER_DO_REQUEST = 20;
 const BUDGET_STATE_RANK: Record<BudgetState, number> = {
   normal: 0,
   recovery: 1,
@@ -89,6 +94,8 @@ const BUDGET_STATE_RANK: Record<BudgetState, number> = {
   throttled: 3,
   hard_limited: 4
 };
+
+let cloudflareTelemetryCache: CloudflareTelemetryCacheEntry | undefined;
 
 export class CommandTargetError extends Error {
   constructor(
@@ -172,7 +179,7 @@ export async function loadBudgetSummaryFromDb(
     return emptyBudgetSummary(generatedAt);
   }
 
-  const [daily, fourHour, burst, connectorStates, taskStates] = await Promise.all([
+  const [daily, fourHour, burst, connectorStates, taskStates, telemetry] = await Promise.all([
     currentUsageWindow(env, "daily", generatedAt),
     currentUsageWindow(env, "four_hour", generatedAt),
     currentUsageWindow(env, "burst", generatedAt),
@@ -181,12 +188,13 @@ export async function loadBudgetSummaryFromDb(
       : listConnectorBudgetStates(env),
     snapshots.tasks
       ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
-      : listTaskBudgetStates(env)
+      : listTaskBudgetStates(env),
+    loadCloudflareTelemetryBestEffort(env, generatedAt)
   ]);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const primaryWindow = daily ?? fourHour ?? burst;
   const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
-  const constraints = budgetConstraints(env, windowSignals);
+  const constraints = budgetConstraints(env, windowSignals, telemetry);
   const bottleneckConstraint = budgetBottleneckConstraint(constraints);
   const constraintStates = constraints
     .filter((constraint) => constraint.sampled && constraint.hard && constraint.state !== "missing")
@@ -205,7 +213,7 @@ export async function loadBudgetSummaryFromDb(
     delayed_event_count: nonNegativeInteger(primaryWindow?.events_delayed),
     compacted_event_count: nonNegativeInteger(primaryWindow?.events_compacted),
     local_spool_bytes: nonNegativeInteger(primaryWindow?.local_spool_bytes),
-    source: windows.length > 0 ? "d1_usage_windows" : "empty",
+    source: windows.length > 0 ? "d1_usage_windows" : telemetry ? "cloudflare_analytics" : "empty",
     generated_at: generatedAt,
     window_sample_count: windows.length,
     constraint_sample_count: constraints.filter((constraint) => constraint.sampled).length,
@@ -214,6 +222,31 @@ export async function loadBudgetSummaryFromDb(
     bottleneck_constraint: bottleneckConstraint,
     d1_write_model: budgetD1WriteModel(env)
   };
+}
+
+export async function bootstrapBudgetWindowsInDb(
+  env: Env,
+  generatedAt = new Date().toISOString()
+): Promise<BudgetSummary> {
+  if (!env.DB) {
+    return emptyBudgetSummary(generatedAt);
+  }
+
+  const timestamp = new Date(generatedAt);
+  const effectiveTimestamp = Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
+  const updatedAt = effectiveTimestamp.toISOString();
+  const zeroMetrics: UsageEventMetrics = {
+    eventsReceived: 0,
+    compacted: 0,
+    delayed: 0,
+    spoolBytes: 0
+  };
+
+  for (const window of usageWindowSpecs(env, effectiveTimestamp)) {
+    await upsertUsageWindow(env, window, zeroMetrics, updatedAt);
+  }
+
+  return loadBudgetSummaryFromDb(env, updatedAt);
 }
 
 export type RecordAppServerInstancesResult = {
@@ -4246,6 +4279,205 @@ function slugPart(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64) || "unknown";
 }
 
+async function loadCloudflareTelemetryBestEffort(
+  env: Env,
+  generatedAt: string
+): Promise<CloudflareTelemetrySample | undefined> {
+  if (
+    !env.CF_TELEMETRY_API_TOKEN ||
+    !env.CF_TELEMETRY_ACCOUNT_ID ||
+    !env.CF_TELEMETRY_API_WORKER ||
+    !env.CF_TELEMETRY_D1_DATABASE_ID
+  ) {
+    return undefined;
+  }
+
+  try {
+    const cacheKey = cloudflareTelemetryCacheKey(env, generatedAt);
+    const now = Date.now();
+    if (cloudflareTelemetryCache?.key === cacheKey && cloudflareTelemetryCache.expiresAt > now) {
+      if (cloudflareTelemetryCache.pending) {
+        return await cloudflareTelemetryCache.pending;
+      }
+      return cloudflareTelemetryCache.sample;
+    }
+
+    const cacheSeconds = positiveIntegerEnv(env.CF_TELEMETRY_CACHE_SECONDS, DEFAULT_CF_TELEMETRY_CACHE_SECONDS);
+    const cacheMs = cacheSeconds * 1000;
+    const failureCacheMs = Math.min(cacheSeconds, DEFAULT_CF_TELEMETRY_FAILURE_CACHE_SECONDS) * 1000;
+    const pending = loadCloudflareTelemetry(env, generatedAt).then(
+      (sample) => {
+        cloudflareTelemetryCache = {
+          key: cacheKey,
+          sample,
+          expiresAt: Date.now() + cacheMs
+        };
+        return sample;
+      },
+      (error) => {
+        cloudflareTelemetryCache = {
+          key: cacheKey,
+          sample: undefined,
+          expiresAt: Date.now() + failureCacheMs
+        };
+        throw error;
+      }
+    );
+    cloudflareTelemetryCache = {
+      key: cacheKey,
+      pending,
+      expiresAt: now + cacheMs
+    };
+    return await pending;
+  } catch (error) {
+    console.warn("Cloudflare telemetry query failed", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+}
+
+function cloudflareTelemetryCacheKey(env: Env, generatedAt: string): string {
+  const end = new Date(generatedAt);
+  const effectiveEnd = Number.isNaN(end.getTime()) ? new Date() : end;
+  const date = new Date(Date.UTC(
+    effectiveEnd.getUTCFullYear(),
+    effectiveEnd.getUTCMonth(),
+    effectiveEnd.getUTCDate()
+  )).toISOString().slice(0, 10);
+  return [
+    env.CF_TELEMETRY_ACCOUNT_ID,
+    env.CF_TELEMETRY_API_WORKER,
+    env.CF_TELEMETRY_WEB_WORKER ?? "",
+    env.CF_TELEMETRY_D1_DATABASE_ID,
+    env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? "",
+    date
+  ].join("\0");
+}
+
+async function loadCloudflareTelemetry(env: Env, generatedAt: string): Promise<CloudflareTelemetrySample> {
+  const end = new Date(generatedAt);
+  const effectiveEnd = Number.isNaN(end.getTime()) ? new Date() : end;
+  const windowStart = new Date(Date.UTC(
+    effectiveEnd.getUTCFullYear(),
+    effectiveEnd.getUTCMonth(),
+    effectiveEnd.getUTCDate()
+  ));
+  const date = windowStart.toISOString().slice(0, 10);
+  const webWorker = env.CF_TELEMETRY_WEB_WORKER;
+  const variables = {
+    accountTag: env.CF_TELEMETRY_ACCOUNT_ID!,
+    apiScriptName: env.CF_TELEMETRY_API_WORKER!,
+    webScriptName: webWorker || env.CF_TELEMETRY_API_WORKER!,
+    includeWebWorker: Boolean(webWorker && webWorker !== env.CF_TELEMETRY_API_WORKER),
+    databaseId: env.CF_TELEMETRY_D1_DATABASE_ID!,
+    doNamespaceName: env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? "",
+    includeDoPeriodic: Boolean(env.CF_TELEMETRY_DO_NAMESPACE_NAME),
+    start: windowStart.toISOString(),
+    end: effectiveEnd.toISOString(),
+    dateStart: date,
+    dateEnd: date
+  };
+  const timeoutMs = positiveIntegerEnv(env.CF_TELEMETRY_TIMEOUT_MS, DEFAULT_CF_TELEMETRY_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(CLOUDFLARE_GRAPHQL_ENDPOINT, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.CF_TELEMETRY_API_TOKEN}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ query: CLOUDFLARE_TELEMETRY_QUERY, variables }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`GraphQL HTTP ${response.status}`);
+    }
+
+    const body = await response.json() as CloudflareGraphqlResponse;
+    if (body.errors?.length) {
+      throw new Error(body.errors.map((error) => error.message).join("; "));
+    }
+
+    const account = body.data?.viewer?.accounts?.[0];
+    if (!account) {
+      throw new Error("GraphQL account telemetry was empty");
+    }
+
+    const doInboundWebsocketMessages = sumGraphqlMetric(account.durableObjectsPeriodicGroups, "inboundWebsocketMsgCount");
+    const doRequests = sumGraphqlMetric(account.durableObjectsInvocationsAdaptiveGroups, "requests");
+    return {
+      windowStart: windowStart.toISOString(),
+      windowEnd: new Date(windowStart.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      updatedAt: effectiveEnd.toISOString(),
+      workerRequestsDaily:
+        sumGraphqlMetric(account.apiWorkerInvocations, "requests")
+        + sumGraphqlMetric(account.webWorkerInvocations, "requests"),
+      durableObjectRequestEquivalentsDaily:
+        doRequests + Math.ceil(doInboundWebsocketMessages / WS_INCOMING_MESSAGES_PER_DO_REQUEST),
+      d1RowsReadDaily: sumGraphqlMetric(account.d1AnalyticsAdaptiveGroups, "rowsRead"),
+      d1RowsWrittenDaily: sumGraphqlMetric(account.d1AnalyticsAdaptiveGroups, "rowsWritten")
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function sumGraphqlMetric(rows: CloudflareGraphqlMetricRow[] | undefined, field: string): number {
+  return (rows ?? []).reduce((total, row) => total + nonNegativeInteger(row.sum?.[field]), 0);
+}
+
+const CLOUDFLARE_TELEMETRY_QUERY = `query ChaopCloudflareTelemetry(
+  $accountTag: string!
+  $apiScriptName: string!
+  $webScriptName: string!
+  $includeWebWorker: Boolean!
+  $databaseId: string!
+  $doNamespaceName: string!
+  $includeDoPeriodic: Boolean!
+  $start: Time!
+  $end: Time!
+  $dateStart: Date!
+  $dateEnd: Date!
+) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      apiWorkerInvocations: workersInvocationsAdaptive(
+        limit: 1000
+        filter: { scriptName: $apiScriptName, datetime_geq: $start, datetime_leq: $end }
+      ) {
+        sum { requests }
+      }
+      webWorkerInvocations: workersInvocationsAdaptive(
+        limit: 1000
+        filter: { scriptName: $webScriptName, datetime_geq: $start, datetime_leq: $end }
+      ) @include(if: $includeWebWorker) {
+        sum { requests }
+      }
+      d1AnalyticsAdaptiveGroups(
+        limit: 1000
+        filter: { databaseId: $databaseId, date_geq: $dateStart, date_leq: $dateEnd }
+      ) {
+        sum { rowsRead rowsWritten }
+      }
+      durableObjectsInvocationsAdaptiveGroups(
+        limit: 1000
+        filter: { scriptName: $apiScriptName, datetime_geq: $start, datetime_leq: $end }
+      ) {
+        sum { requests }
+      }
+      durableObjectsPeriodicGroups(
+        limit: 1000
+        filter: { name: $doNamespaceName, datetime_geq: $start, datetime_leq: $end }
+      ) @include(if: $includeDoPeriodic) {
+        sum { inboundWebsocketMsgCount }
+      }
+    }
+  }
+}`;
+
 function emptyBudgetSummary(generatedAt: string): BudgetSummary {
   const constraints = budgetConstraints({}, []);
   return {
@@ -4288,7 +4520,8 @@ function budgetWindowSignalFromRow(env: Env, row: UsageWindowRow): BudgetWindowS
 
 function budgetConstraints(
   env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
-  windows: BudgetWindowSignal[]
+  windows: BudgetWindowSignal[],
+  telemetry?: CloudflareTelemetrySample | undefined
 ): BudgetConstraint[] {
   const model = budgetD1WriteModel(env);
   const windowsByType = new Map(windows.map((window) => [window.window_type, window]));
@@ -4300,7 +4533,8 @@ function budgetConstraints(
       "daily",
       model.daily_budget_units,
       windowsByType.get("daily"),
-      model.budgeted_rows_written_per_event
+      model.budgeted_rows_written_per_event,
+      telemetry?.d1RowsWrittenDaily
     ),
     d1WriteConstraint(
       "d1_rows_written_four_hour",
@@ -4320,29 +4554,35 @@ function budgetConstraints(
       windowsByType.get("burst"),
       model.budgeted_rows_written_per_event
     ),
-    missingConstraint(
+    cloudflareTelemetryConstraint(
       "worker_requests_daily",
       "Worker requests / day",
-      "Cloudflare Worker request usage is not sampled by Chaop yet; keep Cloudflare budget alerts enabled.",
+      "Cloudflare GraphQL Analytics API Worker request usage for the Chaop API and Web Workers.",
       "daily",
       "worker_request",
-      model.free_worker_requests_per_day
+      model.free_worker_requests_per_day,
+      telemetry?.workerRequestsDaily,
+      telemetry
     ),
-    missingConstraint(
+    cloudflareTelemetryConstraint(
       "durable_object_requests_daily",
       "Durable Object requests / day",
-      "Durable Object request usage, including incoming WebSocket message billing at Cloudflare's 20:1 compute-request ratio, is not sampled by Chaop yet.",
+      "Cloudflare GraphQL Analytics API Durable Object request-equivalent usage, including periodic inbound WebSocket messages at the 20:1 request ratio when exposed.",
       "daily",
       "durable_object_request",
-      CLOUDFLARE_FREE_DURABLE_OBJECT_REQUESTS_PER_DAY
+      CLOUDFLARE_FREE_DURABLE_OBJECT_REQUESTS_PER_DAY,
+      telemetry?.durableObjectRequestEquivalentsDaily,
+      telemetry
     ),
-    missingConstraint(
+    cloudflareTelemetryConstraint(
       "d1_rows_read_daily",
       "D1 rows read / day",
-      "Cloudflare D1 rows-read usage is not sampled by Chaop yet.",
+      "Cloudflare GraphQL Analytics API D1 rows-read usage for the Chaop control database.",
       "daily",
       "d1_row_read",
-      CLOUDFLARE_FREE_D1_ROWS_READ_PER_DAY
+      CLOUDFLARE_FREE_D1_ROWS_READ_PER_DAY,
+      telemetry?.d1RowsReadDaily,
+      telemetry
     )
   ];
 }
@@ -4354,10 +4594,11 @@ function d1WriteConstraint(
   windowType: BudgetWindowType,
   eventBudget: number,
   window: BudgetWindowSignal | undefined,
-  rowsPerEvent: number
+  rowsPerEvent: number,
+  telemetryUsedRows?: number | undefined
 ): BudgetConstraint {
   const limitUnits = eventBudget * rowsPerEvent;
-  const usedUnits = window ? window.events_received * rowsPerEvent : null;
+  const usedUnits = telemetryUsedRows ?? (window ? window.events_received * rowsPerEvent : null);
   return sampledConstraint({
     id,
     label,
@@ -4367,7 +4608,8 @@ function d1WriteConstraint(
     limitUnits,
     usedUnits,
     perEventUnits: rowsPerEvent,
-    state: window?.budget_state ?? "missing",
+    state: usedUnits === null ? "missing" : budgetStateForUsageCount(usedUnits, thresholdSet(limitUnits)),
+    source: telemetryUsedRows === undefined ? undefined : "cloudflare_analytics",
     window
   });
 }
@@ -4382,6 +4624,7 @@ function sampledConstraint({
   usedUnits,
   perEventUnits,
   state,
+  source,
   window
 }: {
   id: string;
@@ -4393,6 +4636,7 @@ function sampledConstraint({
   usedUnits: number | null;
   perEventUnits: number;
   state: BudgetConstraint["state"];
+  source?: BudgetConstraint["source"] | undefined;
   window: BudgetWindowSignal | undefined;
 }): BudgetConstraint {
   const remainingUnits = usedUnits === null ? null : Math.max(0, limitUnits - usedUnits);
@@ -4406,7 +4650,7 @@ function sampledConstraint({
     hard: true,
     sampled: usedUnits !== null,
     state,
-    source: usedUnits === null ? "missing" : "d1_usage_windows",
+    source: usedUnits === null ? "missing" : source ?? "d1_usage_windows",
     limit_units: limitUnits,
     used_units: usedUnits,
     used_pct: usedUnits === null ? null : usedPctForUnits(usedUnits, limitUnits),
@@ -4420,21 +4664,48 @@ function sampledConstraint({
   };
 }
 
-function missingConstraint(
+function cloudflareTelemetryConstraint(
   id: string,
   label: string,
   detail: string,
   windowType: BudgetConstraint["window_type"],
   unit: BudgetConstraint["unit"],
-  limitUnits: number
+  limitUnits: number,
+  usedUnits: number | undefined,
+  telemetry: CloudflareTelemetrySample | undefined
 ): BudgetConstraint {
+  if (usedUnits !== undefined) {
+    const remainingUnits = Math.max(0, limitUnits - usedUnits);
+    return {
+      id,
+      label,
+      detail,
+      window_type: windowType,
+      unit,
+      hard: true,
+      sampled: true,
+      state: budgetStateForUsageCount(usedUnits, thresholdSet(limitUnits)),
+      source: "cloudflare_analytics",
+      limit_units: limitUnits,
+      used_units: usedUnits,
+      used_pct: usedPctForUnits(usedUnits, limitUnits),
+      remaining_units: remainingUnits,
+      remaining_ratio: ratio(remainingUnits, limitUnits),
+      per_event_units: null,
+      remaining_event_capacity: null,
+      window_start: telemetry?.windowStart,
+      window_end: telemetry?.windowEnd,
+      updated_at: telemetry?.updatedAt
+    };
+  }
+
   return {
     id,
     label,
     detail,
     window_type: windowType,
     unit,
-    hard: false,
+    hard: true,
     sampled: false,
     state: "missing",
     source: "missing",
@@ -4628,6 +4899,42 @@ type UsageWindowRow = {
 type BudgetStateCountRow = {
   budget_state: string;
   count: number;
+};
+
+type CloudflareTelemetrySample = {
+  windowStart: string;
+  windowEnd: string;
+  updatedAt: string;
+  workerRequestsDaily: number;
+  durableObjectRequestEquivalentsDaily: number;
+  d1RowsReadDaily: number;
+  d1RowsWrittenDaily: number;
+};
+
+type CloudflareGraphqlMetricRow = {
+  sum?: Record<string, number | undefined> | undefined;
+};
+
+type CloudflareGraphqlResponse = {
+  data?: {
+    viewer?: {
+      accounts?: Array<{
+        apiWorkerInvocations?: CloudflareGraphqlMetricRow[];
+        webWorkerInvocations?: CloudflareGraphqlMetricRow[];
+        d1AnalyticsAdaptiveGroups?: CloudflareGraphqlMetricRow[];
+        durableObjectsInvocationsAdaptiveGroups?: CloudflareGraphqlMetricRow[];
+        durableObjectsPeriodicGroups?: CloudflareGraphqlMetricRow[];
+      }>;
+    };
+  };
+  errors?: Array<{ message: string }>;
+};
+
+type CloudflareTelemetryCacheEntry = {
+  key: string;
+  sample?: CloudflareTelemetrySample | undefined;
+  pending?: Promise<CloudflareTelemetrySample> | undefined;
+  expiresAt: number;
 };
 
 type UsageWindowSpec = {

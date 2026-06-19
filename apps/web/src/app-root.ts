@@ -23,6 +23,7 @@ import {
   ApiError,
   archiveTask,
   attachHostSession,
+  bootstrapBudgetSamples as requestBudgetBootstrap,
   browserSocketUrl,
   createCommand,
   createLocalThread,
@@ -685,7 +686,10 @@ export class ChaopApp extends LitElement {
         <section class="panel primary">
           <div class="section-heading">
             <h2>Cost posture</h2>
-            <span class="chip ${budget.state}">${budget.state.replace("_", " ")}</span>
+            <div class="section-actions">
+              <button type="button" @click=${this.bootstrapBudgetSamples}>Bootstrap</button>
+              <span class="chip ${budget.state}">${budget.state.replace("_", " ")}</span>
+            </div>
           </div>
           <p class="panel-subtle">${budgetSourceLabel(budget)}</p>
           ${bottleneck
@@ -958,6 +962,22 @@ export class ChaopApp extends LitElement {
       this.hostSessionsRefreshState = "failed";
       this.actionError = actionErrorMessage("Host session refresh failed", error);
       await this.load().catch(() => undefined);
+    }
+  };
+
+  private readonly bootstrapBudgetSamples = async (): Promise<void> => {
+    this.actionError = undefined;
+    this.actionNotice = undefined;
+    try {
+      const budget = await requestBudgetBootstrap();
+      if (!this.data) return;
+      this.data = {
+        ...this.data,
+        budget
+      };
+      this.actionNotice = "Budget samples bootstrapped.";
+    } catch (error) {
+      this.actionError = actionErrorMessage("Budget bootstrap failed", error);
     }
   };
 
