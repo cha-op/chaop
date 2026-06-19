@@ -249,17 +249,27 @@ ARTIFACTS -> chaop-artifacts
 WorkspaceDO -> Durable Object namespace
 ```
 
-### 通过 env 文件部署 API Worker
+### 通过 ops 仓部署 API Worker
 
-私有部署 env 文件写好后，用仓库内的 API 部署脚本：
+部署实例值和本地 secret material 放在私有 ops 仓，不放在这个仓库：
+
+```text
+../chaop-ops/deployments/mahane/chaop.env
+../chaop-ops/secrets/cloudflare-deploy.token
+../chaop-ops/secrets/cloudflare-telemetry.token
+```
+
+私有部署 profile 写好后，用仓库内的 API 部署脚本：
 
 ```bash
-CHAOP_DEPLOY_ENV_FILE=/path/to/chaop.env \
-CHAOP_DEPLOY_SECRET_ENV_FILE=/path/to/deploy.env \
+CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < ../chaop-ops/secrets/cloudflare-deploy.token)" \
+CHAOP_DEPLOY_ENV_FILE=../chaop-ops/deployments/mahane/chaop.env \
+CF_TELEMETRY_WEB_WORKER=chaop-web \
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO \
 pnpm deploy:api
 ```
 
-第一个文件保存部署实例值，例如域名、资源名、D1/R2 绑定，以及 Access 配置。第二个文件保存 secret，例如 `CLOUDFLARE_API_TOKEN`。脚本会在 `.codex-tmp/deploy/api/` 下写入临时 Wrangler 配置，执行远端 D1 migration，然后部署 API Worker。
+部署 profile 保存部署实例值，例如域名、资源名、D1/R2 绑定，以及 Access 配置。deploy token 保存在 `../chaop-ops/secrets/` 下的已忽略文件里，只传给当前 Wrangler 进程。脚本会在 `.codex-tmp/deploy/api/` 下写入临时 Wrangler 配置，执行远端 D1 migration，然后部署 API Worker。
 
 生成的 Worker runtime vars 会包含 `ACCESS_TEAM_DOMAIN` 和 `ACCESS_AUD`。Worker 在 Cloudflare Access 放行 browser 或 service-token 请求之后，还需要用它们校验 Access JWT。
 
@@ -359,14 +369,19 @@ Account Analytics: Read
 除非你接受 Worker 运行时持有部署权限，否则不要复用部署 token。第一次 API deploy 生成 `.codex-tmp/deploy/api/wrangler.jsonc` 之后，把 telemetry token 写成 Worker secret：
 
 ```bash
-pnpm --filter @chaop/worker exec wrangler secret put CF_TELEMETRY_API_TOKEN --config .codex-tmp/deploy/api/wrangler.jsonc
+CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < ../chaop-ops/secrets/cloudflare-deploy.token)" \
+pnpm --filter @chaop/worker exec wrangler secret put CF_TELEMETRY_API_TOKEN \
+  --config .codex-tmp/deploy/api/wrangler.jsonc \
+  < ../chaop-ops/secrets/cloudflare-telemetry.token
 ```
 
 然后重新部署 API Worker，让 runtime environment 和 secret revision 生效：
 
 ```bash
-CHAOP_DEPLOY_ENV_FILE=/path/to/chaop.env \
-CHAOP_DEPLOY_SECRET_ENV_FILE=/path/to/deploy.env \
+CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < ../chaop-ops/secrets/cloudflare-deploy.token)" \
+CHAOP_DEPLOY_ENV_FILE=../chaop-ops/deployments/mahane/chaop.env \
+CF_TELEMETRY_WEB_WORKER=chaop-web \
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO \
 pnpm deploy:api
 ```
 

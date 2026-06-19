@@ -249,17 +249,27 @@ ARTIFACTS -> chaop-artifacts
 WorkspaceDO -> Durable Object namespace
 ```
 
-### Deploy the API Worker from env files
+### Deploy the API Worker from the ops repository
 
-Use the checked-in API deployment script once the private deployment env files contain the required values:
+Keep deployment-instance values and local secret material in the private ops repository, not in this repository:
+
+```text
+../chaop-ops/deployments/mahane/chaop.env
+../chaop-ops/secrets/cloudflare-deploy.token
+../chaop-ops/secrets/cloudflare-telemetry.token
+```
+
+Use the checked-in API deployment script once the private deployment profile contains the required non-secret values:
 
 ```bash
-CHAOP_DEPLOY_ENV_FILE=/path/to/chaop.env \
-CHAOP_DEPLOY_SECRET_ENV_FILE=/path/to/deploy.env \
+CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < ../chaop-ops/secrets/cloudflare-deploy.token)" \
+CHAOP_DEPLOY_ENV_FILE=../chaop-ops/deployments/mahane/chaop.env \
+CF_TELEMETRY_WEB_WORKER=chaop-web \
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO \
 pnpm deploy:api
 ```
 
-The first file should contain deployment-instance values such as domains, resource names, D1/R2 bindings, and Access configuration. The second file should contain secrets such as `CLOUDFLARE_API_TOKEN`. The script writes a temporary Wrangler config under `.codex-tmp/deploy/api/`, applies remote D1 migrations, then deploys the API Worker.
+The deployment profile contains deployment-instance values such as domains, resource names, D1/R2 bindings, and Access configuration. The deploy token stays as an ignored file under `../chaop-ops/secrets/` and is passed only to the current Wrangler process. The script writes a temporary Wrangler config under `.codex-tmp/deploy/api/`, applies remote D1 migrations, then deploys the API Worker.
 
 The generated Worker runtime vars include `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. They are required because the Worker verifies Cloudflare Access JWTs after Access forwards an authenticated browser or service-token request.
 
@@ -359,14 +369,19 @@ Account Analytics: Read
 Do not reuse the deployment token for runtime telemetry unless you accept that the Worker would hold deploy-capable permissions. After the first API deploy has generated `.codex-tmp/deploy/api/wrangler.jsonc`, write the telemetry token as a Worker secret:
 
 ```bash
-pnpm --filter @chaop/worker exec wrangler secret put CF_TELEMETRY_API_TOKEN --config .codex-tmp/deploy/api/wrangler.jsonc
+CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < ../chaop-ops/secrets/cloudflare-deploy.token)" \
+pnpm --filter @chaop/worker exec wrangler secret put CF_TELEMETRY_API_TOKEN \
+  --config .codex-tmp/deploy/api/wrangler.jsonc \
+  < ../chaop-ops/secrets/cloudflare-telemetry.token
 ```
 
 Then redeploy the API Worker so the runtime environment and secret revision are active:
 
 ```bash
-CHAOP_DEPLOY_ENV_FILE=/path/to/chaop.env \
-CHAOP_DEPLOY_SECRET_ENV_FILE=/path/to/deploy.env \
+CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < ../chaop-ops/secrets/cloudflare-deploy.token)" \
+CHAOP_DEPLOY_ENV_FILE=../chaop-ops/deployments/mahane/chaop.env \
+CF_TELEMETRY_WEB_WORKER=chaop-web \
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO \
 pnpm deploy:api
 ```
 
