@@ -37,7 +37,7 @@ When D1 is bound, the Browser Budget Board uses Chaop-controlled database signal
 - Delayed events, compacted events, and local spool bytes from the daily usage window when present, otherwise the next available sampled window.
 - Source metadata showing whether the board is backed by D1 usage windows, local sample data, or an empty database.
 - Optional Cloudflare GraphQL Analytics samples for Worker requests, Durable Object request-equivalent usage, D1 rows read, and D1 rows written when `CF_TELEMETRY_API_TOKEN` and the non-secret telemetry selectors are configured.
-- Missing usage windows are displayed as missing samples, not as `0%` usage.
+- Missing current four-hour and burst usage windows are displayed as `0%` local schema-model baselines. Missing daily D1 rows-written still needs Cloudflare Analytics or a real daily usage window because daily D1 writes can include non-event inventory and control-plane writes.
 - Detailed budget constraints for D1 rows written, Worker requests, Durable Object request-equivalent usage, and D1 rows read. The compact posture and throttle decision use the sampled hard constraint with the lowest remaining ratio; missing constraints are shown in the detailed view but do not participate in that minimum.
 - While the browser WebSocket is live, the UI refreshes only `/api/usage-summary` every 60 seconds for Budget Board/top-bar metrics; when WebSocket falls back, the existing 10-second bootstrap polling supplies the same data and the budget-only poll is stopped.
 
@@ -45,7 +45,7 @@ The Worker writes those windows from the same paths that persist thread events, 
 
 The Worker can optionally query Cloudflare's GraphQL Analytics API for the current UTC day. That path uses `workersInvocationsAdaptive` for the API/Web Worker request count, `d1AnalyticsAdaptiveGroups` for D1 rows read and written, and Durable Object analytics for request-equivalent usage. Incoming Durable Object WebSocket messages are folded into request equivalents at Cloudflare's 20 incoming messages to 1 request ratio only when `CF_TELEMETRY_DO_NAMESPACE_NAME` scopes the periodic metric to the Chaop Durable Object namespace. The query has a short timeout that defaults to five seconds, a per-isolate cache that defaults to five minutes, and a failure backoff of at most 60 seconds. Failures keep those constraints as `missing` instead of blocking the Browser API.
 
-The Budget Board `Bootstrap` action writes zero-count current `daily`, `four_hour`, and `burst` usage windows. Use it after a fresh deploy or a quiet period when D1 rows-written constraints are otherwise missing because no event has opened the current windows yet. It does not backfill historic events, scan the event table, or call billing APIs.
+The Budget Board `Bootstrap` action writes zero-count current `daily`, `four_hour`, and `burst` usage windows. It is a manual recovery and diagnostics tool, not required for normal display: unopened current four-hour and burst windows are shown as local `0%` baselines without writing rows. Bootstrap does not backfill historic events, scan the event table, or call billing APIs.
 
 The board does not call Cloudflare billing APIs, does not call OpenAI billing APIs, and does not upload deployment-instance secrets. Cloudflare GraphQL Analytics is an operational analytics source, not the official invoice source. Treat the board as an operator posture estimate and keep the Cloudflare and OpenAI budget alerts above enabled.
 

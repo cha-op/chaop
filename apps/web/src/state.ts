@@ -26,24 +26,28 @@ const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], 
 
 export function budgetSourceLabel(budget: BudgetSummary): string {
   const windowSampleCount = budget.window_sample_count ?? (budget.windows ?? []).length;
+  const constraintSampleCount = budget.constraint_sample_count ?? budget.constraints?.filter((constraint) => constraint.sampled).length ?? 0;
+  const constraintCount = budget.constraints?.length ?? 0;
+  const schemaModelCount = budget.constraints?.filter((constraint) => constraint.source === "schema_model" && constraint.sampled).length ?? 0;
   if (budget.source === "d1_usage_windows") {
     if (!budget.constraints) {
       return `Live database summary from ${windowSampleCount} bounded usage windows; detailed constraints are not reported by this control plane.`;
     }
-    const constraintSampleCount = budget.constraint_sample_count ?? budget.constraints.filter((constraint) => constraint.sampled).length;
-    const constraintCount = budget.constraints.length;
-    return `Live database summary from ${windowSampleCount} bounded usage windows and ${constraintSampleCount}/${constraintCount} sampled budget constraints.`;
+    const baseline = schemaModelCount > 0 ? `, including ${schemaModelCount} local model baselines` : "";
+    return `Live database summary from ${windowSampleCount} bounded usage windows and ${constraintSampleCount}/${constraintCount} sampled budget constraints${baseline}.`;
   }
   if (budget.source === "cloudflare_analytics") {
-    const constraintSampleCount = budget.constraint_sample_count ?? budget.constraints?.filter((constraint) => constraint.sampled).length ?? 0;
-    const constraintCount = budget.constraints?.length ?? 0;
-    return `Cloudflare analytics summary with ${constraintSampleCount}/${constraintCount} sampled budget constraints; no Chaop usage windows are open yet.`;
+    const baseline = schemaModelCount > 0 ? `, including ${schemaModelCount} local model baselines` : "";
+    return `Cloudflare analytics summary with ${constraintSampleCount}/${constraintCount} sampled budget constraints${baseline}; no Chaop usage windows are open yet.`;
   }
   if (budget.source === "sample") {
     return "Sample data for local development.";
   }
   if (budget.source === undefined) {
     return "Summary source not reported by this control plane.";
+  }
+  if (schemaModelCount > 0) {
+    return `No D1 or Cloudflare usage samples yet; ${schemaModelCount} local short-window baselines are shown as 0.`;
   }
   return "No usage windows recorded yet.";
 }

@@ -20,6 +20,7 @@ superseded_by:
 - Runtime telemetry 使用单独的 `CF_TELEMETRY_API_TOKEN` Worker secret；非 secret selector vars 由 API deploy script 生成。
 - 后续 telemetry debugging 发现 Cloudflare GraphQL Analytics 不支持 GraphQL directives，而且线上查询常见耗时约两秒；Worker 查询现在不再使用 directives，默认 timeout 调整为五秒。
 - D1 row-write telemetry 显示当前日写入偏高主要来自 Host Session inventory churn，不是 command events。Worker 现在会跳过未变化的 Host Session inventory upserts，并且只广播变化行。
+- 当前 four-hour 和 burst constraints 不再依赖已持久化的 usage-window row 才能显示可用 posture。如果当前短窗口尚未打开，Worker 会返回 `schema_model` zero baseline，而不是 unsampled missing constraint。
 
 ## 实现说明
 - `POST /api/budget/bootstrap` 需要 Browser auth 和 origin check，只写当前 `daily`、`four_hour` 和 `burst` usage windows。
@@ -28,6 +29,7 @@ superseded_by:
 - Budget Board 的 compact posture 继续使用 sampled hard constraints 中 remaining ratio 最低的一项。
 - 面向用户的部署文档和成本文档已经说明可选 Cloudflare token 权限，并继续遵守不记录部署实例值的要求。
 - Missing constraint details 现在会把显示的数值标成 limit，避免 UI 看起来像那些数值是当前用量。
+- Budget Board source text 现在会说明 current UTC-day Cloudflare Analytics 与 Chaop local schema-model short windows 的区别。
 
 ## 验证
 - `pnpm --filter @chaop/worker typecheck`
@@ -38,6 +40,7 @@ superseded_by:
 - Project journal validator。
 - `git diff --check`
 - 使用与 Worker 查询相同字段集的 live Cloudflare GraphQL smoke test。
+- 本次 follow-up 的 local short-window baselines 已由 Worker 和 Web unit tests 覆盖。
 
 ## 证据
 - 原始 live telemetry query 失败信息为 `directives not supported`。
@@ -45,6 +48,6 @@ superseded_by:
 - 远端 D1 行数显示只有 295 条 `events` rows 和 157 个 usage-window event counts，但有 1,177 条 `host_sessions` rows，因此重复 Host Session inventory upserts 是最强的 write amplification 来源。
 
 ## 下一步
-- 从已验证的 commit 部署 API 和 Web Workers。
+- 从已验证的 follow-up commit 部署 API 和 Web Workers。
 - 部署后观察 Budget Board。Cloudflare 当前日 counters 可能会在下一个 UTC 日之前继续偏高，因为 Analytics 返回的是当天累计值，不是只统计修复后的窗口。
-- 后续保留一个 backlog：让 cost posture detailed view 更清楚地区分 Cloudflare telemetry actual usage 和配置上限，并解释 D1 write drivers。
+- 后续保留一个 backlog：让 cost posture detailed view 更清楚地解释 event-window estimates 之外的 D1 write drivers。

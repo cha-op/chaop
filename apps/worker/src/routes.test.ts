@@ -1459,7 +1459,7 @@ test("usage summary returns bounded D1 budget windows", async () => {
   );
 });
 
-test("usage summary marks missing D1 budget windows as unsampled", async () => {
+test("usage summary treats missing short D1 budget windows as zero local baselines", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/usage-summary", {
       headers: {
@@ -1480,7 +1480,7 @@ test("usage summary marks missing D1 budget windows as unsampled", async () => {
     window_sample_count: number;
     constraint_sample_count: number;
     bottleneck_constraint: { id: string; remaining_ratio: number };
-    constraints: Array<{ id: string; sampled: boolean }>;
+    constraints: Array<{ id: string; sampled: boolean; source: string; used_pct: number | null }>;
     windows: Array<{ window_type: string; used_pct: number; budget_units: number }>;
   };
 
@@ -1489,28 +1489,28 @@ test("usage summary marks missing D1 budget windows as unsampled", async () => {
   assert.equal(body.state, "throttled");
   assert.equal(body.daily_used_pct, null);
   assert.equal(body.four_hour_used_pct, 17.3);
-  assert.equal(body.burst_used_pct, null);
+  assert.equal(body.burst_used_pct, 0);
   assert.equal(body.window_sample_count, 1);
-  assert.equal(body.constraint_sample_count, 1);
+  assert.equal(body.constraint_sample_count, 2);
   assert.deepEqual(
     [body.bottleneck_constraint.id, body.bottleneck_constraint.remaining_ratio],
     ["d1_rows_written_four_hour", 0.827]
   );
   assert.deepEqual(
-    body.constraints.map((constraint) => [constraint.id, constraint.sampled]),
+    body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_pct]),
     [
-      ["d1_rows_written_daily", false],
-      ["d1_rows_written_four_hour", true],
-      ["d1_rows_written_burst", false],
-      ["worker_requests_daily", false],
-      ["durable_object_requests_daily", false],
-      ["d1_rows_read_daily", false]
+      ["d1_rows_written_daily", false, "missing", null],
+      ["d1_rows_written_four_hour", true, "d1_usage_windows", 17.3],
+      ["d1_rows_written_burst", true, "schema_model", 0],
+      ["worker_requests_daily", false, "missing", null],
+      ["durable_object_requests_daily", false, "missing", null],
+      ["d1_rows_read_daily", false, "missing", null]
     ]
   );
   assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct, window.budget_units]), [["four_hour", 17.3, 1388]]);
 });
 
-test("usage summary reports missing percentages when no current D1 budget windows exist", async () => {
+test("usage summary reports zero short-window baselines when no current D1 budget windows exist", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/usage-summary", {
       headers: {
@@ -1529,28 +1529,31 @@ test("usage summary reports missing percentages when no current D1 budget window
     burst_used_pct: number | null;
     window_sample_count: number;
     constraint_sample_count: number;
-    bottleneck_constraint?: unknown;
-    constraints: Array<{ id: string; sampled: boolean; used_pct: number | null }>;
+    bottleneck_constraint?: { id: string; source: string; used_pct: number };
+    constraints: Array<{ id: string; sampled: boolean; source: string; used_pct: number | null }>;
     windows: unknown[];
   };
 
   assert.equal(response.status, 200);
   assert.equal(body.source, "empty");
   assert.equal(body.daily_used_pct, null);
-  assert.equal(body.four_hour_used_pct, null);
-  assert.equal(body.burst_used_pct, null);
+  assert.equal(body.four_hour_used_pct, 0);
+  assert.equal(body.burst_used_pct, 0);
   assert.equal(body.window_sample_count, 0);
-  assert.equal(body.constraint_sample_count, 0);
-  assert.equal(body.bottleneck_constraint, undefined);
+  assert.equal(body.constraint_sample_count, 2);
   assert.deepEqual(
-    body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.used_pct]),
+    [body.bottleneck_constraint?.id, body.bottleneck_constraint?.source, body.bottleneck_constraint?.used_pct],
+    ["d1_rows_written_burst", "schema_model", 0]
+  );
+  assert.deepEqual(
+    body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_pct]),
     [
-      ["d1_rows_written_daily", false, null],
-      ["d1_rows_written_four_hour", false, null],
-      ["d1_rows_written_burst", false, null],
-      ["worker_requests_daily", false, null],
-      ["durable_object_requests_daily", false, null],
-      ["d1_rows_read_daily", false, null]
+      ["d1_rows_written_daily", false, "missing", null],
+      ["d1_rows_written_four_hour", true, "schema_model", 0],
+      ["d1_rows_written_burst", true, "schema_model", 0],
+      ["worker_requests_daily", false, "missing", null],
+      ["durable_object_requests_daily", false, "missing", null],
+      ["d1_rows_read_daily", false, "missing", null]
     ]
   );
   assert.deepEqual(body.windows, []);
@@ -1685,7 +1688,7 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
       doNamespaceName: "WorkspaceDO"
     });
     assert.equal(body.source, "cloudflare_analytics");
-    assert.equal(body.constraint_sample_count, 4);
+    assert.equal(body.constraint_sample_count, 6);
     assert.deepEqual([body.bottleneck_constraint.id, body.bottleneck_constraint.source], [
       "d1_rows_written_daily",
       "cloudflare_analytics"
@@ -1694,8 +1697,8 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
       body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_units]),
       [
         ["d1_rows_written_daily", true, "cloudflare_analytics", 96],
-        ["d1_rows_written_four_hour", false, "missing", null],
-        ["d1_rows_written_burst", false, "missing", null],
+        ["d1_rows_written_four_hour", true, "schema_model", 0],
+        ["d1_rows_written_burst", true, "schema_model", 0],
         ["worker_requests_daily", true, "cloudflare_analytics", 25],
         ["durable_object_requests_daily", true, "cloudflare_analytics", 43],
         ["d1_rows_read_daily", true, "cloudflare_analytics", 1234]
@@ -1739,13 +1742,13 @@ test("usage summary keeps Cloudflare telemetry constraints missing when the quer
 
     assert.equal(response.status, 200);
     assert.equal(body.source, "empty");
-    assert.equal(body.constraint_sample_count, 0);
+    assert.equal(body.constraint_sample_count, 2);
     assert.deepEqual(
       body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.used_units]),
       [
         ["d1_rows_written_daily", false, null],
-        ["d1_rows_written_four_hour", false, null],
-        ["d1_rows_written_burst", false, null],
+        ["d1_rows_written_four_hour", true, 0],
+        ["d1_rows_written_burst", true, 0],
         ["worker_requests_daily", false, null],
         ["durable_object_requests_daily", false, null],
         ["d1_rows_read_daily", false, null]

@@ -194,7 +194,8 @@ export async function loadBudgetSummaryFromDb(
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const primaryWindow = daily ?? fourHour ?? burst;
   const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
-  const constraints = budgetConstraints(env, windowSignals, telemetry);
+  const localBaselines = localBudgetWindowBaselines(env, generatedAt);
+  const constraints = budgetConstraints(env, windowSignals, telemetry, localBaselines);
   const bottleneckConstraint = budgetBottleneckConstraint(constraints);
   const constraintStates = constraints
     .filter((constraint) => constraint.sampled && constraint.hard && constraint.state !== "missing")
@@ -208,8 +209,8 @@ export async function loadBudgetSummaryFromDb(
   return {
     state: worstBudgetState(states),
     daily_used_pct: windowPct(env, daily),
-    four_hour_used_pct: windowPct(env, fourHour),
-    burst_used_pct: windowPct(env, burst),
+    four_hour_used_pct: windowPct(env, fourHour) ?? localBaselines.get("four_hour")?.used_pct ?? null,
+    burst_used_pct: windowPct(env, burst) ?? localBaselines.get("burst")?.used_pct ?? null,
     delayed_event_count: nonNegativeInteger(primaryWindow?.events_delayed),
     compacted_event_count: nonNegativeInteger(primaryWindow?.events_compacted),
     local_spool_bytes: nonNegativeInteger(primaryWindow?.local_spool_bytes),
@@ -3935,7 +3936,10 @@ async function upsertUsageWindow(
     .run();
 }
 
-function usageWindowSpecs(env: Env, timestamp: Date): UsageWindowSpec[] {
+function usageWindowSpecs(
+  env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
+  timestamp: Date
+): UsageWindowSpec[] {
   const dailyBudget = positiveIntegerEnv(env.CHAOP_DAILY_BUDGET_UNITS, DEFAULT_DAILY_BUDGET_UNITS);
   const fourHourSoftBudget = positiveIntegerEnv(env.CHAOP_4H_SOFT_BUDGET_UNITS, DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS);
   const fourHourHardBudget = Math.max(
@@ -4533,13 +4537,48 @@ function budgetWindowSignalFromRow(env: Env, row: UsageWindowRow): BudgetWindowS
   };
 }
 
+function localBudgetWindowBaselines(
+  env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
+  generatedAt: string
+): Map<BudgetWindowType, BudgetWindowSignal> {
+  const timestamp = new Date(generatedAt);
+  const safeTimestamp = Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
+  return new Map(
+    usageWindowSpecs(env, safeTimestamp)
+      .filter((spec) => spec.windowType === "four_hour" || spec.windowType === "burst")
+      .map((spec) => [spec.windowType, zeroBudgetWindowSignal(spec)])
+  );
+}
+
+function zeroBudgetWindowSignal(spec: UsageWindowSpec): BudgetWindowSignal {
+  return {
+    window_type: spec.windowType,
+    window_start: spec.windowStart,
+    window_end: spec.windowEnd,
+    budget_state: "normal",
+    used_pct: 0,
+    budget_units: spec.budgetUnits,
+    events_received: 0,
+    events_compacted: 0,
+    events_delayed: 0,
+    local_spool_bytes: 0,
+    estimated_d1_rows_written: 0,
+    updated_at: spec.windowStart
+  };
+}
+
 function budgetConstraints(
   env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
   windows: BudgetWindowSignal[],
-  telemetry?: CloudflareTelemetrySample | undefined
+  telemetry?: CloudflareTelemetrySample | undefined,
+  localBaselines = new Map<BudgetWindowType, BudgetWindowSignal>()
 ): BudgetConstraint[] {
   const model = budgetD1WriteModel(env);
   const windowsByType = new Map(windows.map((window) => [window.window_type, window]));
+  const fourHourWindow = windowsByType.get("four_hour");
+  const burstWindow = windowsByType.get("burst");
+  const fourHourBaseline = fourHourWindow ? undefined : localBaselines.get("four_hour");
+  const burstBaseline = burstWindow ? undefined : localBaselines.get("burst");
   return [
     d1WriteConstraint(
       "d1_rows_written_daily",
@@ -4557,8 +4596,10 @@ function budgetConstraints(
       "Chaop local four-hour guardrail that prevents one busy period from consuming the full daily D1 rows-written posture.",
       "four_hour",
       model.four_hour_hard_budget_units,
-      windowsByType.get("four_hour"),
-      model.budgeted_rows_written_per_event
+      fourHourWindow ?? fourHourBaseline,
+      model.budgeted_rows_written_per_event,
+      undefined,
+      fourHourBaseline ? "schema_model" : undefined
     ),
     d1WriteConstraint(
       "d1_rows_written_burst",
@@ -4566,8 +4607,10 @@ function budgetConstraints(
       "Chaop burst guardrail for short spikes, modelled from D1 rows written per persisted event.",
       "burst",
       model.burst_budget_units,
-      windowsByType.get("burst"),
-      model.budgeted_rows_written_per_event
+      burstWindow ?? burstBaseline,
+      model.budgeted_rows_written_per_event,
+      undefined,
+      burstBaseline ? "schema_model" : undefined
     ),
     cloudflareTelemetryConstraint(
       "worker_requests_daily",
@@ -4610,7 +4653,8 @@ function d1WriteConstraint(
   eventBudget: number,
   window: BudgetWindowSignal | undefined,
   rowsPerEvent: number,
-  telemetryUsedRows?: number | undefined
+  telemetryUsedRows?: number | undefined,
+  localSource?: BudgetConstraint["source"] | undefined
 ): BudgetConstraint {
   const limitUnits = eventBudget * rowsPerEvent;
   const usedUnits = telemetryUsedRows ?? (window ? window.events_received * rowsPerEvent : null);
@@ -4624,7 +4668,7 @@ function d1WriteConstraint(
     usedUnits,
     perEventUnits: rowsPerEvent,
     state: usedUnits === null ? "missing" : budgetStateForUsageCount(usedUnits, thresholdSet(limitUnits)),
-    source: telemetryUsedRows === undefined ? undefined : "cloudflare_analytics",
+    source: telemetryUsedRows === undefined ? localSource : "cloudflare_analytics",
     window
   });
 }

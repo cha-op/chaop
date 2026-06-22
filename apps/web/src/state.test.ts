@@ -186,6 +186,38 @@ test("budgetSourceLabel describes Cloudflare analytics-only budget constraints",
   );
 });
 
+test("budgetSourceLabel describes local model baselines", () => {
+  const budget = {
+    ...payload().budget,
+    source: "cloudflare_analytics" as const,
+    window_sample_count: 0,
+    constraint_sample_count: 6,
+    constraints: Array.from({ length: 6 }, (_, index) => ({
+      id: `constraint-${index}`,
+      label: `Constraint ${index}`,
+      detail: "Test constraint",
+      window_type: "daily" as const,
+      unit: "d1_row" as const,
+      hard: true,
+      sampled: true,
+      state: "normal" as const,
+      source: index === 1 || index === 2 ? "schema_model" as const : "cloudflare_analytics" as const,
+      limit_units: 100,
+      used_units: index === 1 || index === 2 ? 0 : 10,
+      used_pct: index === 1 || index === 2 ? 0 : 10,
+      remaining_units: index === 1 || index === 2 ? 100 : 90,
+      remaining_ratio: index === 1 || index === 2 ? 1 : 0.9,
+      per_event_units: index === 1 || index === 2 ? 10 : null,
+      remaining_event_capacity: index === 1 || index === 2 ? 10 : null
+    }))
+  };
+
+  assert.equal(
+    budgetSourceLabel(budget),
+    "Cloudflare analytics summary with 6/6 sampled budget constraints, including 2 local model baselines; no Chaop usage windows are open yet."
+  );
+});
+
 test("budgetPctLabel distinguishes missing samples from zero usage", () => {
   assert.equal(budgetPctLabel(null), "missing");
   assert.equal(budgetPctLabel(undefined), "missing");

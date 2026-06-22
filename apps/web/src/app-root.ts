@@ -691,7 +691,11 @@ export class ChaopApp extends LitElement {
               <span class="chip ${budget.state}">${budget.state.replace("_", " ")}</span>
             </div>
           </div>
-          <p class="panel-subtle">${budgetSourceLabel(budget)}</p>
+          <p class="panel-subtle">
+            ${budgetSourceLabel(budget)}
+            <br>
+            Daily Cloudflare rows are current UTC-day analytics; 4h/minute rows are Chaop local schema-model windows, with unopened current windows shown as 0.
+          </p>
           ${bottleneck
             ? html`
                 <article class="budget-bottleneck">
@@ -1633,7 +1637,8 @@ function budgetConstraintDetail(constraint: BudgetConstraint): string {
   const capacity = constraint.remaining_event_capacity === null
     ? ""
     : `, ${formatCount(constraint.remaining_event_capacity)} events left`;
-  return `${used} / ${limit} ${budgetConstraintUnitLabel(constraint.unit)}, ${remaining} remaining${capacity}`;
+  const source = constraint.source === "schema_model" ? "; local model baseline" : "";
+  return `${used} / ${limit} ${budgetConstraintUnitLabel(constraint.unit)}, ${remaining} remaining${capacity}${source}`;
 }
 
 function budgetConstraintSampleLabel(sampled: number, total: number): string {
