@@ -82,7 +82,7 @@ const DEFAULT_BURST_EVENTS_PER_MINUTE = Math.max(
 );
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const ONE_MINUTE_MS = 60 * 1000;
-const DEFAULT_CF_TELEMETRY_TIMEOUT_MS = 1_500;
+const DEFAULT_CF_TELEMETRY_TIMEOUT_MS = 5_000;
 const DEFAULT_CF_TELEMETRY_CACHE_SECONDS = 300;
 const DEFAULT_CF_TELEMETRY_FAILURE_CACHE_SECONDS = 60;
 const CLOUDFLARE_GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
@@ -483,7 +483,7 @@ export async function recordHostSessions(
       !reportedAppServerPresent && !canUseAppServerAbsence && previous?.app_server_present === true
         ? 1
         : reportedAppServerPresent ? 1 : 0;
-    await env.DB.prepare(
+    const result = await env.DB.prepare(
       `INSERT INTO host_sessions (
          id, connector_id, hostname, workspace_id, session_id, title, title_source, app_server_present,
          cwd, discovered_at, updated_at
@@ -499,7 +499,20 @@ export async function recordHostSessions(
          title_source = excluded.title_source,
          app_server_present = excluded.app_server_present,
          cwd = excluded.cwd,
-         updated_at = excluded.updated_at`
+         updated_at = excluded.updated_at
+       WHERE host_sessions.hostname IS NOT excluded.hostname
+          OR host_sessions.workspace_id IS NOT (
+            CASE
+              WHEN host_sessions.attached_task_id IS NOT NULL OR host_sessions.attached_thread_id IS NOT NULL
+              THEN host_sessions.workspace_id
+              ELSE excluded.workspace_id
+            END
+          )
+          OR host_sessions.title IS NOT excluded.title
+          OR host_sessions.title_source IS NOT excluded.title_source
+          OR host_sessions.app_server_present IS NOT excluded.app_server_present
+          OR host_sessions.cwd IS NOT excluded.cwd
+          OR host_sessions.updated_at IS NOT excluded.updated_at`
     )
       .bind(
         id,
@@ -515,6 +528,9 @@ export async function recordHostSessions(
         session.updated_at
       )
       .run();
+    if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+      continue;
+    }
     const stored = await findHostSession(env, session.session_id, connectorId);
     if (stored) {
       upserted.push(stored);
@@ -4365,14 +4381,14 @@ async function loadCloudflareTelemetry(env: Env, generatedAt: string): Promise<C
   ));
   const date = windowStart.toISOString().slice(0, 10);
   const webWorker = env.CF_TELEMETRY_WEB_WORKER;
+  const includeWebWorker = Boolean(webWorker && webWorker !== env.CF_TELEMETRY_API_WORKER);
+  const includeDoPeriodic = Boolean(env.CF_TELEMETRY_DO_NAMESPACE_NAME);
   const variables = {
     accountTag: env.CF_TELEMETRY_ACCOUNT_ID!,
     apiScriptName: env.CF_TELEMETRY_API_WORKER!,
     webScriptName: webWorker || env.CF_TELEMETRY_API_WORKER!,
-    includeWebWorker: Boolean(webWorker && webWorker !== env.CF_TELEMETRY_API_WORKER),
     databaseId: env.CF_TELEMETRY_D1_DATABASE_ID!,
-    doNamespaceName: env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? "",
-    includeDoPeriodic: Boolean(env.CF_TELEMETRY_DO_NAMESPACE_NAME),
+    doNamespaceName: env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? "__chaop_disabled__",
     start: windowStart.toISOString(),
     end: effectiveEnd.toISOString(),
     dateStart: date,
@@ -4414,9 +4430,10 @@ async function loadCloudflareTelemetry(env: Env, generatedAt: string): Promise<C
       updatedAt: effectiveEnd.toISOString(),
       workerRequestsDaily:
         sumGraphqlMetric(account.apiWorkerInvocations, "requests")
-        + sumGraphqlMetric(account.webWorkerInvocations, "requests"),
+        + (includeWebWorker ? sumGraphqlMetric(account.webWorkerInvocations, "requests") : 0),
       durableObjectRequestEquivalentsDaily:
-        doRequests + Math.ceil(doInboundWebsocketMessages / WS_INCOMING_MESSAGES_PER_DO_REQUEST),
+        doRequests
+        + (includeDoPeriodic ? Math.ceil(doInboundWebsocketMessages / WS_INCOMING_MESSAGES_PER_DO_REQUEST) : 0),
       d1RowsReadDaily: sumGraphqlMetric(account.d1AnalyticsAdaptiveGroups, "rowsRead"),
       d1RowsWrittenDaily: sumGraphqlMetric(account.d1AnalyticsAdaptiveGroups, "rowsWritten")
     };
@@ -4433,10 +4450,8 @@ const CLOUDFLARE_TELEMETRY_QUERY = `query ChaopCloudflareTelemetry(
   $accountTag: string!
   $apiScriptName: string!
   $webScriptName: string!
-  $includeWebWorker: Boolean!
   $databaseId: string!
   $doNamespaceName: string!
-  $includeDoPeriodic: Boolean!
   $start: Time!
   $end: Time!
   $dateStart: Date!
@@ -4453,7 +4468,7 @@ const CLOUDFLARE_TELEMETRY_QUERY = `query ChaopCloudflareTelemetry(
       webWorkerInvocations: workersInvocationsAdaptive(
         limit: 1000
         filter: { scriptName: $webScriptName, datetime_geq: $start, datetime_leq: $end }
-      ) @include(if: $includeWebWorker) {
+      ) {
         sum { requests }
       }
       d1AnalyticsAdaptiveGroups(
@@ -4471,7 +4486,7 @@ const CLOUDFLARE_TELEMETRY_QUERY = `query ChaopCloudflareTelemetry(
       durableObjectsPeriodicGroups(
         limit: 1000
         filter: { name: $doNamespaceName, datetime_geq: $start, datetime_leq: $end }
-      ) @include(if: $includeDoPeriodic) {
+      ) {
         sum { inboundWebsocketMsgCount }
       }
     }

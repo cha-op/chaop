@@ -285,7 +285,7 @@ CF_TELEMETRY_TIMEOUT_MS
 CF_TELEMETRY_CACHE_SECONDS
 ```
 
-API 部署脚本默认会从 `CLOUDFLARE_ACCOUNT_ID` 推导 `CF_TELEMETRY_ACCOUNT_ID`，从已部署的 API Worker 名称推导 `CF_TELEMETRY_API_WORKER`，从 `CHAOP_D1_DATABASE_ID` 推导 `CF_TELEMETRY_D1_DATABASE_ID`。如果 GUI Worker 是单独的 script name，请设置 `CF_TELEMETRY_WEB_WORKER`。如果你想把 incoming WebSocket message count 折算进 Durable Object request equivalents，请把 `CF_TELEMETRY_DO_NAMESPACE_NAME` 设置为 Durable Object analytics 的 `name` 维度，通常是 `WorkspaceDO`。`CF_TELEMETRY_CACHE_SECONDS` 默认是 300 秒；失败查询最多 60 秒后重试。Telemetry token 本身必须保存为 Worker secret，不要写成 Wrangler var。
+API 部署脚本默认会从 `CLOUDFLARE_ACCOUNT_ID` 推导 `CF_TELEMETRY_ACCOUNT_ID`，从已部署的 API Worker 名称推导 `CF_TELEMETRY_API_WORKER`，从 `CHAOP_D1_DATABASE_ID` 推导 `CF_TELEMETRY_D1_DATABASE_ID`。如果 GUI Worker 是单独的 script name，请设置 `CF_TELEMETRY_WEB_WORKER`。如果你想把 incoming WebSocket message count 折算进 Durable Object request equivalents，请把 `CF_TELEMETRY_DO_NAMESPACE_NAME` 设置为 Durable Object analytics 的 `name` 维度，通常是 `WorkspaceDO`。`CF_TELEMETRY_TIMEOUT_MS` 默认是 5000 毫秒。`CF_TELEMETRY_CACHE_SECONDS` 默认是 300 秒；失败查询最多 60 秒后重试。Telemetry token 本身必须保存为 Worker secret，不要写成 Wrangler var。
 
 ### 配置分离域名
 

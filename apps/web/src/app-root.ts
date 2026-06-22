@@ -1625,7 +1625,7 @@ function budgetWindowDetail(window: BudgetWindow): string {
 function budgetConstraintDetail(constraint: BudgetConstraint): string {
   if (!constraint.sampled) {
     const limit = constraint.limit_units === null ? "unknown limit" : `${formatCount(constraint.limit_units)} ${budgetConstraintUnitLabel(constraint.unit)}`;
-    return `${limit}; usage sample missing`;
+    return `limit ${limit}; usage sample missing`;
   }
   const used = constraint.used_units === null ? "missing" : formatCount(constraint.used_units);
   const limit = constraint.limit_units === null ? "unknown" : formatCount(constraint.limit_units);

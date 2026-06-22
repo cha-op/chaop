@@ -1031,6 +1031,35 @@ test("recordHostSessions preserves stored sessions outside the latest top-N repo
   });
 });
 
+test("recordHostSessions skips unchanged host session rows", async () => {
+  const db = hostSessionsInventoryDb();
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Attached session",
+          title_source: "history",
+          cwd: "/workspace/attached",
+          updated_at: "2026-06-12T10:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 0);
+  assert.equal(db.hostSessionWrites, 0);
+  assert.deepEqual(db.sync, {
+    connectorId: "connector-online",
+    reported: 1,
+    stored: 0
+  });
+});
+
 test("recordHostSessions clears app-server-only sessions omitted from inventory reports", async () => {
   const db = hostSessionsInventoryDb({
     initialAppServerPresent: 1,
@@ -3237,6 +3266,7 @@ function hostSessionsInventoryDb(options: {
   const counters = {
     sync: undefined as { connectorId: string; reported: number; stored: number } | undefined,
     demotedSessions: 0,
+    hostSessionWrites: 0,
     hasSession(sessionId: string) {
       return sessions.has(sessionId);
     },
@@ -3306,7 +3336,7 @@ function hostSessionsInventoryDb(options: {
             return {
               async run() {
                 const existing = sessions.get(sessionId);
-                sessions.set(sessionId, {
+                const next = {
                   id,
                   connector_id: connectorId,
                   hostname,
@@ -3322,8 +3352,20 @@ function hostSessionsInventoryDb(options: {
                   attached_task_id: existing?.attached_task_id ?? null,
                   attached_thread_id: existing?.attached_thread_id ?? null,
                   updated_at: updatedAt
-                });
-                return { success: true };
+                };
+                const changed = !existing ||
+                  existing.hostname !== next.hostname ||
+                  existing.workspace_id !== next.workspace_id ||
+                  existing.title !== next.title ||
+                  existing.title_source !== next.title_source ||
+                  existing.app_server_present !== next.app_server_present ||
+                  existing.cwd !== next.cwd ||
+                  existing.updated_at !== next.updated_at;
+                if (changed) {
+                  sessions.set(sessionId, next);
+                  counters.hostSessionWrites += 1;
+                }
+                return { success: true, meta: { changes: changed ? 1 : 0 } };
               }
             };
           }
@@ -3469,6 +3511,9 @@ function hostSessionsInventoryDb(options: {
     },
     get demotedSessions() {
       return counters.demotedSessions;
+    },
+    get hostSessionWrites() {
+      return counters.hostSessionWrites;
     }
   };
 

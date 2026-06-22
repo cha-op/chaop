@@ -1665,10 +1665,8 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
     assert.equal(variables.accountTag, "account-1");
     assert.equal(variables.apiScriptName, "chaop-api");
     assert.equal(variables.webScriptName, "chaop-web");
-    assert.equal(variables.includeWebWorker, true);
     assert.equal(variables.databaseId, "database-1");
     assert.equal(variables.doNamespaceName, "WorkspaceDO");
-    assert.equal(variables.includeDoPeriodic, true);
     assert.match(String(variables.start), /^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/);
     assert.match(String(variables.end), /^\d{4}-\d{2}-\d{2}T/);
     assert.equal(variables.dateStart, String(variables.start).slice(0, 10));
@@ -1677,18 +1675,14 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
       accountTag: variables.accountTag,
       apiScriptName: variables.apiScriptName,
       webScriptName: variables.webScriptName,
-      includeWebWorker: variables.includeWebWorker,
       databaseId: variables.databaseId,
-      doNamespaceName: variables.doNamespaceName,
-      includeDoPeriodic: variables.includeDoPeriodic
+      doNamespaceName: variables.doNamespaceName
     }, {
       accountTag: "account-1",
       apiScriptName: "chaop-api",
       webScriptName: "chaop-web",
-      includeWebWorker: true,
       databaseId: "database-1",
-      doNamespaceName: "WorkspaceDO",
-      includeDoPeriodic: true
+      doNamespaceName: "WorkspaceDO"
     });
     assert.equal(body.source, "cloudflare_analytics");
     assert.equal(body.constraint_sample_count, 4);
@@ -2793,7 +2787,7 @@ function budgetBootstrapDb(): D1Database & { readonly usageWindowUpserts: number
                   local_spool_bytes: args[9],
                   updated_at: args[10]
                 });
-                return { success: true };
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -2876,7 +2870,7 @@ function commandTargetDb(
           bind() {
             return {
               async run() {
-                return { success: true };
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -3116,7 +3110,7 @@ function commandTargetDb(
           bind() {
             return {
               async run() {
-                return { success: true };
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -3289,7 +3283,7 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
                   attached_thread_id: null,
                   updated_at: updatedAt
                 });
-                return { success: true };
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -3857,7 +3851,7 @@ function hostSessionAttachBackfillDb(
                 session.app_server_present = appServerPresent;
                 session.cwd = cwd ?? "/workspace/project";
                 session.updated_at = updatedAt;
-                return { success: true };
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }

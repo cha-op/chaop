@@ -285,7 +285,7 @@ CF_TELEMETRY_TIMEOUT_MS
 CF_TELEMETRY_CACHE_SECONDS
 ```
 
-The API deploy script defaults `CF_TELEMETRY_ACCOUNT_ID` from `CLOUDFLARE_ACCOUNT_ID`, `CF_TELEMETRY_API_WORKER` from the deployed API Worker name, and `CF_TELEMETRY_D1_DATABASE_ID` from `CHAOP_D1_DATABASE_ID`. Set `CF_TELEMETRY_WEB_WORKER` when the GUI Worker has a separate script name. Set `CF_TELEMETRY_DO_NAMESPACE_NAME` to the Durable Object analytics `name` dimension, normally `WorkspaceDO`, if you want incoming WebSocket message counts folded into Durable Object request equivalents. `CF_TELEMETRY_CACHE_SECONDS` defaults to 300 seconds, with failed queries retried after at most 60 seconds. Keep the token itself as a Worker secret, not as a Wrangler var.
+The API deploy script defaults `CF_TELEMETRY_ACCOUNT_ID` from `CLOUDFLARE_ACCOUNT_ID`, `CF_TELEMETRY_API_WORKER` from the deployed API Worker name, and `CF_TELEMETRY_D1_DATABASE_ID` from `CHAOP_D1_DATABASE_ID`. Set `CF_TELEMETRY_WEB_WORKER` when the GUI Worker has a separate script name. Set `CF_TELEMETRY_DO_NAMESPACE_NAME` to the Durable Object analytics `name` dimension, normally `WorkspaceDO`, if you want incoming WebSocket message counts folded into Durable Object request equivalents. `CF_TELEMETRY_TIMEOUT_MS` defaults to 5000 milliseconds. `CF_TELEMETRY_CACHE_SECONDS` defaults to 300 seconds, with failed queries retried after at most 60 seconds. Keep the token itself as a Worker secret, not as a Wrangler var.
 
 ### Configure split domains
 
