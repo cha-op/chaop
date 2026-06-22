@@ -719,6 +719,7 @@ export class ChaopApp extends LitElement {
                   <small>No sampled hard budget constraint is available yet.</small>
                 </article>
               `}
+          ${budgetTelemetryTrend(budget)}
           <div class="budget-bars">
             ${constraints.map((constraint) => budgetConstraintBar(constraint))}
           </div>
@@ -779,6 +780,7 @@ export class ChaopApp extends LitElement {
                 `
               : nothing}
           </dl>
+          ${budgetD1ActivitySignals(budget)}
         </aside>
       </section>
     `;
@@ -1796,6 +1798,139 @@ function isRealtimeAppServerInstancesPayload(value: unknown): value is RealtimeA
   );
 }
 
+function budgetTelemetryTrend(budget: BudgetSummary) {
+  const history = budget.telemetry_history;
+  const points = (history?.points ?? []).filter(
+    (point): point is BudgetTelemetryPointWithWrites => point.d1_rows_written_daily !== null
+  );
+  const latest = points.at(-1);
+  const slopes = history?.slopes ?? [];
+  const limit = budget.d1_write_model?.free_rows_written_per_day ?? 100_000;
+
+  if (!history || points.length === 0) {
+    return html`
+      <section class="budget-trend missing">
+        <div>
+          <h3>D1 rows written trend</h3>
+          <span>missing</span>
+        </div>
+        <p>No Cloudflare telemetry samples have been persisted yet.</p>
+      </section>
+    `;
+  }
+
+  const plotted = budgetTelemetryPlot(points, limit);
+  return html`
+    <section class="budget-trend">
+      <div class="budget-trend-header">
+        <div>
+          <h3>D1 rows written trend</h3>
+          <span>${points.length.toLocaleString("en-GB")} samples</span>
+        </div>
+        <strong title=${latest ? formatAbsoluteIso(latest.sampled_at) : ""}>
+          ${latest ? formatCount(latest.d1_rows_written_daily) : "missing"}
+        </strong>
+      </div>
+      <svg class="budget-trend-chart" viewBox="0 0 640 180" role="img" aria-label="D1 rows written over time">
+        <line x1="44" y1="150" x2="620" y2="150"></line>
+        <line x1="44" y1="24" x2="44" y2="150"></line>
+        <polyline points=${plotted.polyline}></polyline>
+        ${plotted.points.map(
+          (point) => html`<circle cx=${point.x} cy=${point.y} r="3"><title>${formatCount(point.value)} rows at ${formatAbsoluteIso(point.sampled_at)}</title></circle>`
+        )}
+        <text x="44" y="18">${formatCount(plotted.yMax)}</text>
+        <text x="44" y="170">${formatTimeLabel(points[0]!.sampled_at)}</text>
+        <text x="620" y="170" text-anchor="end">${formatTimeLabel(points.at(-1)!.sampled_at)}</text>
+      </svg>
+      <div class="budget-slopes">
+        ${slopes.map((slope) => html`
+          <div>
+            <span>${slope.window}</span>
+            <strong>${budgetSlopePrimaryLabel(slope)}</strong>
+            <small>${budgetSlopeSecondaryLabel(slope)}</small>
+          </div>
+        `)}
+      </div>
+    </section>
+  `;
+}
+
+function budgetTelemetryPlot(points: BudgetTelemetryPointWithWrites[], limit: number): {
+  yMax: number;
+  polyline: string;
+  points: Array<{ x: number; y: number; value: number; sampled_at: string }>;
+} {
+  const chart = {
+    left: 44,
+    right: 620,
+    top: 24,
+    bottom: 150
+  };
+  const timestamps = points.map((point) => Date.parse(point.sampled_at)).filter(Number.isFinite);
+  const minX = Math.min(...timestamps);
+  const maxX = Math.max(...timestamps);
+  const yMax = Math.max(limit, ...points.map((point) => point.d1_rows_written_daily), 1);
+  const plotted = points.map((point, index) => {
+    const timestamp = Date.parse(point.sampled_at);
+    const x = maxX === minX
+      ? chart.left + (chart.right - chart.left) / 2
+      : chart.left + ((timestamp - minX) / (maxX - minX)) * (chart.right - chart.left);
+    const y = chart.bottom - (point.d1_rows_written_daily / yMax) * (chart.bottom - chart.top);
+    return {
+      x: Math.round(x * 10) / 10,
+      y: Math.round(y * 10) / 10,
+      value: point.d1_rows_written_daily,
+      sampled_at: point.sampled_at,
+      index
+    };
+  });
+  return {
+    yMax,
+    polyline: plotted.map((point) => `${point.x},${point.y}`).join(" "),
+    points: plotted
+  };
+}
+
+function budgetSlopePrimaryLabel(slope: BudgetTelemetrySlope): string {
+  if (slope.d1_rows_written_delta === null || slope.d1_rows_written_per_minute === null) return "missing";
+  return `${formatCount(slope.d1_rows_written_delta)} rows`;
+}
+
+function budgetSlopeSecondaryLabel(slope: BudgetTelemetrySlope): string {
+  if (slope.d1_rows_written_per_minute === null || slope.projected_d1_rows_written_daily === null) {
+    return `${slope.sample_count} samples`;
+  }
+  return `${slope.d1_rows_written_per_minute.toLocaleString("en-GB")} rows/min, projected ${formatCount(slope.projected_d1_rows_written_daily)}`;
+}
+
+function budgetD1ActivitySignals(budget: BudgetSummary) {
+  const signals = budget.d1_activity?.signals ?? [];
+  if (signals.length === 0) return nothing;
+  return html`
+    <section class="budget-activity">
+      <h3>D1 write activity</h3>
+      <div>
+        ${signals.map((signal) => html`
+          <article class=${signal.sampled ? "" : "missing"}>
+            <span>${signal.label}</span>
+            <strong>${signal.rows_written_daily === null ? "missing" : formatCount(signal.rows_written_daily)}</strong>
+            <small title=${signal.updated_at ? formatAbsoluteIso(signal.updated_at) : signal.detail}>${signal.detail}</small>
+          </article>
+        `)}
+      </div>
+    </section>
+  `;
+}
+
+function formatTimeLabel(iso: string): string {
+  const timestamp = new Date(iso);
+  if (Number.isNaN(timestamp.getTime())) return "unknown";
+  return timestamp.toLocaleTimeString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
 function budgetConstraintBar(constraint: BudgetConstraint) {
   return html`
     <div class="budget-bar ${constraint.sampled ? "" : "missing"}">
@@ -1819,3 +1954,7 @@ function formatBytes(bytes: number): string {
 }
 
 type BudgetWindow = NonNullable<BudgetSummary["windows"]>[number];
+type BudgetTelemetryPointWithWrites = NonNullable<BudgetSummary["telemetry_history"]>["points"][number] & {
+  d1_rows_written_daily: number;
+};
+type BudgetTelemetrySlope = NonNullable<BudgetSummary["telemetry_history"]>["slopes"][number];

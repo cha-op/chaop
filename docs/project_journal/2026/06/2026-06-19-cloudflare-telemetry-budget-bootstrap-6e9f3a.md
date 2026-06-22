@@ -21,6 +21,9 @@ superseded_by:
 - Follow-up telemetry debugging found that Cloudflare GraphQL Analytics rejects GraphQL directives and that the live query commonly takes around two seconds, so the Worker query now avoids directives and uses a five-second default timeout.
 - D1 row-write telemetry showed high current-day writes dominated by host-session inventory churn, not command events. The Worker now skips unchanged host-session inventory upserts and only broadcasts changed rows.
 - Current four-hour and burst constraints no longer require a persisted usage-window row to render a usable posture. If the current short window has not opened yet, the Worker returns a `schema_model` zero baseline instead of an unsampled missing constraint.
+- Budget Board now persists low-frequency Cloudflare telemetry samples and shows a focused D1 rows-written trend with 15-minute and one-hour slopes.
+- Budget Board now separates measured current-day D1 writes, schema-model persisted-event estimates, and the residual gap so non-event write drivers are visible without scanning large D1 tables.
+- The local connector was intentionally stopped during this investigation to avoid unnecessary D1 writes while Chaop is not actively in use.
 
 ## Implementation Notes
 - `POST /api/budget/bootstrap` is Browser-authenticated, origin-checked, and writes only the current `daily`, `four_hour`, and `burst` usage windows.
@@ -30,6 +33,9 @@ superseded_by:
 - User-facing deployment and cost documentation explain the optional Cloudflare token permission and preserve the generic, non-instance-value requirement.
 - Missing constraint details now label displayed values as limits so the UI does not read like those values are current usage.
 - Budget Board source text now calls out the split between current UTC-day Cloudflare Analytics and Chaop local schema-model short windows.
+- Telemetry history uses a bounded `budget_telemetry_samples` table with five-minute default buckets, `INSERT OR IGNORE` to avoid writing on every refresh, and a 60 second default per-isolate read cache.
+- Slope calculations stay within the same UTC day as the latest Cloudflare sample, avoiding false negative deltas across the daily counter reset.
+- D1 write activity signals are derived from already loaded budget data and Cloudflare telemetry; exact query-meta attribution remains a later write-path instrumentation task.
 
 ## Validation
 - `pnpm --filter @chaop/worker typecheck`
@@ -41,6 +47,7 @@ superseded_by:
 - `git diff --check`
 - Live Cloudflare GraphQL smoke test using the same field set as the Worker query.
 - Follow-up validation for local short-window baselines is covered by Worker and Web unit tests.
+- Follow-up validation for telemetry history and activity signals is covered by Worker and Web unit tests.
 
 ## Evidence
 - The original live telemetry query failed with `directives not supported`.
@@ -48,6 +55,6 @@ superseded_by:
 - Remote D1 row counts showed only 295 `events` rows and 157 usage-window event counts, but 1,177 `host_sessions` rows, making repeated host-session inventory upserts the strongest write-amplification source.
 
 ## Next Steps
-- Deploy the API and Web Workers from the validated follow-up commit.
+- Add exact D1 query-meta attribution around write paths when the current lower-cost activity signals are not enough.
+- Add a real write guard for non-essential Chaop writes after the budget posture enters `hard_limited`.
 - Monitor Budget Board after deploy. Current-day Cloudflare counters may remain high until the next UTC day because Analytics reports the accumulated day, not a post-fix-only window.
-- Keep a follow-up backlog item for a deeper cost posture view that explains D1 write drivers beyond event-window estimates.

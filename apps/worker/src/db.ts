@@ -9,9 +9,13 @@ import type {
   AttachHostSessionResponse,
   BootstrapPayload,
   BudgetConstraint,
+  BudgetD1Activity,
   BudgetD1WriteModel,
   BudgetState,
   BudgetSummary,
+  BudgetTelemetryHistory,
+  BudgetTelemetryPoint,
+  BudgetTelemetrySlope,
   BudgetWindowSignal,
   BudgetWindowType,
   CommandDispatch,
@@ -85,6 +89,10 @@ const ONE_MINUTE_MS = 60 * 1000;
 const DEFAULT_CF_TELEMETRY_TIMEOUT_MS = 5_000;
 const DEFAULT_CF_TELEMETRY_CACHE_SECONDS = 300;
 const DEFAULT_CF_TELEMETRY_FAILURE_CACHE_SECONDS = 60;
+const DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS = 300;
+const DEFAULT_BUDGET_TELEMETRY_HISTORY_CACHE_SECONDS = 60;
+const BUDGET_TELEMETRY_HISTORY_HOURS = 24;
+const BUDGET_TELEMETRY_HISTORY_LIMIT = 300;
 const CLOUDFLARE_GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 const WS_INCOMING_MESSAGES_PER_DO_REQUEST = 20;
 const BUDGET_STATE_RANK: Record<BudgetState, number> = {
@@ -96,6 +104,7 @@ const BUDGET_STATE_RANK: Record<BudgetState, number> = {
 };
 
 let cloudflareTelemetryCache: CloudflareTelemetryCacheEntry | undefined;
+let budgetTelemetryHistoryCache: BudgetTelemetryHistoryCacheEntry | undefined;
 
 export class CommandTargetError extends Error {
   constructor(
@@ -195,8 +204,13 @@ export async function loadBudgetSummaryFromDb(
   const primaryWindow = daily ?? fourHour ?? burst;
   const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
   const localBaselines = localBudgetWindowBaselines(env, generatedAt);
+  const telemetrySampleInserted = await persistBudgetTelemetrySampleBestEffort(env, telemetry, generatedAt);
+  const telemetryHistory = await loadBudgetTelemetryHistoryBestEffort(env, generatedAt, {
+    force: telemetrySampleInserted
+  });
   const constraints = budgetConstraints(env, windowSignals, telemetry, localBaselines);
   const bottleneckConstraint = budgetBottleneckConstraint(constraints);
+  const d1Activity = budgetD1ActivitySignals(env, generatedAt, daily, telemetry);
   const constraintStates = constraints
     .filter((constraint) => constraint.sampled && constraint.hard && constraint.state !== "missing")
     .map((constraint) => constraint.state as BudgetState);
@@ -221,7 +235,9 @@ export async function loadBudgetSummaryFromDb(
     windows: windowSignals,
     constraints,
     bottleneck_constraint: bottleneckConstraint,
-    d1_write_model: budgetD1WriteModel(env)
+    d1_write_model: budgetD1WriteModel(env),
+    telemetry_history: telemetryHistory,
+    d1_activity: d1Activity
   };
 }
 
@@ -4360,6 +4376,8 @@ async function loadCloudflareTelemetryBestEffort(
 function cloudflareTelemetryCacheKey(env: Env, generatedAt: string): string {
   const end = new Date(generatedAt);
   const effectiveEnd = Number.isNaN(end.getTime()) ? new Date() : end;
+  const sampleSeconds = positiveIntegerEnv(env.CF_TELEMETRY_SAMPLE_SECONDS, DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS);
+  const sampleBucket = telemetrySampleBucketStart(effectiveEnd.toISOString(), sampleSeconds).toISOString();
   const date = new Date(Date.UTC(
     effectiveEnd.getUTCFullYear(),
     effectiveEnd.getUTCMonth(),
@@ -4371,7 +4389,8 @@ function cloudflareTelemetryCacheKey(env: Env, generatedAt: string): string {
     env.CF_TELEMETRY_WEB_WORKER ?? "",
     env.CF_TELEMETRY_D1_DATABASE_ID,
     env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? "",
-    date
+    date,
+    sampleBucket
   ].join("\0");
 }
 
@@ -4448,6 +4467,256 @@ async function loadCloudflareTelemetry(env: Env, generatedAt: string): Promise<C
 
 function sumGraphqlMetric(rows: CloudflareGraphqlMetricRow[] | undefined, field: string): number {
   return (rows ?? []).reduce((total, row) => total + nonNegativeInteger(row.sum?.[field]), 0);
+}
+
+async function persistBudgetTelemetrySampleBestEffort(
+  env: Env,
+  telemetry: CloudflareTelemetrySample | undefined,
+  generatedAt: string
+): Promise<boolean> {
+  if (!env.DB || !telemetry) return false;
+
+  try {
+    const sampleSeconds = positiveIntegerEnv(env.CF_TELEMETRY_SAMPLE_SECONDS, DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS);
+    const sampledAt = telemetrySampleBucketStart(generatedAt, sampleSeconds).toISOString();
+    const result = await env.DB.prepare(
+      `INSERT OR IGNORE INTO budget_telemetry_samples (
+         id, sample_type, sampled_at, window_start, window_end,
+         d1_rows_written_daily, d1_rows_read_daily, worker_requests_daily,
+         durable_object_requests_daily, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        `budget-telemetry:cloudflare_daily:${sampledAt}`,
+        "cloudflare_daily",
+        sampledAt,
+        telemetry.windowStart,
+        telemetry.windowEnd,
+        telemetry.d1RowsWrittenDaily,
+        telemetry.d1RowsReadDaily,
+        telemetry.workerRequestsDaily,
+        telemetry.durableObjectRequestEquivalentsDaily,
+        generatedAt
+      )
+      .run();
+    return Boolean((result.meta as { changes?: number } | undefined)?.changes);
+  } catch (error) {
+    console.warn("Budget telemetry sample could not be persisted", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return false;
+  }
+}
+
+async function loadBudgetTelemetryHistoryBestEffort(
+  env: Env,
+  generatedAt: string,
+  options: { force?: boolean | undefined } = {}
+): Promise<BudgetTelemetryHistory | undefined> {
+  if (!env.DB) return undefined;
+
+  try {
+    const cacheKey = budgetTelemetryHistoryCacheKey(env, generatedAt);
+    const now = Date.now();
+    if (!options.force && budgetTelemetryHistoryCache?.key === cacheKey && budgetTelemetryHistoryCache.expiresAt > now) {
+      return budgetTelemetryHistoryCache.history;
+    }
+
+    const effectiveAt = safeDate(generatedAt);
+    const since = new Date(effectiveAt.getTime() - BUDGET_TELEMETRY_HISTORY_HOURS * 60 * 60 * 1000).toISOString();
+    const rows = await allRows<BudgetTelemetrySampleRow>(
+      env.DB.prepare(
+        `SELECT sampled_at, d1_rows_written_daily, d1_rows_read_daily,
+                worker_requests_daily, durable_object_requests_daily
+         FROM budget_telemetry_samples
+         WHERE sample_type = ? AND sampled_at >= ?
+         ORDER BY sampled_at DESC
+         LIMIT ?`
+      )
+        .bind("cloudflare_daily", since, BUDGET_TELEMETRY_HISTORY_LIMIT)
+    );
+    const points = rows.reverse().map(budgetTelemetryPointFromRow);
+    const history: BudgetTelemetryHistory = {
+      source: "cloudflare_analytics",
+      latest_sample_at: points.at(-1)?.sampled_at,
+      points,
+      slopes: budgetTelemetrySlopes(points)
+    };
+    budgetTelemetryHistoryCache = {
+      key: cacheKey,
+      history,
+      expiresAt: now + positiveIntegerEnv(
+        env.CF_TELEMETRY_HISTORY_CACHE_SECONDS,
+        DEFAULT_BUDGET_TELEMETRY_HISTORY_CACHE_SECONDS
+      ) * 1000
+    };
+    return history;
+  } catch (error) {
+    console.warn("Budget telemetry history could not be loaded", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    budgetTelemetryHistoryCache = {
+      key: budgetTelemetryHistoryCacheKey(env, generatedAt),
+      history: undefined,
+      expiresAt: Date.now() + DEFAULT_CF_TELEMETRY_FAILURE_CACHE_SECONDS * 1000
+    };
+    return undefined;
+  }
+}
+
+function budgetTelemetryHistoryCacheKey(env: Env, generatedAt: string): string {
+  const sampleSeconds = positiveIntegerEnv(env.CF_TELEMETRY_SAMPLE_SECONDS, DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS);
+  const sampleBucket = telemetrySampleBucketStart(generatedAt, sampleSeconds).toISOString();
+  return [
+    env.CF_TELEMETRY_ACCOUNT_ID ?? "",
+    env.CF_TELEMETRY_D1_DATABASE_ID ?? "",
+    sampleBucket
+  ].join("\0");
+}
+
+function budgetTelemetryPointFromRow(row: BudgetTelemetrySampleRow): BudgetTelemetryPoint {
+  return {
+    sampled_at: row.sampled_at,
+    d1_rows_written_daily: nullableNonNegativeInteger(row.d1_rows_written_daily),
+    d1_rows_read_daily: nullableNonNegativeInteger(row.d1_rows_read_daily),
+    worker_requests_daily: nullableNonNegativeInteger(row.worker_requests_daily),
+    durable_object_requests_daily: nullableNonNegativeInteger(row.durable_object_requests_daily)
+  };
+}
+
+function budgetTelemetrySlopes(points: BudgetTelemetryPoint[]): BudgetTelemetrySlope[] {
+  return [
+    budgetTelemetrySlope(points, "15m", 15 * 60 * 1000),
+    budgetTelemetrySlope(points, "1h", 60 * 60 * 1000)
+  ];
+}
+
+function budgetTelemetrySlope(
+  points: BudgetTelemetryPoint[],
+  window: BudgetTelemetrySlope["window"],
+  windowMs: number
+): BudgetTelemetrySlope {
+  const eligible = points
+    .filter((point): point is BudgetTelemetryPoint & { d1_rows_written_daily: number } =>
+      point.d1_rows_written_daily !== null
+    )
+    .sort((left, right) => Date.parse(left.sampled_at) - Date.parse(right.sampled_at));
+  const latest = eligible.at(-1);
+  if (!latest) {
+    return emptyBudgetTelemetrySlope(window);
+  }
+
+  const latestAt = safeDate(latest.sampled_at);
+  const windowStartMs = latestAt.getTime() - windowMs;
+  const sameDay = utcDateKey(latestAt);
+  const windowPoints = eligible.filter((point) => {
+    const sampledAt = safeDate(point.sampled_at);
+    return sampledAt.getTime() >= windowStartMs && utcDateKey(sampledAt) === sameDay;
+  });
+  const first = windowPoints[0];
+  if (!first || windowPoints.length < 2) {
+    return {
+      ...emptyBudgetTelemetrySlope(window),
+      sample_count: windowPoints.length
+    };
+  }
+
+  const firstAt = safeDate(first.sampled_at);
+  const minutes = Math.max(0, (latestAt.getTime() - firstAt.getTime()) / 60_000);
+  const delta = Math.max(0, latest.d1_rows_written_daily - first.d1_rows_written_daily);
+  const perMinute = minutes > 0 ? Math.round((delta / minutes) * 10) / 10 : null;
+  const projected = perMinute === null
+    ? null
+    : Math.round(latest.d1_rows_written_daily + perMinute * minutesUntilUtcDayEnd(latestAt));
+
+  return {
+    window,
+    sample_count: windowPoints.length,
+    minutes: Math.round(minutes * 10) / 10,
+    d1_rows_written_delta: delta,
+    d1_rows_written_per_minute: perMinute,
+    projected_d1_rows_written_daily: projected
+  };
+}
+
+function emptyBudgetTelemetrySlope(window: BudgetTelemetrySlope["window"]): BudgetTelemetrySlope {
+  return {
+    window,
+    sample_count: 0,
+    minutes: 0,
+    d1_rows_written_delta: null,
+    d1_rows_written_per_minute: null,
+    projected_d1_rows_written_daily: null
+  };
+}
+
+function budgetD1ActivitySignals(
+  env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
+  generatedAt: string,
+  daily: UsageWindowRow | undefined,
+  telemetry: CloudflareTelemetrySample | undefined
+): BudgetD1Activity {
+  const model = budgetD1WriteModel(env);
+  const eventEstimate = daily ? nonNegativeInteger(daily.events_received) * model.budgeted_rows_written_per_event : null;
+  const measuredDaily = telemetry?.d1RowsWrittenDaily ?? null;
+  const residual = measuredDaily === null || eventEstimate === null ? null : Math.max(0, measuredDaily - eventEstimate);
+  return {
+    generated_at: generatedAt,
+    source: "d1_write_activity_signals",
+    signals: [
+      {
+        id: "cloudflare_d1_rows_written_daily",
+        label: "Measured D1 writes today",
+        detail: "Cloudflare GraphQL Analytics cumulative rows_written for the current UTC day.",
+        source: "cloudflare_analytics",
+        rows_written_daily: measuredDaily,
+        sampled: measuredDaily !== null,
+        updated_at: telemetry?.updatedAt
+      },
+      {
+        id: "estimated_event_persistence_daily",
+        label: "Estimated persisted event writes",
+        detail: "Current daily usage-window event count multiplied by the schema-derived steady rows-written per event.",
+        source: daily ? "d1_usage_windows" : "schema_model",
+        rows_written_daily: eventEstimate,
+        sampled: eventEstimate !== null,
+        updated_at: daily?.updated_at
+      },
+      {
+        id: "estimated_non_event_residual_daily",
+        label: "Measured minus event estimate",
+        detail: "Residual writes after subtracting Chaop's persisted-event estimate. This can include indexes, control-plane rows, inventory sync, manual D1 work, and model error.",
+        source: "cloudflare_analytics",
+        rows_written_daily: residual,
+        sampled: residual !== null,
+        updated_at: telemetry?.updatedAt
+      }
+    ]
+  };
+}
+
+function telemetrySampleBucketStart(generatedAt: string, sampleSeconds: number): Date {
+  const timestamp = safeDate(generatedAt);
+  const bucketMs = Math.max(1, sampleSeconds) * 1000;
+  return new Date(Math.floor(timestamp.getTime() / bucketMs) * bucketMs);
+}
+
+function minutesUntilUtcDayEnd(timestamp: Date): number {
+  const end = new Date(Date.UTC(
+    timestamp.getUTCFullYear(),
+    timestamp.getUTCMonth(),
+    timestamp.getUTCDate() + 1
+  ));
+  return Math.max(0, (end.getTime() - timestamp.getTime()) / 60_000);
+}
+
+function utcDateKey(timestamp: Date): string {
+  return timestamp.toISOString().slice(0, 10);
+}
+
+function safeDate(value: string): Date {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
 }
 
 const CLOUDFLARE_TELEMETRY_QUERY = `query ChaopCloudflareTelemetry(
@@ -4916,6 +5185,10 @@ function nonNegativeInteger(value: number | undefined): number {
   return Math.max(0, Math.floor(value));
 }
 
+function nullableNonNegativeInteger(value: number | null | undefined): number | null {
+  return value === null || value === undefined ? null : nonNegativeInteger(value);
+}
+
 type ConnectorRow = {
   id: string;
   name: string;
@@ -4970,6 +5243,14 @@ type CloudflareTelemetrySample = {
   d1RowsWrittenDaily: number;
 };
 
+type BudgetTelemetrySampleRow = {
+  sampled_at: string;
+  d1_rows_written_daily: number | null;
+  d1_rows_read_daily: number | null;
+  worker_requests_daily: number | null;
+  durable_object_requests_daily: number | null;
+};
+
 type CloudflareGraphqlMetricRow = {
   sum?: Record<string, number | undefined> | undefined;
 };
@@ -4993,6 +5274,12 @@ type CloudflareTelemetryCacheEntry = {
   key: string;
   sample?: CloudflareTelemetrySample | undefined;
   pending?: Promise<CloudflareTelemetrySample> | undefined;
+  expiresAt: number;
+};
+
+type BudgetTelemetryHistoryCacheEntry = {
+  key: string;
+  history?: BudgetTelemetryHistory | undefined;
   expiresAt: number;
 };
 

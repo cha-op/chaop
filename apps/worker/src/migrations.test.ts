@@ -96,6 +96,18 @@ test("usage window latest index is added by forward migration", async () => {
   );
 });
 
+test("budget telemetry samples are added by forward migration", async () => {
+  const migration = await readMigration("0013_budget_telemetry_samples.sql");
+
+  assert.match(migration, /CREATE TABLE budget_telemetry_samples/);
+  assert.match(migration, /sample_type TEXT NOT NULL/);
+  assert.match(migration, /d1_rows_written_daily INTEGER/);
+  assert.match(
+    migration,
+    /CREATE INDEX idx_budget_telemetry_samples_type_sampled_at\s+ON budget_telemetry_samples\(sample_type, sampled_at\)/
+  );
+});
+
 async function readMigration(fileName: string): Promise<string> {
 	return await readFile(new URL(fileName, migrationsDir), "utf8");
 }

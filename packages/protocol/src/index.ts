@@ -110,6 +110,46 @@ export type BudgetD1WriteModel = {
   components: BudgetD1WriteModelComponent[];
 };
 
+export type BudgetTelemetryPoint = {
+  sampled_at: string;
+  d1_rows_written_daily: number | null;
+  d1_rows_read_daily: number | null;
+  worker_requests_daily: number | null;
+  durable_object_requests_daily: number | null;
+};
+
+export type BudgetTelemetrySlope = {
+  window: "15m" | "1h";
+  sample_count: number;
+  minutes: number;
+  d1_rows_written_delta: number | null;
+  d1_rows_written_per_minute: number | null;
+  projected_d1_rows_written_daily: number | null;
+};
+
+export type BudgetTelemetryHistory = {
+  source: "cloudflare_analytics";
+  latest_sample_at?: string | undefined;
+  points: BudgetTelemetryPoint[];
+  slopes: BudgetTelemetrySlope[];
+};
+
+export type BudgetD1ActivitySignal = {
+  id: string;
+  label: string;
+  detail: string;
+  source: "cloudflare_analytics" | "d1_usage_windows" | "schema_model";
+  rows_written_daily: number | null;
+  sampled: boolean;
+  updated_at?: string | undefined;
+};
+
+export type BudgetD1Activity = {
+  generated_at: string;
+  source: "d1_write_activity_signals";
+  signals: BudgetD1ActivitySignal[];
+};
+
 export type RealtimeMode =
   | "realtime"
   | "summary"
@@ -417,6 +457,8 @@ export type BudgetSummary = {
   constraints?: BudgetConstraint[] | undefined;
   bottleneck_constraint?: BudgetConstraint | undefined;
   d1_write_model?: BudgetD1WriteModel | undefined;
+  telemetry_history?: BudgetTelemetryHistory | undefined;
+  d1_activity?: BudgetD1Activity | undefined;
 };
 
 export type BootstrapPayload = {

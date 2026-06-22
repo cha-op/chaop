@@ -526,7 +526,99 @@ export function fallbackBootstrap(): BootstrapPayload {
           estimated_d1_rows_written: 1800,
           updated_at: "2026-06-09T21:58:05.000Z"
         }
-      ]
+      ],
+      telemetry_history: {
+        source: "cloudflare_analytics",
+        latest_sample_at: "2026-06-09T21:55:00.000Z",
+        points: [
+          {
+            sampled_at: "2026-06-09T20:55:00.000Z",
+            d1_rows_written_daily: 60200,
+            d1_rows_read_daily: 1804000,
+            worker_requests_daily: 820,
+            durable_object_requests_daily: 2100
+          },
+          {
+            sampled_at: "2026-06-09T21:10:00.000Z",
+            d1_rows_written_daily: 64100,
+            d1_rows_read_daily: 1821000,
+            worker_requests_daily: 890,
+            durable_object_requests_daily: 2200
+          },
+          {
+            sampled_at: "2026-06-09T21:25:00.000Z",
+            d1_rows_written_daily: 69000,
+            d1_rows_read_daily: 1855000,
+            worker_requests_daily: 940,
+            durable_object_requests_daily: 2290
+          },
+          {
+            sampled_at: "2026-06-09T21:40:00.000Z",
+            d1_rows_written_daily: 72300,
+            d1_rows_read_daily: 1873000,
+            worker_requests_daily: 990,
+            durable_object_requests_daily: 2380
+          },
+          {
+            sampled_at: "2026-06-09T21:55:00.000Z",
+            d1_rows_written_daily: 75000,
+            d1_rows_read_daily: 1886000,
+            worker_requests_daily: 1040,
+            durable_object_requests_daily: 2460
+          }
+        ],
+        slopes: [
+          {
+            window: "15m",
+            sample_count: 2,
+            minutes: 15,
+            d1_rows_written_delta: 2700,
+            d1_rows_written_per_minute: 180,
+            projected_d1_rows_written_daily: 97800
+          },
+          {
+            window: "1h",
+            sample_count: 5,
+            minutes: 60,
+            d1_rows_written_delta: 14800,
+            d1_rows_written_per_minute: 246.7,
+            projected_d1_rows_written_daily: 106200
+          }
+        ]
+      },
+      d1_activity: {
+        generated_at: "2026-06-09T21:58:05.000Z",
+        source: "d1_write_activity_signals",
+        signals: [
+          {
+            id: "cloudflare_d1_rows_written_daily",
+            label: "Measured D1 writes today",
+            detail: "Cloudflare GraphQL Analytics cumulative rows_written for the current UTC day.",
+            source: "cloudflare_analytics",
+            rows_written_daily: 75000,
+            sampled: true,
+            updated_at: "2026-06-09T21:55:00.000Z"
+          },
+          {
+            id: "estimated_event_persistence_daily",
+            label: "Estimated persisted event writes",
+            detail: "Current daily usage-window event count multiplied by the schema-derived steady rows-written per event.",
+            source: "d1_usage_windows",
+            rows_written_daily: 75000,
+            sampled: true,
+            updated_at: "2026-06-09T21:58:05.000Z"
+          },
+          {
+            id: "estimated_non_event_residual_daily",
+            label: "Measured minus event estimate",
+            detail: "Residual writes after subtracting Chaop's persisted-event estimate.",
+            source: "cloudflare_analytics",
+            rows_written_daily: 0,
+            sampled: true,
+            updated_at: "2026-06-09T21:55:00.000Z"
+          }
+        ]
+      }
     },
     server_time: new Date().toISOString()
   };

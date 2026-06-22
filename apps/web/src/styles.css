@@ -792,6 +792,123 @@ textarea {
   color: #64748b;
 }
 
+.budget-trend {
+  display: grid;
+  gap: 12px;
+  max-width: 720px;
+  margin: 0 0 24px;
+  border-bottom: 1px solid #dbe5ef;
+  padding-bottom: 18px;
+}
+
+.budget-trend h3,
+.budget-activity h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.budget-trend-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: start;
+}
+
+.budget-trend-header div {
+  display: grid;
+  gap: 4px;
+}
+
+.budget-trend-header span,
+.budget-trend p,
+.budget-slopes small,
+.budget-activity small {
+  color: #64748b;
+}
+
+.budget-trend p {
+  margin: 0;
+}
+
+.budget-trend-chart {
+  width: 100%;
+  aspect-ratio: 32 / 9;
+  min-height: 150px;
+  overflow: visible;
+}
+
+.budget-trend-chart line {
+  stroke: #cbd5e1;
+  stroke-width: 1;
+}
+
+.budget-trend-chart polyline {
+  fill: none;
+  stroke: #0f766e;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 3;
+}
+
+.budget-trend-chart circle {
+  fill: #0f766e;
+  stroke: #ffffff;
+  stroke-width: 2;
+}
+
+.budget-trend-chart text {
+  fill: #64748b;
+  font-size: 12px;
+}
+
+.budget-slopes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.budget-slopes div,
+.budget-activity article {
+  display: grid;
+  gap: 4px;
+  border-top: 1px solid #e5e7eb;
+  padding-top: 10px;
+}
+
+.budget-slopes span,
+.budget-activity span {
+  color: #64748b;
+}
+
+.budget-trend.missing {
+  color: #64748b;
+}
+
+.budget-activity {
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.budget-activity > div {
+  display: grid;
+  gap: 12px;
+}
+
+.budget-activity article {
+  grid-template-columns: minmax(140px, 1fr) auto;
+  gap: 4px 12px;
+}
+
+.budget-activity article.missing span,
+.budget-activity article.missing strong {
+  color: #64748b;
+}
+
+.budget-activity small {
+  grid-column: 1 / -1;
+}
+
 .budget-bar div {
   display: flex;
   justify-content: space-between;
@@ -897,5 +1014,21 @@ meter {
 
   .panel.primary {
     min-height: auto;
+  }
+}
+
+@media (max-width: 640px) {
+  .budget-trend-header,
+  .budget-bottleneck {
+    grid-template-columns: 1fr;
+  }
+
+  .budget-trend-header {
+    display: grid;
+  }
+
+  .budget-slopes,
+  .budget-activity article {
+    grid-template-columns: 1fr;
   }
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { handleRequest } from "./routes.js";
+import { loadBudgetSummaryFromDb } from "./db.js";
 import type { Env } from "./types.js";
 
 const devEnv: Env = {
@@ -1661,6 +1662,14 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
       constraint_sample_count: number;
       bottleneck_constraint: { id: string; source: string };
       constraints: Array<{ id: string; sampled: boolean; source: string; used_units: number | null }>;
+      telemetry_history: {
+        latest_sample_at?: string;
+        points: Array<{ sampled_at: string; d1_rows_written_daily: number | null }>;
+        slopes: Array<{ window: string; sample_count: number; d1_rows_written_delta: number | null }>;
+      };
+      d1_activity: {
+        signals: Array<{ id: string; sampled: boolean; rows_written_daily: number | null }>;
+      };
     };
 
     assert.equal(response.status, 200);
@@ -1702,6 +1711,23 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
         ["worker_requests_daily", true, "cloudflare_analytics", 25],
         ["durable_object_requests_daily", true, "cloudflare_analytics", 43],
         ["d1_rows_read_daily", true, "cloudflare_analytics", 1234]
+      ]
+    );
+    assert.equal(body.telemetry_history.points.length, 1);
+    assert.equal(body.telemetry_history.points[0]!.d1_rows_written_daily, 96);
+    assert.deepEqual(
+      body.telemetry_history.slopes.map((slope) => [slope.window, slope.sample_count, slope.d1_rows_written_delta]),
+      [
+        ["15m", 1, null],
+        ["1h", 1, null]
+      ]
+    );
+    assert.deepEqual(
+      body.d1_activity.signals.map((signal) => [signal.id, signal.sampled, signal.rows_written_daily]),
+      [
+        ["cloudflare_d1_rows_written_daily", true, 96],
+        ["estimated_event_persistence_daily", false, null],
+        ["estimated_non_event_residual_daily", false, null]
       ]
     );
   } finally {
@@ -1822,6 +1848,86 @@ test("usage summary caches Cloudflare telemetry samples within the configured TT
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("budget telemetry cache expires on sample bucket boundaries", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: fetchCount } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: fetchCount * 100, rowsWritten: fetchCount * 10 } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const env: Env = {
+    ...devEnv,
+    DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] }),
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "account-bucket-cache",
+    CF_TELEMETRY_API_WORKER: "chaop-api",
+    CF_TELEMETRY_D1_DATABASE_ID: "database-bucket-cache",
+    CF_TELEMETRY_CACHE_SECONDS: "300",
+    CF_TELEMETRY_SAMPLE_SECONDS: "300"
+  };
+
+  try {
+    await loadBudgetSummaryFromDb(env, "2026-06-15T09:04:59.000Z");
+    const second = await loadBudgetSummaryFromDb(env, "2026-06-15T09:05:00.000Z");
+
+    assert.equal(fetchCount, 2);
+    assert.equal(second.telemetry_history?.points.at(-1)?.d1_rows_written_daily, 20);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("budget telemetry history keeps the latest bounded samples", async () => {
+  const samples = Array.from({ length: 305 }, (_, index) => {
+    const sampledAt = new Date(Date.UTC(2026, 5, 15, 8, index, 0)).toISOString();
+    return {
+      id: `sample-${index}`,
+      sample_type: "cloudflare_daily",
+      sampled_at: sampledAt,
+      window_start: "2026-06-15T00:00:00.000Z",
+      window_end: "2026-06-16T00:00:00.000Z",
+      d1_rows_written_daily: index,
+      d1_rows_read_daily: index * 10,
+      worker_requests_daily: index * 2,
+      durable_object_requests_daily: index * 3,
+      created_at: sampledAt
+    };
+  });
+  const body = await loadBudgetSummaryFromDb(
+    {
+      ...devEnv,
+      DB: budgetSummaryDb([], {
+        expiredWindowTypes: ["daily", "four_hour", "burst"],
+        telemetrySamples: samples
+      })
+    },
+    "2026-06-15T13:05:00.000Z"
+  );
+  const points = body.telemetry_history?.points ?? [];
+
+  assert.equal(points.length, 300);
+  assert.equal(points[0]!.d1_rows_written_daily, 5);
+  assert.equal(points.at(-1)!.d1_rows_written_daily, 304);
+  assert.equal(body.telemetry_history?.latest_sample_at, "2026-06-15T13:04:00.000Z");
 });
 
 test("agent bootstrap rejects invalid secret", async () => {
@@ -2671,8 +2777,12 @@ function readOnlyBootstrapDb(): D1Database {
 
 function budgetSummaryDb(
   omitWindowTypes: string[] = [],
-  options: { expiredWindowTypes?: string[] | undefined } = {}
+  options: {
+    expiredWindowTypes?: string[] | undefined;
+    telemetrySamples?: Record<string, unknown>[] | undefined;
+  } = {}
 ): D1Database {
+  const telemetrySamples: Record<string, unknown>[] = [...(options.telemetrySamples ?? [])];
   const windows: Record<string, Record<string, unknown>> = {
     daily: {
       id: "usage-daily",
@@ -2760,6 +2870,63 @@ function budgetSummaryDb(
         };
       }
 
+      if (/INSERT OR IGNORE INTO budget_telemetry_samples/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            sampleType: string,
+            sampledAt: string,
+            windowStart: string,
+            windowEnd: string,
+            d1RowsWrittenDaily: number | null,
+            d1RowsReadDaily: number | null,
+            workerRequestsDaily: number | null,
+            durableObjectRequestsDaily: number | null,
+            createdAt: string
+          ) {
+            return {
+              async run() {
+                if (telemetrySamples.some((sample) => sample.id === id)) {
+                  return { meta: { changes: 0 } };
+                }
+                telemetrySamples.push({
+                  id,
+                  sample_type: sampleType,
+                  sampled_at: sampledAt,
+                  window_start: windowStart,
+                  window_end: windowEnd,
+                  d1_rows_written_daily: d1RowsWrittenDaily,
+                  d1_rows_read_daily: d1RowsReadDaily,
+                  worker_requests_daily: workerRequestsDaily,
+                  durable_object_requests_daily: durableObjectRequestsDaily,
+                  created_at: createdAt
+                });
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM budget_telemetry_samples/.test(sql)) {
+        const descending = /ORDER BY sampled_at DESC/.test(sql);
+        return {
+          bind(sampleType: string, since: string, limit: number) {
+            return {
+              async all() {
+                const results = telemetrySamples
+                  .filter((sample) => sample.sample_type === sampleType && String(sample.sampled_at) >= since)
+                  .sort((left, right) => descending
+                    ? String(right.sampled_at).localeCompare(String(left.sampled_at))
+                    : String(left.sampled_at).localeCompare(String(right.sampled_at)))
+                  .slice(0, limit);
+                return { results };
+              }
+            };
+          }
+        };
+      }
+
       throw new Error(`Unexpected SQL in budget summary fake: ${sql}`);
     }
   } as unknown as D1Database;
@@ -2827,6 +2994,18 @@ function budgetBootstrapDb(): D1Database & { readonly usageWindowUpserts: number
         return {
           async all() {
             return { results: [] };
+          }
+        };
+      }
+
+      if (/FROM budget_telemetry_samples/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async all() {
+                return { results: [] };
+              }
+            };
           }
         };
       }
