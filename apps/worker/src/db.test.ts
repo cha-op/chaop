@@ -1060,6 +1060,38 @@ test("recordHostSessions skips unchanged host session rows", async () => {
   });
 });
 
+test("recordHostSessions includes unchanged reported rows in full snapshot payloads", async () => {
+  const db = hostSessionsInventoryDb();
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "full",
+      app_server_inventory_ok: true,
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Attached session",
+          title_source: "history",
+          cwd: "/workspace/attached",
+          updated_at: "2026-06-12T10:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 1);
+  assert.equal(result.host_sessions[0]?.session_id, "session-attached");
+  assert.equal(db.hostSessionWrites, 0);
+  assert.deepEqual(db.sync, {
+    connectorId: "connector-online",
+    reported: 1,
+    stored: 1
+  });
+});
+
 test("recordHostSessions clears app-server-only sessions omitted from inventory reports", async () => {
   const db = hostSessionsInventoryDb({
     initialAppServerPresent: 1,
