@@ -40,6 +40,7 @@ superseded_by:
 - Preserved structured safety payloads in Browser API errors so a server-side safety block immediately updates the local UI posture.
 - Fixed a second review finding by making unreadable emergency-pause state fail closed instead of allowing guarded writes.
 - Added the `agent_event` guard so running connector WebSocket events are rejected before D1 event persistence when dogfood safety is paused or hard-limited.
+- Refined `agent_event` handling so noisy non-terminal events are blocked during pause or hard limit, while terminal `command.finished` / `command.failed` events can still close the command and clear socket activity.
 - Narrowed safety copy from broad "dogfood writes" wording to "guarded dogfood actions" so cleanup paths that remain intentionally available are not misrepresented.
 
 ## Local Validation

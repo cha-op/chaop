@@ -306,23 +306,27 @@ export class WorkspaceDO implements DurableObject {
     }
 
     if (message.kind === "agent.event" && isAgentCommandEvent(message.payload)) {
-      try {
-        await assertDogfoodSafetyActionAllowed(this.env, "agent_event");
-      } catch (error) {
-        if (error instanceof DogfoodSafetyError) {
-          ws.send(
-            JSON.stringify(
-              createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
-                command_id: message.payload.command_id,
-                kind: message.payload.kind,
-                accepted: false,
-                reason: error.message
-              })
-            )
-          );
-          return;
+      const finalCommandEvent =
+        message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
+      if (!finalCommandEvent) {
+        try {
+          await assertDogfoodSafetyActionAllowed(this.env, "agent_event");
+        } catch (error) {
+          if (error instanceof DogfoodSafetyError) {
+            ws.send(
+              JSON.stringify(
+                createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+                  command_id: message.payload.command_id,
+                  kind: message.payload.kind,
+                  accepted: false,
+                  reason: error.message
+                })
+              )
+            );
+            return;
+          }
+          throw error;
         }
-        throw error;
       }
       const result = await recordAgentEvent(this.env, connectorId, message.payload);
       ws.send(
@@ -337,8 +341,6 @@ export class WorkspaceDO implements DurableObject {
       if (result.event) {
         this.broadcastToBrowsers(threadEventMessage(result.event));
       }
-      const finalCommandEvent =
-        message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
       const resultFinalCommandEvent =
         result.event?.kind === "command.finished" || result.event?.kind === "command.failed";
       if (result.accepted && (finalCommandEvent || resultFinalCommandEvent)) {

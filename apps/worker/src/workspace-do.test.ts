@@ -1765,6 +1765,64 @@ test("agent event ack is rejected while dogfood safety blocks agent events", asy
   assert.equal(db.commandQueries, 0);
 });
 
+test("terminal agent events bypass dogfood safety block and clear socket activity", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: false,
+    activeCommandIds: ["command-1"]
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = dogfoodSafetyBlockedTerminalAgentEventDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "command.finished",
+      priority: "P1",
+      summary: "Finished while paused"
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, {
+    command_id: "command-1",
+    kind: "command.finished",
+    accepted: true
+  });
+  assert.deepEqual(
+    (agentSocket.deserializeAttachment() as { activeCommandIds?: string[] }).activeCommandIds,
+    []
+  );
+  assert.equal(browserSent.length, 1);
+  const browserEvent = JSON.parse(browserSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { event?: { kind?: string; summary?: string } };
+  };
+  assert.equal(browserEvent.kind, "thread.event");
+  assert.equal(browserEvent.payload?.event?.kind, "command.finished");
+  assert.equal(browserEvent.payload?.event?.summary, "Finished while paused");
+  assert.equal(db.safetyQueries, 0);
+  assert.equal(db.commandUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+});
+
 test("rejected stale final command events still poll pending work for the connector", async () => {
   const sent: string[] = [];
   const agentSocket = {
@@ -2115,6 +2173,165 @@ function dogfoodSafetyBlockedAgentEventDb(): D1Database & { readonly commandQuer
       return counters.commandQueries;
     }
   } as unknown as D1Database & { readonly commandQueries: number };
+}
+
+function dogfoodSafetyBlockedTerminalAgentEventDb(): D1Database & {
+  readonly safetyQueries: number;
+  readonly commandUpdates: number;
+  readonly eventInserts: number;
+} {
+  const counters = {
+    safetyQueries: 0,
+    commandUpdates: 0,
+    eventInserts: 0
+  };
+  return {
+    prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql, { paused: true });
+      if (safetyStatement) {
+        counters.safetyQueries += 1;
+        return safetyStatement;
+      }
+
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
+        return {
+          bind(commandId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                return {
+                  id: "command-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  task_id: null,
+                  type: "codex",
+                  target_connector_id: null,
+                  target_connector_id_source: "auto",
+                  lease_owner_connector_id: "connector-online",
+                  state: "running",
+                  lease_target_host_session_id: null
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /lease_owner_connector_id = \?/.test(sql) && /state IN \('leased', 'running'\)/.test(sql)) {
+        return {
+          bind(
+            nextState: string,
+            connectorId: string,
+            updatedAt: string,
+            commandId: string,
+            ownerConnectorId: string
+          ) {
+            assert.equal(nextState, "succeeded");
+            assert.equal(connectorId, "connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(ownerConnectorId, "connector-online");
+            return {
+              async run() {
+                counters.commandUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 1 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            workspaceId: string,
+            threadId: string,
+            commandId: string,
+            seq: number,
+            kind: string,
+            priority: string,
+            summary: string,
+            createdAt: string
+          ) {
+            assert.match(id, /^event-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-1");
+            assert.equal(commandId, "command-1");
+            assert.equal(seq, 1);
+            assert.equal(kind, "command.finished");
+            assert.equal(priority, "P1");
+            assert.equal(summary, "Finished while paused");
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
+      if (/UPDATE connectors/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { active_count: 0 };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get safetyQueries() {
+      return counters.safetyQueries;
+    },
+    get commandUpdates() {
+      return counters.commandUpdates;
+    },
+    get eventInserts() {
+      return counters.eventInserts;
+    }
+  } as unknown as D1Database & {
+    readonly safetyQueries: number;
+    readonly commandUpdates: number;
+    readonly eventInserts: number;
+  };
 }
 
 function safetyQueryStatement(sql: string, options: { paused?: boolean } = {}) {
