@@ -412,17 +412,26 @@ function mergeById<T extends { id: string }>(
   return Array.from(merged.values());
 }
 
-function mergeHostSessions(
+export function mergeHostSessions(
   incoming: HostSessionSummary[],
-  current: HostSessionSummary[]
+  current: HostSessionSummary[],
+  options: { snapshotConnectorId?: string | undefined } = {}
 ): HostSessionSummary[] {
   const merged = new Map<string, HostSessionSummary>();
+  const incomingIds = new Set(incoming.map((item) => item.id));
 
   for (const item of incoming) {
     merged.set(item.id, item);
   }
 
   for (const item of current) {
+    if (
+      options.snapshotConnectorId !== undefined &&
+      item.connector_id === options.snapshotConnectorId &&
+      !incomingIds.has(item.id)
+    ) {
+      continue;
+    }
     const existing = merged.get(item.id);
     if (existing) {
       merged.set(item.id, newerByUpdatedAt(existing, item));

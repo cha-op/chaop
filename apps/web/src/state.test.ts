@@ -30,6 +30,7 @@ import {
   mergeBootstrapPayload,
   mergeAppServerInstances,
   mergeConnectorSummaries,
+  mergeHostSessions,
   normaliseCommandMode,
   primaryAppServerInstanceForConnector
 } from "./state.ts";
@@ -64,6 +65,44 @@ test("mergeBootstrapPayload keeps realtime host sessions newer than bootstrap sy
   const merged = mergeBootstrapPayload(current, incoming);
 
   assert.deepEqual(merged.host_sessions, [currentSession]);
+});
+
+test("mergeHostSessions keeps newer attached state over stale realtime inventory", () => {
+  const attachedSession = hostSession("session-app-server", {
+    app_server_present: true,
+    attached_task_id: "task-api",
+    attached_thread_id: "thread-api",
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+  const staleInventorySession = hostSession("session-app-server", {
+    app_server_present: false,
+    updated_at: "2026-06-12T10:01:00.000Z"
+  });
+
+  const merged = mergeHostSessions([staleInventorySession], [attachedSession], {
+    snapshotConnectorId: "connector-1"
+  });
+
+  assert.deepEqual(merged, [attachedSession]);
+});
+
+test("mergeHostSessions removes omitted connector sessions from realtime snapshots", () => {
+  const reportedSession = hostSession("session-reported", {
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+  const omittedSession = hostSession("session-omitted", {
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+  const otherConnectorSession = hostSession("session-other-connector", {
+    connector_id: "connector-2",
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+
+  const merged = mergeHostSessions([reportedSession], [omittedSession, otherConnectorSession], {
+    snapshotConnectorId: "connector-1"
+  });
+
+  assert.deepEqual(merged, [reportedSession, otherConnectorSession]);
 });
 
 test("mergeBootstrapPayload keeps newer app-server instance state over stale bootstrap", () => {

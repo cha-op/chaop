@@ -58,6 +58,7 @@ import {
   mergeBootstrapPayload,
   mergeAppServerInstances,
   mergeConnectorSummaries,
+  mergeHostSessions,
   normaliseCommandMode,
   type CommandExecutionMode
 } from "./state.js";
@@ -1359,19 +1360,11 @@ export class ChaopApp extends LitElement {
       this.hostSessionsRealtimeSyncedAt = newerIso(this.hostSessionsRealtimeSyncedAt, payload.synced_at);
       this.hostSessionsRefreshState = "idle";
     }
-    const hostSessions = payload.host_sessions;
-    const incomingIds = new Set(hostSessions.map((session) => session.id));
     this.data = {
       ...this.data,
-      host_sessions: [
-        ...hostSessions,
-        ...this.data.host_sessions.filter((session) => {
-          if (payload.snapshot && payload.connector_id && session.connector_id === payload.connector_id) {
-            return false;
-          }
-          return !incomingIds.has(session.id);
-        })
-      ]
+      host_sessions: mergeHostSessions(payload.host_sessions, this.data.host_sessions, {
+        snapshotConnectorId: payload.snapshot ? payload.connector_id : undefined
+      })
     };
     this.ensureCommandMode();
   }
