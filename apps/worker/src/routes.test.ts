@@ -1409,9 +1409,9 @@ test("usage summary returns bounded D1 budget windows", async () => {
   assert.equal(response.status, 200);
   assert.equal(body.source, "d1_usage_windows");
   assert.equal(body.state, "throttled");
-  assert.equal(body.daily_used_pct, 20);
-  assert.equal(body.four_hour_used_pct, 28.8);
-  assert.equal(body.burst_used_pct, 3.6);
+  assert.equal(body.daily_used_pct, 26);
+  assert.equal(body.four_hour_used_pct, 37.4);
+  assert.equal(body.burst_used_pct, 4.7);
   assert.equal(body.delayed_event_count, 8);
   assert.equal(body.compacted_event_count, 55);
   assert.equal(body.local_spool_bytes, 4096);
@@ -1425,7 +1425,7 @@ test("usage summary returns bounded D1 budget windows", async () => {
       body.d1_write_model.burst_budget_units,
       body.d1_write_model.command_lifecycle_with_task_rows_written
     ],
-    [20, 5000, 833, 500, 20]
+    [26, 3846, 641, 384, 20]
   );
   assert.deepEqual(
     [
@@ -1434,7 +1434,7 @@ test("usage summary returns bounded D1 budget windows", async () => {
       body.bottleneck_constraint.remaining_ratio,
       body.bottleneck_constraint.remaining_event_capacity
     ],
-    ["d1_rows_written_four_hour", 28.8, 0.712, 593]
+    ["d1_rows_written_four_hour", 37.4, 0.626, 401]
   );
   assert.deepEqual(
     body.constraints.map((constraint) => [
@@ -1446,9 +1446,9 @@ test("usage summary returns bounded D1 budget windows", async () => {
       constraint.remaining_event_capacity
     ]),
     [
-      ["d1_rows_written_daily", true, "normal", 20, 0.8, 4000],
-      ["d1_rows_written_four_hour", true, "normal", 28.8, 0.712, 593],
-      ["d1_rows_written_burst", true, "normal", 3.6, 0.964, 482],
+      ["d1_rows_written_daily", true, "normal", 26, 0.74, 2846],
+      ["d1_rows_written_four_hour", true, "normal", 37.4, 0.626, 401],
+      ["d1_rows_written_burst", true, "normal", 4.7, 0.953, 366],
       ["worker_requests_daily", false, "missing", null, null, null],
       ["durable_object_requests_daily", false, "missing", null, null, null],
       ["d1_rows_read_daily", false, "missing", null, null, null]
@@ -1464,9 +1464,9 @@ test("usage summary returns bounded D1 budget windows", async () => {
       window.budget_state
     ]),
     [
-      ["daily", 20, 5000, 1000, 20000, "normal"],
-      ["four_hour", 28.8, 833, 240, 4800, "normal"],
-      ["burst", 3.6, 500, 18, 360, "normal"]
+      ["daily", 26, 3846, 1000, 26000, "normal"],
+      ["four_hour", 37.4, 641, 240, 6240, "normal"],
+      ["burst", 4.7, 384, 18, 468, "normal"]
     ]
   );
 });
@@ -1500,26 +1500,26 @@ test("usage summary treats missing short D1 budget windows as zero local baselin
   assert.equal(body.source, "d1_usage_windows");
   assert.equal(body.state, "throttled");
   assert.equal(body.daily_used_pct, null);
-  assert.equal(body.four_hour_used_pct, 28.8);
+  assert.equal(body.four_hour_used_pct, 37.4);
   assert.equal(body.burst_used_pct, 0);
   assert.equal(body.window_sample_count, 1);
-  assert.equal(body.constraint_sample_count, 2);
+  assert.equal(body.constraint_sample_count, 1);
   assert.deepEqual(
     [body.bottleneck_constraint.id, body.bottleneck_constraint.remaining_ratio],
-    ["d1_rows_written_four_hour", 0.712]
+    ["d1_rows_written_four_hour", 0.626]
   );
   assert.deepEqual(
     body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_pct]),
     [
       ["d1_rows_written_daily", false, "missing", null],
-      ["d1_rows_written_four_hour", true, "d1_usage_windows", 28.8],
-      ["d1_rows_written_burst", true, "schema_model", 0],
+      ["d1_rows_written_four_hour", true, "d1_usage_windows", 37.4],
+      ["d1_rows_written_burst", false, "schema_model", 0],
       ["worker_requests_daily", false, "missing", null],
       ["durable_object_requests_daily", false, "missing", null],
       ["d1_rows_read_daily", false, "missing", null]
     ]
   );
-  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct, window.budget_units]), [["four_hour", 28.8, 833]]);
+  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct, window.budget_units]), [["four_hour", 37.4, 641]]);
 });
 
 test("usage summary reports zero short-window baselines when no current D1 budget windows exist", async () => {
@@ -1552,17 +1552,14 @@ test("usage summary reports zero short-window baselines when no current D1 budge
   assert.equal(body.four_hour_used_pct, 0);
   assert.equal(body.burst_used_pct, 0);
   assert.equal(body.window_sample_count, 0);
-  assert.equal(body.constraint_sample_count, 2);
-  assert.deepEqual(
-    [body.bottleneck_constraint?.id, body.bottleneck_constraint?.source, body.bottleneck_constraint?.used_pct],
-    ["d1_rows_written_burst", "schema_model", 0]
-  );
+  assert.equal(body.constraint_sample_count, 0);
+  assert.equal(body.bottleneck_constraint, undefined);
   assert.deepEqual(
     body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_pct]),
     [
       ["d1_rows_written_daily", false, "missing", null],
-      ["d1_rows_written_four_hour", true, "schema_model", 0],
-      ["d1_rows_written_burst", true, "schema_model", 0],
+      ["d1_rows_written_four_hour", false, "schema_model", 0],
+      ["d1_rows_written_burst", false, "schema_model", 0],
       ["worker_requests_daily", false, "missing", null],
       ["durable_object_requests_daily", false, "missing", null],
       ["d1_rows_read_daily", false, "missing", null]
@@ -1708,7 +1705,7 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
       doNamespaceName: "WorkspaceDO"
     });
     assert.equal(body.source, "cloudflare_analytics");
-    assert.equal(body.constraint_sample_count, 6);
+    assert.equal(body.constraint_sample_count, 4);
     assert.deepEqual([body.bottleneck_constraint.id, body.bottleneck_constraint.source], [
       "d1_rows_written_daily",
       "cloudflare_analytics"
@@ -1717,8 +1714,8 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
       body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_units]),
       [
         ["d1_rows_written_daily", true, "cloudflare_analytics", 96],
-        ["d1_rows_written_four_hour", true, "schema_model", 0],
-        ["d1_rows_written_burst", true, "schema_model", 0],
+        ["d1_rows_written_four_hour", false, "schema_model", 0],
+        ["d1_rows_written_burst", false, "schema_model", 0],
         ["worker_requests_daily", true, "cloudflare_analytics", 25],
         ["durable_object_requests_daily", true, "cloudflare_analytics", 43],
         ["d1_rows_read_daily", true, "cloudflare_analytics", 1234]
@@ -1739,6 +1736,83 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
         ["cloudflare_d1_rows_written_daily", true, 96],
         ["estimated_event_persistence_daily", false, null],
         ["estimated_non_event_residual_daily", false, null]
+      ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("usage summary keeps local D1 write estimate when telemetry is lower", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 20 } }],
+            webWorkerInvocations: [{ sum: { requests: 5 } }],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 1234, rowsWritten: 96 } }],
+            durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 40 } }],
+            durableObjectsPeriodicGroups: [{ sum: { inboundWebsocketMsgCount: 41 } }]
+          }
+        ]
+      }
+    }
+  }), {
+    headers: { "content-type": "application/json; charset=utf-8" }
+  })) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: budgetSummaryDb(),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "account-1",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_WEB_WORKER: "chaop-web",
+        CF_TELEMETRY_D1_DATABASE_ID: "database-1",
+        CF_TELEMETRY_DO_NAMESPACE_NAME: "WorkspaceDO"
+      }
+    );
+    const body = (await response.json()) as {
+      constraint_sample_count: number;
+      bottleneck_constraint: { id: string; source: string; used_units: number };
+      constraints: Array<{ id: string; sampled: boolean; source: string; used_units: number | null }>;
+      d1_activity: {
+        signals: Array<{ id: string; sampled: boolean; rows_written_daily: number | null }>;
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.constraint_sample_count, 6);
+    assert.deepEqual(
+      [body.bottleneck_constraint.id, body.bottleneck_constraint.source, body.bottleneck_constraint.used_units],
+      ["d1_rows_written_four_hour", "d1_usage_windows", 6240]
+    );
+    assert.deepEqual(
+      body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_units]),
+      [
+        ["d1_rows_written_daily", true, "d1_usage_windows", 26000],
+        ["d1_rows_written_four_hour", true, "d1_usage_windows", 6240],
+        ["d1_rows_written_burst", true, "d1_usage_windows", 468],
+        ["worker_requests_daily", true, "cloudflare_analytics", 25],
+        ["durable_object_requests_daily", true, "cloudflare_analytics", 43],
+        ["d1_rows_read_daily", true, "cloudflare_analytics", 1234]
+      ]
+    );
+    assert.deepEqual(
+      body.d1_activity.signals.map((signal) => [signal.id, signal.sampled, signal.rows_written_daily]),
+      [
+        ["cloudflare_d1_rows_written_daily", true, 96],
+        ["estimated_event_persistence_daily", true, 26000],
+        ["estimated_non_event_residual_daily", true, 0]
       ]
     );
   } finally {
@@ -1779,13 +1853,13 @@ test("usage summary keeps Cloudflare telemetry constraints missing when the quer
 
     assert.equal(response.status, 200);
     assert.equal(body.source, "empty");
-    assert.equal(body.constraint_sample_count, 2);
+    assert.equal(body.constraint_sample_count, 0);
     assert.deepEqual(
       body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.used_units]),
       [
         ["d1_rows_written_daily", false, null],
-        ["d1_rows_written_four_hour", true, 0],
-        ["d1_rows_written_burst", true, 0],
+        ["d1_rows_written_four_hour", false, 0],
+        ["d1_rows_written_burst", false, 0],
         ["worker_requests_daily", false, null],
         ["durable_object_requests_daily", false, null],
         ["d1_rows_read_daily", false, null]

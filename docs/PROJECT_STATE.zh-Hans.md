@@ -22,7 +22,7 @@
 - 九个 PR 的 app-server lifecycle roadmap 已实现到 Budget Board real-metrics 切片。
 - Deployed E2E smoke 现在有已记录的 Access-cookie browser path，以及 repo-local skill，用于重复执行低成本 API、Web、browser 和 Budget Board 验证。
 - 下一轮 dogfood usability roadmap 已记录，会先保证成本安全，再推进 managed app-server Thread Centre chat MVP、human-in-the-loop turns 和 persistent connector operations。
-- 本地 no-telemetry D1 rows-written guardrails 现在使用 attached-command lifecycle 的每 event 20 行成本，而不是更便宜的 12-row steady event estimate。
+- 本地 D1 rows-written guardrails 现在使用 Cloudflare telemetry 和本地保守 estimate 中较大的一个；no-telemetry fallback 按每 event 26 行预算。
 - 已完成的工作流状态记录在 `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.zh-Hans.md`。
 
 ## 恢复入口

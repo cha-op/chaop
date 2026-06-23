@@ -76,8 +76,10 @@ const D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN =
   D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN + D1_COMMAND_STATE_UPDATE_ROWS + D1_CONNECTOR_ACTIVITY_UPDATE_ROWS;
 const D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN =
   D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN + D1_TASK_STATE_UPDATE_ROWS;
-// Local guardrails use the common attached-command lifecycle so missing telemetry stays conservative.
-const D1_BUDGETED_ROWS_WRITTEN_PER_EVENT = D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN;
+const D1_COMMAND_LIFECYCLE_DAY_BOUNDARY_ROWS_WRITTEN =
+  D1_FIRST_EVENT_IN_DAY_ROWS_WRITTEN + D1_COMMAND_STATE_UPDATE_ROWS + D1_TASK_STATE_UPDATE_ROWS + D1_CONNECTOR_ACTIVITY_UPDATE_ROWS;
+// Local guardrails include command lifecycle and daily-window boundary overhead so missing telemetry stays conservative.
+const D1_BUDGETED_ROWS_WRITTEN_PER_EVENT = D1_COMMAND_LIFECYCLE_DAY_BOUNDARY_ROWS_WRITTEN;
 const DEFAULT_DAILY_BUDGET_UNITS = Math.floor(CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY / D1_BUDGETED_ROWS_WRITTEN_PER_EVENT);
 const DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS = Math.max(1, Math.floor(DEFAULT_DAILY_BUDGET_UNITS / 6));
 const DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS = Math.max(1, Math.ceil(DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS * 0.75));
@@ -4927,7 +4929,10 @@ function d1WriteConstraint(
   localSource?: BudgetConstraint["source"] | undefined
 ): BudgetConstraint {
   const limitUnits = eventBudget * rowsPerEvent;
-  const usedUnits = telemetryUsedRows ?? (window ? window.events_received * rowsPerEvent : null);
+  const localUsedRows = window ? window.events_received * rowsPerEvent : null;
+  const usedUnits = d1RowsWrittenConstraintUsedUnits(localUsedRows, telemetryUsedRows);
+  const sampled = localSource === "schema_model" ? false : usedUnits !== null;
+  const source = d1RowsWrittenConstraintSource(localUsedRows, telemetryUsedRows, localSource);
   return sampledConstraint({
     id,
     label,
@@ -4938,9 +4943,25 @@ function d1WriteConstraint(
     usedUnits,
     perEventUnits: rowsPerEvent,
     state: usedUnits === null ? "missing" : budgetStateForUsageCount(usedUnits, thresholdSet(limitUnits)),
-    source: telemetryUsedRows === undefined ? localSource : "cloudflare_analytics",
+    source,
+    sampled,
     window
   });
+}
+
+function d1RowsWrittenConstraintUsedUnits(localUsedRows: number | null, telemetryUsedRows: number | undefined): number | null {
+  if (telemetryUsedRows === undefined) return localUsedRows;
+  return localUsedRows === null ? telemetryUsedRows : Math.max(localUsedRows, telemetryUsedRows);
+}
+
+function d1RowsWrittenConstraintSource(
+  localUsedRows: number | null,
+  telemetryUsedRows: number | undefined,
+  localSource?: BudgetConstraint["source"] | undefined
+): BudgetConstraint["source"] | undefined {
+  if (telemetryUsedRows === undefined) return localSource;
+  if (localUsedRows !== null && localUsedRows > telemetryUsedRows) return localSource ?? "d1_usage_windows";
+  return "cloudflare_analytics";
 }
 
 function sampledConstraint({
@@ -4954,6 +4975,7 @@ function sampledConstraint({
   perEventUnits,
   state,
   source,
+  sampled,
   window
 }: {
   id: string;
@@ -4966,6 +4988,7 @@ function sampledConstraint({
   perEventUnits: number;
   state: BudgetConstraint["state"];
   source?: BudgetConstraint["source"] | undefined;
+  sampled?: boolean | undefined;
   window: BudgetWindowSignal | undefined;
 }): BudgetConstraint {
   const remainingUnits = usedUnits === null ? null : Math.max(0, limitUnits - usedUnits);
@@ -4977,7 +5000,7 @@ function sampledConstraint({
     window_type: windowType,
     unit,
     hard: true,
-    sampled: usedUnits !== null,
+    sampled: sampled ?? usedUnits !== null,
     state,
     source: usedUnits === null ? "missing" : source ?? "d1_usage_windows",
     limit_units: limitUnits,
@@ -5132,6 +5155,13 @@ function budgetD1WriteModel(env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4
         rows_written: D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN - D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN,
         frequency: "per command event with an attached task",
         detail: "Updates command state, task state, and connector activity in addition to the persisted event."
+      },
+      {
+        id: "guardrail_budget",
+        label: "No-telemetry guardrail budget",
+        rows_written: D1_BUDGETED_ROWS_WRITTEN_PER_EVENT,
+        frequency: "per event for local fallback capacity",
+        detail: "Budgets an attached command lifecycle at a daily usage-window boundary when Cloudflare telemetry is unavailable or lower than the local estimate."
       },
       {
         id: "backfill_batch",
