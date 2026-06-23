@@ -1305,51 +1305,52 @@ fn run_app_server_command(
         timeout_seconds,
         &cancel,
     )?;
-    let (resume_params, fallback_thread_id, require_resumed_thread_id) = if let Some(thread_id) =
-        resolved_thread_id
-    {
-        (
-            serde_json::json!({
-                "threadId": thread_id.clone(),
-                "cwd": cwd.clone(),
-                "runtimeWorkspaceRoots": [cwd.clone()],
-                "excludeTurns": true
-            }),
-            thread_id,
-            false,
-        )
-    } else {
-        let codex_home = config
-            .session_inventory
-            .codex_home
-            .clone()
-            .unwrap_or_else(default_codex_home);
-        let rollout_path = find_rollout_path(
-            &codex_home,
-            session_id,
-            config.session_inventory.max_sessions,
-        )
-        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
-        let Some(rollout_path) = rollout_path else {
-            return Err(AppServerCommandError::Other(format!(
-                "active app-server thread {session_id} was not found and no local rollout was available"
-            )));
+    let (resume_params, fallback_thread_id, require_resumed_thread_id, requested_turn_cwd) =
+        if let Some(thread_id) = resolved_thread_id {
+            (
+                serde_json::json!({
+                    "threadId": thread_id.clone(),
+                    "cwd": cwd.clone(),
+                    "runtimeWorkspaceRoots": [cwd.clone()],
+                    "excludeTurns": true
+                }),
+                thread_id,
+                false,
+                cwd.clone(),
+            )
+        } else {
+            let codex_home = config
+                .session_inventory
+                .codex_home
+                .clone()
+                .unwrap_or_else(default_codex_home);
+            let rollout_path = find_rollout_path(
+                &codex_home,
+                session_id,
+                config.session_inventory.max_sessions,
+            )
+            .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+            let Some(rollout_path) = rollout_path else {
+                return Err(AppServerCommandError::Other(format!(
+                    "active app-server thread {session_id} was not found and no local rollout was available"
+                )));
+            };
+            let resume_cwd = rollout_resume_cwd(&rollout_path, session_id)
+                .map_err(|error| AppServerCommandError::Other(error.to_string()))?
+                .unwrap_or_else(|| cwd.clone());
+            (
+                serde_json::json!({
+                    "threadId": session_id,
+                    "path": rollout_path.to_string_lossy(),
+                    "cwd": resume_cwd.clone(),
+                    "runtimeWorkspaceRoots": [resume_cwd.clone()],
+                    "excludeTurns": true
+                }),
+                session_id.to_owned(),
+                true,
+                resume_cwd,
+            )
         };
-        let resume_cwd = rollout_resume_cwd(&rollout_path, session_id)
-            .map_err(|error| AppServerCommandError::Other(error.to_string()))?
-            .unwrap_or_else(|| cwd.clone());
-        (
-            serde_json::json!({
-                "threadId": session_id,
-                "path": rollout_path.to_string_lossy(),
-                "cwd": resume_cwd.clone(),
-                "runtimeWorkspaceRoots": [resume_cwd],
-                "excludeTurns": true
-            }),
-            session_id.to_owned(),
-            true,
-        )
-    };
     let resume_response = send_app_server_request_for_command(
         &mut socket,
         request_id,
@@ -1371,6 +1372,12 @@ fn run_app_server_command(
         }
         None => fallback_thread_id,
     };
+    let turn_cwd = resume_response
+        .pointer("/result/thread/cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or(requested_turn_cwd);
 
     let turn_response = send_app_server_turn_start_for_command(
         &mut socket,
@@ -1384,8 +1391,8 @@ fn run_app_server_command(
                 "text": prompt,
                 "text_elements": []
             }],
-            "cwd": cwd.clone(),
-            "runtimeWorkspaceRoots": [cwd],
+            "cwd": turn_cwd.clone(),
+            "runtimeWorkspaceRoots": [turn_cwd],
             "approvalPolicy": "never"
         }),
         socket_timeout,
@@ -5770,6 +5777,7 @@ mod tests {
                     "thread": {
                         "id": "thread-from-path",
                         "sessionId": "session-tree-1",
+                        "cwd": "/tmp/project-from-response",
                         "turns": []
                     }
                 }
@@ -5854,6 +5862,18 @@ mod tests {
                 .pointer("/params/threadId")
                 .and_then(serde_json::Value::as_str),
             Some("thread-from-path")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-response")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/runtimeWorkspaceRoots/0")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-response")
         );
         assert_eq!(
             turn_start_request

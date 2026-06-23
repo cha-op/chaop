@@ -29,6 +29,7 @@ superseded_by:
 - 2026-06-16 的 regression follow-up 将 initialize、unarchive 和 resume 统一收敛到同一个本机 app-server deadline 内，把本机 read timeout 映射成清晰的 app-server method timeout，并且在 `thread/list` 找不到匹配 thread 时不再把本机 session id 猜作 `threadId`。
 - 当历史 rollout/session id 不在 app-server `thread/list` 中时，connector 现在会从 Codex history 解析本机 rollout 文件路径，并用这个 path 调用 app-server `thread/resume`，而不是猜测 `threadId`。
 - Managed app-server command execution 在 active `thread/list` miss 后也会使用同一个 rollout path fallback，然后用 app-server resume 返回的真实 `thread.id` 启动 turn。
+- Review follow-up 会让后续 app-server `turn/start` 使用 rollout-path resume 解析出的 cwd 或 app-server resume 返回的 cwd，而不是回到可能已经 stale 的 attached cwd。
 - Archive/unarchive sync 在 source 和 target `thread/list` 都 miss 后也会使用 rollout path resume，然后对 resume 返回的真实 app-server `thread.id` 执行 archive/unarchive。
 - Review follow-up 会拒绝 session id 不匹配的 app-server ensure response，path-based attach 和 command resume 会使用 rollout 里的 cwd，并且 page-budgeted `thread/list` miss 后会继续尝试 rollout resume。
 - Review follow-up 也会在返回 ensured Host Session 前校验 app-server `thread/resume` response 的 session id，避免 stale 或异常 app-server response 把错误的本机 session attach 进来。
@@ -42,6 +43,7 @@ superseded_by:
 - `cargo test -p chaop-agent`
 - `cargo test -p chaop-agent session_inventory -- --nocapture`
 - `cargo test -p chaop-agent ensure_host_session_rejects_mismatched_resume_session_id -- --test-threads=1`
+- `cargo test -p chaop-agent app_server_command_resumes_unlisted_session_from_rollout_path -- --test-threads=1`
 - `pnpm --dir apps/web test`
 - `pnpm --dir apps/worker test -- routes.test.ts`
 - `pnpm test`

@@ -23,6 +23,7 @@ superseded_by:
 ## Implementation Notes
 - `POST /api/host-sessions/refresh` now returns dispatched, debounced, and cooldown counts so the Browser can show why a refresh did or did not fan out.
 - `WorkspaceDO` chooses the newest ready socket per connector when requesting inventory, then marks that socket as pending Host Session refresh so command dispatch continues to wait for the requested local snapshot.
+- Full Host Session inventory reports are now broadcast to browsers with `snapshot: true`, so live browser state can prune stale omitted connector sessions.
 - Review follow-up: pending Host Session refresh guards now expire after a bounded wait, so a stuck or missing inventory report cannot block command dispatch forever.
 - Review follow-up: if a connector socket disconnects while it owns a pending Host Session refresh, the Durable Object clears that connector's refresh cooldown so a reconnect can request inventory immediately.
 - Review follow-up: Host Session sync metadata now records stored reported sessions separately from changed rows, so unchanged inventory reports no longer publish `stored_session_count = 0`.
@@ -34,6 +35,7 @@ superseded_by:
 - `pnpm --filter @chaop/web test`
 - `pnpm --filter @chaop/worker test`
 - `pnpm --filter @chaop/worker test` after the reconnect cooldown fix.
+- `pnpm --filter @chaop/worker test` after the full-inventory browser snapshot fix.
 - `cargo test --workspace`
 - `pnpm test`
 - `pnpm build`

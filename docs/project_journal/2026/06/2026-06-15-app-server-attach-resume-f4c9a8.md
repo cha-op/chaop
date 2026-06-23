@@ -29,6 +29,7 @@ superseded_by:
 - Regression follow-up on 2026-06-16 bounds initialize, unarchive, and resume through one local app-server deadline, maps local read timeouts to a clear app-server method timeout, and stops guessing `threadId` from the local session id when `thread/list` has no matching thread.
 - When a historical rollout/session id is absent from app-server `thread/list`, the connector now resolves the local rollout file path from Codex history and calls app-server `thread/resume` with that path instead of guessing a `threadId`.
 - Managed app-server command execution uses the same rollout path fallback after an active `thread/list` miss, then starts the turn on the real `thread.id` returned by app-server resume.
+- Review follow-up keeps the subsequent app-server `turn/start` in the cwd resolved by rollout-path resume or returned by app-server resume, instead of falling back to a stale attached cwd.
 - Archive/unarchive sync now uses rollout path resume after source and target `thread/list` misses, then mutates the real app-server `thread.id` returned by resume.
 - Review follow-up rejects app-server ensure responses for a different session id, uses rollout cwd for path-based attach and command resumes, and falls back to rollout resume after page-budgeted `thread/list` misses.
 - Review follow-up also validates the app-server `thread/resume` response session id before returning an ensured Host Session, so a stale or unexpected app-server response cannot attach the wrong local session.
@@ -42,6 +43,7 @@ superseded_by:
 - `cargo test -p chaop-agent`
 - `cargo test -p chaop-agent session_inventory -- --nocapture`
 - `cargo test -p chaop-agent ensure_host_session_rejects_mismatched_resume_session_id -- --test-threads=1`
+- `cargo test -p chaop-agent app_server_command_resumes_unlisted_session_from_rollout_path -- --test-threads=1`
 - `pnpm --dir apps/web test`
 - `pnpm --dir apps/worker test -- routes.test.ts`
 - `pnpm test`
