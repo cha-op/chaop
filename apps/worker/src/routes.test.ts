@@ -1994,6 +1994,36 @@ test("safety posture includes connector and task budget states", async () => {
   );
 });
 
+test("safety posture fails closed when pause state cannot be read", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        pauseReadError: "control setting unavailable"
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      paused: boolean;
+      paused_reason?: string | undefined;
+      actions: Array<{ state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "hard_limited");
+  assert.equal(body.safety.paused, true);
+  assert.match(body.safety.paused_reason ?? "", /could not be loaded/);
+  assert.equal(body.safety.actions.every((guard) => guard.state === "blocked"), true);
+});
+
 test("safety pause and resume update the operator guard state", async () => {
   const db = safetyPauseDb();
   const pause = await handleRequest(
@@ -2116,6 +2146,43 @@ test("connector budget state blocks command creation before command writes", asy
   assert.equal(body.guard.budget_state, "throttled");
   assert.equal(body.safety.state, "throttled");
   assert.match(body.error, /Cost posture is throttled/);
+});
+
+test("pause state read failures block command creation before command writes", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, {
+        safety: {
+          pauseReadError: "control setting unavailable"
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string; budget_state: string };
+    safety: { paused: boolean; state: string };
+  };
+
+  assert.equal(response.status, 429);
+  assert.match(body.error, /could not be loaded/);
+  assert.equal(body.guard.action, "command_create");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.guard.budget_state, "hard_limited");
+  assert.equal(body.safety.paused, true);
+  assert.equal(body.safety.state, "hard_limited");
 });
 
 test("conservative safety posture blocks host session inventory refresh before Durable Object dispatch", async () => {
@@ -3458,6 +3525,7 @@ type DogfoodSafetyFakeOptions = {
   includeUsageWindows?: boolean | undefined;
   includeBudgetStateCounts?: boolean | undefined;
   paused?: boolean | undefined;
+  pauseReadError?: string | undefined;
   pauseReason?: string | undefined;
   usageWindows?: Record<string, Record<string, unknown> | undefined> | undefined;
   telemetrySample?: Record<string, unknown> | undefined;
@@ -3475,6 +3543,7 @@ function dogfoodSafetyQueryFake(
         assert.equal(key, "dogfood_safety.pause");
         return {
           async first() {
+            if (options.pauseReadError) throw new Error(options.pauseReadError);
             if (!options.paused) return undefined;
             const updatedAt = "2026-06-15T09:00:00.000Z";
             return {
@@ -3574,6 +3643,7 @@ function safetyPauseDb(options: DogfoodSafetyFakeOptions = {}): D1Database {
             assert.equal(key, "dogfood_safety.pause");
             return {
               async first() {
+                if (options.pauseReadError) throw new Error(options.pauseReadError);
                 if (!paused) return undefined;
                 return {
                   value_json: JSON.stringify({

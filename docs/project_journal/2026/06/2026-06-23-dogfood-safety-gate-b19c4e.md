@@ -38,6 +38,7 @@ superseded_by:
 - Added tests for conservative posture, emergency pause/resume, blocked command creation, blocked Host Session refresh, migration coverage, null telemetry handling, and Browser safety helper behaviour.
 - Fixed the first review finding by including connector and active task budget states in the dogfood safety posture and server-side guard decisions.
 - Preserved structured safety payloads in Browser API errors so a server-side safety block immediately updates the local UI posture.
+- Fixed a second review finding by making unreadable emergency-pause state fail closed instead of allowing guarded writes.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

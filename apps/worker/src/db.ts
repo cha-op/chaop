@@ -277,7 +277,7 @@ export async function loadDogfoodSafetyPostureFromDb(
   }
 
   const [pause, daily, fourHour, burst, connectorStates, taskStates, telemetry] = await Promise.all([
-    loadDogfoodSafetyPause(env),
+    loadDogfoodSafetyPause(env, effectiveGeneratedAt),
     currentUsageWindow(env, "daily", effectiveGeneratedAt),
     currentUsageWindow(env, "four_hour", effectiveGeneratedAt),
     currentUsageWindow(env, "burst", effectiveGeneratedAt),
@@ -4969,7 +4969,10 @@ const CLOUDFLARE_TELEMETRY_QUERY = `query ChaopCloudflareTelemetry(
   }
 }`;
 
-async function loadDogfoodSafetyPause(env: Env): Promise<DogfoodSafetyPauseSetting | undefined> {
+async function loadDogfoodSafetyPause(
+  env: Env,
+  generatedAt = new Date().toISOString()
+): Promise<DogfoodSafetyPauseSetting | undefined> {
   if (!env.DB) return undefined;
   try {
     const row = await env.DB.prepare(
@@ -4990,7 +4993,11 @@ async function loadDogfoodSafetyPause(env: Env): Promise<DogfoodSafetyPauseSetti
     console.warn("Dogfood safety pause state could not be loaded", {
       message: error instanceof Error ? error.message : String(error)
     });
-    return undefined;
+    return {
+      paused: true,
+      reason: "Dogfood safety pause state could not be loaded; dogfood writes are blocked until the control-plane setting is readable.",
+      updated_at: generatedAt
+    };
   }
 }
 
