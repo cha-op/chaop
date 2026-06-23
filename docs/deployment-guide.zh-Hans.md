@@ -504,7 +504,7 @@ codex app-server --listen ws://127.0.0.1:9876
 app_server_url = "ws://127.0.0.1:9876"
 ```
 
-`report_interval_seconds` 控制周期性本机重扫间隔；周期路径只有 inventory 变化时才会上报。Host Sessions 的 refresh 按钮会请求在线 connectors 立即重扫并上报。只有 app-server list 调用成功、`thread/list` 所有分页都已耗尽，且合并后的 Host Session report 没有被 `max_sessions` 截断时，app-server inventory report 才会被当作完整快照；短暂 app-server list 失败或被截断的 report 不会清除已有 Host Sessions 的已知 app-server presence。
+Host Session inventory 默认按需触发。Connector 空闲时不会周期性重扫本机 Codex sessions；Host Sessions 页面里的 refresh 按钮会请求在线 connectors 立即重扫并上报，浏览器也可以在 Host Sessions 页面打开时显式启用一分钟一次的自动刷新。Durable Object 会按 connector 对 refresh 请求做 debounce，所以多个浏览器 listener 不会提高 connector 重扫频率。创建、attach、archive 或其他会修改本机 session 状态的用户动作，仍然可以触发一次即时 inventory report，用来保持 UI 状态一致。`report_interval_seconds` 会保留给 private compatibility 和后续 connector-side auto modes，但它不是默认 idle polling 路径。只有 app-server list 调用成功、`thread/list` 所有分页都已耗尽，且合并后的 Host Session report 没有被 `max_sessions` 截断时，app-server inventory report 才会被当作完整快照；短暂 app-server list 失败或被截断的 report 不会清除已有 Host Sessions 的已知 app-server presence。
 
 在仓库外创建本地文件目录：
 

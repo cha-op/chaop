@@ -258,10 +258,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
     if (!env.WORKSPACE_DO) return json(request, env, { error: "Workspace Durable Object binding is unavailable" }, 503);
 
-    const dispatchedTo = await requestHostSessionRefresh(env);
+    const refresh = await requestHostSessionRefresh(env);
     const response: RefreshHostSessionsResponse = {
       requested: true,
-      dispatched_to: dispatchedTo,
+      dispatched_to: refresh.dispatched_to,
+      debounced_connector_count: refresh.debounced_connector_count,
+      cooldown_ms: refresh.cooldown_ms,
       server_time: new Date().toISOString()
     };
     return json(request, env, response, 202);
@@ -542,16 +544,30 @@ async function broadcastThreadEvents(env: Env, events: ThreadEvent[]): Promise<v
   });
 }
 
-async function requestHostSessionRefresh(env: Env): Promise<number> {
-  if (!env.WORKSPACE_DO) return 0;
+async function requestHostSessionRefresh(env: Env): Promise<{
+  dispatched_to: number;
+  debounced_connector_count?: number | undefined;
+  cooldown_ms?: number | undefined;
+}> {
+  if (!env.WORKSPACE_DO) return { dispatched_to: 0 };
 
   const id = env.WORKSPACE_DO.idFromName("global");
   const stub = env.WORKSPACE_DO.get(id);
   const response = await stub.fetch("https://workspace-do/internal/refresh-host-sessions", {
     method: "POST"
   });
-  const body = await response.json().catch(() => ({})) as { dispatched_to?: unknown };
-  return typeof body.dispatched_to === "number" ? body.dispatched_to : 0;
+  const body = await response.json().catch(() => ({})) as {
+    dispatched_to?: unknown;
+    debounced_connector_count?: unknown;
+    cooldown_ms?: unknown;
+  };
+  return {
+    dispatched_to: typeof body.dispatched_to === "number" ? body.dispatched_to : 0,
+    debounced_connector_count: typeof body.debounced_connector_count === "number"
+      ? body.debounced_connector_count
+      : undefined,
+    cooldown_ms: typeof body.cooldown_ms === "number" ? body.cooldown_ms : undefined
+  };
 }
 
 class ConnectorRpcError extends Error {

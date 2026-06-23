@@ -38,6 +38,7 @@ const HOST_SESSION_APP_SERVER_ENSURE_TIMEOUT_MS = 15_000;
 const HOST_SESSION_BACKFILL_TIMEOUT_MS = 15_000;
 const THREAD_ARCHIVE_SYNC_TIMEOUT_MS = 20_000;
 const APP_SERVER_REPORT_CACHE_MS = 60_000;
+const HOST_SESSIONS_REFRESH_COOLDOWN_MS = 60_000;
 
 type SocketAttachment = {
   socketType?: string;
@@ -88,6 +89,7 @@ export class WorkspaceDO implements DurableObject {
       acceptedAt: number;
     }
   >();
+  private readonly hostSessionsRefreshSentAt = new Map<string, number>();
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -206,7 +208,7 @@ export class WorkspaceDO implements DurableObject {
       const capabilitiesChanged = readyPayload
         ? await updateConnectorCapabilities(this.env, connectorId, readyPayload.capabilities)
         : false;
-      this.markAgentReady(ws, connectorId, readyPayload !== undefined && (!wasReady || capabilitiesChanged));
+      this.markAgentReady(ws, connectorId);
       ws.send(
         JSON.stringify(
           createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
@@ -217,6 +219,7 @@ export class WorkspaceDO implements DurableObject {
       );
       if (readyPayload && (!wasReady || capabilitiesChanged)) {
         await this.broadcastConnectorUpdate(connectorId);
+        await this.sendPendingCommandsAndReleased(ws, connectorId);
       }
       if (!readyPayload && !wasReady) {
         await markConnectorOnline(this.env, connectorId);
@@ -480,14 +483,48 @@ export class WorkspaceDO implements DurableObject {
 
   private refreshHostSessions(): Response {
     const sockets = this.ctx.getWebSockets("agent");
+    const latestReadySocketByConnector = new Map<string, WebSocket>();
     for (const socket of sockets) {
+      const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+      const connectorId = attachment?.connectorId;
+      if (!connectorId || !isReadyAgentSocket(socket, connectorId)) {
+        continue;
+      }
+      const previous = latestReadySocketByConnector.get(connectorId);
+      if (!previous || socketConnectedAt(socket) > socketConnectedAt(previous)) {
+        latestReadySocketByConnector.set(connectorId, socket);
+      }
+    }
+
+    const now = Date.now();
+    let dispatchedTo = 0;
+    let debouncedConnectorCount = 0;
+    for (const [connectorId, socket] of latestReadySocketByConnector) {
+      const lastSentAt = this.hostSessionsRefreshSentAt.get(connectorId);
+      if (
+        lastSentAt !== undefined &&
+        now - lastSentAt < HOST_SESSIONS_REFRESH_COOLDOWN_MS
+      ) {
+        debouncedConnectorCount += 1;
+        continue;
+      }
+
       socket.send(
         JSON.stringify(
-          createEnvelope("host_sessions.refresh", { type: "worker", id: "workspace-do-global" }, {})
+          createEnvelope("host_sessions.refresh", { type: "worker", id: "workspace-do-global" }, {}, {
+            target: { type: "connector", id: connectorId }
+          })
         )
       );
+      this.hostSessionsRefreshSentAt.set(connectorId, now);
+      this.markHostSessionsRefreshPending(socket, connectorId);
+      dispatchedTo += 1;
     }
-    return new Response(JSON.stringify({ dispatched_to: sockets.length }), {
+    return new Response(JSON.stringify({
+      dispatched_to: dispatchedTo,
+      debounced_connector_count: debouncedConnectorCount,
+      cooldown_ms: HOST_SESSIONS_REFRESH_COOLDOWN_MS
+    }), {
       headers: { "content-type": "application/json; charset=utf-8" }
     });
   }
@@ -766,7 +803,10 @@ export class WorkspaceDO implements DurableObject {
     connectorId: string,
     options: { skipStaleExplicitCleanup?: boolean } = {}
   ): Promise<string[]> {
-    if (!isReadyAgentSocket(ws, connectorId) || hasPendingHostSessionsDispatch(ws, connectorId)) {
+    if (
+      !isReadyAgentSocket(ws, connectorId) ||
+      this.hasPendingHostSessionsDispatchForConnector(connectorId)
+    ) {
       return [];
     }
     let releasedConnectorIds: string[] = [];
@@ -802,6 +842,17 @@ export class WorkspaceDO implements DurableObject {
       }
     }
     return releasedConnectorIds;
+  }
+
+  private hasPendingHostSessionsDispatchForConnector(connectorId: string): boolean {
+    if (typeof this.ctx.getWebSockets !== "function") {
+      return false;
+    }
+    const taggedSockets = this.ctx.getWebSockets(`agent:${connectorId}`);
+    const sockets = taggedSockets.length > 0
+      ? taggedSockets
+      : this.ctx.getWebSockets("agent").filter((socket) => isAgentSocketForConnector(socket, connectorId));
+    return sockets.some((socket) => hasPendingHostSessionsDispatch(socket, connectorId));
   }
 
   private async sendPendingCommandsAndReleased(ws: WebSocket, connectorId: string): Promise<void> {
@@ -913,6 +964,21 @@ export class WorkspaceDO implements DurableObject {
       pendingHostSessionsDispatch: false
     });
     return true;
+  }
+
+  private markHostSessionsRefreshPending(ws: WebSocket, connectorId: string): void {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
+    if (
+      attachment?.socketType !== "agent" ||
+      attachment.connectorId !== connectorId ||
+      attachment.agentReady !== true
+    ) {
+      return;
+    }
+    ws.serializeAttachment({
+      ...attachment,
+      pendingHostSessionsDispatch: true
+    });
   }
 
   private recordSocketCommand(ws: WebSocket, connectorId: string, commandId: string): void {

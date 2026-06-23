@@ -75,6 +75,8 @@ mode = "codex_exec"
 App-server execution 当前只会把 lifecycle events 和最终 assistant message 摘要发回 Cloudflare；app-server `commandExecution` output 默认不会上传。CLI adapter 还会在 Codex JSONL 包含 token usage 时回传 token-usage 摘要。Connector 不会上传完整 Codex stdout/stderr、本机 transcripts、artefacts 或 token 级日志。
 `codex_exec` 会通过 stdin 传入 Codex prompt，`app_server` 会通过 `turn/start` 传入；每个 Codex command 都有 connector 配置里的 runtime timeout。
 
+Connector 空闲时 Host Session inventory 会保持静默。Browser 的 Host Sessions 页面提供手动 refresh 按钮，以及显式启用的一分钟自动刷新；Durable Object 会按 connector 去重这些 refresh 请求，所以额外打开的浏览器窗口不会提高 connector 重扫频率。创建或 attach 本机 thread 这类会修改 Host Sessions 的用户动作，仍然可以触发一次即时 inventory report，避免 UI 长时间停留在旧状态。
+
 ## 后续需要保留的成本控制
 
 - 每台 host 保持一个 Rust connector，本机多个逻辑 agent 都从它聚合。

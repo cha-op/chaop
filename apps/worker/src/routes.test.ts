@@ -114,7 +114,11 @@ test("host session refresh dispatches to the workspace durable object", async ()
         get: () => ({
           fetch: async (input: RequestInfo | URL) => {
             internalPath = new URL(String(input)).pathname;
-            return new Response(JSON.stringify({ dispatched_to: 2 }), {
+            return new Response(JSON.stringify({
+              dispatched_to: 2,
+              debounced_connector_count: 1,
+              cooldown_ms: 60_000
+            }), {
               headers: { "content-type": "application/json; charset=utf-8" }
             });
           }
@@ -122,11 +126,18 @@ test("host session refresh dispatches to the workspace durable object", async ()
       } as unknown as DurableObjectNamespace
     }
   );
-  const body = (await response.json()) as { requested: boolean; dispatched_to: number };
+  const body = (await response.json()) as {
+    requested: boolean;
+    dispatched_to: number;
+    debounced_connector_count: number;
+    cooldown_ms: number;
+  };
 
   assert.equal(response.status, 202);
   assert.equal(body.requested, true);
   assert.equal(body.dispatched_to, 2);
+  assert.equal(body.debounced_connector_count, 1);
+  assert.equal(body.cooldown_ms, 60_000);
   assert.equal(internalPath, "/internal/refresh-host-sessions");
 });
 

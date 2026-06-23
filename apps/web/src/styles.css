@@ -215,6 +215,21 @@ main {
   max-width: 100%;
 }
 
+.sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #475569;
+  font-size: 0.86rem;
+  line-height: 1;
+}
+
+.sync-toggle input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+}
+
 .sync-meta,
 .sync-note {
   color: #64748b;

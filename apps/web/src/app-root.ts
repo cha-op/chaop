@@ -14,6 +14,7 @@ import {
   type CreateLocalThreadResponse,
   type HostSessionsUpdatePayload,
   type HostSessionSummary,
+  type RefreshHostSessionsResponse,
   type TaskState,
   type TaskSummary,
   type ThreadEvent,
@@ -73,6 +74,7 @@ type RealtimeAppServerInstancesPayload = AppServerInstancesUpdatePayload;
 
 const FALLBACK_POLL_MS = 10_000;
 const BUDGET_REFRESH_MS = 60_000;
+const HOST_SESSIONS_AUTO_REFRESH_MS = 60_000;
 const SOCKET_RECONNECT_MS = 3_000;
 const SHOW_CODEX_CLI_FALLBACK = import.meta.env.VITE_CHAOP_SHOW_CODEX_CLI_FALLBACK === "true";
 
@@ -125,6 +127,9 @@ export class ChaopApp extends LitElement {
   private hostSessionsRefreshSummary: string | undefined;
 
   @state()
+  private hostSessionsAutoRefresh = false;
+
+  @state()
   private newThreadTitle = "New Codex thread";
 
   @state()
@@ -144,6 +149,8 @@ export class ChaopApp extends LitElement {
   private pollTimer: number | undefined;
 
   private budgetTimer: number | undefined;
+
+  private hostSessionsAutoTimer: number | undefined;
 
   private reconnectTimer: number | undefined;
 
@@ -174,6 +181,8 @@ export class ChaopApp extends LitElement {
     window.clearInterval(this.clockTimer);
     this.disconnectRealtime();
     this.stopBudgetPolling();
+    this.stopHostSessionsAutoRefresh();
+    this.hostSessionsAutoRefresh = false;
     super.disconnectedCallback();
   }
 
@@ -236,7 +245,12 @@ export class ChaopApp extends LitElement {
   }
 
   private readonly onHashChange = (): void => {
-    this.view = viewFromHash();
+    const nextView = viewFromHash();
+    if (this.view === "host-sessions" && nextView !== "host-sessions") {
+      this.hostSessionsAutoRefresh = false;
+      this.stopHostSessionsAutoRefresh();
+    }
+    this.view = nextView;
     const nextThreadId = threadIdFromHash();
     if (nextThreadId !== this.selectedThreadId) {
       this.commandModeExplicit = false;
@@ -546,6 +560,14 @@ export class ChaopApp extends LitElement {
               >
                 ${this.hostSessionsRefreshState === "refreshing" ? "Refreshing..." : "Refresh"}
               </button>
+              <label class="sync-toggle" title="Request host inventory at most once per minute while this page is open.">
+                <input
+                  type="checkbox"
+                  .checked=${this.hostSessionsAutoRefresh}
+                  @change=${this.toggleHostSessionsAutoRefresh}
+                />
+                Auto 60s
+              </label>
               <span class="sync-meta">${formatSyncStatus(lastSyncedAt, this.clockNow)}</span>
               <span>${unattached.length} available</span>
             </div>
@@ -953,23 +975,61 @@ export class ChaopApp extends LitElement {
   }
 
   private readonly refreshHostSessionInventory = async (): Promise<void> => {
+    await this.requestHostSessionInventory();
+  };
+
+  private readonly toggleHostSessionsAutoRefresh = (event: Event): void => {
+    const enabled = (event.target as HTMLInputElement).checked;
+    this.hostSessionsAutoRefresh = enabled;
+    if (enabled) {
+      this.startHostSessionsAutoRefresh();
+      void this.requestHostSessionInventory();
+    } else {
+      this.stopHostSessionsAutoRefresh();
+    }
+  };
+
+  private startHostSessionsAutoRefresh(): void {
+    this.stopHostSessionsAutoRefresh();
+    this.hostSessionsAutoTimer = window.setInterval(() => {
+      if (this.view !== "host-sessions" || !this.hostSessionsAutoRefresh) {
+        this.stopHostSessionsAutoRefresh();
+        this.hostSessionsAutoRefresh = false;
+        return;
+      }
+      void this.requestHostSessionInventory();
+    }, HOST_SESSIONS_AUTO_REFRESH_MS);
+  }
+
+  private stopHostSessionsAutoRefresh(): void {
+    if (this.hostSessionsAutoTimer !== undefined) {
+      window.clearInterval(this.hostSessionsAutoTimer);
+      this.hostSessionsAutoTimer = undefined;
+    }
+  }
+
+  private async requestHostSessionInventory(): Promise<void> {
+    if (this.hostSessionsRefreshState === "refreshing") return;
     this.actionError = undefined;
     this.actionNotice = undefined;
     this.hostSessionsRefreshState = "refreshing";
     this.hostSessionsRefreshSummary = undefined;
     try {
       const response = await refreshHostSessions();
-      this.hostSessionsRefreshSummary = refreshSummary(response.dispatched_to);
-      await this.load();
-      window.setTimeout(() => void this.load(), 1_200);
-      window.setTimeout(() => void this.load(), 2_500);
+      this.hostSessionsRefreshSummary = refreshSummary(response);
+      if (response.dispatched_to > 0 && this.realtimeState !== "live") {
+        window.setTimeout(() => {
+          void this.load().catch((error) => {
+            this.actionError = actionErrorMessage("Host session refresh load failed", error);
+          });
+        }, 2_000);
+      }
       this.hostSessionsRefreshState = "idle";
     } catch (error) {
       this.hostSessionsRefreshState = "failed";
       this.actionError = actionErrorMessage("Host session refresh failed", error);
-      await this.load().catch(() => undefined);
     }
-  };
+  }
 
   private readonly bootstrapBudgetSamples = async (): Promise<void> => {
     this.actionError = undefined;
@@ -1462,10 +1522,22 @@ function instanceTooltip(instance: AppServerInstanceSummary, nowMs: number): str
   return `${formatMode(instance.scope)} ${formatMode(instance.endpoint_type)} app-server, ${instance.active_turn_count} active turns, changed ${changed}, seen ${seen}`;
 }
 
-function refreshSummary(dispatchedTo: number): string {
-  if (dispatchedTo === 0) return "No online connector accepted the refresh request.";
-  if (dispatchedTo === 1) return "Refresh requested from 1 online connector.";
-  return `Refresh requested from ${dispatchedTo} online connectors.`;
+function refreshSummary(response: RefreshHostSessionsResponse): string {
+  const debouncedCount = response.debounced_connector_count ?? 0;
+  if (response.dispatched_to === 0 && debouncedCount > 0) {
+    const cooldown = response.cooldown_ms ? ` for ${formatAge(response.cooldown_ms)}` : "";
+    const connectorLabel = debouncedCount === 1 ? "connector" : "connectors";
+    return `Refresh already requested recently on ${debouncedCount} online ${connectorLabel}${cooldown}.`;
+  }
+  if (response.dispatched_to === 0) return "No online connector accepted the refresh request.";
+  const dispatchedLabel = response.dispatched_to === 1
+    ? "Refresh requested from 1 online connector"
+    : `Refresh requested from ${response.dispatched_to} online connectors`;
+  if (debouncedCount === 0) return `${dispatchedLabel}.`;
+  const debouncedLabel = debouncedCount === 1
+    ? "1 connector was already cooling down"
+    : `${debouncedCount} connectors were already cooling down`;
+  return `${dispatchedLabel}; ${debouncedLabel}.`;
 }
 
 function formatSyncStatus(iso: string | undefined, nowMs: number): string {

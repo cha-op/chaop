@@ -75,6 +75,8 @@ mode = "codex_exec"
 The connector currently sends only lifecycle events and the final assistant message summary back to Cloudflare for app-server execution. It does not upload app-server `commandExecution` output by default. The CLI adapter also sends a token-usage summary when Codex JSONL includes one. It does not upload full Codex stdout/stderr, local transcripts, artefacts, or per-token logs.
 Codex prompts are passed over stdin for `codex_exec` and through `turn/start` for `app_server`; connector config keeps a runtime timeout for each Codex command.
 
+Host Session inventory is quiet while the connector is idle. The Browser Host Sessions page has a manual refresh button and an opt-in one-minute auto-refresh; the Durable Object deduplicates those refresh requests per connector so extra browser windows do not increase connector rescan frequency. User actions that mutate Host Sessions, such as creating or attaching a local thread, can still trigger one immediate inventory report so the UI does not stay stale.
+
 ## Cost Controls To Keep
 
 - Keep one Rust connector per host and aggregate local logical agents behind it.

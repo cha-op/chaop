@@ -366,6 +366,8 @@ export type HostSessionSyncSummary = {
 export type RefreshHostSessionsResponse = {
   requested: true;
   dispatched_to: number;
+  debounced_connector_count?: number | undefined;
+  cooldown_ms?: number | undefined;
   server_time: string;
 };
 

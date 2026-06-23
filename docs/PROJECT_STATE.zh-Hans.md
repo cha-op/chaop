@@ -11,7 +11,7 @@
 - Rust connector 默认执行 placeholder，也可以通过私有 `execution.mode = "codex_exec"` 配置显式开启本机 Codex CLI execution，或通过私有 `execution.mode = "app_server"` 加 `session_inventory.app_server_url` 对已 attach thread 执行 Codex app-server command。
 - Thread Command Centre 现在把显示用 execution modes 和 protocol command types 分开：managed app-server execution 会作为产品路径显示，Codex CLI fallback 默认隐藏，除非 Web build 显式开启。
 - Thread Command Centre 现在会在所选 thread 有已 attach 的 app-server Host Session 时，把隐式 command submission 默认切到 managed app-server execution；Worker 也会为该目标推断 `execution_mode = "app_server"`，并拒绝可能意外落到 `codex_exec` 的裸 `codex` 请求。
-- Rust connector 会上报轻量本机 Codex session inventory，可以可选使用 app-server `Thread.name` 做 title enrichment，并且在配置 `session_inventory.app_server_url` 后可以创建新的本机 app-server thread。
+- Rust connector 会按需上报轻量本机 Codex session inventory，可以可选使用 app-server `Thread.name` 做 title enrichment，并且在配置 `session_inventory.app_server_url` 后可以创建新的本机 app-server thread。
 - Rust connector 现在可以管理一个专用的本机 Codex app-server listener，在声明 app-server capabilities 前先做健康检查，并通过 `agent.ready` 刷新 connector capabilities。
 - Managed connector app-server mode 现在支持用于周期维护和本机 upgrade-marker trigger 的 draining restart：connector 会上报 `draining`，在 active turns 结束前撤回 app-server capabilities，然后重启并在健康检查通过后重新声明 capabilities。
 - Operations Map 和 Host Sessions 现在会展示 AppServerInstance state，包括 connector identity、placement、endpoint type、active turns、changed/seen age，以及不健康 lifecycle states。
