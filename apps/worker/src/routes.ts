@@ -103,7 +103,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return json(request, env, { error: "DB binding is required" }, 503);
     }
     const response: DogfoodSafetyPostureResponse = {
-      safety: env.DB ? await loadDogfoodSafetyPostureFromDb(env) : sampleSafety
+      safety: env.DB ? await loadDogfoodSafetyPostureFromDb(env, undefined, {}, {
+        refreshCloudflareTelemetry: true
+      }) : sampleSafety
     };
     return json(request, env, response);
   }

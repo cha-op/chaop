@@ -142,6 +142,10 @@ export class NotFoundError extends Error {
   readonly status = 404;
 }
 
+type DogfoodSafetyPostureOptions = {
+  refreshCloudflareTelemetry?: boolean | undefined;
+};
+
 export type RecordAgentEventResult = {
   accepted: boolean;
   dispatch_pending?: boolean;
@@ -265,7 +269,8 @@ export async function loadBudgetSummaryFromDb(
 export async function loadDogfoodSafetyPostureFromDb(
   env: Env,
   generatedAt = new Date().toISOString(),
-  snapshots: { connectors?: ConnectorSummary[] | undefined; tasks?: TaskSummary[] | undefined } = {}
+  snapshots: { connectors?: ConnectorSummary[] | undefined; tasks?: TaskSummary[] | undefined } = {},
+  options: DogfoodSafetyPostureOptions = {}
 ): Promise<DogfoodSafetyPosture> {
   const effectiveGeneratedAt = generatedAt ?? new Date().toISOString();
   if (!env.DB) {
@@ -276,6 +281,9 @@ export async function loadDogfoodSafetyPostureFromDb(
     });
   }
 
+  const telemetryPromise = options.refreshCloudflareTelemetry
+    ? loadCloudflareTelemetryBestEffort(env, effectiveGeneratedAt)
+    : loadLatestPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt);
   const [pause, daily, fourHour, burst, connectorStates, taskStates, telemetry] = await Promise.all([
     loadDogfoodSafetyPause(env, effectiveGeneratedAt),
     currentUsageWindow(env, "daily", effectiveGeneratedAt),
@@ -287,7 +295,7 @@ export async function loadDogfoodSafetyPostureFromDb(
     snapshots.tasks
       ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
       : listTaskBudgetStates(env),
-    loadCloudflareTelemetryBestEffort(env, effectiveGeneratedAt)
+    telemetryPromise
   ]);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
@@ -4561,6 +4569,48 @@ async function loadCloudflareTelemetryBestEffort(
   }
 }
 
+async function loadLatestPersistedCloudflareTelemetrySample(
+  env: Env,
+  generatedAt: string
+): Promise<CloudflareTelemetrySample | undefined> {
+  if (!env.DB) return undefined;
+
+  try {
+    const effectiveAt = safeDate(generatedAt);
+    const windowStart = new Date(Date.UTC(
+      effectiveAt.getUTCFullYear(),
+      effectiveAt.getUTCMonth(),
+      effectiveAt.getUTCDate()
+    )).toISOString();
+    const row = await env.DB.prepare(
+      `SELECT sampled_at, window_start, window_end,
+              d1_rows_written_daily, d1_rows_read_daily,
+              worker_requests_daily, durable_object_requests_daily
+       FROM budget_telemetry_samples
+       WHERE sample_type = ? AND selector_hash = ? AND window_start = ?
+       ORDER BY sampled_at DESC
+       LIMIT 1`
+    )
+      .bind("cloudflare_daily", cloudflareTelemetrySelectorHash(env), windowStart)
+      .first<BudgetTelemetryLatestSampleRow>();
+    if (!row) return undefined;
+    return {
+      windowStart: row.window_start,
+      windowEnd: row.window_end,
+      updatedAt: row.sampled_at,
+      workerRequestsDaily: optionalNonNegativeInteger(row.worker_requests_daily),
+      durableObjectRequestEquivalentsDaily: optionalNonNegativeInteger(row.durable_object_requests_daily),
+      d1RowsReadDaily: optionalNonNegativeInteger(row.d1_rows_read_daily),
+      d1RowsWrittenDaily: optionalNonNegativeInteger(row.d1_rows_written_daily)
+    };
+  } catch (error) {
+    console.warn("Persisted Cloudflare telemetry sample could not be loaded", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+}
+
 function cloudflareTelemetryCacheKey(env: Env, generatedAt: string): string {
   const end = new Date(generatedAt);
   const effectiveEnd = Number.isNaN(end.getTime()) ? new Date() : end;
@@ -5681,6 +5731,11 @@ type BudgetTelemetrySampleRow = {
   d1_rows_read_daily: number | null;
   worker_requests_daily: number | null;
   durable_object_requests_daily: number | null;
+};
+
+type BudgetTelemetryLatestSampleRow = BudgetTelemetrySampleRow & {
+  window_start: string;
+  window_end: string;
 };
 
 type DogfoodSafetyPauseSetting = {

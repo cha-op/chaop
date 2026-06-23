@@ -169,6 +169,39 @@ test("mergeBootstrapPayload keeps current app-server instances when legacy boots
   assert.deepEqual(merged.app_server_instances, [currentInstance]);
 });
 
+test("mergeBootstrapPayload normalises legacy bootstrap without safety", () => {
+  const incoming = payload();
+  delete (incoming as Partial<BootstrapPayload>).safety;
+
+  const merged = mergeBootstrapPayload(undefined, incoming);
+
+  assert.equal(merged.safety.state, "normal");
+  assert.equal(merged.safety.paused, false);
+  assert.equal(merged.safety.generated_at, incoming.server_time);
+  assert.equal(merged.safety.actions.every((guard) => guard.state === "allowed"), true);
+  assert.equal(safetyActionBlocked(merged, "command_create"), false);
+});
+
+test("mergeBootstrapPayload keeps current safety when legacy bootstrap omits the field", () => {
+  const current = payload({
+    safety: {
+      ...safety(),
+      state: "hard_limited",
+      paused: true,
+      paused_reason: "operator stop",
+      summary: "Emergency pause active."
+    }
+  });
+  const incoming = payload();
+  delete (incoming as Partial<BootstrapPayload>).safety;
+
+  const merged = mergeBootstrapPayload(current, incoming);
+
+  assert.equal(merged.safety.state, "hard_limited");
+  assert.equal(merged.safety.paused, true);
+  assert.equal(merged.safety.paused_reason, "operator stop");
+});
+
 test("budgetSourceLabel reports unknown source for legacy budget payloads", () => {
   const budget = { ...payload().budget };
   delete (budget as Partial<typeof budget>).source;

@@ -887,7 +887,7 @@ export class WorkspaceDO implements DurableObject {
   private async sendPendingCommands(
     ws: WebSocket,
     connectorId: string,
-    options: { skipSafetyCheck?: boolean; skipStaleExplicitCleanup?: boolean } = {}
+    options: { skipStaleExplicitCleanup?: boolean } = {}
   ): Promise<string[]> {
     if (
       !isReadyAgentSocket(ws, connectorId) ||
@@ -895,7 +895,7 @@ export class WorkspaceDO implements DurableObject {
     ) {
       return [];
     }
-    if (!options.skipSafetyCheck && !(await this.canDispatchPendingCommands())) {
+    if (!(await this.canDispatchPendingCommands())) {
       return [];
     }
     let releasedConnectorIds: string[] = [];
@@ -971,6 +971,9 @@ export class WorkspaceDO implements DurableObject {
         return [];
       }
       const releasedConnectorIds = await this.cleanupStaleExplicitAppServerCommandTargets(connectorId);
+      if (!(await this.canDispatchPendingCommands())) {
+        return [];
+      }
       const targetConnectorIds = new Set([connectorId, ...releasedConnectorIds]);
       const readySockets = [...targetConnectorIds].flatMap((targetConnectorId) => {
         const targetSockets = this.ctx.getWebSockets(`agent:${targetConnectorId}`);
@@ -986,7 +989,6 @@ export class WorkspaceDO implements DurableObject {
           const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
           return attachment?.connectorId
             ? this.sendPendingCommands(socket, attachment.connectorId, {
-              skipSafetyCheck: true,
               skipStaleExplicitCleanup: true
             })
             : undefined;
@@ -1016,6 +1018,9 @@ export class WorkspaceDO implements DurableObject {
         connectorIds.add(releasedConnectorId);
       }
     }
+    if (!(await this.canDispatchPendingCommands())) {
+      return [];
+    }
     const readySockets = [...connectorIds].flatMap((connectorId) =>
       pendingRefreshConnectorIds.has(connectorId)
         ? []
@@ -1028,7 +1033,6 @@ export class WorkspaceDO implements DurableObject {
       const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
       return attachment?.connectorId
         ? this.sendPendingCommands(socket, attachment.connectorId, {
-          skipSafetyCheck: true,
           skipStaleExplicitCleanup: true
         })
         : undefined;

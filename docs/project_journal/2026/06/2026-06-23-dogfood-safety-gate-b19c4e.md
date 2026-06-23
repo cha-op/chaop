@@ -50,6 +50,9 @@ superseded_by:
 - Treated malformed emergency-pause setting rows as fail-closed, matching unreadable pause state behaviour.
 - Removed machine-local validation paths from the tracked journal entries.
 - Kept the standalone safety-posture endpoint aligned with sample bootstrap data when local dev mode runs without a D1 binding.
+- Normalised legacy bootstrap payloads without `safety`, so a staggered Web/API deployment does not blank the Browser shell.
+- Moved guarded write-path safety checks to persisted telemetry samples instead of live Cloudflare GraphQL calls, while keeping `/api/safety-posture` as the explicit live refresh path.
+- Rechecked `command_create` safety after stale app-server target cleanup before dispatching pending commands.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`
@@ -61,5 +64,5 @@ superseded_by:
 - `git diff --check`
 
 ## Next Steps
-- Commit and push the review fix.
-- Refresh the API/Web deployment, run deployed E2E smoke, then rerun the three review lanes and resolve every GitHub conversation before merge.
+- Commit and push the latest review fix.
+- Rerun the three review lanes and resolve every GitHub conversation before merge.

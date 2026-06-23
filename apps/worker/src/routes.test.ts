@@ -2262,6 +2262,46 @@ test("connector budget state blocks command creation before command writes", asy
   assert.match(body.error, /Cost posture is throttled/);
 });
 
+test("command creation safety guard does not fetch live Cloudflare telemetry", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response("{}", { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/commands", {
+        method: "POST",
+        headers: {
+          origin: "https://app.example.com"
+        },
+        body: JSON.stringify({
+          workspace_id: "workspace-api",
+          thread_id: "thread-orders-500",
+          prompt: "Summarise current errors"
+        })
+      }),
+      {
+        ...devEnv,
+        DB: commandTargetDb({ id: "connector-online" }),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "telemetry-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_D1_DATABASE_ID: "telemetry-database"
+      }
+    );
+    const body = (await response.json()) as { accepted?: boolean };
+
+    assert.equal(response.status, 202);
+    assert.equal(body.accepted, true);
+    assert.equal(fetchCount, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("pause state read failures block command creation before command writes", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/commands", {

@@ -1237,6 +1237,39 @@ test("dispatch-pending cleans stale app-server targets before ready sockets", as
   assert.equal(sent.length, 0);
 });
 
+test("dispatch-pending stops after stale cleanup moves safety to hard limit", async () => {
+  const sent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true
+  }, sent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({
+    pendingCommand: true,
+    safetyBudgetStateAfterStaleCleanup: "hard_limited"
+  });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  const response = await workspace.fetch(new Request("https://workspace-do/internal/dispatch-pending", {
+    method: "POST",
+    body: JSON.stringify({ connector_id: "connector-online" })
+  }));
+
+  assert.equal((await response.json() as { dispatched_to?: number }).dispatched_to, 0);
+  assert.equal(db.staleExplicitCleanupQueries, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
+  assert.equal(sent.length, 0);
+});
+
 test("dispatch-pending releases and retries when socket send fails", async () => {
   const throwingSocket = mutableSocketWithAttachment({
     socketType: "agent",
@@ -1446,6 +1479,45 @@ test("global dispatch-pending cleans stale app-server targets before ready socke
   assert.equal((await response.json() as { dispatched_to?: number }).dispatched_to, 0);
   assert.equal(db.staleExplicitCleanupQueries, 1);
   assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(sent.length, 0);
+});
+
+test("global dispatch-pending stops after stale cleanup moves safety to hard limit", async () => {
+  const sent: string[] = [];
+  const firstSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true
+  }, sent);
+  const secondSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 350,
+    agentReady: true
+  }, sent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent" || tag === "agent:connector-online") return [firstSocket, secondSocket];
+      if (tag === "browser") return [];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({
+    pendingCommand: true,
+    safetyBudgetStateAfterStaleCleanup: "hard_limited"
+  });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  const response = await workspace.fetch(new Request("https://workspace-do/internal/dispatch-pending", {
+    method: "POST",
+    body: JSON.stringify({})
+  }));
+
+  assert.equal((await response.json() as { dispatched_to?: number }).dispatched_to, 0);
+  assert.equal(db.staleExplicitCleanupQueries, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
   assert.equal(sent.length, 0);
 });
 
@@ -3920,6 +3992,7 @@ function readyGatedDispatchDb(options: {
   pendingCommand?: boolean;
   safetyPaused?: boolean;
   safetyBudgetState?: BudgetState;
+  safetyBudgetStateAfterStaleCleanup?: BudgetState;
 } = {}): D1Database & {
   readonly capabilityUpdates: number;
   readonly connectorOnlineUpdates: number;
@@ -3967,7 +4040,11 @@ function readyGatedDispatchDb(options: {
     prepare(sql: string) {
       const safetyOptions: { paused?: boolean; budgetState?: BudgetState } = {};
       if (options.safetyPaused !== undefined) safetyOptions.paused = options.safetyPaused;
-      if (options.safetyBudgetState !== undefined) safetyOptions.budgetState = options.safetyBudgetState;
+      const effectiveBudgetState = options.safetyBudgetStateAfterStaleCleanup !== undefined
+        && counters.staleExplicitCleanupQueries > 0
+        ? options.safetyBudgetStateAfterStaleCleanup
+        : options.safetyBudgetState;
+      if (effectiveBudgetState !== undefined) safetyOptions.budgetState = effectiveBudgetState;
       const safetyStatement = safetyQueryStatement(sql, safetyOptions);
       if (safetyStatement) return safetyStatement;
 

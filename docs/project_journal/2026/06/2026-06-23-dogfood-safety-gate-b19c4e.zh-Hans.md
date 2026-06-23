@@ -50,6 +50,9 @@ superseded_by:
 - malformed emergency-pause setting rows 现在会 fail closed，与 pause state 无法读取时的行为保持一致。
 - 已移除 tracked journal entries 中的本机验证路径。
 - 本地 dev mode 无 D1 binding 时，standalone safety-posture endpoint 现在会与 sample bootstrap data 保持一致。
+- legacy bootstrap payload 缺少 `safety` 时现在会自动补默认 posture，避免 Web/API 错峰部署导致 Browser shell 空白。
+- 受保护写路径的 safety check 现在只读取已持久化 telemetry sample，不再等待 live Cloudflare GraphQL；`/api/safety-posture` 仍作为显式 live refresh 路径。
+- stale app-server target cleanup 之后会重新检查 `command_create` safety，再决定是否 dispatch pending commands。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`
@@ -61,5 +64,5 @@ superseded_by:
 - `git diff --check`
 
 ## 下一步
-- 提交并推送这次 review fix。
-- 刷新部署 API/Web，运行 deployed E2E smoke，然后重新运行三路 review，并在 merge 前 resolve 所有 GitHub conversations。
+- 提交并推送最新 review fix。
+- 重新运行三路 review，并在 merge 前 resolve 所有 GitHub conversations。
