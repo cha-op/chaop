@@ -49,6 +49,7 @@ superseded_by:
 - 当 safety 挡住非终态 connector progress events 时，已经 dispatch 的 command 现在会被标记为 failed，避免 paused 或 hard-limited command 一直停在 leased 或 running。
 - malformed emergency-pause setting rows 现在会 fail closed，与 pause state 无法读取时的行为保持一致。
 - 已移除 tracked journal entries 中的本机验证路径。
+- 本地 dev mode 无 D1 binding 时，standalone safety-posture endpoint 现在会与 sample bootstrap data 保持一致。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

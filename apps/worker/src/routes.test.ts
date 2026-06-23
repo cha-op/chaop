@@ -1877,6 +1877,38 @@ test("budget bootstrap opens zero-count current usage windows", async () => {
   );
 });
 
+test("safety posture returns sample safety when dev mode has no D1 binding", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    devEnv
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      actions: Array<{ action: string; state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "conservative");
+  assert.deepEqual(
+    body.safety.actions.map((guard) => [guard.action, guard.state]),
+    [
+      ["command_create", "allowed"],
+      ["local_thread_create", "allowed"],
+      ["host_session_refresh", "blocked"],
+      ["host_session_attach", "allowed"],
+      ["task_archive", "allowed"],
+      ["budget_bootstrap", "allowed"],
+      ["agent_event", "allowed"]
+    ]
+  );
+});
+
 test("safety posture reports conservative inventory guard without blocking focused writes", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/safety-posture", {

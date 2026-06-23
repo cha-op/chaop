@@ -49,6 +49,7 @@ superseded_by:
 - Failed already dispatched commands when safety blocks non-terminal connector progress events, so paused or hard-limited commands do not stay leased or running until disconnect.
 - Treated malformed emergency-pause setting rows as fail-closed, matching unreadable pause state behaviour.
 - Removed machine-local validation paths from the tracked journal entries.
+- Kept the standalone safety-posture endpoint aligned with sample bootstrap data when local dev mode runs without a D1 binding.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

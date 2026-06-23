@@ -54,7 +54,7 @@ import {
   setDogfoodSafetyPauseInDb,
   unarchiveTaskInDb
 } from "./db.js";
-import { budget, sampleBootstrap } from "./sample-data.js";
+import { budget, sampleBootstrap, safety as sampleSafety } from "./sample-data.js";
 import type { Env } from "./types.js";
 
 const HOST_SESSION_BACKFILL_EVENT_LIMIT = 30;
@@ -103,7 +103,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return json(request, env, { error: "DB binding is required" }, 503);
     }
     const response: DogfoodSafetyPostureResponse = {
-      safety: await loadDogfoodSafetyPostureFromDb(env)
+      safety: env.DB ? await loadDogfoodSafetyPostureFromDb(env) : sampleSafety
     };
     return json(request, env, response);
   }
