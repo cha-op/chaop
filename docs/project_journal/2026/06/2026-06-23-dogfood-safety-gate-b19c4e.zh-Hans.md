@@ -56,6 +56,7 @@ superseded_by:
 - stale app-server target cleanup 之后会在 direct `agent.ready` 和 internal dispatch paths 上重新检查 `command_create` safety，再决定是否 dispatch pending commands。
 - 无 D1 的 sample mode 只保留 read-only safety：sample refresh 会被 sample safety 阻挡，pause/resume 必须有真实 D1 binding。
 - Server 返回 safety block 并带回新 posture 后，Host Session auto-refresh 会立刻停止。
+- 已修复同一 Cloudflare telemetry bucket 内的持久化路径：累计 counters 增长时会更新既有 bucket row，让后续 write guards 与最近一次显式 safety 或 budget refresh 对齐。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

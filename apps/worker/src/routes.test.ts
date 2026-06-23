@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { handleRequest } from "./routes.js";
-import { loadBudgetSummaryFromDb } from "./db.js";
+import { loadBudgetSummaryFromDb, loadDogfoodSafetyPostureFromDb } from "./db.js";
 import type { Env } from "./types.js";
 
 const devEnv: Env = {
@@ -2899,6 +2899,62 @@ test("budget telemetry cache expires on sample bucket boundaries", async () => {
   }
 });
 
+test("budget telemetry refresh updates an existing sample bucket for later safety guards", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    const rowsWritten = fetchCount === 1 ? 1_000 : 120_000;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: fetchCount } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: fetchCount * 100, rowsWritten } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const db = budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] });
+  const env: Env = {
+    ...devEnv,
+    DB: db,
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "account-same-bucket-upsert",
+    CF_TELEMETRY_API_WORKER: "chaop-api-upsert",
+    CF_TELEMETRY_D1_DATABASE_ID: "database-same-bucket-upsert",
+    CF_TELEMETRY_CACHE_SECONDS: "1",
+    CF_TELEMETRY_SAMPLE_SECONDS: "300"
+  };
+
+  try {
+    const first = await loadBudgetSummaryFromDb(env, "2026-06-15T09:04:00.000Z");
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const second = await loadBudgetSummaryFromDb(env, "2026-06-15T09:04:30.000Z");
+    const safety = await loadDogfoodSafetyPostureFromDb(env, "2026-06-15T09:04:45.000Z");
+
+    assert.equal(fetchCount, 2);
+    assert.equal(first.telemetry_history?.points.length, 1);
+    assert.equal(first.telemetry_history?.points.at(-1)?.d1_rows_written_daily, 1_000);
+    assert.equal(second.telemetry_history?.points.length, 1);
+    assert.equal(second.telemetry_history?.points.at(-1)?.d1_rows_written_daily, 120_000);
+    assert.equal(safety.state, "hard_limited");
+    assert.equal(safety.bottleneck_constraint?.id, "d1_rows_written_daily");
+    assert.equal(safety.bottleneck_constraint?.used_units, 120_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("budget telemetry samples are scoped by telemetry selectors", async () => {
   const originalFetch = globalThis.fetch;
   let fetchCount = 0;
@@ -3926,7 +3982,7 @@ function dogfoodSafetyQueryFake(
     };
   }
 
-  if (/INSERT OR IGNORE INTO budget_telemetry_samples/.test(sql) && options.telemetrySamples) {
+  if (/INSERT INTO budget_telemetry_samples/.test(sql) && options.telemetrySamples) {
     return {
       bind(
         id: string,
@@ -3945,10 +4001,7 @@ function dogfoodSafetyQueryFake(
           async run() {
             const samples = options.telemetrySamples;
             if (!samples) return { meta: { changes: 0 } };
-            if (samples.some((sample) => sample.id === id)) {
-              return { meta: { changes: 0 } };
-            }
-            samples.push({
+            return upsertTelemetrySample(samples, {
               id,
               sample_type: sampleType,
               selector_hash: selectorHash,
@@ -3961,7 +4014,6 @@ function dogfoodSafetyQueryFake(
               durable_object_requests_daily: durableObjectRequestsDaily,
               created_at: createdAt
             });
-            return { meta: { changes: 1 } };
           }
         };
       }
@@ -4001,6 +4053,64 @@ function budgetStateCountRows(states: string[]): Array<{ budget_state: string; c
     counts.set(state, (counts.get(state) ?? 0) + 1);
   }
   return [...counts.entries()].map(([budget_state, count]) => ({ budget_state, count }));
+}
+
+function upsertTelemetrySample(
+  samples: Record<string, unknown>[],
+  incoming: Record<string, unknown>
+): { meta: { changes: number } } {
+  const existing = samples.find((sample) => sample.id === incoming.id);
+  if (!existing) {
+    samples.push(incoming);
+    return { meta: { changes: 1 } };
+  }
+
+  const next = {
+    ...existing,
+    window_start: incoming.window_start,
+    window_end: incoming.window_end,
+    d1_rows_written_daily: maxTelemetryCounter(existing.d1_rows_written_daily, incoming.d1_rows_written_daily),
+    d1_rows_read_daily: maxTelemetryCounter(existing.d1_rows_read_daily, incoming.d1_rows_read_daily),
+    worker_requests_daily: maxTelemetryCounter(existing.worker_requests_daily, incoming.worker_requests_daily),
+    durable_object_requests_daily: maxTelemetryCounter(
+      existing.durable_object_requests_daily,
+      incoming.durable_object_requests_daily
+    )
+  };
+  const changed = (
+    next.window_start !== existing.window_start ||
+    next.window_end !== existing.window_end ||
+    next.d1_rows_written_daily !== existing.d1_rows_written_daily ||
+    next.d1_rows_read_daily !== existing.d1_rows_read_daily ||
+    next.worker_requests_daily !== existing.worker_requests_daily ||
+    next.durable_object_requests_daily !== existing.durable_object_requests_daily
+  );
+  if (!changed) {
+    return { meta: { changes: 0 } };
+  }
+
+  Object.assign(existing, {
+    ...next,
+    created_at: newerIso(String(existing.created_at ?? ""), String(incoming.created_at ?? ""))
+  });
+  return { meta: { changes: 1 } };
+}
+
+function maxTelemetryCounter(current: unknown, incoming: unknown): number | null {
+  const currentNumber = nullableCounter(current);
+  const incomingNumber = nullableCounter(incoming);
+  if (incomingNumber === null) return currentNumber;
+  return currentNumber === null ? incomingNumber : Math.max(currentNumber, incomingNumber);
+}
+
+function nullableCounter(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : null;
+}
+
+function newerIso(current: string, incoming: string): string {
+  if (!current) return incoming;
+  if (!incoming) return current;
+  return current > incoming ? current : incoming;
 }
 
 function safetyPauseDb(options: DogfoodSafetyFakeOptions = {}): D1Database {
@@ -4177,7 +4287,8 @@ function budgetSummaryDb(
     prepare(sql: string) {
       const safetyQuery = dogfoodSafetyQueryFake(sql, {
         includeUsageWindows: false,
-        includeBudgetStateCounts: false
+        includeBudgetStateCounts: false,
+        telemetrySamples
       });
       if (safetyQuery) return safetyQuery;
 
@@ -4221,7 +4332,7 @@ function budgetSummaryDb(
         };
       }
 
-      if (/INSERT OR IGNORE INTO budget_telemetry_samples/.test(sql)) {
+      if (/INSERT INTO budget_telemetry_samples/.test(sql)) {
         return {
           bind(
             id: string,
@@ -4238,10 +4349,7 @@ function budgetSummaryDb(
           ) {
             return {
               async run() {
-                if (telemetrySamples.some((sample) => sample.id === id)) {
-                  return { meta: { changes: 0 } };
-                }
-                telemetrySamples.push({
+                return upsertTelemetrySample(telemetrySamples, {
                   id,
                   sample_type: sampleType,
                   selector_hash: selectorHash,
@@ -4254,7 +4362,6 @@ function budgetSummaryDb(
                   durable_object_requests_daily: durableObjectRequestsDaily,
                   created_at: createdAt
                 });
-                return { meta: { changes: 1 } };
               }
             };
           }

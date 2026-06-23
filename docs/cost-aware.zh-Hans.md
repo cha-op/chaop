@@ -38,7 +38,7 @@ D1 绑定可用时，Browser 里的 Budget Board 会使用 Chaop 自己控制的
 - 页面会显示 source metadata，区分当前是 D1 usage windows、本地 sample data，还是空数据库。
 - 缺失的当前 four-hour 和 burst usage windows 会显示成 `0%` 的本地 schema-model baselines。缺失的 daily D1 rows-written 仍然需要 Cloudflare Analytics 或真实 daily usage window，因为 daily D1 writes 可能包含非 event 的 inventory 和 control-plane writes。
 - 配好 `CF_TELEMETRY_API_TOKEN` 和非 secret telemetry selectors 后，页面可以额外读取 Cloudflare GraphQL Analytics samples，用于 Worker requests、Durable Object request-equivalent usage、D1 rows read 和 D1 rows written。
-- 最近 24 小时的 Cloudflare telemetry history。样本默认按 5 分钟 bucket 通过 `INSERT OR IGNORE` 持久化；同一个 bucket 内重复刷新 Budget Board 不会再写一条 sample row。
+- 最近 24 小时的 Cloudflare telemetry history。样本默认按 5 分钟 bucket 持久化；同一个 bucket 内重复刷新 Budget Board 不会新增 history point，但如果累计 counters 增长，Chaop 会更新这个 bucket row，避免后续 safety guard 读取过期 telemetry。
 - Server-side dogfood safety guard 使用已持久化的 Cloudflare telemetry samples 和本地 usage windows，不会把 live GraphQL query 放到受保护写路径前面。`/api/safety-posture` 仍然是面向 operator 的 safety data 显式 live refresh 路径，并会把刷新到的 sample 写入同一个低频 telemetry bucket，方便后续写入 guard 复用。
 - 聚焦 D1 rows-written 的趋势图。当前 UI 只画 D1 rows written，并展示 15 分钟和 1 小时斜率，以及从 Cloudflare 当日累计样本推导出来的同日投影。
 - 低成本 D1 write activity signals：Cloudflare 测得的当前日 D1 writes、从当前 daily usage window 和 schema write model 推导出的保守 event write 估计值，以及两者之间的 residual gap。Cloudflare telemetry 低于本地 estimate 时，Chaop 会用本地 estimate 作为 daily D1 write guardrail。

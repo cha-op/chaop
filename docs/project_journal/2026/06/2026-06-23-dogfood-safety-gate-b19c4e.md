@@ -56,6 +56,7 @@ superseded_by:
 - Rechecked `command_create` safety after stale app-server target cleanup before dispatching pending commands on both direct `agent.ready` and internal dispatch paths.
 - Kept no-D1 sample-mode safety read-only: sample refresh is blocked by sample safety, while pause/resume requires a real D1 binding.
 - Stopped Host Session auto-refresh immediately after a server safety block returns updated safety posture.
+- Fixed the same-bucket Cloudflare telemetry persistence path so cumulative counters update the existing bucket row, keeping later write guards aligned with the latest explicit safety or budget refresh.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

@@ -4722,11 +4722,71 @@ async function persistBudgetTelemetrySampleBestEffort(
     const sampledAt = telemetrySampleBucketStart(generatedAt, sampleSeconds).toISOString();
     const selectorHash = cloudflareTelemetrySelectorHash(env);
     const result = await env.DB.prepare(
-      `INSERT OR IGNORE INTO budget_telemetry_samples (
+      `INSERT INTO budget_telemetry_samples (
          id, sample_type, selector_hash, sampled_at, window_start, window_end,
          d1_rows_written_daily, d1_rows_read_daily, worker_requests_daily,
          durable_object_requests_daily, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         window_start = excluded.window_start,
+         window_end = excluded.window_end,
+         d1_rows_written_daily = CASE
+           WHEN excluded.d1_rows_written_daily IS NULL THEN budget_telemetry_samples.d1_rows_written_daily
+           WHEN budget_telemetry_samples.d1_rows_written_daily IS NULL THEN excluded.d1_rows_written_daily
+           WHEN excluded.d1_rows_written_daily > budget_telemetry_samples.d1_rows_written_daily THEN excluded.d1_rows_written_daily
+           ELSE budget_telemetry_samples.d1_rows_written_daily
+         END,
+         d1_rows_read_daily = CASE
+           WHEN excluded.d1_rows_read_daily IS NULL THEN budget_telemetry_samples.d1_rows_read_daily
+           WHEN budget_telemetry_samples.d1_rows_read_daily IS NULL THEN excluded.d1_rows_read_daily
+           WHEN excluded.d1_rows_read_daily > budget_telemetry_samples.d1_rows_read_daily THEN excluded.d1_rows_read_daily
+           ELSE budget_telemetry_samples.d1_rows_read_daily
+         END,
+         worker_requests_daily = CASE
+           WHEN excluded.worker_requests_daily IS NULL THEN budget_telemetry_samples.worker_requests_daily
+           WHEN budget_telemetry_samples.worker_requests_daily IS NULL THEN excluded.worker_requests_daily
+           WHEN excluded.worker_requests_daily > budget_telemetry_samples.worker_requests_daily THEN excluded.worker_requests_daily
+           ELSE budget_telemetry_samples.worker_requests_daily
+         END,
+         durable_object_requests_daily = CASE
+           WHEN excluded.durable_object_requests_daily IS NULL THEN budget_telemetry_samples.durable_object_requests_daily
+           WHEN budget_telemetry_samples.durable_object_requests_daily IS NULL THEN excluded.durable_object_requests_daily
+           WHEN excluded.durable_object_requests_daily > budget_telemetry_samples.durable_object_requests_daily THEN excluded.durable_object_requests_daily
+           ELSE budget_telemetry_samples.durable_object_requests_daily
+         END,
+         created_at = CASE
+           WHEN excluded.created_at > budget_telemetry_samples.created_at THEN excluded.created_at
+           ELSE budget_telemetry_samples.created_at
+         END
+       WHERE
+         (
+           excluded.d1_rows_written_daily IS NOT NULL
+           AND (
+             budget_telemetry_samples.d1_rows_written_daily IS NULL
+             OR excluded.d1_rows_written_daily > budget_telemetry_samples.d1_rows_written_daily
+           )
+         )
+         OR (
+           excluded.d1_rows_read_daily IS NOT NULL
+           AND (
+             budget_telemetry_samples.d1_rows_read_daily IS NULL
+             OR excluded.d1_rows_read_daily > budget_telemetry_samples.d1_rows_read_daily
+           )
+         )
+         OR (
+           excluded.worker_requests_daily IS NOT NULL
+           AND (
+             budget_telemetry_samples.worker_requests_daily IS NULL
+             OR excluded.worker_requests_daily > budget_telemetry_samples.worker_requests_daily
+           )
+         )
+         OR (
+           excluded.durable_object_requests_daily IS NOT NULL
+           AND (
+             budget_telemetry_samples.durable_object_requests_daily IS NULL
+             OR excluded.durable_object_requests_daily > budget_telemetry_samples.durable_object_requests_daily
+           )
+         )`
     )
       .bind(
         `budget-telemetry:cloudflare_daily:${selectorHash}:${sampledAt}`,
