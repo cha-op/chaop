@@ -4,7 +4,7 @@ title: Dogfood Usability Roadmap
 status: active
 created: 2026-06-23
 updated: 2026-06-23
-branch: wip/app-server-attach-resume
+branch: wip/dogfood-safety-gate
 pr:
 supersedes:
 superseded_by:
@@ -41,5 +41,5 @@ superseded_by:
 - merge 前运行三路 review，然后 resolve 或明确关闭每个 GitHub conversation。
 
 ## 当前下一步
-- 收尾当前 app-server attach/resume PR；在 checks、reviews 和 conversations 都干净后合并。
-- 合并后立即从更新后的 `master` 开始 PR A。
+- PR A 现在已经在 `wip/dogfood-safety-gate` 上开始。
+- 先实现 dogfood safety gate：可见 cost posture、对高成本 write/refresh actions 的 server-side guards，以及 emergency pause 或 stop path。

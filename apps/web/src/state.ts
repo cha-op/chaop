@@ -5,6 +5,8 @@ import type {
   CommandSummary,
   CreateCommandRequest,
   ConnectorSummary,
+  DogfoodSafetyAction,
+  DogfoodSafetyActionGuard,
   HostSessionBackfillSummary,
   HostSessionSummary,
   HostSessionSyncSummary,
@@ -23,6 +25,28 @@ const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], 
   draining: 3,
   healthy: 4
 };
+
+export function safetyGuardForAction(
+  data: BootstrapPayload | undefined,
+  action: DogfoodSafetyAction
+): DogfoodSafetyActionGuard | undefined {
+  return data?.safety.actions.find((guard) => guard.action === action);
+}
+
+export function safetyActionBlocked(
+  data: BootstrapPayload | undefined,
+  action: DogfoodSafetyAction
+): boolean {
+  return safetyGuardForAction(data, action)?.state === "blocked";
+}
+
+export function safetyActionReason(
+  data: BootstrapPayload | undefined,
+  action: DogfoodSafetyAction
+): string | undefined {
+  const guard = safetyGuardForAction(data, action);
+  return guard?.state === "blocked" ? guard.reason : undefined;
+}
 
 export function budgetSourceLabel(budget: BudgetSummary): string {
   const windowSampleCount = budget.window_sample_count ?? (budget.windows ?? []).length;

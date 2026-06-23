@@ -1877,6 +1877,211 @@ test("budget bootstrap opens zero-count current usage windows", async () => {
   );
 });
 
+test("safety posture reports conservative inventory guard without blocking focused writes", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        usageWindows: {
+          daily: safetyUsageWindow("daily", 3000)
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      paused: boolean;
+      actions: Array<{ action: string; state: string; reason: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "conservative");
+  assert.equal(body.safety.paused, false);
+  assert.deepEqual(
+    body.safety.actions.map((guard) => [guard.action, guard.state]),
+    [
+      ["command_create", "allowed"],
+      ["local_thread_create", "allowed"],
+      ["host_session_refresh", "blocked"],
+      ["host_session_attach", "allowed"],
+      ["task_archive", "allowed"],
+      ["budget_bootstrap", "allowed"]
+    ]
+  );
+  assert.match(
+    body.safety.actions.find((guard) => guard.action === "host_session_refresh")!.reason,
+    /broad refresh|Host Session refresh/
+  );
+});
+
+test("safety posture treats null persisted telemetry fields as missing", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        telemetrySample: {
+          sampled_at: "2026-06-15T09:00:00.000Z",
+          window_start: "2026-06-15T00:00:00.000Z",
+          window_end: "2026-06-16T00:00:00.000Z",
+          d1_rows_written_daily: null,
+          d1_rows_read_daily: null,
+          worker_requests_daily: null,
+          durable_object_requests_daily: null
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      bottleneck_constraint?: unknown;
+      actions: Array<{ action: string; state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "normal");
+  assert.equal(body.safety.bottleneck_constraint, undefined);
+  assert.equal(body.safety.actions.every((guard) => guard.state === "allowed"), true);
+});
+
+test("safety pause and resume update the operator guard state", async () => {
+  const db = safetyPauseDb();
+  const pause = await handleRequest(
+    new Request("https://api.example.com/api/safety/pause", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        reason: "test stop"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+  const paused = (await pause.json()) as {
+    safety: {
+      paused: boolean;
+      paused_reason?: string;
+      actions: Array<{ state: string }>;
+    };
+  };
+  const resume = await handleRequest(
+    new Request("https://api.example.com/api/safety/resume", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+  const resumed = (await resume.json()) as {
+    safety: {
+      paused: boolean;
+      actions: Array<{ state: string }>;
+    };
+  };
+
+  assert.equal(pause.status, 200);
+  assert.equal(paused.safety.paused, true);
+  assert.equal(paused.safety.paused_reason, "test stop");
+  assert.equal(paused.safety.actions.every((guard) => guard.state === "blocked"), true);
+  assert.equal(resume.status, 200);
+  assert.equal(resumed.safety.paused, false);
+  assert.equal(resumed.safety.actions.every((guard) => guard.state === "allowed"), true);
+});
+
+test("safety pause blocks command creation before command writes", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, {
+        safety: {
+          paused: true,
+          pauseReason: "test stop"
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string };
+    safety: { paused: boolean };
+  };
+
+  assert.equal(response.status, 429);
+  assert.match(body.error, /test stop/);
+  assert.equal(body.guard.action, "command_create");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.safety.paused, true);
+});
+
+test("conservative safety posture blocks host session inventory refresh before Durable Object dispatch", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/refresh", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        usageWindows: {
+          daily: safetyUsageWindow("daily", 3000)
+        }
+      }),
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not be called while safety blocks refresh");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string; budget_state: string };
+  };
+
+  assert.equal(response.status, 429);
+  assert.equal(body.guard.action, "host_session_refresh");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.guard.budget_state, "conservative");
+  assert.match(body.error, /Host Session refresh is paused/);
+});
+
 test("usage summary samples Cloudflare telemetry constraints when configured", async () => {
   const originalFetch = globalThis.fetch;
   let requestedBody: { variables?: Record<string, unknown> } | undefined;
@@ -3176,6 +3381,183 @@ function readOnlyBootstrapDb(): D1Database {
   } as unknown as D1Database;
 }
 
+type DogfoodSafetyFakeOptions = {
+  includeUsageWindows?: boolean | undefined;
+  paused?: boolean | undefined;
+  pauseReason?: string | undefined;
+  usageWindows?: Record<string, Record<string, unknown> | undefined> | undefined;
+  telemetrySample?: Record<string, unknown> | undefined;
+};
+
+function dogfoodSafetyQueryFake(
+  sql: string,
+  options: DogfoodSafetyFakeOptions = {}
+) {
+  if (/SELECT[\s\S]+FROM control_plane_settings/.test(sql)) {
+    return {
+      bind(key: string) {
+        assert.equal(key, "dogfood_safety.pause");
+        return {
+          async first() {
+            if (!options.paused) return undefined;
+            const updatedAt = "2026-06-15T09:00:00.000Z";
+            return {
+              value_json: JSON.stringify({
+                paused: true,
+                reason: options.pauseReason,
+                updated_by: "operator@example.com",
+                updated_at: updatedAt
+              }),
+              updated_at: updatedAt
+            };
+          }
+        };
+      }
+    };
+  }
+
+  if (options.includeUsageWindows !== false && /FROM usage_windows/.test(sql)) {
+    return {
+      bind(windowType: string, windowStartAt: string, windowEndAt: string) {
+        assert.match(windowStartAt, /^\d{4}-\d{2}-\d{2}T/);
+        assert.equal(windowEndAt, windowStartAt);
+        return {
+          async first() {
+            return options.usageWindows?.[windowType];
+          }
+        };
+      }
+    };
+  }
+
+  if (
+    /FROM budget_telemetry_samples/.test(sql)
+    && /window_start = \?/.test(sql)
+    && /LIMIT 1/.test(sql)
+  ) {
+    return {
+      bind(sampleType: string, selectorHash: string, windowStart: string) {
+        assert.equal(sampleType, "cloudflare_daily");
+        assert.equal(typeof selectorHash, "string");
+        assert.match(windowStart, /^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/);
+        return {
+          async first() {
+            return options.telemetrySample;
+          }
+        };
+      }
+    };
+  }
+
+  return undefined;
+}
+
+function safetyPauseDb(options: DogfoodSafetyFakeOptions = {}): D1Database {
+  let paused = options.paused ?? false;
+  let pauseReason = options.pauseReason;
+  let pauseUpdatedBy = "operator@example.com";
+  let pauseUpdatedAt = "2026-06-15T09:00:00.000Z";
+
+  return {
+    prepare(sql: string) {
+      if (/SELECT[\s\S]+FROM control_plane_settings/.test(sql)) {
+        return {
+          bind(key: string) {
+            assert.equal(key, "dogfood_safety.pause");
+            return {
+              async first() {
+                if (!paused) return undefined;
+                return {
+                  value_json: JSON.stringify({
+                    paused: true,
+                    reason: pauseReason,
+                    updated_by: pauseUpdatedBy,
+                    updated_at: pauseUpdatedAt
+                  }),
+                  updated_at: pauseUpdatedAt
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO control_plane_settings/.test(sql)) {
+        return {
+          bind(key: string, valueJson: string, updatedAt: string) {
+            assert.equal(key, "dogfood_safety.pause");
+            return {
+              async run() {
+                const value = JSON.parse(valueJson) as {
+                  reason?: string | undefined;
+                  updated_by?: string | undefined;
+                  updated_at?: string | undefined;
+                };
+                paused = true;
+                pauseReason = value.reason;
+                pauseUpdatedBy = value.updated_by ?? "operator@example.com";
+                pauseUpdatedAt = value.updated_at ?? updatedAt;
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/DELETE FROM control_plane_settings/.test(sql)) {
+        return {
+          bind(key: string) {
+            assert.equal(key, "dogfood_safety.pause");
+            return {
+              async run() {
+                paused = false;
+                pauseReason = undefined;
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      const safetyQuery = dogfoodSafetyQueryFake(sql, {
+        ...options,
+        paused,
+        pauseReason,
+        includeUsageWindows: options.includeUsageWindows
+      });
+      if (safetyQuery) return safetyQuery;
+
+      throw new Error(`Unexpected SQL in safety pause fake: ${sql}`);
+    }
+  } as unknown as D1Database;
+}
+
+function safetyUsageWindow(windowType: "daily" | "four_hour" | "burst", eventsReceived: number) {
+  const windowStart = windowType === "daily"
+    ? "2026-06-15T00:00:00.000Z"
+    : windowType === "four_hour"
+      ? "2026-06-15T08:00:00.000Z"
+      : "2026-06-15T09:00:00.000Z";
+  const windowEnd = windowType === "daily"
+    ? "2026-06-16T00:00:00.000Z"
+    : windowType === "four_hour"
+      ? "2026-06-15T12:00:00.000Z"
+      : "2026-06-15T09:01:00.000Z";
+  return {
+    id: `usage-${windowType}`,
+    window_type: windowType,
+    window_start: windowStart,
+    window_end: windowEnd,
+    budget_state: "normal",
+    used_pct: 0,
+    events_received: eventsReceived,
+    events_compacted: 0,
+    events_delayed: 0,
+    local_spool_bytes: 0,
+    updated_at: "2026-06-15T09:00:00.000Z"
+  };
+}
+
 function budgetSummaryDb(
   omitWindowTypes: string[] = [],
   options: {
@@ -3235,6 +3617,9 @@ function budgetSummaryDb(
 
   return {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql, { includeUsageWindows: false });
+      if (safetyQuery) return safetyQuery;
+
       if (/FROM usage_windows/.test(sql)) {
         assert.match(sql, /WHERE window_type = \?/);
         assert.match(sql, /window_start <= \?/);
@@ -3349,6 +3734,9 @@ function budgetBootstrapDb(): D1Database & { readonly usageWindowUpserts: number
 
   return {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql, { includeUsageWindows: false });
+      if (safetyQuery) return safetyQuery;
+
       if (/INSERT INTO usage_windows/.test(sql)) {
         return {
           bind(...args: unknown[]) {
@@ -3445,6 +3833,7 @@ function commandTargetDb(
     expectedTargetConnectorIdSource?: "explicit" | "attached" | "auto";
     expectedAutoConnectorId?: string;
     expectedExecutionMode?: "app_server" | "codex_cli_fallback";
+    safety?: DogfoodSafetyFakeOptions | undefined;
   } = {}
 ): D1Database {
   const supportsCodex = options.supportsCodex ?? true;
@@ -3458,6 +3847,9 @@ function commandTargetDb(
   const attachedThreadAppServerPresent = options.attachedThreadAppServerPresent ?? false;
   return {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql, options.safety);
+      if (safetyQuery) return safetyQuery;
+
       if (/INSERT INTO users/.test(sql)) {
         return {
           bind() {
@@ -3762,6 +4154,9 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
 
   const db = {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql);
+      if (safetyQuery) return safetyQuery;
+
       if (/INSERT INTO users/.test(sql)) {
         return {
           bind(userId: string, email: string, name: string) {
@@ -4160,6 +4555,9 @@ function taskArchiveSyncDb(
 
   const db = {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql);
+      if (safetyQuery) return safetyQuery;
+
       if (/FROM host_sessions hs/.test(sql) && /hs\.attached_task_id = \?/.test(sql)) {
         return {
           bind(taskId: string) {
@@ -4382,6 +4780,9 @@ function hostSessionAttachBackfillDb(
 
   const db = {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql);
+      if (safetyQuery) return safetyQuery;
+
       if (/SELECT hs\.id, hs\.connector_id/.test(sql) && /FROM host_sessions hs/.test(sql)) {
         return {
           bind(sessionId: string, connectorId?: string) {

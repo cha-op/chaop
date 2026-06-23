@@ -26,6 +26,9 @@ import type {
   CreateLocalThreadResponse,
   CreateCommandRequest,
   CreateCommandResponse,
+  DogfoodSafetyAction,
+  DogfoodSafetyActionGuard,
+  DogfoodSafetyPosture,
   AgentHostSession,
   DetachHostSessionResponse,
   HostSessionSummary,
@@ -96,6 +99,7 @@ const DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS = 300;
 const DEFAULT_BUDGET_TELEMETRY_HISTORY_CACHE_SECONDS = 60;
 const BUDGET_TELEMETRY_HISTORY_HOURS = 24;
 const BUDGET_TELEMETRY_HISTORY_LIMIT = 300;
+const DOGFOOD_SAFETY_PAUSE_KEY = "dogfood_safety.pause";
 const CLOUDFLARE_GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 const WS_INCOMING_MESSAGES_PER_DO_REQUEST = 20;
 const BUDGET_STATE_RANK: Record<BudgetState, number> = {
@@ -120,6 +124,18 @@ export class CommandTargetError extends Error {
 
 export class LocalThreadTargetError extends Error {
   readonly status = 404;
+}
+
+export class DogfoodSafetyError extends Error {
+  readonly status = 429;
+
+  constructor(
+    message: string,
+    readonly posture: DogfoodSafetyPosture,
+    readonly guard: DogfoodSafetyActionGuard
+  ) {
+    super(message);
+  }
 }
 
 export class NotFoundError extends Error {
@@ -164,6 +180,7 @@ export async function loadBootstrapFromDb(
     listRecentEvents(env)
   ]);
   const budgetSummary = await loadBudgetSummaryFromDb(env, undefined, { connectors, tasks });
+  const safety = await loadDogfoodSafetyPostureFromDb(env, budgetSummary.generated_at);
 
   return {
     user,
@@ -178,6 +195,7 @@ export async function loadBootstrapFromDb(
     running_commands: runningCommands,
     events,
     budget: budgetSummary,
+    safety,
     server_time: new Date().toISOString()
   };
 }
@@ -242,6 +260,102 @@ export async function loadBudgetSummaryFromDb(
     telemetry_history: telemetryHistory,
     d1_activity: d1Activity
   };
+}
+
+export async function loadDogfoodSafetyPostureFromDb(
+  env: Env,
+  generatedAt = new Date().toISOString()
+): Promise<DogfoodSafetyPosture> {
+  const effectiveGeneratedAt = generatedAt ?? new Date().toISOString();
+  if (!env.DB) {
+    return dogfoodSafetyPosture({
+      generatedAt: effectiveGeneratedAt,
+      paused: undefined,
+      constraints: budgetConstraints({}, [], undefined, localBudgetWindowBaselines({}, effectiveGeneratedAt))
+    });
+  }
+
+  const [pause, daily, fourHour, burst, telemetry] = await Promise.all([
+    loadDogfoodSafetyPause(env),
+    currentUsageWindow(env, "daily", effectiveGeneratedAt),
+    currentUsageWindow(env, "four_hour", effectiveGeneratedAt),
+    currentUsageWindow(env, "burst", effectiveGeneratedAt),
+    loadLatestPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt)
+  ]);
+  const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
+  const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
+  const constraints = budgetConstraints(
+    env,
+    windowSignals,
+    telemetry,
+    localBudgetWindowBaselines(env, effectiveGeneratedAt)
+  );
+  return dogfoodSafetyPosture({
+    generatedAt: effectiveGeneratedAt,
+    paused: pause,
+    constraints
+  });
+}
+
+export async function setDogfoodSafetyPauseInDb(
+  env: Env,
+  paused: boolean,
+  actor: BrowserIdentity,
+  reason?: string | undefined,
+  generatedAt = new Date().toISOString()
+): Promise<DogfoodSafetyPosture> {
+  if (!env.DB) {
+    return dogfoodSafetyPosture({
+      generatedAt,
+      paused: paused
+        ? {
+          paused: true,
+          reason: boundedSafetyReason(reason),
+          updated_by: actor.email,
+          updated_at: generatedAt
+        }
+        : undefined,
+      constraints: budgetConstraints({}, [], undefined, localBudgetWindowBaselines({}, generatedAt))
+    });
+  }
+
+  if (paused) {
+    await env.DB.prepare(
+      `INSERT INTO control_plane_settings (key, value_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+    )
+      .bind(
+        DOGFOOD_SAFETY_PAUSE_KEY,
+        JSON.stringify({
+          paused: true,
+          reason: boundedSafetyReason(reason),
+          updated_by: actor.email,
+          updated_at: generatedAt
+        }),
+        generatedAt
+      )
+      .run();
+  } else {
+    await env.DB.prepare("DELETE FROM control_plane_settings WHERE key = ?")
+      .bind(DOGFOOD_SAFETY_PAUSE_KEY)
+      .run();
+  }
+
+  return loadDogfoodSafetyPostureFromDb(env, generatedAt);
+}
+
+export async function assertDogfoodSafetyActionAllowed(
+  env: Env,
+  action: DogfoodSafetyAction,
+  generatedAt = new Date().toISOString()
+): Promise<DogfoodSafetyPosture> {
+  const posture = await loadDogfoodSafetyPostureFromDb(env, generatedAt);
+  const guard = posture.actions.find((item) => item.action === action);
+  if (guard?.state === "blocked") {
+    throw new DogfoodSafetyError(guard.reason, posture, guard);
+  }
+  return posture;
 }
 
 export async function bootstrapBudgetWindowsInDb(
@@ -4844,6 +4958,204 @@ const CLOUDFLARE_TELEMETRY_QUERY = `query ChaopCloudflareTelemetry(
   }
 }`;
 
+async function loadDogfoodSafetyPause(env: Env): Promise<DogfoodSafetyPauseSetting | undefined> {
+  if (!env.DB) return undefined;
+  try {
+    const row = await env.DB.prepare(
+      "SELECT value_json, updated_at FROM control_plane_settings WHERE key = ? LIMIT 1"
+    )
+      .bind(DOGFOOD_SAFETY_PAUSE_KEY)
+      .first<{ value_json: string; updated_at: string }>();
+    if (!row) return undefined;
+    const parsed = JSON.parse(row.value_json) as unknown;
+    if (!isRecord(parsed) || parsed.paused !== true) return undefined;
+    return {
+      paused: true,
+      reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
+      updated_by: typeof parsed.updated_by === "string" ? parsed.updated_by : undefined,
+      updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : row.updated_at
+    };
+  } catch (error) {
+    console.warn("Dogfood safety pause state could not be loaded", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+}
+
+async function loadLatestPersistedCloudflareTelemetrySample(
+  env: Env,
+  generatedAt: string
+): Promise<CloudflareTelemetrySample | undefined> {
+  if (!env.DB) return undefined;
+  try {
+    const effectiveAt = safeDate(generatedAt);
+    const dayStart = new Date(Date.UTC(
+      effectiveAt.getUTCFullYear(),
+      effectiveAt.getUTCMonth(),
+      effectiveAt.getUTCDate()
+    )).toISOString();
+    const row = await env.DB.prepare(
+      `SELECT sampled_at, window_start, window_end,
+              d1_rows_written_daily, d1_rows_read_daily,
+              worker_requests_daily, durable_object_requests_daily
+       FROM budget_telemetry_samples
+       WHERE sample_type = ? AND selector_hash = ? AND window_start = ?
+       ORDER BY sampled_at DESC
+       LIMIT 1`
+    )
+      .bind("cloudflare_daily", cloudflareTelemetrySelectorHash(env), dayStart)
+      .first<BudgetTelemetrySampleWithWindowRow>();
+    if (!row) return undefined;
+    return {
+      windowStart: row.window_start,
+      windowEnd: row.window_end,
+      updatedAt: row.sampled_at,
+      workerRequestsDaily: optionalNonNegativeInteger(row.worker_requests_daily),
+      durableObjectRequestEquivalentsDaily: optionalNonNegativeInteger(row.durable_object_requests_daily),
+      d1RowsReadDaily: optionalNonNegativeInteger(row.d1_rows_read_daily),
+      d1RowsWrittenDaily: optionalNonNegativeInteger(row.d1_rows_written_daily)
+    };
+  } catch (error) {
+    console.warn("Persisted Cloudflare telemetry sample could not be loaded", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+}
+
+function dogfoodSafetyPosture({
+  generatedAt,
+  paused,
+  constraints
+}: {
+  generatedAt: string;
+  paused: DogfoodSafetyPauseSetting | undefined;
+  constraints: BudgetConstraint[];
+}): DogfoodSafetyPosture {
+  const bottleneck = budgetBottleneckConstraint(constraints);
+  const sampledStates = constraints
+    .filter((constraint) => constraint.sampled && constraint.hard && constraint.state !== "missing")
+    .map((constraint) => constraint.state as BudgetState);
+  const state = paused ? "hard_limited" : worstBudgetState(sampledStates);
+  const actions = DOGFOOD_SAFETY_ACTIONS.map((action) =>
+    dogfoodSafetyGuard(action, state, paused, bottleneck)
+  );
+  return {
+    state,
+    paused: paused !== undefined,
+    paused_reason: paused?.reason,
+    paused_by: paused?.updated_by,
+    paused_at: paused?.updated_at,
+    generated_at: generatedAt,
+    summary: dogfoodSafetySummary(state, paused, bottleneck),
+    bottleneck_constraint: bottleneck,
+    actions
+  };
+}
+
+function dogfoodSafetyGuard(
+  action: DogfoodSafetyAction,
+  state: BudgetState,
+  paused: DogfoodSafetyPauseSetting | undefined,
+  bottleneck: BudgetConstraint | undefined
+): DogfoodSafetyActionGuard {
+  const blocked = dogfoodSafetyActionBlocked(action, state, paused);
+  return {
+    action,
+    state: blocked ? "blocked" : "allowed",
+    reason: blocked
+      ? dogfoodSafetyBlockedReason(action, state, paused, bottleneck)
+      : dogfoodSafetyAllowedReason(action, state, bottleneck),
+    budget_state: state,
+    constraint_id: bottleneck?.id,
+    constraint_label: bottleneck?.label,
+    remaining_event_capacity: bottleneck?.remaining_event_capacity
+  };
+}
+
+function dogfoodSafetyActionBlocked(
+  action: DogfoodSafetyAction,
+  state: BudgetState,
+  paused: DogfoodSafetyPauseSetting | undefined
+): boolean {
+  if (paused) return true;
+  if (state === "hard_limited" || state === "throttled") return true;
+  return action === "host_session_refresh" && state === "conservative";
+}
+
+function dogfoodSafetyBlockedReason(
+  action: DogfoodSafetyAction,
+  state: BudgetState,
+  paused: DogfoodSafetyPauseSetting | undefined,
+  bottleneck: BudgetConstraint | undefined
+): string {
+  if (paused) {
+    return paused.reason
+      ? `Dogfood emergency pause is active: ${paused.reason}`
+      : "Dogfood emergency pause is active.";
+  }
+  if (action === "host_session_refresh" && state === "conservative") {
+    return "Host Session refresh is paused while cost posture is conservative; use existing attached threads or resume when the bottleneck clears.";
+  }
+  const bottleneckLabel = bottleneck ? ` Current bottleneck: ${bottleneck.label}.` : "";
+  return `Cost posture is ${state.replace("_", " ")}; this write or refresh action is blocked.${bottleneckLabel}`;
+}
+
+function dogfoodSafetyAllowedReason(
+  action: DogfoodSafetyAction,
+  state: BudgetState,
+  bottleneck: BudgetConstraint | undefined
+): string {
+  if (state === "conservative" && action !== "host_session_refresh") {
+    return "Allowed, but broad refresh remains blocked until cost posture returns to normal.";
+  }
+  if (bottleneck) {
+    return `Allowed. Current bottleneck is ${bottleneck.label}.`;
+  }
+  return "Allowed. No sampled hard budget bottleneck is currently available.";
+}
+
+function dogfoodSafetySummary(
+  state: BudgetState,
+  paused: DogfoodSafetyPauseSetting | undefined,
+  bottleneck: BudgetConstraint | undefined
+): string {
+  if (paused) {
+    return paused.reason
+      ? `Emergency pause active: ${paused.reason}`
+      : "Emergency pause active.";
+  }
+  if (state === "hard_limited" || state === "throttled") {
+    return bottleneck
+      ? `Cost posture is ${state.replace("_", " ")}; ${bottleneck.label} is blocking dogfood writes.`
+      : `Cost posture is ${state.replace("_", " ")}; dogfood writes are blocked.`;
+  }
+  if (state === "conservative") {
+    return bottleneck
+      ? `Cost posture is conservative; ${bottleneck.label} is the current bottleneck.`
+      : "Cost posture is conservative; broad refresh is blocked.";
+  }
+  return bottleneck
+    ? `Dogfood writes are allowed. Current bottleneck: ${bottleneck.label}.`
+    : "Dogfood writes are allowed.";
+}
+
+function boundedSafetyReason(reason: string | undefined): string | undefined {
+  const trimmed = reason?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, 240);
+}
+
+const DOGFOOD_SAFETY_ACTIONS: DogfoodSafetyAction[] = [
+  "command_create",
+  "local_thread_create",
+  "host_session_refresh",
+  "host_session_attach",
+  "task_archive",
+  "budget_bootstrap"
+];
+
 function emptyBudgetSummary(generatedAt: string): BudgetSummary {
   const constraints = budgetConstraints({}, []);
   return {
@@ -5294,6 +5606,14 @@ function nonNegativeInteger(value: number | undefined): number {
   return Math.max(0, Math.floor(value));
 }
 
+function optionalNonNegativeInteger(value: number | null | undefined): number | undefined {
+  return value === null || value === undefined ? undefined : nonNegativeInteger(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function nullableNonNegativeInteger(value: number | null | undefined): number | null {
   return value === null || value === undefined ? null : nonNegativeInteger(value);
 }
@@ -5346,10 +5666,10 @@ type CloudflareTelemetrySample = {
   windowStart: string;
   windowEnd: string;
   updatedAt: string;
-  workerRequestsDaily: number;
-  durableObjectRequestEquivalentsDaily: number;
-  d1RowsReadDaily: number;
-  d1RowsWrittenDaily: number;
+  workerRequestsDaily?: number | undefined;
+  durableObjectRequestEquivalentsDaily?: number | undefined;
+  d1RowsReadDaily?: number | undefined;
+  d1RowsWrittenDaily?: number | undefined;
 };
 
 type BudgetTelemetrySampleRow = {
@@ -5358,6 +5678,18 @@ type BudgetTelemetrySampleRow = {
   d1_rows_read_daily: number | null;
   worker_requests_daily: number | null;
   durable_object_requests_daily: number | null;
+};
+
+type BudgetTelemetrySampleWithWindowRow = BudgetTelemetrySampleRow & {
+  window_start: string;
+  window_end: string;
+};
+
+type DogfoodSafetyPauseSetting = {
+  paused: true;
+  reason?: string | undefined;
+  updated_by?: string | undefined;
+  updated_at: string;
 };
 
 type CloudflareGraphqlMetricRow = {

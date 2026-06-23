@@ -9,7 +9,10 @@ import type {
   CreateLocalThreadResponse,
   DetachHostSessionRequest,
   DetachHostSessionResponse,
+  DogfoodSafetyPostureResponse,
   RefreshHostSessionsResponse,
+  SetDogfoodSafetyPauseRequest,
+  SetDogfoodSafetyPauseResponse,
   TaskArchiveResponse,
   ThreadEventsResponse
 } from "@chaop/protocol";
@@ -63,6 +66,27 @@ export async function loadUsageSummary(): Promise<BudgetSummary> {
 
 export async function bootstrapBudgetSamples(): Promise<BudgetSummary> {
   return postJson("/api/budget/bootstrap", {});
+}
+
+export async function loadSafetyPosture(): Promise<DogfoodSafetyPostureResponse> {
+  const response = await fetch(apiUrl("/api/safety-posture"), {
+    credentials: "include",
+    headers: devHeaders()
+  });
+  if (!response.ok) {
+    throw await responseError(response, "Safety posture failed");
+  }
+  return (await response.json()) as DogfoodSafetyPostureResponse;
+}
+
+export async function pauseDogfoodSafety(
+  request: SetDogfoodSafetyPauseRequest
+): Promise<SetDogfoodSafetyPauseResponse> {
+  return postJson("/api/safety/pause", request);
+}
+
+export async function resumeDogfoodSafety(): Promise<SetDogfoodSafetyPauseResponse> {
+  return postJson("/api/safety/resume", {});
 }
 
 export async function createCommand(request: CreateCommandRequest): Promise<CreateCommandResponse> {

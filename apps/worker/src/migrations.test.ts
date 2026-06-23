@@ -108,6 +108,16 @@ test("budget telemetry samples are added by forward migration", async () => {
   );
 });
 
+test("control plane settings are added by forward migration", async () => {
+  const migration = await readMigration("0015_control_plane_settings.sql");
+
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS control_plane_settings/);
+  assert.match(migration, /key TEXT PRIMARY KEY/);
+  assert.match(migration, /value_json TEXT NOT NULL/);
+  assert.match(migration, /updated_at TEXT NOT NULL/);
+  assert.match(migration, /CREATE INDEX IF NOT EXISTS idx_control_plane_settings_updated/);
+});
+
 async function readMigration(fileName: string): Promise<string> {
 	return await readFile(new URL(fileName, migrationsDir), "utf8");
 }

@@ -463,6 +463,48 @@ export type BudgetSummary = {
   d1_activity?: BudgetD1Activity | undefined;
 };
 
+export type DogfoodSafetyAction =
+  | "command_create"
+  | "local_thread_create"
+  | "host_session_refresh"
+  | "host_session_attach"
+  | "task_archive"
+  | "budget_bootstrap";
+
+export type DogfoodSafetyActionState = "allowed" | "blocked";
+
+export type DogfoodSafetyActionGuard = {
+  action: DogfoodSafetyAction;
+  state: DogfoodSafetyActionState;
+  reason: string;
+  budget_state: BudgetState;
+  constraint_id?: string | undefined;
+  constraint_label?: string | undefined;
+  remaining_event_capacity?: number | null | undefined;
+};
+
+export type DogfoodSafetyPosture = {
+  state: BudgetState;
+  paused: boolean;
+  paused_reason?: string | undefined;
+  paused_by?: string | undefined;
+  paused_at?: string | undefined;
+  generated_at: string;
+  summary: string;
+  bottleneck_constraint?: BudgetConstraint | undefined;
+  actions: DogfoodSafetyActionGuard[];
+};
+
+export type DogfoodSafetyPostureResponse = {
+  safety: DogfoodSafetyPosture;
+};
+
+export type SetDogfoodSafetyPauseRequest = {
+  reason?: string | undefined;
+};
+
+export type SetDogfoodSafetyPauseResponse = DogfoodSafetyPostureResponse;
+
 export type BootstrapPayload = {
   user: {
     id: string;
@@ -480,6 +522,7 @@ export type BootstrapPayload = {
   running_commands: CommandSummary[];
   events: ThreadEvent[];
   budget: BudgetSummary;
+  safety: DogfoodSafetyPosture;
   server_time: string;
 };
 

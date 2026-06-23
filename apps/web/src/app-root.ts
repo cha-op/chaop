@@ -12,6 +12,7 @@ import {
   type ConnectorSummary,
   type ConnectorsUpdatePayload,
   type CreateLocalThreadResponse,
+  type DogfoodSafetyAction,
   type HostSessionsUpdatePayload,
   type HostSessionSummary,
   type RefreshHostSessionsResponse,
@@ -30,9 +31,12 @@ import {
   createLocalThread,
   detachHostSession,
   loadBootstrap,
+  loadSafetyPosture,
   loadUsageSummary,
   loadThreadEvents,
+  pauseDogfoodSafety,
   refreshHostSessions,
+  resumeDogfoodSafety,
   unarchiveTask
 } from "./api.js";
 import {
@@ -60,6 +64,8 @@ import {
   mergeConnectorSummaries,
   mergeHostSessions,
   normaliseCommandMode,
+  safetyActionBlocked,
+  safetyActionReason,
   type CommandExecutionMode
 } from "./state.js";
 
@@ -129,6 +135,9 @@ export class ChaopApp extends LitElement {
 
   @state()
   private hostSessionsAutoRefresh = false;
+
+  @state()
+  private safetyControlState: "idle" | "updating" | "failed" = "idle";
 
   @state()
   private newThreadTitle = "New Codex thread";
@@ -219,6 +228,7 @@ export class ChaopApp extends LitElement {
         </aside>
         <main>
           ${this.renderTopBar()}
+          ${this.renderSafetyGate()}
           ${this.actionError ? html`<div class="action-alert" role="alert">${this.actionError}</div>` : nothing}
           ${this.actionNotice ? html`<div class="action-notice" role="status">${this.actionNotice}</div>` : nothing}
           ${this.view === "operations-map" ? this.renderOperationsMap() : nothing}
@@ -271,6 +281,7 @@ export class ChaopApp extends LitElement {
 
   private renderTopBar() {
     const budget = this.data!.budget;
+    const safety = this.data!.safety;
     const bottleneck = budgetBottleneckConstraint(budget);
     const budgetChipState = budgetCompactState(budget, bottleneck);
     return html`
@@ -281,12 +292,92 @@ export class ChaopApp extends LitElement {
         </div>
         <div class="topbar-status">
           <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
+          <span class="chip ${safety.paused ? "hard_limited" : safety.state}">${safetyChipLabel(safety)}</span>
           <span class="chip ${budgetChipState}">${budgetCompactLabel(bottleneck)}</span>
           <span class="identity">${this.data!.user.email}</span>
         </div>
       </header>
     `;
   }
+
+  private renderSafetyGate() {
+    const safety = this.data!.safety;
+    const blocked = safety.actions.filter((guard) => guard.state === "blocked");
+    const bottleneck = safety.bottleneck_constraint;
+    return html`
+      <section class=${`safety-gate ${safety.paused ? "paused" : safety.state}`}>
+        <div>
+          <strong>Dogfood safety</strong>
+          <span>${safety.summary}</span>
+        </div>
+        <div class="safety-facts">
+          ${bottleneck
+            ? html`<span>${bottleneck.label}: ${budgetPctLabel(bottleneck.used_pct)}</span>`
+            : html`<span>No sampled bottleneck</span>`}
+          <span>${blocked.length} blocked actions</span>
+          <button
+            type="button"
+            class=${safety.paused ? "" : "danger-action"}
+            ?disabled=${this.safetyControlState === "updating"}
+            @click=${safety.paused ? this.resumeDogfoodSafety : this.pauseDogfoodSafety}
+          >
+            ${this.safetyControlState === "updating"
+              ? "Updating..."
+              : safety.paused
+                ? "Resume"
+                : "Pause writes"}
+          </button>
+        </div>
+      </section>
+    `;
+  }
+
+  private safetyBlocked(action: DogfoodSafetyAction): boolean {
+    return safetyActionBlocked(this.data, action);
+  }
+
+  private safetyButtonTitle(action: DogfoodSafetyAction): string {
+    return safetyActionReason(this.data, action) ?? "Allowed by dogfood safety gate";
+  }
+
+  private guardSafetyAction(action: DogfoodSafetyAction): boolean {
+    const reason = safetyActionReason(this.data, action);
+    if (!reason) return true;
+    this.actionError = reason;
+    return false;
+  }
+
+  private readonly pauseDogfoodSafety = async (): Promise<void> => {
+    this.safetyControlState = "updating";
+    this.actionError = undefined;
+    this.actionNotice = undefined;
+    try {
+      const response = await pauseDogfoodSafety({ reason: "Operator emergency pause from Browser" });
+      this.mergeSafetyPosture(response.safety);
+      this.hostSessionsAutoRefresh = false;
+      this.stopHostSessionsAutoRefresh();
+      this.actionNotice = "Dogfood writes paused.";
+      this.safetyControlState = "idle";
+    } catch (error) {
+      this.safetyControlState = "failed";
+      this.actionError = actionErrorMessage("Safety pause failed", error);
+    }
+  };
+
+  private readonly resumeDogfoodSafety = async (): Promise<void> => {
+    this.safetyControlState = "updating";
+    this.actionError = undefined;
+    this.actionNotice = undefined;
+    try {
+      const response = await resumeDogfoodSafety();
+      this.mergeSafetyPosture(response.safety);
+      this.actionNotice = "Dogfood writes resumed.";
+      this.safetyControlState = "idle";
+    } catch (error) {
+      this.safetyControlState = "failed";
+      this.actionError = actionErrorMessage("Safety resume failed", error);
+    }
+  };
 
   private renderOperationsMap() {
     const appServerInstances = appServerInstancesForDisplay(this.data);
@@ -391,6 +482,8 @@ export class ChaopApp extends LitElement {
         <div class="task-actions">
           <button
             type="button"
+            title=${this.safetyButtonTitle("task_archive")}
+            ?disabled=${this.safetyBlocked("task_archive")}
             @click=${(event: Event) => {
               event.stopPropagation();
               void this.toggleTaskArchive(task);
@@ -434,7 +527,12 @@ export class ChaopApp extends LitElement {
             <div class="section-actions">
               ${task
                 ? html`
-                    <button type="button" @click=${() => void this.toggleTaskArchive(task)}>
+                    <button
+                      type="button"
+                      title=${this.safetyButtonTitle("task_archive")}
+                      ?disabled=${this.safetyBlocked("task_archive")}
+                      @click=${() => void this.toggleTaskArchive(task)}
+                    >
                       ${task.archived_at ? "Unarchive" : "Archive"}
                     </button>
                   `
@@ -461,7 +559,8 @@ export class ChaopApp extends LitElement {
           <button
             class="primary-action"
             type="button"
-            ?disabled=${this.commandState === "submitting" || this.commandPrompt.trim().length === 0}
+            title=${this.safetyButtonTitle("command_create")}
+            ?disabled=${this.commandState === "submitting" || this.commandPrompt.trim().length === 0 || this.safetyBlocked("command_create")}
             @click=${this.submitCommand}
           >
             ${this.commandState === "submitting" ? "Submitting..." : `Run ${commandModeLabel(this.commandMode)} command`}
@@ -556,7 +655,8 @@ export class ChaopApp extends LitElement {
             <div class="section-actions host-sync-actions">
               <button
                 type="button"
-                ?disabled=${this.hostSessionsRefreshState === "refreshing"}
+                title=${this.safetyButtonTitle("host_session_refresh")}
+                ?disabled=${this.hostSessionsRefreshState === "refreshing" || this.safetyBlocked("host_session_refresh")}
                 @click=${this.refreshHostSessionInventory}
               >
                 ${this.hostSessionsRefreshState === "refreshing" ? "Refreshing..." : "Refresh"}
@@ -565,6 +665,7 @@ export class ChaopApp extends LitElement {
                 <input
                   type="checkbox"
                   .checked=${this.hostSessionsAutoRefresh}
+                  ?disabled=${this.safetyBlocked("host_session_refresh")}
                   @change=${this.toggleHostSessionsAutoRefresh}
                 />
                 Auto 60s
@@ -643,6 +744,8 @@ export class ChaopApp extends LitElement {
           : html`
               <button
                 type="button"
+                title=${this.safetyButtonTitle("host_session_attach")}
+                ?disabled=${this.safetyBlocked("host_session_attach")}
                 @click=${(event: Event) => {
                   event.stopPropagation();
                   void this.attachSession(session);
@@ -710,7 +813,14 @@ export class ChaopApp extends LitElement {
           <div class="section-heading">
             <h2>Cost posture</h2>
             <div class="section-actions">
-              <button type="button" @click=${this.bootstrapBudgetSamples}>Bootstrap</button>
+              <button
+                type="button"
+                title=${this.safetyButtonTitle("budget_bootstrap")}
+                ?disabled=${this.safetyBlocked("budget_bootstrap")}
+                @click=${this.bootstrapBudgetSamples}
+              >
+                Bootstrap
+              </button>
               <span class="chip ${budget.state}">${budget.state.replace("_", " ")}</span>
             </div>
           </div>
@@ -816,6 +926,10 @@ export class ChaopApp extends LitElement {
       this.actionError = "No thread selected";
       return;
     }
+    if (!this.guardSafetyAction("command_create")) {
+      this.commandState = "failed";
+      return;
+    }
 
     const task = this.taskForThread(thread.id);
     this.ensureCommandMode();
@@ -873,7 +987,8 @@ export class ChaopApp extends LitElement {
         <button
           type="submit"
           class="primary-action"
-          ?disabled=${this.newThreadState === "creating" || !canCreate}
+          title=${this.safetyButtonTitle("local_thread_create")}
+          ?disabled=${this.newThreadState === "creating" || !canCreate || this.safetyBlocked("local_thread_create")}
         >
           ${this.newThreadState === "creating" ? "Creating..." : "New local thread"}
         </button>
@@ -897,6 +1012,10 @@ export class ChaopApp extends LitElement {
     if (localThreadConnectors(this.data, workspaceId).length === 0) {
       this.newThreadState = "failed";
       this.actionError = `${MANAGED_APP_SERVER_UNAVAILABLE} Local thread creation requires app-server thread capability.`;
+      return;
+    }
+    if (!this.guardSafetyAction("local_thread_create")) {
+      this.newThreadState = "failed";
       return;
     }
 
@@ -933,6 +1052,7 @@ export class ChaopApp extends LitElement {
     const action = task.archived_at ? "Unarchive" : "Archive";
     this.actionError = undefined;
     this.actionNotice = undefined;
+    if (!this.guardSafetyAction("task_archive")) return;
     try {
       const response = task.archived_at
         ? await unarchiveTask(task.id)
@@ -949,6 +1069,7 @@ export class ChaopApp extends LitElement {
   private async attachSession(session: HostSessionSummary): Promise<void> {
     this.actionError = undefined;
     this.actionNotice = undefined;
+    if (!this.guardSafetyAction("host_session_attach")) return;
     try {
       const response = await attachHostSession(session.session_id, { connector_id: session.connector_id });
       this.mergeAttachedSession(response);
@@ -981,6 +1102,12 @@ export class ChaopApp extends LitElement {
 
   private readonly toggleHostSessionsAutoRefresh = (event: Event): void => {
     const enabled = (event.target as HTMLInputElement).checked;
+    if (enabled && !this.guardSafetyAction("host_session_refresh")) {
+      (event.target as HTMLInputElement).checked = false;
+      this.hostSessionsAutoRefresh = false;
+      this.stopHostSessionsAutoRefresh();
+      return;
+    }
     this.hostSessionsAutoRefresh = enabled;
     if (enabled) {
       this.startHostSessionsAutoRefresh();
@@ -1011,6 +1138,11 @@ export class ChaopApp extends LitElement {
 
   private async requestHostSessionInventory(): Promise<void> {
     if (this.hostSessionsRefreshState === "refreshing") return;
+    if (!this.guardSafetyAction("host_session_refresh")) {
+      this.hostSessionsRefreshState = "idle";
+      this.hostSessionsRefreshSummary = undefined;
+      return;
+    }
     this.actionError = undefined;
     this.actionNotice = undefined;
     this.hostSessionsRefreshState = "refreshing";
@@ -1035,12 +1167,15 @@ export class ChaopApp extends LitElement {
   private readonly bootstrapBudgetSamples = async (): Promise<void> => {
     this.actionError = undefined;
     this.actionNotice = undefined;
+    if (!this.guardSafetyAction("budget_bootstrap")) return;
     try {
       const budget = await requestBudgetBootstrap();
+      const safetyResponse = await loadSafetyPosture();
       if (!this.data) return;
       this.data = {
         ...this.data,
-        budget
+        budget,
+        safety: safetyResponse.safety
       };
       this.actionNotice = "Budget samples bootstrapped.";
     } catch (error) {
@@ -1070,6 +1205,14 @@ export class ChaopApp extends LitElement {
           (item) => !(response.events ?? []).some((event) => event.id === item.id)
         )
       ]
+    };
+  }
+
+  private mergeSafetyPosture(safety: BootstrapPayload["safety"]): void {
+    if (!this.data) return;
+    this.data = {
+      ...this.data,
+      safety
     };
   }
 
@@ -1326,11 +1469,19 @@ export class ChaopApp extends LitElement {
   private async refreshBudgetSummary(): Promise<void> {
     if (!this.data) return;
     try {
-      const budget = await loadUsageSummary();
+      const [budget, safetyResponse] = await Promise.all([
+        loadUsageSummary(),
+        loadSafetyPosture()
+      ]);
       this.data = {
         ...this.data,
-        budget
+        budget,
+        safety: safetyResponse.safety
       };
+      if (this.safetyBlocked("host_session_refresh") && this.hostSessionsAutoRefresh) {
+        this.hostSessionsAutoRefresh = false;
+        this.stopHostSessionsAutoRefresh();
+      }
       if (this.actionError?.startsWith("Budget refresh failed:")) {
         this.actionError = undefined;
       }
@@ -1498,6 +1649,12 @@ function realtimeLabel(state: RealtimeState): string {
     live: "Live",
     polling: "Polling 10s"
   }[state];
+}
+
+function safetyChipLabel(safety: BootstrapPayload["safety"]): string {
+  if (safety.paused) return "Paused";
+  if (safety.state === "hard_limited") return "Hard limit";
+  return `Safety ${safety.state.replace("_", " ")}`;
 }
 
 function titleSourceLabel(source: HostSessionSummary["title_source"]): string {

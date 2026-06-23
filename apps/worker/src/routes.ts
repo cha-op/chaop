@@ -9,10 +9,13 @@ import {
   type CreateCommandResponse,
   type CreateLocalThreadRequest,
   type DetachHostSessionRequest,
+  type DogfoodSafetyPostureResponse,
   type HostSessionAppServerEnsureResult,
   type HostSessionSummary,
   type LocalThreadCreateResult,
   type RefreshHostSessionsResponse,
+  type SetDogfoodSafetyPauseRequest,
+  type SetDogfoodSafetyPauseResponse,
   type TaskArchiveResponse,
   type TaskArchiveSyncSummary,
   type ThreadEvent,
@@ -26,9 +29,11 @@ import {
 } from "./auth.js";
 import {
   CommandTargetError,
+  DogfoodSafetyError,
   LocalThreadTargetError,
   NotFoundError,
   archiveTaskInDb,
+  assertDogfoodSafetyActionAllowed,
   attachCreatedLocalThreadInDb,
   attachHostSessionInDb,
   bootstrapBudgetWindowsInDb,
@@ -41,10 +46,12 @@ import {
   listThreadEventsInDb,
   loadBudgetSummaryFromDb,
   loadBootstrapFromDb,
+  loadDogfoodSafetyPostureFromDb,
   loadHostSessionInDb,
   markHostSessionAppServerPresentInDb,
   recordHostSessionBackfillEvents,
   recordHostSessions,
+  setDogfoodSafetyPauseInDb,
   unarchiveTaskInDb
 } from "./db.js";
 import { budget, sampleBootstrap } from "./sample-data.js";
@@ -87,12 +94,60 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return json(request, env, summary);
   }
 
+  if (request.method === "GET" && url.pathname === "/api/safety-posture") {
+    const originCheck = validateBrowserOrigin(request, env);
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB && !allowsSampleData(env)) {
+      return json(request, env, { error: "DB binding is required" }, 503);
+    }
+    const response: DogfoodSafetyPostureResponse = {
+      safety: await loadDogfoodSafetyPostureFromDb(env)
+    };
+    return json(request, env, response);
+  }
+
+  if (request.method === "POST" && (url.pathname === "/api/safety/pause" || url.pathname === "/api/safety/resume")) {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB && !allowsSampleData(env)) {
+      return json(request, env, { error: "DB binding is required" }, 503);
+    }
+    const payload = await readOptionalJson(request);
+    if (!payload.ok) {
+      return json(request, env, { error: payload.message }, 400);
+    }
+    if (!isSetDogfoodSafetyPauseRequest(payload.value)) {
+      return json(request, env, { error: "Invalid safety pause payload" }, 400);
+    }
+    const response: SetDogfoodSafetyPauseResponse = {
+      safety: await setDogfoodSafetyPauseInDb(
+        env,
+        url.pathname.endsWith("/pause"),
+        auth.user,
+        payload.value.reason
+      )
+    };
+    return json(request, env, response, 200);
+  }
+
   if (request.method === "POST" && url.pathname === "/api/budget/bootstrap") {
     const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
     if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
     const auth = await authenticateBrowser(request, env);
     if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
     if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+    try {
+      await assertDogfoodSafetyActionAllowed(env, "budget_bootstrap");
+    } catch (error) {
+      if (error instanceof DogfoodSafetyError) {
+        return dogfoodSafetyErrorResponse(request, env, error);
+      }
+      throw error;
+    }
     const summary = await bootstrapBudgetWindowsInDb(env);
     return json(request, env, summary, 201);
   }
@@ -171,6 +226,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     try {
+      const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "command_create");
+      if (safetyResponse) return safetyResponse;
       const { response, targetConnectorId } = await createCommandInDb(env, auth.user, commandRequest);
       if (targetConnectorId) {
         await dispatchPendingCommand(env, targetConnectorId);
@@ -202,6 +259,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     const threadRequest = payload.value;
     try {
+      const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "local_thread_create");
+      if (safetyResponse) return safetyResponse;
       const connectorId = await chooseConnectorForLocalThread(env, auth.user, threadRequest);
       const session = await requestLocalThreadCreate(env, connectorId, threadRequest);
       const response = await attachCreatedLocalThreadInDb(env, connectorId, threadRequest.workspace_id, session);
@@ -230,6 +289,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     const taskId = decodeURIComponent(taskArchiveMatch[1] ?? "");
     try {
+      const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "task_archive");
+      if (safetyResponse) return safetyResponse;
       const archived = taskArchiveMatch[2] === "archive";
       const task = archived ? await archiveTaskInDb(env, taskId) : await unarchiveTaskInDb(env, taskId);
       const hostSession = await findAttachedHostSessionForTaskInDb(env, taskId);
@@ -262,6 +323,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
     if (!env.WORKSPACE_DO) return json(request, env, { error: "Workspace Durable Object binding is unavailable" }, 503);
 
+    const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "host_session_refresh");
+    if (safetyResponse) return safetyResponse;
     const refresh = await requestHostSessionRefresh(env);
     const response: RefreshHostSessionsResponse = {
       requested: true,
@@ -312,6 +375,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     try {
       const sessionId = decodeURIComponent(attachHostSessionMatch[1] ?? "");
+      const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "host_session_attach");
+      if (safetyResponse) return safetyResponse;
       const connectorId = await ensureHostSessionAppServerIfAvailable(env, sessionId, payload.value.connector_id);
       const attachment = await attachHostSessionInDb(
         env,
@@ -443,6 +508,30 @@ function json(request: Request, env: Env, payload: unknown, status = 200): Respo
       "content-type": "application/json; charset=utf-8"
     })
   });
+}
+
+async function dogfoodSafetyGuardResponse(
+  request: Request,
+  env: Env,
+  action: Parameters<typeof assertDogfoodSafetyActionAllowed>[1]
+): Promise<Response | undefined> {
+  try {
+    await assertDogfoodSafetyActionAllowed(env, action);
+    return undefined;
+  } catch (error) {
+    if (error instanceof DogfoodSafetyError) {
+      return dogfoodSafetyErrorResponse(request, env, error);
+    }
+    throw error;
+  }
+}
+
+function dogfoodSafetyErrorResponse(request: Request, env: Env, error: DogfoodSafetyError): Response {
+  return json(request, env, {
+    error: error.message,
+    safety: error.posture,
+    guard: error.guard
+  }, error.status);
 }
 
 function optionsResponse(request: Request, env: Env): Response {
@@ -932,6 +1021,10 @@ function isCreateCommandRequest(value: unknown): value is CreateCommandRequest {
     commandExecutionModeMatchesType(value) &&
     optionalString(value.target_connector_id)
   );
+}
+
+function isSetDogfoodSafetyPauseRequest(value: unknown): value is SetDogfoodSafetyPauseRequest {
+  return isRecord(value) && optionalString(value.reason);
 }
 
 function isCreateLocalThreadRequest(value: unknown): value is CreateLocalThreadRequest {

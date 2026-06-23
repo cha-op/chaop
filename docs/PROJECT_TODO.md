@@ -24,8 +24,8 @@
 - [done] PR6: Add drain, scheduled restart, and upgrade flow.
 - [done] PR7: Add the multi-instance and thread placement foundation.
 - [done] PR8: Replace Budget Board placeholders with real bounded usage/cost metrics.
-- [in_progress] Close and merge the current app-server attach/resume PR after the full test gate, three review lanes, and resolved GitHub conversations.
-- [planned] PR A: Add a dogfood safety gate with visible cost posture, guarded write/refresh actions, and an emergency pause or stop path.
+- [done] Close and merge the app-server attach/resume PR after the full test gate, three review lanes, and resolved GitHub conversations.
+- [in_progress] PR A: Add a dogfood safety gate with visible cost posture, guarded write/refresh actions, and an emergency pause or stop path.
 - [planned] PR B: Add the Thread Centre chat MVP for managed app-server threads, prompt submission, live progress, and assistant final-answer rendering.
 - [planned] PR C: Add human-in-the-loop approval/input handling for Codex app-server turns.
 - [planned] PR D: Add the persistent connector dogfood runbook and operational scripts for start, stop, observation, and recovery.

@@ -32,7 +32,9 @@ import {
   mergeConnectorSummaries,
   mergeHostSessions,
   normaliseCommandMode,
-  primaryAppServerInstanceForConnector
+  primaryAppServerInstanceForConnector,
+  safetyActionBlocked,
+  safetyActionReason
 } from "./state.ts";
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
@@ -275,6 +277,30 @@ test("budgetPctLabel distinguishes missing samples from zero usage", () => {
   assert.equal(budgetPctLabel(undefined), "missing");
   assert.equal(budgetPctLabel(0), "0%");
   assert.equal(budgetPctLabel(125.4), "125.4%");
+});
+
+test("safety helpers expose blocked action reasons only for guarded actions", () => {
+  const baseSafety = safety();
+  const data = payload({
+    safety: {
+      ...baseSafety,
+      actions: baseSafety.actions.map((guard) =>
+        guard.action === "host_session_refresh"
+          ? {
+            ...guard,
+            state: "blocked",
+            reason: "Refresh is paused while cost posture is conservative.",
+            budget_state: "conservative"
+          }
+          : guard
+      )
+    }
+  });
+
+  assert.equal(safetyActionBlocked(data, "host_session_refresh"), true);
+  assert.equal(safetyActionReason(data, "host_session_refresh"), "Refresh is paused while cost posture is conservative.");
+  assert.equal(safetyActionBlocked(data, "command_create"), false);
+  assert.equal(safetyActionReason(data, "command_create"), undefined);
 });
 
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {
@@ -901,8 +927,31 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
       window_sample_count: 0,
       windows: []
     },
+    safety: safety(),
     server_time: "2026-06-12T10:00:00.000Z",
     ...overrides
+  };
+}
+
+function safety(): BootstrapPayload["safety"] {
+  return {
+    state: "normal",
+    paused: false,
+    generated_at: "2026-06-12T10:00:00.000Z",
+    summary: "Dogfood writes are allowed.",
+    actions: [
+      "command_create",
+      "local_thread_create",
+      "host_session_refresh",
+      "host_session_attach",
+      "task_archive",
+      "budget_bootstrap"
+    ].map((action) => ({
+      action: action as BootstrapPayload["safety"]["actions"][number]["action"],
+      state: "allowed" as const,
+      reason: "Allowed.",
+      budget_state: "normal" as const
+    }))
   };
 }
 

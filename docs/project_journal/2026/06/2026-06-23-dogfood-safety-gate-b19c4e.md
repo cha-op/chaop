@@ -1,0 +1,51 @@
+---
+id: 20260623-b19c4e
+title: Dogfood Safety Gate
+status: active
+created: 2026-06-23
+updated: 2026-06-23
+branch: wip/dogfood-safety-gate
+pr:
+supersedes:
+superseded_by:
+---
+
+[ British English | [简体中文](2026-06-23-dogfood-safety-gate-b19c4e.zh-Hans.md) ]
+
+# Dogfood Safety Gate
+
+## Summary
+- PR A starts from the updated `master` after the app-server attach/resume PR was merged.
+- The goal is to keep dogfood usage cost-safe before adding the richer Thread Centre chat flow.
+- The slice should expose the current safety posture prominently, guard costly write and refresh actions on the server, and provide an emergency pause or stop path that works even when multiple browsers are open.
+
+## Implementation Plan
+- Add a protocol/API safety posture that derives from the current Budget Summary and any emergency pause flag.
+- Gate expensive browser-triggered operations such as command creation, local thread creation, Host Session refresh, and app-server attach/backfill when posture is unsafe.
+- Add a Browser control for emergency pause/resume and make disabled actions explain the active limit instead of failing silently.
+- Keep broad Host Session inventory opt-in and debounce-preserving.
+- Update tests, bilingual docs, and deployed E2E smoke expectations before opening the PR.
+
+## Validation Plan
+- Run focused worker/web tests while developing.
+- Run the full local gate before commit: pnpm tests, Rust tests, journal validation, build, formatting, and diff checks.
+- Redeploy API and Web after code changes, then run the deployed E2E smoke.
+- Run three review lanes before merge and resolve every GitHub conversation.
+
+## Progress
+- Implemented the protocol safety posture, Worker guard, emergency pause/resume API, and Browser safety strip.
+- Guarded command creation, local thread creation, Host Session refresh, app-server attach, task archive/unarchive, and budget bootstrap from the server side.
+- Added tests for conservative posture, emergency pause/resume, blocked command creation, blocked Host Session refresh, migration coverage, null telemetry handling, and Browser safety helper behaviour.
+
+## Local Validation
+- `pnpm --filter @chaop/web test`
+- `pnpm --filter @chaop/worker test`
+- `pnpm test`
+- `pnpm build`
+- `cargo fmt --check`
+- `python3 /Users/joey/.codex/personal-sync/overlays/private/releases/5f1ab3fa5d9f7d534507216a2d6f765694f9b710/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo .`
+- `git diff --check`
+
+## Next Steps
+- Create the review anchor commit and run the three review lanes.
+- Push the PR, deploy the API/Web refresh, run deployed E2E smoke, then resolve review conversations before merge.
