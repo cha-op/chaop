@@ -1295,7 +1295,8 @@ export async function findAttachedHostSessionForTaskInDb(
 export async function recordHostSessionBackfillEvents(
   env: Env,
   hostSession: HostSessionSummary,
-  events: AgentBackfillEvent[]
+  events: AgentBackfillEvent[],
+  accountedAt = new Date().toISOString()
 ): Promise<ThreadEvent[]> {
   if (!env.DB || !hostSession.attached_thread_id) {
     return [];
@@ -1366,7 +1367,7 @@ export async function recordHostSessionBackfillEvents(
     }
     imported.push(stored);
   }
-  await recordUsageWindowsForEventsBestEffort(env, imported);
+  await recordUsageWindowsForEventsBestEffort(env, imported, accountedAt);
 
   return imported;
 }
@@ -3863,10 +3864,10 @@ async function appendEvent(
   return event;
 }
 
-async function recordUsageWindowsForEventsBestEffort(env: Env, events: ThreadEvent[]): Promise<void> {
+async function recordUsageWindowsForEventsBestEffort(env: Env, events: ThreadEvent[], accountedAt?: string): Promise<void> {
   if (events.length === 0) return;
   try {
-    await recordUsageWindowsForEvents(env, events);
+    await recordUsageWindowsForEvents(env, events, accountedAt);
   } catch (error) {
     console.warn("Usage window update failed", {
       event_count: events.length,
@@ -3875,10 +3876,11 @@ async function recordUsageWindowsForEventsBestEffort(env: Env, events: ThreadEve
   }
 }
 
-async function recordUsageWindowsForEvents(env: Env, events: ThreadEvent[]): Promise<void> {
+async function recordUsageWindowsForEvents(env: Env, events: ThreadEvent[], accountedAt?: string): Promise<void> {
   const aggregates = new Map<string, UsageWindowAggregate>();
   for (const event of events) {
-    const timestamp = new Date(event.created_at);
+    const accountingTimestamp = accountedAt ?? event.created_at;
+    const timestamp = new Date(accountingTimestamp);
     if (Number.isNaN(timestamp.getTime())) continue;
 
     const metrics = usageMetricsForEvent(event);
@@ -3889,7 +3891,7 @@ async function recordUsageWindowsForEvents(env: Env, events: ThreadEvent[]): Pro
         existing.metrics.compacted += metrics.compacted;
         existing.metrics.delayed += metrics.delayed;
         existing.metrics.spoolBytes += metrics.spoolBytes;
-        existing.updatedAt = newerIso(existing.updatedAt, event.created_at);
+        existing.updatedAt = newerIso(existing.updatedAt, accountingTimestamp);
       } else {
         aggregates.set(window.id, {
           window,
@@ -3899,7 +3901,7 @@ async function recordUsageWindowsForEvents(env: Env, events: ThreadEvent[]): Pro
             delayed: metrics.delayed,
             spoolBytes: metrics.spoolBytes
           },
-          updatedAt: event.created_at
+          updatedAt: accountingTimestamp
         });
       }
     }
@@ -4876,7 +4878,8 @@ function budgetConstraints(
       fourHourWindow ?? fourHourBaseline,
       model.budgeted_rows_written_per_event,
       undefined,
-      fourHourBaseline ? "schema_model" : undefined
+      fourHourBaseline ? "schema_model" : undefined,
+      model.four_hour_soft_budget_units
     ),
     d1WriteConstraint(
       "d1_rows_written_burst",
@@ -4931,9 +4934,11 @@ function d1WriteConstraint(
   window: BudgetWindowSignal | undefined,
   rowsPerEvent: number,
   telemetryUsedRows?: number | undefined,
-  localSource?: BudgetConstraint["source"] | undefined
+  localSource?: BudgetConstraint["source"] | undefined,
+  softEventBudget?: number | undefined
 ): BudgetConstraint {
   const limitUnits = eventBudget * rowsPerEvent;
+  const softLimitUnits = softEventBudget === undefined ? undefined : softEventBudget * rowsPerEvent;
   const localUsedRows = window ? window.events_received * rowsPerEvent : null;
   const usedUnits = d1RowsWrittenConstraintUsedUnits(localUsedRows, telemetryUsedRows);
   const sampled = localSource === "schema_model" ? false : usedUnits !== null;
@@ -4947,7 +4952,7 @@ function d1WriteConstraint(
     limitUnits,
     usedUnits,
     perEventUnits: rowsPerEvent,
-    state: usedUnits === null ? "missing" : budgetStateForUsageCount(usedUnits, thresholdSet(limitUnits)),
+    state: usedUnits === null ? "missing" : budgetStateForUsageCount(usedUnits, thresholdSet(limitUnits, softLimitUnits)),
     source,
     sampled,
     window

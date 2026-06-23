@@ -232,7 +232,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const archived = taskArchiveMatch[2] === "archive";
       const task = archived ? await archiveTaskInDb(env, taskId) : await unarchiveTaskInDb(env, taskId);
       const hostSession = await findAttachedHostSessionForTaskInDb(env, taskId);
-      const archiveSync = hostSession?.app_server_present === true
+      const archiveSync = hostSession && isAppServerHostSessionLineage(hostSession)
         ? await requestThreadArchiveSync(env, hostSession, archived)
         : undefined;
       const response: TaskArchiveResponse = {
@@ -624,14 +624,14 @@ async function ensureHostSessionAppServerIfAvailable(
   if (await hasLiveHostSessionAttachmentInDb(env, hostSession)) {
     return hostSession.connector_id;
   }
-  if (hostSession.app_server_present) {
-    return hostSession.connector_id;
-  }
   if (!(await connectorHasCapability(env, hostSession.connector_id, "host_session_app_server_ensure"))) {
     return hostSession.connector_id;
   }
 
   const session = await requestHostSessionAppServerEnsure(env, hostSession);
+  if (session.session_id !== hostSession.session_id) {
+    throw new ConnectorRpcError("Connector returned a different app-server host session", 502);
+  }
   if (session.app_server_present !== true) {
     throw new ConnectorRpcError("Connector did not return an app-server-backed host session", 502);
   }
@@ -746,6 +746,10 @@ async function requestThreadArchiveSync(
     archived,
     error: body.synced === false ? "No matching app-server thread was found" : undefined
   };
+}
+
+function isAppServerHostSessionLineage(hostSession: HostSessionSummary): boolean {
+  return hostSession.app_server_present === true || hostSession.title_source === "app_server";
 }
 
 async function requestAndRecordHostSessionBackfill(

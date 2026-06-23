@@ -1404,8 +1404,8 @@ test("recordHostSessionBackfillEvents imports events idempotently", async () => 
     }
   ];
 
-  const first = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events);
-  const second = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events);
+  const first = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events, "2026-06-23T09:15:30.000Z");
+  const second = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events, "2026-06-23T09:16:30.000Z");
 
   assert.equal(first.length, 2);
   assert.equal(first[0]?.seq, 1);
@@ -1414,6 +1414,11 @@ test("recordHostSessionBackfillEvents imports events idempotently", async () => 
   assert.equal(db.eventInserts, 2);
   assert.equal(db.sequenceUpdates, 2);
   assert.equal(db.usageWindowUpserts, 3);
+  assert.deepEqual(db.usageWindowBinds.map((args) => args[2]), [
+    "2026-06-23T00:00:00.000Z",
+    "2026-06-23T08:00:00.000Z",
+    "2026-06-23T09:15:00.000Z"
+  ]);
   assert.deepEqual(db.usageWindowBinds.map((args) => args[6]), [2, 2, 2]);
   assert.deepEqual(db.usageWindowBinds.map((args) => args[7]), [2, 2, 2]);
   assert.deepEqual(db.usageWindowBinds.map((args) => args[8]), [2, 2, 2]);
