@@ -1,6 +1,6 @@
 ---
 id: 20260623-6a4b8d-zh-Hans
-title: Conservative D1 Write Guardrail
+title: 保守 D1 写入护栏
 status: active
 created: 2026-06-23
 updated: 2026-06-23
@@ -12,7 +12,7 @@ superseded_by:
 
 [ [British English](2026-06-23-conservative-d1-write-guardrail-6a4b8d.md) | 简体中文 ]
 
-# Conservative D1 Write Guardrail
+# 保守 D1 写入护栏
 
 ## 摘要
 - 合并前 review 发现：Cloudflare telemetry missing 时，本地 D1 rows-written guardrails 使用了最便宜的 steady persisted-event 成本，也就是 12 行。
@@ -25,6 +25,7 @@ superseded_by:
 - 详细 D1 write model 仍然展示更便宜的 event components：steady realtime event 12 行，window-boundary event 14/16/18 行，backfill event 每个 6 行加 batched usage-window updates，steady attached command lifecycle 20 行，以及 no-telemetry guardrail budget 26 行。
 - Cloudflare telemetry 可用时仍然优先使用实测值。保守 fallback 主要覆盖 telemetry 未配置、missing 或临时失败的时候。
 - tracked Wrangler defaults 已更新到保守 event capacities，避免新的通用部署继承旧的乐观阈值。
+- 部署指南示例也使用同一组保守 capacities，因为 deploy profile 中的值会覆盖 Worker runtime vars。
 - Review follow-up 会在 D1 rows-written constraint state 中保留 four-hour soft budget，并按导入时间记录 Host Session backfill usage windows，同时在 thread history 里保留原始 event timestamp。
 
 ## 验证

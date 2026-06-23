@@ -25,6 +25,7 @@ superseded_by:
 - The detailed D1 write model still exposes cheaper event components: 12 rows for a steady realtime event, 14/16/18 rows for window-boundary events, 6 rows per backfill event plus batched usage-window updates, 20 rows for a steady attached command lifecycle, and 26 rows for the no-telemetry guardrail budget.
 - Cloudflare telemetry remains preferred when available. The conservative fallback matters when telemetry is unconfigured, missing, or temporarily failing.
 - Tracked Wrangler defaults were updated to the conservative event capacities so new generic deployments do not inherit the older optimistic thresholds.
+- Deployment guide examples use the same conservative capacities because deploy profiles override Worker runtime vars when present.
 - Review follow-up keeps the four-hour soft budget in the D1 rows-written constraint state and charges Host Session backfill usage windows at import time, while preserving original event timestamps in thread history.
 
 ## Validation
