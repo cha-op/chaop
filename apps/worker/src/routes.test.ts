@@ -1912,7 +1912,8 @@ test("safety posture reports conservative inventory guard without blocking focus
       ["host_session_refresh", "blocked"],
       ["host_session_attach", "allowed"],
       ["task_archive", "allowed"],
-      ["budget_bootstrap", "allowed"]
+      ["budget_bootstrap", "allowed"],
+      ["agent_event", "allowed"]
     ]
   );
   assert.match(

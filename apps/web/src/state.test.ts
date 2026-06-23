@@ -938,14 +938,15 @@ function safety(): BootstrapPayload["safety"] {
     state: "normal",
     paused: false,
     generated_at: "2026-06-12T10:00:00.000Z",
-    summary: "Dogfood writes are allowed.",
+    summary: "Guarded dogfood actions are allowed.",
     actions: [
       "command_create",
       "local_thread_create",
       "host_session_refresh",
       "host_session_attach",
       "task_archive",
-      "budget_bootstrap"
+      "budget_bootstrap",
+      "agent_event"
     ].map((action) => ({
       action: action as BootstrapPayload["safety"]["actions"][number]["action"],
       state: "allowed" as const,

@@ -356,7 +356,7 @@ export class ChaopApp extends LitElement {
       this.mergeSafetyPosture(response.safety);
       this.hostSessionsAutoRefresh = false;
       this.stopHostSessionsAutoRefresh();
-      this.actionNotice = "Dogfood writes paused.";
+      this.actionNotice = "Guarded dogfood actions paused.";
       this.safetyControlState = "idle";
     } catch (error) {
       this.safetyControlState = "failed";
@@ -371,7 +371,7 @@ export class ChaopApp extends LitElement {
     try {
       const response = await resumeDogfoodSafety();
       this.mergeSafetyPosture(response.safety);
-      this.actionNotice = "Dogfood writes resumed.";
+      this.actionNotice = "Guarded dogfood actions resumed.";
       this.safetyControlState = "idle";
     } catch (error) {
       this.safetyControlState = "failed";

@@ -4995,7 +4995,7 @@ async function loadDogfoodSafetyPause(
     });
     return {
       paused: true,
-      reason: "Dogfood safety pause state could not be loaded; dogfood writes are blocked until the control-plane setting is readable.",
+      reason: "Dogfood safety pause state could not be loaded; guarded dogfood actions are blocked until the control-plane setting is readable.",
       updated_at: generatedAt
     };
   }
@@ -5159,8 +5159,8 @@ function dogfoodSafetySummary(
   }
   if (state === "hard_limited" || state === "throttled") {
     return bottleneck
-      ? `Cost posture is ${state.replace("_", " ")}; ${bottleneck.label} is blocking dogfood writes.`
-      : `Cost posture is ${state.replace("_", " ")}; dogfood writes are blocked.`;
+      ? `Cost posture is ${state.replace("_", " ")}; ${bottleneck.label} is blocking guarded dogfood actions.`
+      : `Cost posture is ${state.replace("_", " ")}; guarded dogfood actions are blocked.`;
   }
   if (state === "conservative") {
     return bottleneck
@@ -5168,8 +5168,8 @@ function dogfoodSafetySummary(
       : "Cost posture is conservative; broad refresh is blocked.";
   }
   return bottleneck
-    ? `Dogfood writes are allowed. Current bottleneck: ${bottleneck.label}.`
-    : "Dogfood writes are allowed.";
+    ? `Guarded dogfood actions are allowed. Current bottleneck: ${bottleneck.label}.`
+    : "Guarded dogfood actions are allowed.";
 }
 
 function boundedSafetyReason(reason: string | undefined): string | undefined {
@@ -5184,7 +5184,8 @@ const DOGFOOD_SAFETY_ACTIONS: DogfoodSafetyAction[] = [
   "host_session_refresh",
   "host_session_attach",
   "task_archive",
-  "budget_bootstrap"
+  "budget_bootstrap",
+  "agent_event"
 ];
 
 function emptyBudgetSummary(generatedAt: string): BudgetSummary {

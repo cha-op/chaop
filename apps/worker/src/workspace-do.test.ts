@@ -1729,6 +1729,42 @@ test("agent event ack rejects stale command events", async () => {
   });
 });
 
+test("agent event ack is rejected while dogfood safety blocks agent events", async () => {
+  const sent: string[] = [];
+  const agentSocket = {
+    send(message: string) {
+      sent.push(message);
+    },
+    deserializeAttachment() {
+      return { socketType: "agent", connectorId: "connector-online", connectedAt: 300, agentReady: true };
+    }
+  } as unknown as WebSocket;
+  const db = dogfoodSafetyBlockedAgentEventDb();
+  const workspace = new WorkspaceDO({} as DurableObjectState, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "command.output",
+      priority: "P2",
+      summary: "Should not be persisted"
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean; reason?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.command_id, "command-1");
+  assert.equal(ack.payload?.kind, "command.output");
+  assert.equal(ack.payload?.accepted, false);
+  assert.match(ack.payload?.reason ?? "", /Dogfood emergency pause is active/);
+  assert.equal(db.commandQueries, 0);
+});
+
 test("rejected stale final command events still poll pending work for the connector", async () => {
   const sent: string[] = [];
   const agentSocket = {
@@ -1936,6 +1972,9 @@ test("rejected targeted app-server starts trigger pending dispatch to available 
 function staleCommandEventDb(): D1Database {
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
@@ -1968,6 +2007,9 @@ function staleFinalCommandEventDb(): D1Database & { readonly pendingDispatchQuer
   const counters = { pendingDispatchQueries: 0 };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
@@ -2047,6 +2089,100 @@ function staleFinalCommandEventDb(): D1Database & { readonly pendingDispatchQuer
   } as D1Database & { readonly pendingDispatchQueries: number };
 }
 
+function dogfoodSafetyBlockedAgentEventDb(): D1Database & { readonly commandQueries: number } {
+  const counters = { commandQueries: 0 };
+  return {
+    prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql, { paused: true });
+      if (safetyStatement) return safetyStatement;
+
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
+        counters.commandQueries += 1;
+        return {
+          bind() {
+            return {
+              async first() {
+                return undefined;
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandQueries() {
+      return counters.commandQueries;
+    }
+  } as unknown as D1Database & { readonly commandQueries: number };
+}
+
+function safetyQueryStatement(sql: string, options: { paused?: boolean } = {}) {
+  if (/SELECT value_json, updated_at FROM control_plane_settings/.test(sql)) {
+    return {
+      bind(key: string) {
+        assert.equal(key, "dogfood_safety.pause");
+        return {
+          async first() {
+            return options.paused
+              ? {
+                value_json: JSON.stringify({
+                  paused: true,
+                  reason: "operator stop",
+                  updated_at: "2026-06-12T10:00:00.000Z"
+                }),
+                updated_at: "2026-06-12T10:00:00.000Z"
+              }
+              : undefined;
+          }
+        };
+      }
+    };
+  }
+
+  if (/FROM usage_windows/.test(sql)) {
+    return {
+      bind() {
+        return {
+          async first() {
+            return undefined;
+          }
+        };
+      }
+    };
+  }
+
+  if (/FROM budget_telemetry_samples/.test(sql)) {
+    return {
+      bind() {
+        return {
+          async first() {
+            return undefined;
+          }
+        };
+      }
+    };
+  }
+
+  if (/FROM connectors/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+    return {
+      async all() {
+        return { results: [] };
+      }
+    };
+  }
+
+  if (/FROM tasks/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+    return {
+      async all() {
+        return { results: [] };
+      }
+    };
+  }
+
+  return undefined;
+}
+
 function rejectedStartedEventWithFailedResultDb(): D1Database & {
   readonly explicitFailures: number;
   readonly pendingDispatchQueries: number;
@@ -2057,6 +2193,9 @@ function rejectedStartedEventWithFailedResultDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
@@ -2250,6 +2389,9 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {

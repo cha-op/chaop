@@ -39,6 +39,8 @@ superseded_by:
 - Fixed the first review finding by including connector and active task budget states in the dogfood safety posture and server-side guard decisions.
 - Preserved structured safety payloads in Browser API errors so a server-side safety block immediately updates the local UI posture.
 - Fixed a second review finding by making unreadable emergency-pause state fail closed instead of allowing guarded writes.
+- Added the `agent_event` guard so running connector WebSocket events are rejected before D1 event persistence when dogfood safety is paused or hard-limited.
+- Narrowed safety copy from broad "dogfood writes" wording to "guarded dogfood actions" so cleanup paths that remain intentionally available are not misrepresented.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

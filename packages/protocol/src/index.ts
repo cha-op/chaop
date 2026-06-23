@@ -469,7 +469,8 @@ export type DogfoodSafetyAction =
   | "host_session_refresh"
   | "host_session_attach"
   | "task_archive"
-  | "budget_bootstrap";
+  | "budget_bootstrap"
+  | "agent_event";
 
 export type DogfoodSafetyActionState = "allowed" | "blocked";
 

@@ -39,6 +39,8 @@ superseded_by:
 - 已修复第一条 review 发现的问题：dogfood safety posture 和 server-side guard decisions 现在会纳入 connector 与 active task 的 budget states。
 - Browser API error 现在会保留结构化 safety payload，因此 server-side safety block 可以立即更新本地 UI posture。
 - 已修复第二条 review 发现的问题：emergency-pause state 无法读取时现在会 fail closed，而不是继续允许受保护的写入。
+- 已新增 `agent_event` guard；当 dogfood safety 暂停或进入 hard limit 时，运行中的 connector WebSocket events 会在 D1 event persistence 前被拒绝。
+- 已把 safety 文案从宽泛的 “dogfood writes” 收窄为 “guarded dogfood actions”，避免把仍需保留的 cleanup paths 误描述为同一类受阻动作。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

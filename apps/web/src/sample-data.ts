@@ -695,6 +695,12 @@ function fallbackSafety(): DogfoodSafetyPosture {
         state: "allowed",
         reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
         ...guarded
+      },
+      {
+        action: "agent_event",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
       }
     ]
   };
