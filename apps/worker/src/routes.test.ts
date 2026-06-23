@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { handleRequest } from "./routes.js";
 import { loadBudgetSummaryFromDb, loadDogfoodSafetyPostureFromDb } from "./db.js";
 import type { Env } from "./types.js";
@@ -10,6 +11,50 @@ const devEnv: Env = {
   CHAOP_GUI_DOMAIN: "app.example.com",
   AGENT_BOOTSTRAP_SECRET: "test-bootstrap"
 };
+
+async function accessJwtTestContext(teamDomain: string): Promise<{
+  env: Env;
+  jwt: string;
+  restore: () => void;
+}> {
+  const audience = "test-access-aud";
+  const kid = "test-access-key";
+  const { publicKey, privateKey } = await generateKeyPair("RS256");
+  const jwk = await exportJWK(publicKey);
+  jwk.kid = kid;
+  jwk.alg = "RS256";
+  jwk.use = "sig";
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const requestUrl = input instanceof Request ? input.url : String(input);
+    assert.equal(requestUrl, `${teamDomain}/cdn-cgi/access/certs`);
+    return new Response(JSON.stringify({ keys: [jwk] }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const jwt = await new SignJWT({ email: "operator@example.com" })
+    .setProtectedHeader({ alg: "RS256", kid })
+    .setIssuer(teamDomain)
+    .setAudience(audience)
+    .setSubject("operator")
+    .setIssuedAt()
+    .setExpirationTime("1h")
+    .sign(privateKey);
+
+  return {
+    env: {
+      CHAOP_API_DOMAIN: "api.example.com",
+      CHAOP_GUI_DOMAIN: "app.example.com",
+      ACCESS_AUD: audience,
+      ACCESS_TEAM_DOMAIN: teamDomain
+    },
+    jwt,
+    restore: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
 
 test("health route returns service metadata", async () => {
   const response = await handleRequest(new Request("https://api.example.com/api/health"), devEnv);
@@ -140,6 +185,37 @@ test("host session refresh dispatches to the workspace durable object", async ()
   assert.equal(body.debounced_connector_count, 1);
   assert.equal(body.cooldown_ms, 60_000);
   assert.equal(internalPath, "/internal/refresh-host-sessions");
+});
+
+test("host session refresh requires D1 binding outside sample mode", async () => {
+  const { env, jwt, restore } = await accessJwtTestContext("https://access-refresh.example.com");
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/host-sessions/refresh", {
+        method: "POST",
+        headers: {
+          origin: "https://app.example.com",
+          "cf-access-jwt-assertion": jwt
+        }
+      }),
+      {
+        ...env,
+        WORKSPACE_DO: {
+          idFromName: () => ({}) as DurableObjectId,
+          get: () => ({
+            fetch: async () => {
+              throw new Error("DO should not be called without a D1 binding");
+            }
+          }) as unknown as DurableObjectStub
+        } as unknown as DurableObjectNamespace
+      }
+    );
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: "DB binding is required" });
+  } finally {
+    restore();
+  }
 });
 
 test("sample safety blocks host session refresh before Durable Object dispatch", async () => {

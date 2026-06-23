@@ -58,6 +58,7 @@ superseded_by:
 - Stopped Host Session auto-refresh immediately after a server safety block returns updated safety posture.
 - Fixed the same-bucket Cloudflare telemetry persistence path so cumulative counters update the existing bucket row, keeping later write guards aligned with the latest explicit safety or budget refresh.
 - Tightened guarded write telemetry reads to use the current UTC day's persisted maximum cumulative counters per metric, so a later lower Cloudflare sample cannot relax an earlier hard limit.
+- Made production Host Session refresh fail closed when the D1 binding is unavailable, while keeping sample-mode refresh governed by sample safety.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

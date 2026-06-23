@@ -323,6 +323,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
     const auth = await authenticateBrowser(request, env);
     if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB && !allowsSampleData(env)) return json(request, env, { error: "DB binding is required" }, 503);
     if (!env.WORKSPACE_DO) return json(request, env, { error: "Workspace Durable Object binding is unavailable" }, 503);
 
     const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "host_session_refresh");
