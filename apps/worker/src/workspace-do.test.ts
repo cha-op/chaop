@@ -1119,6 +1119,50 @@ test("agent.ready dispatches pending commands while conservative posture blocks 
   assert.equal(attachment.pendingHostSessionsDispatch, false);
 });
 
+test("agent.ready stops pending dispatch after stale cleanup moves safety to hard limit", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({
+    pendingCommand: true,
+    safetyBudgetState: "conservative",
+    safetyBudgetStateAfterStaleCleanup: "hard_limited"
+  });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.ready",
+    payload: { capabilities: ["placeholder_commands"] }
+  }));
+
+  assert.equal(db.capabilityUpdates, 1);
+  assert.equal(db.staleExplicitCleanupQueries, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
+  assert.equal(sent.length, 1);
+  assert.equal(browserSent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; capabilities?: string[] };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.ready");
+});
+
 test("agent.ready does not dispatch while a peer socket has host-session refresh pending", async () => {
   const staleSent: string[] = [];
   const refreshingSent: string[] = [];

@@ -468,6 +468,7 @@ export type DogfoodSafetyAction =
   | "local_thread_create"
   | "host_session_refresh"
   | "host_session_attach"
+  | "host_session_detach"
   | "task_archive"
   | "budget_bootstrap"
   | "agent_event";

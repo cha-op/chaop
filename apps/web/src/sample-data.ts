@@ -685,6 +685,12 @@ function fallbackSafety(): DogfoodSafetyPosture {
         ...guarded
       },
       {
+        action: "host_session_detach",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
+      },
+      {
         action: "task_archive",
         state: "allowed",
         reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",

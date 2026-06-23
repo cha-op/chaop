@@ -42,7 +42,7 @@ superseded_by:
 - 已新增 `agent_event` guard；当 dogfood safety 暂停或进入 hard limit 时，运行中的 connector WebSocket events 会在 D1 event persistence 前被拒绝。
 - 已细化 `agent_event` 行为：pause 或 hard limit 期间会挡住高频非终态 events，但 `command.finished` / `command.failed` 仍可关闭 command 并清理 socket activity。
 - 自动 `agent.ready` Host Session refresh dispatch 现在也会走同一个 `host_session_refresh` safety action；当 refresh 被挡住时，同一轮 ready cycle 也不会继续派发 pending command。
-- Server-side safety posture 已从持久化 telemetry sample 改为短缓存 live Cloudflare telemetry best-effort；受保护 action path 不会因此持久化 telemetry sample。
+- `/api/safety-posture` 继续作为短缓存 live Cloudflare telemetry 的显式刷新路径，并会把该 sample 写入低频 telemetry bucket，供后续写入 guard 复用。
 - 已把 safety 文案从宽泛的 “dogfood writes” 收窄为 “guarded dogfood actions”，避免把仍需保留的 cleanup paths 误描述为同一类受阻动作。
 - 已把 conservative Host Session refresh block 和 focused pending command dispatch 拆开，避免 conservative posture 卡住已经接受的工作。
 - 每次 pending command lease/dispatch 前都会重新检查 `command_create` safety，因此 terminal command cleanup 不会在 dogfood safety pause、hard limit 或 throttled 状态下启动下一条 pending command。
@@ -52,7 +52,10 @@ superseded_by:
 - 本地 dev mode 无 D1 binding 时，standalone safety-posture endpoint 现在会与 sample bootstrap data 保持一致。
 - legacy bootstrap payload 缺少 `safety` 时现在会自动补默认 posture，避免 Web/API 错峰部署导致 Browser shell 空白。
 - 受保护写路径的 safety check 现在只读取已持久化 telemetry sample，不再等待 live Cloudflare GraphQL；`/api/safety-posture` 仍作为显式 live refresh 路径。
-- stale app-server target cleanup 之后会重新检查 `command_create` safety，再决定是否 dispatch pending commands。
+- Host Session detach 现在也经过 safety gate，因为 detach 可能清除 attachment、失败 command，并触发 released work dispatch。
+- stale app-server target cleanup 之后会在 direct `agent.ready` 和 internal dispatch paths 上重新检查 `command_create` safety，再决定是否 dispatch pending commands。
+- 无 D1 的 sample mode 只保留 read-only safety：sample refresh 会被 sample safety 阻挡，pause/resume 必须有真实 D1 binding。
+- Server 返回 safety block 并带回新 posture 后，Host Session auto-refresh 会立刻停止。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

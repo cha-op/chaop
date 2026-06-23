@@ -901,6 +901,9 @@ export class WorkspaceDO implements DurableObject {
     let releasedConnectorIds: string[] = [];
     if (!options.skipStaleExplicitCleanup) {
       releasedConnectorIds = await this.cleanupStaleExplicitAppServerCommandTargets(connectorId);
+      if (!(await this.canDispatchPendingCommands())) {
+        return releasedConnectorIds;
+      }
     }
     const dispatches = await pendingCommandsForConnector(this.env, connectorId);
     for (const payload of dispatches) {

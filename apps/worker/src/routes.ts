@@ -115,7 +115,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
     const auth = await authenticateBrowser(request, env);
     if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
-    if (!env.DB && !allowsSampleData(env)) {
+    if (!env.DB) {
       return json(request, env, { error: "DB binding is required" }, 503);
     }
     const payload = await readOptionalJson(request);
@@ -434,6 +434,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     try {
+      const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "host_session_detach");
+      if (safetyResponse) return safetyResponse;
       const {
         released_connector_ids: releasedConnectorIds,
         failed_events: failedEvents,
@@ -517,6 +519,13 @@ async function dogfoodSafetyGuardResponse(
   env: Env,
   action: Parameters<typeof assertDogfoodSafetyActionAllowed>[1]
 ): Promise<Response | undefined> {
+  if (!env.DB && allowsSampleData(env)) {
+    const guard = sampleSafety.actions.find((item) => item.action === action);
+    if (guard?.state === "blocked") {
+      return dogfoodSafetyErrorResponse(request, env, new DogfoodSafetyError(guard.reason, sampleSafety, guard));
+    }
+    return undefined;
+  }
   try {
     await assertDogfoodSafetyActionAllowed(env, action);
     return undefined;

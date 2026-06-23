@@ -297,6 +297,9 @@ export async function loadDogfoodSafetyPostureFromDb(
       : listTaskBudgetStates(env),
     telemetryPromise
   ]);
+  if (options.refreshCloudflareTelemetry) {
+    await persistBudgetTelemetrySampleBestEffort(env, telemetry, effectiveGeneratedAt);
+  }
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
   const constraints = budgetConstraints(
@@ -5204,6 +5207,7 @@ const DOGFOOD_SAFETY_ACTIONS: DogfoodSafetyAction[] = [
   "local_thread_create",
   "host_session_refresh",
   "host_session_attach",
+  "host_session_detach",
   "task_archive",
   "budget_bootstrap",
   "agent_event"

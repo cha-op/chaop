@@ -42,7 +42,7 @@ superseded_by:
 - Added the `agent_event` guard so running connector WebSocket events are rejected before D1 event persistence when dogfood safety is paused or hard-limited.
 - Refined `agent_event` handling so noisy non-terminal events are blocked during pause or hard limit, while terminal `command.finished` / `command.failed` events can still close the command and clear socket activity.
 - Guarded automatic `agent.ready` Host Session refresh dispatches with the same `host_session_refresh` safety action, and skipped pending command dispatch in the same ready cycle when the refresh is blocked.
-- Switched server-side safety posture from persisted telemetry samples to short-cached live Cloudflare telemetry best-effort, without persisting telemetry from guarded action paths.
+- Kept `/api/safety-posture` as the explicit short-cached live Cloudflare telemetry refresh, and persisted that sample into the low-frequency telemetry bucket for later write guards.
 - Narrowed safety copy from broad "dogfood writes" wording to "guarded dogfood actions" so cleanup paths that remain intentionally available are not misrepresented.
 - Split conservative Host Session refresh blocking from focused pending command dispatch so a conservative posture does not strand already accepted work.
 - Re-checked `command_create` safety before every pending command lease/dispatch, so terminal command cleanup cannot start another pending command while dogfood safety is paused, hard-limited, or throttled.
@@ -52,7 +52,10 @@ superseded_by:
 - Kept the standalone safety-posture endpoint aligned with sample bootstrap data when local dev mode runs without a D1 binding.
 - Normalised legacy bootstrap payloads without `safety`, so a staggered Web/API deployment does not blank the Browser shell.
 - Moved guarded write-path safety checks to persisted telemetry samples instead of live Cloudflare GraphQL calls, while keeping `/api/safety-posture` as the explicit live refresh path.
-- Rechecked `command_create` safety after stale app-server target cleanup before dispatching pending commands.
+- Guarded Host Session detach with the safety gate because detaching can clear attachments, fail commands, and dispatch released work.
+- Rechecked `command_create` safety after stale app-server target cleanup before dispatching pending commands on both direct `agent.ready` and internal dispatch paths.
+- Kept no-D1 sample-mode safety read-only: sample refresh is blocked by sample safety, while pause/resume requires a real D1 binding.
+- Stopped Host Session auto-refresh immediately after a server safety block returns updated safety posture.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

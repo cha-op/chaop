@@ -39,7 +39,7 @@ D1 绑定可用时，Browser 里的 Budget Board 会使用 Chaop 自己控制的
 - 缺失的当前 four-hour 和 burst usage windows 会显示成 `0%` 的本地 schema-model baselines。缺失的 daily D1 rows-written 仍然需要 Cloudflare Analytics 或真实 daily usage window，因为 daily D1 writes 可能包含非 event 的 inventory 和 control-plane writes。
 - 配好 `CF_TELEMETRY_API_TOKEN` 和非 secret telemetry selectors 后，页面可以额外读取 Cloudflare GraphQL Analytics samples，用于 Worker requests、Durable Object request-equivalent usage、D1 rows read 和 D1 rows written。
 - 最近 24 小时的 Cloudflare telemetry history。样本默认按 5 分钟 bucket 通过 `INSERT OR IGNORE` 持久化；同一个 bucket 内重复刷新 Budget Board 不会再写一条 sample row。
-- Server-side dogfood safety guard 使用已持久化的 Cloudflare telemetry samples 和本地 usage windows，不会把 live GraphQL query 放到受保护写路径前面。`/api/safety-posture` 仍然是面向 operator 的 safety data 显式 live refresh 路径。
+- Server-side dogfood safety guard 使用已持久化的 Cloudflare telemetry samples 和本地 usage windows，不会把 live GraphQL query 放到受保护写路径前面。`/api/safety-posture` 仍然是面向 operator 的 safety data 显式 live refresh 路径，并会把刷新到的 sample 写入同一个低频 telemetry bucket，方便后续写入 guard 复用。
 - 聚焦 D1 rows-written 的趋势图。当前 UI 只画 D1 rows written，并展示 15 分钟和 1 小时斜率，以及从 Cloudflare 当日累计样本推导出来的同日投影。
 - 低成本 D1 write activity signals：Cloudflare 测得的当前日 D1 writes、从当前 daily usage window 和 schema write model 推导出的保守 event write 估计值，以及两者之间的 residual gap。Cloudflare telemetry 低于本地 estimate 时，Chaop 会用本地 estimate 作为 daily D1 write guardrail。
 - 详细 budget constraints 会展开 D1 rows written、Worker requests、Durable Object request-equivalent usage 和 D1 rows read。缩略 posture 和 throttle decision 会使用 sampled hard constraints 里 remaining ratio 最低的一项；missing constraints 只在详细视图展示，不参与这个 minimum。
@@ -78,7 +78,7 @@ App-server execution 当前只会把 lifecycle events 和最终 assistant messag
 
 Connector 空闲时 Host Session inventory 会保持静默。Browser 的 Host Sessions 页面提供手动 refresh 按钮，以及显式启用的一分钟自动刷新；Durable Object 会按 connector 去重这些 refresh 请求，所以额外打开的浏览器窗口不会提高 connector 重扫频率。创建或 attach 本机 thread 这类会修改 Host Sessions 的用户动作，仍然可以触发一次即时 inventory report，避免 UI 长时间停留在旧状态。
 
-Dogfood guard 会区分当前 command cleanup 和新 work dispatch。`command.finished`、`command.failed` 这类终态 connector events 在 pause 或 hard limit 期间仍然可以关闭正在运行的 command；但 pending command 在 lease/dispatch 前会重新检查 `command_create` safety，避免继续启动下一轮工作。`conservative` posture 只阻止宽泛 Host Session refresh；已经被接受的 focused command dispatch 仍然允许继续。
+Dogfood guard 会区分当前 command cleanup 和新 work dispatch。`command.finished`、`command.failed` 这类终态 connector events 在 pause 或 hard limit 期间仍然可以关闭正在运行的 command；但 pending command 在 lease/dispatch 前会重新检查 `command_create` safety，包括 stale app-server target cleanup 之后的二次检查，避免继续启动下一轮工作。`conservative` posture 只阻止宽泛 Host Session refresh；已经被接受的 focused command dispatch 仍然允许继续。Host Session detach 也作为写入动作受 guard 保护，因为它可能清除 attachment、失败 command，并触发后续 dispatch。
 
 ## 后续需要保留的成本控制
 

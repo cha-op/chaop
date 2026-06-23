@@ -347,6 +347,13 @@ export class ChaopApp extends LitElement {
     return false;
   }
 
+  private stopHostSessionsAutoRefreshIfBlocked(): void {
+    if (this.hostSessionsAutoRefresh && this.safetyBlocked("host_session_refresh")) {
+      this.hostSessionsAutoRefresh = false;
+      this.stopHostSessionsAutoRefresh();
+    }
+  }
+
   private readonly pauseDogfoodSafety = async (): Promise<void> => {
     this.safetyControlState = "updating";
     this.actionError = undefined;
@@ -1165,6 +1172,7 @@ export class ChaopApp extends LitElement {
     } catch (error) {
       this.hostSessionsRefreshState = "failed";
       this.mergeSafetyPostureFromError(error);
+      this.stopHostSessionsAutoRefreshIfBlocked();
       this.actionError = actionErrorMessage("Host session refresh failed", error);
     }
   }
@@ -1489,10 +1497,7 @@ export class ChaopApp extends LitElement {
         budget,
         safety: safetyResponse.safety
       };
-      if (this.safetyBlocked("host_session_refresh") && this.hostSessionsAutoRefresh) {
-        this.hostSessionsAutoRefresh = false;
-        this.stopHostSessionsAutoRefresh();
-      }
+      this.stopHostSessionsAutoRefreshIfBlocked();
       if (this.actionError?.startsWith("Budget refresh failed:")) {
         this.actionError = undefined;
       }
