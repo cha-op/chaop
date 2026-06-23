@@ -33,6 +33,7 @@ superseded_by:
 - Archive/unarchive sync now uses rollout path resume after source and target `thread/list` misses, then mutates the real app-server `thread.id` returned by resume.
 - Review follow-up rejects app-server ensure responses for a different session id, uses rollout cwd for path-based attach and command resumes, and falls back to rollout resume after page-budgeted `thread/list` misses.
 - Review follow-up also validates the app-server `thread/resume` response session id before returning an ensured Host Session, so a stale or unexpected app-server response cannot attach the wrong local session.
+- Review follow-up also validates rollout-path app-server `thread/resume` responses before managed command `turn/start` and archive/unarchive sync, so a stale or corrupt rollout path cannot run a turn or mutate archive state on a different app-server session.
 - Review follow-up also keeps archive/unarchive sync available for app-server lineage sessions after active inventory demotes `app_server_present`, so an archived app-server thread can be unarchived back through the connector.
 - Successful unarchive sync restores the attached Host Session's D1 `app_server_present` marker when active-only inventory had previously demoted it, so the next managed app-server command is accepted.
 - Review follow-up requests a debounced Host Sessions refresh after `agent.ready` before pending command dispatch, so newly created local sessions become visible without restoring high-frequency connector inventory polling.
@@ -44,6 +45,8 @@ superseded_by:
 - `cargo test -p chaop-agent session_inventory -- --nocapture`
 - `cargo test -p chaop-agent ensure_host_session_rejects_mismatched_resume_session_id -- --test-threads=1`
 - `cargo test -p chaop-agent app_server_command_resumes_unlisted_session_from_rollout_path -- --test-threads=1`
+- `cargo test -p chaop-agent app_server_command_rejects_mismatched_rollout_resume_session_id -- --test-threads=1`
+- `cargo test -p chaop-agent archive_sync_rejects_mismatched_rollout_resume_session_id -- --test-threads=1`
 - `pnpm --dir apps/web test`
 - `pnpm --dir apps/worker test -- routes.test.ts`
 - `pnpm test`

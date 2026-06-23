@@ -1362,15 +1362,32 @@ fn run_app_server_command(
         &cancel,
     )?;
     request_id += 1;
-    let thread_id = match response_thread_id(&resume_response) {
-        Some(thread_id) => thread_id,
-        None if require_resumed_thread_id => {
-            return Err(AppServerCommandError::Other(
-                "app-server thread/resume response did not include thread.id for rollout path resume"
-                    .to_owned(),
-            ));
+    let resumed_thread = if require_resumed_thread_id {
+        let resumed = app_server_thread_from_response(&resume_response)
+            .map_err(|error| {
+                let message = error.to_string();
+                if message == "app-server thread/start response did not include thread.id" {
+                    AppServerCommandError::Other(
+                        "app-server thread/resume response did not include thread.id for rollout path resume"
+                            .to_owned(),
+                    )
+                } else {
+                    AppServerCommandError::Other(message)
+                }
+            })?;
+        if resumed.session_id != session_id {
+            return Err(AppServerCommandError::Other(format!(
+                "app-server thread/resume returned session {} while starting session {session_id}",
+                resumed.session_id
+            )));
         }
-        None => fallback_thread_id,
+        Some(resumed)
+    } else {
+        None
+    };
+    let thread_id = match resumed_thread.as_ref() {
+        Some(resumed) => resumed.id.clone(),
+        None => response_thread_id(&resume_response).unwrap_or(fallback_thread_id),
     };
     let turn_cwd = resume_response
         .pointer("/result/thread/cwd")
@@ -2165,7 +2182,15 @@ fn resume_app_server_thread_from_rollout_path_for_archive(
         deadline,
     )?;
     *next_request_id += 1;
-    Ok(Some(app_server_thread_from_response(&response)?.id))
+    let resumed = app_server_thread_from_response(&response)?;
+    if resumed.session_id != thread_id {
+        return Err(format!(
+            "app-server thread/resume returned session {} while syncing archive for session {thread_id}",
+            resumed.session_id
+        )
+        .into());
+    }
+    Ok(Some(resumed.id))
 }
 
 fn resolve_app_server_thread_ids_for_archive(
@@ -5031,6 +5056,93 @@ mod tests {
     }
 
     #[test]
+    fn archive_sync_rejects_mismatched_rollout_resume_session_id() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            concat!(
+                r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-16T15:01:00.000Z","type":"turn_context","payload":{"cwd":"/tmp/project-from-turn"}}"#
+            ),
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-other",
+                        "cwd": "/tmp/project-from-turn",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let error = set_app_server_thread_archived_at_with_rollout_lookup(
+            &url,
+            "session-tree-1",
+            true,
+            Some((codex_home, SessionInventoryConfig::default().max_sessions)),
+            1,
+        )
+        .expect_err("archive fallback should reject mismatched resume session");
+
+        assert!(error
+            .to_string()
+            .contains("app-server thread/resume returned session session-other while syncing archive for session session-tree-1"));
+
+        let source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("source thread/list request");
+        let target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        assert_eq!(
+            source_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            target_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
     fn archive_sync_succeeds_when_thread_is_already_in_target_state() {
         let (url, requests) = run_fake_app_server_with_requests(vec![
             json!({
@@ -5941,6 +6053,88 @@ mod tests {
         assert_eq!(
             events[0].summary,
             "Codex app-server turn could not start: app-server thread/resume response did not include thread.id for rollout path resume."
+        );
+
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn app_server_command_rejects_mismatched_rollout_resume_session_id() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-other",
+                        "turns": []
+                    }
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                codex_home: Some(codex_home.into()),
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            Some("/tmp/attached-project"),
+            "command-1",
+            "Use the recovered thread",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "command.failed");
+        assert_eq!(
+            events[0].summary,
+            "Codex app-server turn could not start: app-server thread/resume returned session session-other while starting session session-tree-1."
         );
 
         let list_request = requests
