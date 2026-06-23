@@ -14,6 +14,7 @@
 - [done] 为已 attach 的 Host Sessions 增加旧 session history backfill，同时默认不上传宽泛的本机 transcripts。
 - [done] 通过 connector 将 Chaop archive/unarchive 操作同步到本机 Codex app-server archive 状态，同时保持本机 history 文件只读。
 - [done] 为 attach 到本机 app-server Host Session 的 Chaop thread 加入真实 Codex app-server protocol execution。
+- [done] 对不在 app-server `thread/list` 中的历史 rollout session，通过解析本机 rollout path 并调用 app-server `thread/resume` 来完成 attach。
 - [done] PR0：合并已跟踪的 Web deploy script，并通过完整测试、三重 review 和 GitHub conversations resolved 检查。
 - [done] PR1：清理 execution UX 和 capability 文案，让 `codex_exec` 只作为 private fallback。
 - [done] PR2：增加 connector-managed single app-server lifecycle。
@@ -23,3 +24,9 @@
 - [done] PR6：增加 drain、scheduled restart 和 upgrade flow。
 - [done] PR7：增加 multi-instance 和 thread placement foundation。
 - [done] PR8：用真实且 bounded 的 usage/cost metrics 替换 Budget Board placeholder。
+- [in_progress] 在完整 test gate、三路 review 和 GitHub conversations resolved 后，收尾并合并当前 app-server attach/resume PR。
+- [planned] PR A：增加 dogfood safety gate，覆盖可见 cost posture、受保护的 write/refresh actions，以及 emergency pause 或 stop path。
+- [planned] PR B：增加 Thread Centre chat MVP，支持 managed app-server threads、prompt submission、live progress 和 assistant final-answer rendering。
+- [planned] PR C：为 Codex app-server turns 增加 human-in-the-loop approval/input handling。
+- [planned] PR D：增加 persistent connector dogfood runbook 和用于 start、stop、observation、recovery 的 operational scripts。
+- [planned] PR E：强化 dogfood E2E 和 cost telemetry gates；只有再次出现无法解释的写入增长时，才加入精确 D1 write attribution。

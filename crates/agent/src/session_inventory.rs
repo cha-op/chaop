@@ -405,6 +405,39 @@ fn rollout_path_has_session_id(path: &Path, session_id: &str) -> std::io::Result
     Ok(false)
 }
 
+fn rollout_resume_cwd(path: &Path, session_id: &str) -> std::io::Result<Option<String>> {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut matched_session = false;
+    let mut cwd = None;
+    for line in reader.lines().take(80) {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("session_meta")
+                if payload.get("id").and_then(Value::as_str) == Some(session_id) =>
+            {
+                matched_session = true;
+                if let Some(value) = payload.get("cwd").and_then(Value::as_str) {
+                    cwd = Some(value.to_owned());
+                }
+            }
+            Some("turn_context") if matched_session => {
+                if let Some(value) = payload.get("cwd").and_then(Value::as_str) {
+                    cwd = Some(value.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(cwd)
+}
+
 fn read_rollout_backfill(
     path: &Path,
     session_id: &str,
@@ -1133,6 +1166,33 @@ pub fn create_app_server_thread(
     )
 }
 
+pub fn ensure_app_server_host_session(
+    config: &AgentConfig,
+    session_id: &str,
+    title: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    let url =
+        config.session_inventory.app_server_url.as_deref().ok_or(
+            "session_inventory.app_server_url is required for app-server host session attach",
+        )?;
+    let cwd = app_server_command_cwd(config, cwd);
+    let codex_home = config
+        .session_inventory
+        .codex_home
+        .clone()
+        .unwrap_or_else(default_codex_home);
+    ensure_app_server_host_session_at(
+        url,
+        session_id,
+        title,
+        &cwd,
+        None,
+        Some((&codex_home, config.session_inventory.max_sessions)),
+        config.session_inventory.app_server_timeout_seconds,
+    )
+}
+
 pub fn set_app_server_thread_archived(
     config: &AgentConfig,
     thread_id: &str,
@@ -1143,10 +1203,16 @@ pub fn set_app_server_thread_archived(
         .app_server_url
         .as_deref()
         .ok_or("session_inventory.app_server_url is required for app-server archive sync")?;
-    set_app_server_thread_archived_at(
+    let codex_home = config
+        .session_inventory
+        .codex_home
+        .clone()
+        .unwrap_or_else(default_codex_home);
+    set_app_server_thread_archived_at_with_rollout_lookup(
         url,
         thread_id,
         archived,
+        Some((&codex_home, config.session_inventory.max_sessions)),
         config.session_inventory.app_server_timeout_seconds,
     )
 }
@@ -1230,7 +1296,7 @@ fn run_app_server_command(
 
     let cwd = app_server_command_cwd(config, cwd);
     let mut request_id = 1;
-    let thread_id = resolve_app_server_thread_id_for_command(
+    let resolved_thread_id = resolve_app_server_thread_id_for_command(
         &mut socket,
         session_id,
         &mut request_id,
@@ -1238,29 +1304,97 @@ fn run_app_server_command(
         deadline,
         timeout_seconds,
         &cancel,
-    )?
-    .ok_or_else(|| {
-        AppServerCommandError::Other(format!(
-            "active app-server thread {session_id} was not found"
-        ))
-    })?;
+    )?;
+    let (resume_params, fallback_thread_id, require_resumed_thread_id, requested_turn_cwd) =
+        if let Some(thread_id) = resolved_thread_id {
+            (
+                serde_json::json!({
+                    "threadId": thread_id.clone(),
+                    "cwd": cwd.clone(),
+                    "runtimeWorkspaceRoots": [cwd.clone()],
+                    "excludeTurns": true
+                }),
+                thread_id,
+                false,
+                cwd.clone(),
+            )
+        } else {
+            let codex_home = config
+                .session_inventory
+                .codex_home
+                .clone()
+                .unwrap_or_else(default_codex_home);
+            let rollout_path = find_rollout_path(
+                &codex_home,
+                session_id,
+                config.session_inventory.max_sessions,
+            )
+            .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+            let Some(rollout_path) = rollout_path else {
+                return Err(AppServerCommandError::Other(format!(
+                    "active app-server thread {session_id} was not found and no local rollout was available"
+                )));
+            };
+            let resume_cwd = rollout_resume_cwd(&rollout_path, session_id)
+                .map_err(|error| AppServerCommandError::Other(error.to_string()))?
+                .unwrap_or_else(|| cwd.clone());
+            (
+                serde_json::json!({
+                    "threadId": session_id,
+                    "path": rollout_path.to_string_lossy(),
+                    "cwd": resume_cwd.clone(),
+                    "runtimeWorkspaceRoots": [resume_cwd.clone()],
+                    "excludeTurns": true
+                }),
+                session_id.to_owned(),
+                true,
+                resume_cwd,
+            )
+        };
     let resume_response = send_app_server_request_for_command(
         &mut socket,
         request_id,
         "thread/resume",
-        serde_json::json!({
-            "threadId": thread_id,
-            "cwd": cwd.clone(),
-            "runtimeWorkspaceRoots": [cwd.clone()],
-            "excludeTurns": true
-        }),
+        resume_params,
         socket_timeout,
         deadline,
         timeout_seconds,
         &cancel,
     )?;
     request_id += 1;
-    let thread_id = response_thread_id(&resume_response).unwrap_or(thread_id);
+    let resumed_thread = if require_resumed_thread_id {
+        let resumed = app_server_thread_from_response(&resume_response)
+            .map_err(|error| {
+                let message = error.to_string();
+                if message == "app-server thread/start response did not include thread.id" {
+                    AppServerCommandError::Other(
+                        "app-server thread/resume response did not include thread.id for rollout path resume"
+                            .to_owned(),
+                    )
+                } else {
+                    AppServerCommandError::Other(message)
+                }
+            })?;
+        if resumed.session_id != session_id {
+            return Err(AppServerCommandError::Other(format!(
+                "app-server thread/resume returned session {} while starting session {session_id}",
+                resumed.session_id
+            )));
+        }
+        Some(resumed)
+    } else {
+        None
+    };
+    let thread_id = match resumed_thread.as_ref() {
+        Some(resumed) => resumed.id.clone(),
+        None => response_thread_id(&resume_response).unwrap_or(fallback_thread_id),
+    };
+    let turn_cwd = resume_response
+        .pointer("/result/thread/cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or(requested_turn_cwd);
 
     let turn_response = send_app_server_turn_start_for_command(
         &mut socket,
@@ -1274,8 +1408,8 @@ fn run_app_server_command(
                 "text": prompt,
                 "text_elements": []
             }],
-            "cwd": cwd.clone(),
-            "runtimeWorkspaceRoots": [cwd],
+            "cwd": turn_cwd.clone(),
+            "runtimeWorkspaceRoots": [turn_cwd],
             "approvalPolicy": "never"
         }),
         socket_timeout,
@@ -1924,10 +2058,27 @@ fn remaining_app_server_command_timeout(timeout: Duration, deadline: Instant) ->
     remaining.min(timeout).max(Duration::from_millis(1))
 }
 
+#[cfg(test)]
 fn set_app_server_thread_archived_at(
     url: &str,
     thread_id: &str,
     archived: bool,
+    timeout_seconds: u64,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    set_app_server_thread_archived_at_with_rollout_lookup(
+        url,
+        thread_id,
+        archived,
+        None,
+        timeout_seconds,
+    )
+}
+
+fn set_app_server_thread_archived_at_with_rollout_lookup(
+    url: &str,
+    thread_id: &str,
+    archived: bool,
+    rollout_lookup: Option<(&Path, usize)>,
     timeout_seconds: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS);
@@ -1945,7 +2096,34 @@ fn set_app_server_thread_archived_at(
         deadline,
     )?
     else {
-        return Ok(false);
+        let Some(resolved_thread_id) = resume_app_server_thread_from_rollout_path_for_archive(
+            &mut socket,
+            thread_id,
+            rollout_lookup,
+            &mut request_id,
+            timeout,
+            deadline,
+        )?
+        else {
+            return Ok(false);
+        };
+        let method = if archived {
+            "thread/archive"
+        } else {
+            "thread/unarchive"
+        };
+        ensure_app_server_local_budget(deadline)?;
+        let _ = send_app_server_request_before_deadline(
+            &mut socket,
+            request_id,
+            method,
+            serde_json::json!({
+                "threadId": resolved_thread_id
+            }),
+            timeout,
+            deadline,
+        )?;
+        return Ok(true);
     };
     let method = if archived {
         "thread/archive"
@@ -1956,7 +2134,7 @@ fn set_app_server_thread_archived_at(
         return Ok(true);
     };
     for resolved_thread_id in resolved_thread_ids {
-        ensure_app_server_archive_budget(deadline)?;
+        ensure_app_server_local_budget(deadline)?;
         let _ = send_app_server_request_before_deadline(
             &mut socket,
             request_id,
@@ -1970,6 +2148,49 @@ fn set_app_server_thread_archived_at(
         request_id += 1;
     }
     Ok(true)
+}
+
+fn resume_app_server_thread_from_rollout_path_for_archive(
+    socket: &mut AppServerSocket,
+    thread_id: &str,
+    rollout_lookup: Option<(&Path, usize)>,
+    next_request_id: &mut i64,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some((codex_home, max_sessions)) = rollout_lookup else {
+        return Ok(None);
+    };
+    let Some(rollout_path) = find_rollout_path(codex_home, thread_id, max_sessions)? else {
+        return Ok(None);
+    };
+    let mut params = serde_json::json!({
+        "threadId": thread_id,
+        "path": rollout_path.to_string_lossy(),
+        "excludeTurns": true
+    });
+    if let Some(cwd) = rollout_resume_cwd(&rollout_path, thread_id)? {
+        params["cwd"] = serde_json::json!(cwd.clone());
+        params["runtimeWorkspaceRoots"] = serde_json::json!([cwd]);
+    }
+    let response = send_app_server_request_before_deadline(
+        socket,
+        *next_request_id,
+        "thread/resume",
+        params,
+        timeout,
+        deadline,
+    )?;
+    *next_request_id += 1;
+    let resumed = app_server_thread_from_response(&response)?;
+    if resumed.session_id != thread_id {
+        return Err(format!(
+            "app-server thread/resume returned session {} while syncing archive for session {thread_id}",
+            resumed.session_id
+        )
+        .into());
+    }
+    Ok(Some(resumed.id))
 }
 
 fn resolve_app_server_thread_ids_for_archive(
@@ -2062,7 +2283,7 @@ fn find_app_server_thread_ids_in_pages(
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     for _ in 0..APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE {
-        ensure_app_server_archive_budget(deadline)?;
+        ensure_app_server_local_budget(deadline)?;
         let response = send_app_server_thread_list_request(
             socket,
             *next_request_id,
@@ -2120,9 +2341,9 @@ fn find_app_server_thread_ids_in_pages(
     Ok(AppServerArchivePageScan::Exhausted { session_thread_ids })
 }
 
-fn ensure_app_server_archive_budget(deadline: Instant) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_app_server_local_budget(deadline: Instant) -> Result<(), Box<dyn std::error::Error>> {
     if Instant::now() >= deadline {
-        return Err("app-server archive sync exceeded local time budget".into());
+        return Err("app-server request exceeded local time budget".into());
     }
     Ok(())
 }
@@ -2133,6 +2354,185 @@ fn app_server_archive_socket_timeout(timeout_seconds: u64) -> Duration {
             .max(1)
             .min(APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS),
     )
+}
+
+fn ensure_app_server_host_session_at(
+    url: &str,
+    session_id: &str,
+    title: Option<&str>,
+    cwd: &str,
+    rollout_path: Option<&Path>,
+    rollout_lookup: Option<(&Path, usize)>,
+    timeout_seconds: u64,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+    let mut socket = connect_app_server(url, timeout)?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
+    initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
+    let mut request_id = 1;
+    let can_resume_from_rollout = rollout_path.is_some() || rollout_lookup.is_some();
+    let resolved_thread = resolve_app_server_thread_for_ensure(
+        &mut socket,
+        session_id,
+        &mut request_id,
+        timeout,
+        deadline,
+        can_resume_from_rollout,
+    )?;
+    let resume_params = if let Some(resolved_thread) = resolved_thread {
+        let thread_id = resolved_thread.thread_id;
+        if resolved_thread.archived {
+            let _ = send_app_server_request_before_deadline(
+                &mut socket,
+                request_id,
+                "thread/unarchive",
+                serde_json::json!({
+                    "threadId": thread_id.clone()
+                }),
+                timeout,
+                deadline,
+            )?;
+            request_id += 1;
+        }
+        serde_json::json!({
+            "threadId": thread_id,
+            "cwd": cwd,
+            "runtimeWorkspaceRoots": [cwd],
+            "excludeTurns": true
+        })
+    } else {
+        let rollout_path = if let Some(rollout_path) = rollout_path {
+            Some(rollout_path.to_path_buf())
+        } else if let Some((codex_home, max_sessions)) = rollout_lookup {
+            find_rollout_path(codex_home, session_id, max_sessions)?
+        } else {
+            None
+        };
+        let Some(rollout_path) = rollout_path else {
+            return Err(format!(
+                "app-server host session attach could not find local rollout for session {session_id}"
+            )
+            .into());
+        };
+        let resume_cwd =
+            rollout_resume_cwd(&rollout_path, session_id)?.unwrap_or_else(|| cwd.to_owned());
+        serde_json::json!({
+            "threadId": session_id,
+            "path": rollout_path.to_string_lossy(),
+            "cwd": resume_cwd.clone(),
+            "runtimeWorkspaceRoots": [resume_cwd],
+            "excludeTurns": true
+        })
+    };
+    let response = send_app_server_request_before_deadline(
+        &mut socket,
+        request_id,
+        "thread/resume",
+        resume_params,
+        timeout,
+        deadline,
+    )?;
+    let resumed = app_server_thread_from_response(&response)?;
+    if resumed.session_id != session_id {
+        return Err(format!(
+            "app-server thread/resume returned session {} while attaching session {session_id}",
+            resumed.session_id
+        )
+        .into());
+    }
+    let cwd = resumed.cwd.or_else(|| Some(cwd.to_owned()));
+    Ok(AgentHostSession {
+        session_id: session_id.to_owned(),
+        title: compact_title(resumed.name.as_deref())
+            .or_else(|| compact_title(title))
+            .unwrap_or_else(|| {
+                fallback_title(&SessionDraft {
+                    session_id: session_id.to_owned(),
+                    cwd: cwd.clone(),
+                    ..SessionDraft::default()
+                })
+            }),
+        title_source: TitleSource::AppServer,
+        app_server_present: true,
+        cwd,
+        updated_at: resumed.updated_at,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppServerThreadForEnsure {
+    thread_id: String,
+    archived: bool,
+}
+
+fn resolve_app_server_thread_for_ensure(
+    socket: &mut AppServerSocket,
+    session_id: &str,
+    next_request_id: &mut i64,
+    timeout: Duration,
+    deadline: Instant,
+    allow_exhausted_miss: bool,
+) -> Result<Option<AppServerThreadForEnsure>, Box<dyn std::error::Error>> {
+    if let Some(thread_id) = scan_app_server_thread_id_for_ensure(
+        socket,
+        session_id,
+        Some(false),
+        next_request_id,
+        timeout,
+        deadline,
+        allow_exhausted_miss,
+    )? {
+        return Ok(Some(AppServerThreadForEnsure {
+            thread_id,
+            archived: false,
+        }));
+    }
+    Ok(scan_app_server_thread_id_for_ensure(
+        socket,
+        session_id,
+        Some(true),
+        next_request_id,
+        timeout,
+        deadline,
+        allow_exhausted_miss,
+    )?
+    .map(|thread_id| AppServerThreadForEnsure {
+        thread_id,
+        archived: true,
+    }))
+}
+
+fn scan_app_server_thread_id_for_ensure(
+    socket: &mut AppServerSocket,
+    session_id: &str,
+    archived_filter: Option<bool>,
+    next_request_id: &mut i64,
+    timeout: Duration,
+    deadline: Instant,
+    allow_exhausted_miss: bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match find_app_server_thread_ids_in_pages(
+        socket,
+        session_id,
+        archived_filter,
+        next_request_id,
+        timeout,
+        deadline,
+    )? {
+        AppServerArchivePageScan::Complete(scan) => Ok(scan.thread_ids.into_iter().next()),
+        AppServerArchivePageScan::Exhausted { session_thread_ids } => {
+            if let Some(thread_id) = session_thread_ids.into_iter().next() {
+                Ok(Some(thread_id))
+            } else if allow_exhausted_miss {
+                Ok(None)
+            } else {
+                Err(
+                    "app-server host session attach exceeded page budget while resolving thread id"
+                        .into(),
+                )
+            }
+        }
+    }
 }
 
 fn create_app_server_thread_at(
@@ -2280,14 +2680,23 @@ fn send_app_server_request_inner(
 
     loop {
         if let Some((timeout, deadline)) = archive_budget {
-            ensure_app_server_archive_budget(deadline)?;
+            ensure_app_server_local_budget(deadline)?;
             configure_socket_timeout(
                 socket,
                 remaining_app_server_archive_timeout(timeout, deadline),
             )?;
         }
-        match socket.read()? {
-            Message::Text(text) => {
+        match socket.read() {
+            Err(tungstenite::Error::Io(error))
+                if archive_budget.is_some()
+                    && matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+            {
+                return Err(
+                    format!("app-server {method} timed out before matching response").into(),
+                );
+            }
+            Err(error) => return Err(error.into()),
+            Ok(Message::Text(text)) => {
                 let value = serde_json::from_str::<Value>(text.as_ref())?;
                 if value.get("id").and_then(Value::as_i64) != Some(id) {
                     continue;
@@ -2297,10 +2706,10 @@ fn send_app_server_request_inner(
                 }
                 return Ok(value);
             }
-            Message::Close(_) => {
+            Ok(Message::Close(_)) => {
                 return Err(format!("app-server closed before {method} completed").into());
             }
-            _ => {}
+            Ok(_) => {}
         }
     }
 }
@@ -2313,7 +2722,7 @@ fn send_app_server_request_before_deadline(
     timeout: Duration,
     deadline: Instant,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    ensure_app_server_archive_budget(deadline)?;
+    ensure_app_server_local_budget(deadline)?;
     configure_socket_timeout(
         socket,
         remaining_app_server_archive_timeout(timeout, deadline),
@@ -2571,9 +2980,10 @@ mod tests {
         InventoryScope, SessionDraft, TitleSource, app_server_command_result_events_with_cancel,
         app_server_sessions_from_response, app_server_thread_from_response,
         app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
-        create_app_server_thread_at, load_app_server_sessions, read_recent_lines,
-        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
-        set_app_server_thread_archived_at, unix_seconds_to_iso,
+        create_app_server_thread_at, ensure_app_server_host_session_at, load_app_server_sessions,
+        read_recent_lines, remaining_app_server_archive_timeout, resolve_session, rollout_paths,
+        set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
+        unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::json;
@@ -3145,6 +3555,635 @@ mod tests {
         assert_eq!(session.title, "Requested title");
         assert_eq!(session.title_source, TitleSource::AppServer);
         assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
+    }
+
+    #[test]
+    fn resumes_host_session_through_app_server_without_turn_start() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-live-1",
+                            "sessionId": "session-1",
+                            "name": "Recovered title",
+                            "cwd": "/tmp/project",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-1",
+                        "name": "Recovered title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let session = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            None,
+            None,
+            1,
+        )
+        .expect("resumed host session");
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        assert_eq!(
+            list_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+
+        assert_eq!(
+            resume_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert_eq!(
+            resume_request
+                .get("params")
+                .and_then(|params| params.get("threadId"))
+                .and_then(serde_json::Value::as_str),
+            Some("thread-live-1")
+        );
+        assert_eq!(
+            resume_request
+                .get("params")
+                .and_then(|params| params.get("excludeTurns"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.title, "Recovered title");
+        assert_eq!(session.title_source, TitleSource::AppServer);
+        assert!(session.app_server_present);
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(session.updated_at, "2026-06-12T11:24:03.000Z");
+    }
+
+    #[test]
+    fn ensure_host_session_rejects_mismatched_resume_session_id() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-live-1",
+                            "sessionId": "session-1",
+                            "name": "Recovered title",
+                            "cwd": "/tmp/project",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-other",
+                        "name": "Wrong session",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let error = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            None,
+            None,
+            1,
+        )
+        .expect_err("mismatched app-server session id should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("returned session session-other while attaching session session-1")
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("thread/list request")
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("thread/resume request")
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn resumes_archived_host_session_through_resolved_app_server_thread_id() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-archived-1",
+                            "sessionId": "session-1",
+                            "name": "Archived title",
+                            "cwd": "/tmp/project",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "thread": {
+                        "id": "thread-archived-1",
+                        "sessionId": "session-1",
+                        "name": "Archived title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let session = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            None,
+            None,
+            1,
+        )
+        .expect("resumed archived host session");
+        let active_list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("active thread/list request");
+        assert_eq!(
+            active_list_request
+                .get("params")
+                .and_then(|params| params.get("archived"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        let archived_list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("archived thread/list request");
+        assert_eq!(
+            archived_list_request
+                .get("params")
+                .and_then(|params| params.get("archived"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let unarchive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/unarchive request");
+        assert_eq!(
+            unarchive_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/unarchive")
+        );
+        assert_eq!(
+            unarchive_request
+                .get("params")
+                .and_then(|params| params.get("threadId"))
+                .and_then(serde_json::Value::as_str),
+            Some("thread-archived-1")
+        );
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        assert_eq!(
+            resume_request
+                .get("params")
+                .and_then(|params| params.get("threadId"))
+                .and_then(serde_json::Value::as_str),
+            Some("thread-archived-1")
+        );
+        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.title, "Archived title");
+        assert!(session.app_server_present);
+    }
+
+    #[test]
+    fn ensure_host_session_uses_matched_session_before_page_budget_error() {
+        let first_page = [
+            vec![json!({
+                "id": "thread-live-1",
+                "sessionId": "session-1",
+                "name": "Recovered title",
+                "cwd": "/tmp/project",
+                "updatedAt": 1781263443
+            })],
+            (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE - 1)
+                .map(|index| json!({ "id": format!("thread-old-{index}") }))
+                .collect::<Vec<_>>(),
+        ]
+        .concat();
+        let second_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-older-{index}") }))
+            .collect::<Vec<_>>();
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": first_page,
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": second_page,
+                    "nextCursor": "cursor-page-3"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-1",
+                        "name": "Recovered title",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let session = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            None,
+            None,
+            1,
+        )
+        .expect("session match should be usable before page-budget error");
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first thread/list request");
+        let second_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+
+        assert_eq!(
+            first_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            second_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-live-1")
+        );
+        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.title, "Recovered title");
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn ensure_host_session_errors_when_thread_resolution_page_budget_is_exhausted() {
+        let first_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-old-{index}") }))
+            .collect::<Vec<_>>();
+        let second_page = (0..APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE)
+            .map(|index| json!({ "id": format!("thread-older-{index}") }))
+            .collect::<Vec<_>>();
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": first_page,
+                    "nextCursor": "cursor-page-2"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": second_page,
+                    "nextCursor": "cursor-page-3"
+                }
+            }),
+        ]);
+
+        let error = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            None,
+            None,
+            1,
+        )
+        .expect_err("page budget exhaustion should fail");
+        assert!(error.to_string().contains("exceeded page budget"));
+        let first_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first thread/list request");
+        let second_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second thread/list request");
+
+        assert_eq!(
+            first_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            second_request
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str),
+            Some("cursor-page-2")
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn resumes_unlisted_host_session_from_rollout_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rollout_path = tempdir
+            .path()
+            .join("sessions/2026/06/16/rollout-session-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project-from-rollout"}}"#,
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-1",
+                        "name": "Recovered from path",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let session = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            Some(&rollout_path),
+            None,
+            1,
+        )
+        .expect("path-based resume should attach the host session");
+        let active_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("active thread/list request");
+        let archived_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("archived thread/list request");
+
+        assert_eq!(
+            active_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            archived_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        assert_eq!(
+            resume_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-rollout")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/runtimeWorkspaceRoots/0")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-rollout")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/excludeTurns")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.title, "Recovered from path");
+        assert!(session.app_server_present);
+    }
+
+    #[test]
+    fn ensure_host_session_errors_without_resolved_thread_or_rollout_path() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": []
+                }
+            }),
+        ]);
+
+        let error = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            None,
+            None,
+            1,
+        )
+        .expect_err("missing app-server thread and rollout path should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("could not find local rollout for session session-1")
+        );
+        let active_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("active thread/list request");
+        let archived_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("archived thread/list request");
+
+        assert_eq!(
+            active_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            archived_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn ensure_host_session_resume_is_bounded_by_local_deadline() {
+        let (url, requests) = run_fake_app_server_with_unmatched_resume_messages();
+
+        let error = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            None,
+            None,
+            1,
+        )
+        .expect_err("unmatched resume response should fail by deadline");
+        let message = error.to_string();
+        assert!(
+            message.contains("app-server thread/resume timed out before matching response"),
+            "{message}"
+        );
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+
+        assert_eq!(
+            list_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            resume_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-live-1")
+        );
     }
 
     #[test]
@@ -3881,6 +4920,229 @@ mod tests {
     }
 
     #[test]
+    fn archive_sync_resumes_unlisted_rollout_before_archive() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            concat!(
+                r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-16T15:01:00.000Z","type":"turn_context","payload":{"cwd":"/tmp/project-from-turn"}}"#
+            ),
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-tree-1",
+                        "cwd": "/tmp/project-from-turn",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {}
+            }),
+        ]);
+
+        assert!(
+            set_app_server_thread_archived_at_with_rollout_lookup(
+                &url,
+                "session-tree-1",
+                true,
+                Some((codex_home, SessionInventoryConfig::default().max_sessions)),
+                1,
+            )
+            .expect("archive fallback")
+        );
+
+        let source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("source thread/list request");
+        let target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let archive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/archive request");
+
+        assert_eq!(
+            source_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            target_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            resume_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("session-tree-1")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-turn")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/runtimeWorkspaceRoots/0")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-turn")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/excludeTurns")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            archive_request
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/archive")
+        );
+        assert_eq!(
+            archive_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-from-path")
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn archive_sync_rejects_mismatched_rollout_resume_session_id() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            concat!(
+                r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-16T15:01:00.000Z","type":"turn_context","payload":{"cwd":"/tmp/project-from-turn"}}"#
+            ),
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-other",
+                        "cwd": "/tmp/project-from-turn",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let error = set_app_server_thread_archived_at_with_rollout_lookup(
+            &url,
+            "session-tree-1",
+            true,
+            Some((codex_home, SessionInventoryConfig::default().max_sessions)),
+            1,
+        )
+        .expect_err("archive fallback should reject mismatched resume session");
+
+        assert!(error
+            .to_string()
+            .contains("app-server thread/resume returned session session-other while syncing archive for session session-tree-1"));
+
+        let source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("source thread/list request");
+        let target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        assert_eq!(
+            source_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            target_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
     fn archive_sync_succeeds_when_thread_is_already_in_target_state() {
         let (url, requests) = run_fake_app_server_with_requests(vec![
             json!({
@@ -4598,6 +5860,305 @@ mod tests {
     }
 
     #[test]
+    fn app_server_command_resumes_unlisted_session_from_rollout_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            concat!(
+                r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-16T15:01:00.000Z","type":"turn_context","payload":{"cwd":"/tmp/project-from-turn"}}"#
+            ),
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-tree-1",
+                        "cwd": "/tmp/project-from-response",
+                        "turns": []
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "turn": completed_turn("turn-1", "path command")
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                codex_home: Some(codex_home.into()),
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            Some("/tmp/attached-project"),
+            "command-1",
+            "Use the recovered thread",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].summary, "Codex: path command");
+        assert_eq!(events[1].kind, "command.finished");
+
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let turn_start_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("turn/start request");
+
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("session-tree-1")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-turn")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/runtimeWorkspaceRoots/0")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-turn")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-from-path")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-response")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/runtimeWorkspaceRoots/0")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-from-response")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/clientUserMessageId")
+                .and_then(serde_json::Value::as_str),
+            Some("command-1")
+        );
+    }
+
+    #[test]
+    fn app_server_command_requires_thread_id_after_rollout_path_resume() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "sessionId": "session-tree-1",
+                        "turns": []
+                    }
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                codex_home: Some(codex_home.into()),
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            Some("/tmp/attached-project"),
+            "command-1",
+            "Use the recovered thread",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "command.failed");
+        assert_eq!(
+            events[0].summary,
+            "Codex app-server turn could not start: app-server thread/resume response did not include thread.id for rollout path resume."
+        );
+
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn app_server_command_rejects_mismatched_rollout_resume_session_id() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": []
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-other",
+                        "turns": []
+                    }
+                }
+            }),
+        ]);
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                codex_home: Some(codex_home.into()),
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            Some("/tmp/attached-project"),
+            "command-1",
+            "Use the recovered thread",
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "command.failed");
+        assert_eq!(
+            events[0].summary,
+            "Codex app-server turn could not start: app-server thread/resume returned session session-other while starting session session-tree-1."
+        );
+
+        let list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        assert_eq!(
+            list_request
+                .pointer("/params/archived")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/path")
+                .and_then(serde_json::Value::as_str),
+            Some(rollout_path.to_string_lossy().as_ref())
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
     fn app_server_command_resolves_session_beyond_archive_sync_page_budget() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let (url, requests) = run_fake_app_server_with_requests(vec![
@@ -5271,6 +6832,96 @@ mod tests {
                         .send(Message::Text(response.to_string().into()))
                         .expect("send app-server response");
                 }
+            }
+        });
+        (format!("ws://{address}"), requests_rx)
+    }
+
+    fn run_fake_app_server_with_unmatched_resume_messages() -> (String, Receiver<serde_json::Value>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+        let address = listener.local_addr().expect("fake app-server address");
+        let (requests_tx, requests_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("id").and_then(serde_json::Value::as_i64),
+                Some(0)
+            );
+            assert_eq!(
+                initialize.get("method").and_then(serde_json::Value::as_str),
+                Some("initialize")
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {
+                            "userAgent": "codex-test",
+                            "codexHome": "/tmp/codex",
+                            "platformFamily": "unix",
+                            "platformOs": "macos"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized
+                    .get("method")
+                    .and_then(serde_json::Value::as_str),
+                Some("initialized")
+            );
+
+            let list_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(list_request);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "data": [
+                                {
+                                    "id": "thread-live-1",
+                                    "sessionId": "session-1",
+                                    "name": "Recovered title",
+                                    "cwd": "/tmp/project",
+                                    "updatedAt": 1781263443
+                                }
+                            ]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send thread/list response");
+
+            let resume_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(resume_request);
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(2) {
+                if socket
+                    .send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "thread/background",
+                            "params": {}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
             }
         });
         (format!("ws://{address}"), requests_rx)

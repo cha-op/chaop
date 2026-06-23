@@ -8,8 +8,14 @@ import type {
   AppServerInstanceSummary,
   AttachHostSessionResponse,
   BootstrapPayload,
+  BudgetConstraint,
+  BudgetD1Activity,
+  BudgetD1WriteModel,
   BudgetState,
   BudgetSummary,
+  BudgetTelemetryHistory,
+  BudgetTelemetryPoint,
+  BudgetTelemetrySlope,
   BudgetWindowSignal,
   BudgetWindowType,
   CommandDispatch,
@@ -38,12 +44,60 @@ const DEFAULT_WORKSPACE_ID = "workspace-api";
 const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
-const DEFAULT_DAILY_BUDGET_UNITS = 100;
-const DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS = 20;
-const DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS = 35;
-const DEFAULT_BURST_EVENTS_PER_MINUTE = 600;
+const CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY = 100_000;
+const CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY = 100_000;
+const CLOUDFLARE_FREE_D1_ROWS_READ_PER_DAY = 5_000_000;
+const CLOUDFLARE_FREE_DURABLE_OBJECT_REQUESTS_PER_DAY = 100_000;
+const D1_THREAD_SEQUENCE_UPDATE_ROWS = 2;
+const D1_EVENT_INSERT_ROWS = 4;
+const D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS = 2;
+const D1_USAGE_WINDOW_NEW_INSERT_ROWS = 4;
+const D1_USAGE_WINDOW_COUNT = 3;
+const D1_COMMAND_STATE_UPDATE_ROWS = 2;
+const D1_TASK_STATE_UPDATE_ROWS = 4;
+const D1_CONNECTOR_ACTIVITY_UPDATE_ROWS = 2;
+const D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN =
+  D1_THREAD_SEQUENCE_UPDATE_ROWS + D1_EVENT_INSERT_ROWS + D1_USAGE_WINDOW_COUNT * D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS;
+const D1_FIRST_EVENT_IN_MINUTE_ROWS_WRITTEN =
+  D1_THREAD_SEQUENCE_UPDATE_ROWS
+  + D1_EVENT_INSERT_ROWS
+  + (D1_USAGE_WINDOW_COUNT - 1) * D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS
+  + D1_USAGE_WINDOW_NEW_INSERT_ROWS;
+const D1_FIRST_EVENT_IN_FOUR_HOUR_ROWS_WRITTEN =
+  D1_THREAD_SEQUENCE_UPDATE_ROWS
+  + D1_EVENT_INSERT_ROWS
+  + D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS
+  + 2 * D1_USAGE_WINDOW_NEW_INSERT_ROWS;
+const D1_FIRST_EVENT_IN_DAY_ROWS_WRITTEN =
+  D1_THREAD_SEQUENCE_UPDATE_ROWS + D1_EVENT_INSERT_ROWS + D1_USAGE_WINDOW_COUNT * D1_USAGE_WINDOW_NEW_INSERT_ROWS;
+const D1_BACKFILL_ROWS_WRITTEN_PER_EVENT = D1_THREAD_SEQUENCE_UPDATE_ROWS + D1_EVENT_INSERT_ROWS;
+const D1_BACKFILL_SAME_MINUTE_FIXED_ROWS_WRITTEN = D1_USAGE_WINDOW_COUNT * D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS;
+const D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN =
+  D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN + D1_COMMAND_STATE_UPDATE_ROWS + D1_CONNECTOR_ACTIVITY_UPDATE_ROWS;
+const D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN =
+  D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN + D1_TASK_STATE_UPDATE_ROWS;
+const D1_COMMAND_LIFECYCLE_DAY_BOUNDARY_ROWS_WRITTEN =
+  D1_FIRST_EVENT_IN_DAY_ROWS_WRITTEN + D1_COMMAND_STATE_UPDATE_ROWS + D1_TASK_STATE_UPDATE_ROWS + D1_CONNECTOR_ACTIVITY_UPDATE_ROWS;
+// Local guardrails include command lifecycle and daily-window boundary overhead so missing telemetry stays conservative.
+const D1_BUDGETED_ROWS_WRITTEN_PER_EVENT = D1_COMMAND_LIFECYCLE_DAY_BOUNDARY_ROWS_WRITTEN;
+const DEFAULT_DAILY_BUDGET_UNITS = Math.floor(CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY / D1_BUDGETED_ROWS_WRITTEN_PER_EVENT);
+const DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS = Math.max(1, Math.floor(DEFAULT_DAILY_BUDGET_UNITS / 6));
+const DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS = Math.max(1, Math.ceil(DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS * 0.75));
+const DEFAULT_BURST_EVENTS_PER_MINUTE = Math.max(
+  1,
+  Math.floor((CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY * 0.1) / D1_BUDGETED_ROWS_WRITTEN_PER_EVENT)
+);
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const ONE_MINUTE_MS = 60 * 1000;
+const DEFAULT_CF_TELEMETRY_TIMEOUT_MS = 5_000;
+const DEFAULT_CF_TELEMETRY_CACHE_SECONDS = 300;
+const DEFAULT_CF_TELEMETRY_FAILURE_CACHE_SECONDS = 60;
+const DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS = 300;
+const DEFAULT_BUDGET_TELEMETRY_HISTORY_CACHE_SECONDS = 60;
+const BUDGET_TELEMETRY_HISTORY_HOURS = 24;
+const BUDGET_TELEMETRY_HISTORY_LIMIT = 300;
+const CLOUDFLARE_GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
+const WS_INCOMING_MESSAGES_PER_DO_REQUEST = 20;
 const BUDGET_STATE_RANK: Record<BudgetState, number> = {
   normal: 0,
   recovery: 1,
@@ -51,6 +105,9 @@ const BUDGET_STATE_RANK: Record<BudgetState, number> = {
   throttled: 3,
   hard_limited: 4
 };
+
+let cloudflareTelemetryCache: CloudflareTelemetryCacheEntry | undefined;
+let budgetTelemetryHistoryCache: BudgetTelemetryHistoryCacheEntry | undefined;
 
 export class CommandTargetError extends Error {
   constructor(
@@ -134,7 +191,7 @@ export async function loadBudgetSummaryFromDb(
     return emptyBudgetSummary(generatedAt);
   }
 
-  const [daily, fourHour, burst, connectorStates, taskStates] = await Promise.all([
+  const [daily, fourHour, burst, connectorStates, taskStates, telemetry] = await Promise.all([
     currentUsageWindow(env, "daily", generatedAt),
     currentUsageWindow(env, "four_hour", generatedAt),
     currentUsageWindow(env, "burst", generatedAt),
@@ -143,29 +200,73 @@ export async function loadBudgetSummaryFromDb(
       : listConnectorBudgetStates(env),
     snapshots.tasks
       ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
-      : listTaskBudgetStates(env)
+      : listTaskBudgetStates(env),
+    loadCloudflareTelemetryBestEffort(env, generatedAt)
   ]);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const primaryWindow = daily ?? fourHour ?? burst;
+  const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
+  const localBaselines = localBudgetWindowBaselines(env, generatedAt);
+  const telemetrySampleInserted = await persistBudgetTelemetrySampleBestEffort(env, telemetry, generatedAt);
+  const telemetryHistory = await loadBudgetTelemetryHistoryBestEffort(env, generatedAt, {
+    force: telemetrySampleInserted
+  });
+  const constraints = budgetConstraints(env, windowSignals, telemetry, localBaselines);
+  const bottleneckConstraint = budgetBottleneckConstraint(constraints);
+  const d1Activity = budgetD1ActivitySignals(env, generatedAt, daily, telemetry);
+  const constraintStates = constraints
+    .filter((constraint) => constraint.sampled && constraint.hard && constraint.state !== "missing")
+    .map((constraint) => constraint.state as BudgetState);
   const states = [
-    ...windows.map((window) => budgetStateFromString(window.budget_state)),
+    ...constraintStates,
     ...connectorStates.map((row) => budgetStateFromString(row.budget_state)),
     ...taskStates.map((row) => budgetStateFromString(row.budget_state))
   ];
 
   return {
     state: worstBudgetState(states),
-    daily_used_pct: windowPct(daily),
-    four_hour_used_pct: windowPct(fourHour),
-    burst_used_pct: windowPct(burst),
+    daily_used_pct: windowPct(env, daily),
+    four_hour_used_pct: windowPct(env, fourHour) ?? localBaselines.get("four_hour")?.used_pct ?? null,
+    burst_used_pct: windowPct(env, burst) ?? localBaselines.get("burst")?.used_pct ?? null,
     delayed_event_count: nonNegativeInteger(primaryWindow?.events_delayed),
     compacted_event_count: nonNegativeInteger(primaryWindow?.events_compacted),
     local_spool_bytes: nonNegativeInteger(primaryWindow?.local_spool_bytes),
-    source: windows.length > 0 ? "d1_usage_windows" : "empty",
+    source: windows.length > 0 ? "d1_usage_windows" : telemetry ? "cloudflare_analytics" : "empty",
     generated_at: generatedAt,
     window_sample_count: windows.length,
-    windows: windows.map(budgetWindowSignalFromRow)
+    constraint_sample_count: constraints.filter((constraint) => constraint.sampled).length,
+    windows: windowSignals,
+    constraints,
+    bottleneck_constraint: bottleneckConstraint,
+    d1_write_model: budgetD1WriteModel(env),
+    telemetry_history: telemetryHistory,
+    d1_activity: d1Activity
   };
+}
+
+export async function bootstrapBudgetWindowsInDb(
+  env: Env,
+  generatedAt = new Date().toISOString()
+): Promise<BudgetSummary> {
+  if (!env.DB) {
+    return emptyBudgetSummary(generatedAt);
+  }
+
+  const timestamp = new Date(generatedAt);
+  const effectiveTimestamp = Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
+  const updatedAt = effectiveTimestamp.toISOString();
+  const zeroMetrics: UsageEventMetrics = {
+    eventsReceived: 0,
+    compacted: 0,
+    delayed: 0,
+    spoolBytes: 0
+  };
+
+  for (const window of usageWindowSpecs(env, effectiveTimestamp)) {
+    await upsertUsageWindow(env, window, zeroMetrics, updatedAt);
+  }
+
+  return loadBudgetSummaryFromDb(env, updatedAt);
 }
 
 export type RecordAppServerInstancesResult = {
@@ -359,8 +460,22 @@ export async function recordHostSessions(
   report: AgentHostSessionsReport,
   syncedAt = new Date().toISOString(),
   options: { workspaceId?: string | undefined } = {}
-): Promise<{ host_sessions: HostSessionSummary[]; synced_at: string; released_connector_ids: string[]; failed_events: ThreadEvent[] }> {
-  if (!env.DB) return { host_sessions: [], synced_at: syncedAt, released_connector_ids: [], failed_events: [] };
+): Promise<{
+  host_sessions: HostSessionSummary[];
+  synced_at: string;
+  released_connector_ids: string[];
+  failed_events: ThreadEvent[];
+  snapshot: boolean;
+}> {
+  if (!env.DB) {
+    return {
+      host_sessions: [],
+      synced_at: syncedAt,
+      released_connector_ids: [],
+      failed_events: [],
+      snapshot: false
+    };
+  }
 
   const connector = await env.DB.prepare(
     `SELECT hostname
@@ -370,7 +485,15 @@ export async function recordHostSessions(
   )
     .bind(connectorId)
     .first<{ hostname: string }>();
-  if (!connector) return { host_sessions: [], synced_at: syncedAt, released_connector_ids: [], failed_events: [] };
+  if (!connector) {
+    return {
+      host_sessions: [],
+      synced_at: syncedAt,
+      released_connector_ids: [],
+      failed_events: [],
+      snapshot: false
+    };
+  }
 
   const workspace = await env.DB.prepare(
     `SELECT workspace_id
@@ -383,6 +506,8 @@ export async function recordHostSessions(
     .first<{ workspace_id: string }>();
   const workspaceId = options.workspaceId ?? workspace?.workspace_id ?? DEFAULT_WORKSPACE_ID;
   const upserted: HostSessionSummary[] = [];
+  const storedReportedSessions: HostSessionSummary[] = [];
+  let storedReportedSessionCount = 0;
   const releasedConnectorIds = new Set<string>();
   const failedEvents: ThreadEvent[] = [];
   const reportedSessions = report.sessions.slice(0, 200);
@@ -402,7 +527,7 @@ export async function recordHostSessions(
       !reportedAppServerPresent && !canUseAppServerAbsence && previous?.app_server_present === true
         ? 1
         : reportedAppServerPresent ? 1 : 0;
-    await env.DB.prepare(
+    const result = await env.DB.prepare(
       `INSERT INTO host_sessions (
          id, connector_id, hostname, workspace_id, session_id, title, title_source, app_server_present,
          cwd, discovered_at, updated_at
@@ -418,7 +543,20 @@ export async function recordHostSessions(
          title_source = excluded.title_source,
          app_server_present = excluded.app_server_present,
          cwd = excluded.cwd,
-         updated_at = excluded.updated_at`
+         updated_at = excluded.updated_at
+       WHERE host_sessions.hostname IS NOT excluded.hostname
+          OR host_sessions.workspace_id IS NOT (
+            CASE
+              WHEN host_sessions.attached_task_id IS NOT NULL OR host_sessions.attached_thread_id IS NOT NULL
+              THEN host_sessions.workspace_id
+              ELSE excluded.workspace_id
+            END
+          )
+          OR host_sessions.title IS NOT excluded.title
+          OR host_sessions.title_source IS NOT excluded.title_source
+          OR host_sessions.app_server_present IS NOT excluded.app_server_present
+          OR host_sessions.cwd IS NOT excluded.cwd
+          OR host_sessions.updated_at IS NOT excluded.updated_at`
     )
       .bind(
         id,
@@ -434,8 +572,17 @@ export async function recordHostSessions(
         session.updated_at
       )
       .run();
+    if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+      if (previous) {
+        storedReportedSessionCount += 1;
+        storedReportedSessions.push(previous);
+      }
+      continue;
+    }
     const stored = await findHostSession(env, session.session_id, connectorId);
     if (stored) {
+      storedReportedSessionCount += 1;
+      storedReportedSessions.push(stored);
       upserted.push(stored);
       if (
         previous?.app_server_present === true &&
@@ -495,7 +642,7 @@ export async function recordHostSessions(
        reported_session_count = excluded.reported_session_count,
        stored_session_count = excluded.stored_session_count`
   )
-    .bind(connectorId, syncedAt, reportedSessions.length, upserted.length)
+    .bind(connectorId, syncedAt, reportedSessions.length, storedReportedSessionCount)
     .run();
 
   await env.DB.prepare(
@@ -507,11 +654,31 @@ export async function recordHostSessions(
     .run();
 
   return {
-    host_sessions: upserted,
+    host_sessions: inventoryScope === "full"
+      ? [...storedReportedSessions, ...upserted.filter((session) => !reportedSessionIds.has(session.session_id))]
+      : upserted,
     synced_at: syncedAt,
     released_connector_ids: [...releasedConnectorIds],
-    failed_events: failedEvents
+    failed_events: failedEvents,
+    snapshot: canClearMissingAppServerSessions
   };
+}
+
+export async function markHostSessionAppServerPresentInDb(
+  env: Env,
+  hostSession: HostSessionSummary,
+  updatedAt = new Date().toISOString()
+): Promise<void> {
+  if (!env.DB || hostSession.app_server_present === true) return;
+
+  await env.DB.prepare(
+    `UPDATE host_sessions
+     SET app_server_present = 1, updated_at = ?
+     WHERE id = ?
+       AND app_server_present <> 1`
+  )
+    .bind(updatedAt, hostSession.id)
+    .run();
 }
 
 async function cleanupUnavailableAppServerHostSession(
@@ -670,6 +837,34 @@ export async function attachHostSessionInDb(
     thread,
     attachment_created: true
   };
+}
+
+export async function loadHostSessionInDb(
+  env: Env,
+  sessionId: string,
+  connectorId?: string
+): Promise<HostSessionSummary | undefined> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for host session lookup");
+  }
+  return findHostSession(env, sessionId, connectorId);
+}
+
+export async function hasLiveHostSessionAttachmentInDb(
+  env: Env,
+  hostSession: HostSessionSummary
+): Promise<boolean> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for host session attachment lookup");
+  }
+  if (!hostSession.attached_task_id || !hostSession.attached_thread_id) {
+    return false;
+  }
+  const [task, thread] = await Promise.all([
+    loadTask(env, hostSession.attached_task_id),
+    loadThread(env, hostSession.attached_thread_id)
+  ]);
+  return Boolean(task && thread);
 }
 
 export async function detachHostSessionInDb(
@@ -1145,7 +1340,8 @@ export async function findAttachedHostSessionForTaskInDb(
 export async function recordHostSessionBackfillEvents(
   env: Env,
   hostSession: HostSessionSummary,
-  events: AgentBackfillEvent[]
+  events: AgentBackfillEvent[],
+  accountedAt = new Date().toISOString()
 ): Promise<ThreadEvent[]> {
   if (!env.DB || !hostSession.attached_thread_id) {
     return [];
@@ -1157,65 +1353,68 @@ export async function recordHostSessionBackfillEvents(
   }
 
   const imported: ThreadEvent[] = [];
-  for (let index = 0; index < events.length; index += 1) {
-    const event = events[index]!;
-    const eventId = stableBackfillEventId(hostSession, event);
-    const existing = await env.DB.prepare(
-      "SELECT id FROM events WHERE id = ? LIMIT 1"
-    )
-      .bind(eventId)
-      .first<{ id: string }>();
-    if (existing) {
-      continue;
-    }
-
-    const now = new Date().toISOString();
-    const createdAt = normaliseBackfillCreatedAt(event.created_at);
-    const sequence = await env.DB.prepare(
-      `UPDATE threads
-       SET last_seq = last_seq + 1, updated_at = ?
-       WHERE id = ?
-       RETURNING last_seq`
-    )
-      .bind(now, thread.id)
-      .first<{ last_seq: number }>();
-    if (!sequence) {
-      continue;
-    }
-
-    const summary = event.summary.split(/\s+/).join(" ").trim().slice(0, 600);
-    const stored: ThreadEvent = {
-      id: eventId,
-      thread_id: thread.id,
-      seq: sequence.last_seq,
-      kind: event.kind,
-      priority: event.priority,
-      summary,
-      created_at: createdAt
-    };
-
-    const insertResult = await env.DB.prepare(
-      `INSERT OR IGNORE INTO events (
-         id, workspace_id, thread_id, command_id, seq, kind, priority, summary, idempotency_key, created_at
-       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(
-        stored.id,
-        thread.workspace_id,
-        stored.thread_id,
-        stored.seq,
-        stored.kind,
-        stored.priority,
-        stored.summary,
-        event.idempotency_key,
-        stored.created_at
+  try {
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index]!;
+      const eventId = stableBackfillEventId(hostSession, event);
+      const existing = await env.DB.prepare(
+        "SELECT id FROM events WHERE id = ? LIMIT 1"
       )
-      .run();
-    if (insertResult.meta?.changes === 0) {
-      continue;
+        .bind(eventId)
+        .first<{ id: string }>();
+      if (existing) {
+        continue;
+      }
+
+      const now = new Date().toISOString();
+      const createdAt = normaliseBackfillCreatedAt(event.created_at);
+      const sequence = await env.DB.prepare(
+        `UPDATE threads
+         SET last_seq = last_seq + 1, updated_at = ?
+         WHERE id = ?
+         RETURNING last_seq`
+      )
+        .bind(now, thread.id)
+        .first<{ last_seq: number }>();
+      if (!sequence) {
+        continue;
+      }
+
+      const summary = event.summary.split(/\s+/).join(" ").trim().slice(0, 600);
+      const stored: ThreadEvent = {
+        id: eventId,
+        thread_id: thread.id,
+        seq: sequence.last_seq,
+        kind: event.kind,
+        priority: event.priority,
+        summary,
+        created_at: createdAt
+      };
+
+      const insertResult = await env.DB.prepare(
+        `INSERT OR IGNORE INTO events (
+           id, workspace_id, thread_id, command_id, seq, kind, priority, summary, idempotency_key, created_at
+         ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          stored.id,
+          thread.workspace_id,
+          stored.thread_id,
+          stored.seq,
+          stored.kind,
+          stored.priority,
+          stored.summary,
+          event.idempotency_key,
+          stored.created_at
+        )
+        .run();
+      if (insertResult.meta?.changes === 0) {
+        continue;
+      }
+      imported.push(stored);
     }
-    await recordUsageWindowsForEventBestEffort(env, stored);
-    imported.push(stored);
+  } finally {
+    await recordUsageWindowsForEventsBestEffort(env, imported, accountedAt);
   }
 
   return imported;
@@ -3709,28 +3908,55 @@ async function appendEvent(
       event.created_at
     )
     .run();
-  await recordUsageWindowsForEventBestEffort(env, event);
+  await recordUsageWindowsForEventsBestEffort(env, [event]);
   return event;
 }
 
-async function recordUsageWindowsForEventBestEffort(env: Env, event: ThreadEvent): Promise<void> {
+async function recordUsageWindowsForEventsBestEffort(env: Env, events: ThreadEvent[], accountedAt?: string): Promise<void> {
+  if (events.length === 0) return;
   try {
-    await recordUsageWindowsForEvent(env, event);
+    await recordUsageWindowsForEvents(env, events, accountedAt);
   } catch (error) {
     console.warn("Usage window update failed", {
-      event_id: event.id,
+      event_count: events.length,
       message: error instanceof Error ? error.message : String(error)
     });
   }
 }
 
-async function recordUsageWindowsForEvent(env: Env, event: ThreadEvent): Promise<void> {
-  const timestamp = new Date(event.created_at);
-  if (Number.isNaN(timestamp.getTime())) return;
+async function recordUsageWindowsForEvents(env: Env, events: ThreadEvent[], accountedAt?: string): Promise<void> {
+  const aggregates = new Map<string, UsageWindowAggregate>();
+  for (const event of events) {
+    const accountingTimestamp = accountedAt ?? event.created_at;
+    const timestamp = new Date(accountingTimestamp);
+    if (Number.isNaN(timestamp.getTime())) continue;
 
-  const metrics = usageMetricsForEvent(event);
-  for (const window of usageWindowSpecs(env, timestamp)) {
-    await upsertUsageWindow(env, window, metrics, event.created_at);
+    const metrics = usageMetricsForEvent(event);
+    for (const window of usageWindowSpecs(env, timestamp)) {
+      const existing = aggregates.get(window.id);
+      if (existing) {
+        existing.metrics.eventsReceived += 1;
+        existing.metrics.compacted += metrics.compacted;
+        existing.metrics.delayed += metrics.delayed;
+        existing.metrics.spoolBytes += metrics.spoolBytes;
+        existing.updatedAt = newerIso(existing.updatedAt, accountingTimestamp);
+      } else {
+        aggregates.set(window.id, {
+          window,
+          metrics: {
+            eventsReceived: 1,
+            compacted: metrics.compacted,
+            delayed: metrics.delayed,
+            spoolBytes: metrics.spoolBytes
+          },
+          updatedAt: accountingTimestamp
+        });
+      }
+    }
+  }
+
+  for (const aggregate of aggregates.values()) {
+    await upsertUsageWindow(env, aggregate.window, aggregate.metrics, aggregate.updatedAt);
   }
 }
 
@@ -3740,8 +3966,8 @@ async function upsertUsageWindow(
   metrics: UsageEventMetrics,
   updatedAt: string
 ): Promise<void> {
-  const initialState = budgetStateForUsageCount(1, window.thresholds);
-  const initialPct = usedPctForCount(1, window.budgetUnits);
+  const initialState = budgetStateForUsageCount(metrics.eventsReceived, window.thresholds);
+  const initialPct = usedPctForCount(metrics.eventsReceived, window.budgetUnits);
   await env.DB!.prepare(
     `INSERT INTO usage_windows (
        id, window_type, window_start, window_end, budget_state, used_pct,
@@ -3771,7 +3997,7 @@ async function upsertUsageWindow(
       window.windowEnd,
       initialState,
       initialPct,
-      1,
+      metrics.eventsReceived,
       metrics.compacted,
       metrics.delayed,
       metrics.spoolBytes,
@@ -3784,7 +4010,10 @@ async function upsertUsageWindow(
     .run();
 }
 
-function usageWindowSpecs(env: Env, timestamp: Date): UsageWindowSpec[] {
+function usageWindowSpecs(
+  env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
+  timestamp: Date
+): UsageWindowSpec[] {
   const dailyBudget = positiveIntegerEnv(env.CHAOP_DAILY_BUDGET_UNITS, DEFAULT_DAILY_BUDGET_UNITS);
   const fourHourSoftBudget = positiveIntegerEnv(env.CHAOP_4H_SOFT_BUDGET_UNITS, DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS);
   const fourHourHardBudget = Math.max(
@@ -3870,7 +4099,11 @@ function usedPctForCount(count: number, budgetUnits: number): number {
   return Math.round((count * 1000) / budgetUnits) / 10;
 }
 
-function usageMetricsForEvent(event: ThreadEvent): UsageEventMetrics {
+function newerIso(current: string, incoming: string): string {
+  return current > incoming ? current : incoming;
+}
+
+function usageMetricsForEvent(event: ThreadEvent): EventUsageMetrics {
   return {
     compacted: event.kind === "command.output" ? 1 : 0,
     delayed: event.priority === "P2" || event.priority === "P3" ? 1 : 0,
@@ -4140,7 +4373,479 @@ function slugPart(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64) || "unknown";
 }
 
+async function loadCloudflareTelemetryBestEffort(
+  env: Env,
+  generatedAt: string
+): Promise<CloudflareTelemetrySample | undefined> {
+  if (
+    !env.CF_TELEMETRY_API_TOKEN ||
+    !env.CF_TELEMETRY_ACCOUNT_ID ||
+    !env.CF_TELEMETRY_API_WORKER ||
+    !env.CF_TELEMETRY_D1_DATABASE_ID
+  ) {
+    return undefined;
+  }
+
+  try {
+    const cacheKey = cloudflareTelemetryCacheKey(env, generatedAt);
+    const now = Date.now();
+    if (cloudflareTelemetryCache?.key === cacheKey && cloudflareTelemetryCache.expiresAt > now) {
+      if (cloudflareTelemetryCache.pending) {
+        return await cloudflareTelemetryCache.pending;
+      }
+      return cloudflareTelemetryCache.sample;
+    }
+
+    const cacheSeconds = positiveIntegerEnv(env.CF_TELEMETRY_CACHE_SECONDS, DEFAULT_CF_TELEMETRY_CACHE_SECONDS);
+    const cacheMs = cacheSeconds * 1000;
+    const failureCacheMs = Math.min(cacheSeconds, DEFAULT_CF_TELEMETRY_FAILURE_CACHE_SECONDS) * 1000;
+    const pending = loadCloudflareTelemetry(env, generatedAt).then(
+      (sample) => {
+        cloudflareTelemetryCache = {
+          key: cacheKey,
+          sample,
+          expiresAt: Date.now() + cacheMs
+        };
+        return sample;
+      },
+      (error) => {
+        cloudflareTelemetryCache = {
+          key: cacheKey,
+          sample: undefined,
+          expiresAt: Date.now() + failureCacheMs
+        };
+        throw error;
+      }
+    );
+    cloudflareTelemetryCache = {
+      key: cacheKey,
+      pending,
+      expiresAt: now + cacheMs
+    };
+    return await pending;
+  } catch (error) {
+    console.warn("Cloudflare telemetry query failed", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+}
+
+function cloudflareTelemetryCacheKey(env: Env, generatedAt: string): string {
+  const end = new Date(generatedAt);
+  const effectiveEnd = Number.isNaN(end.getTime()) ? new Date() : end;
+  const sampleSeconds = positiveIntegerEnv(env.CF_TELEMETRY_SAMPLE_SECONDS, DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS);
+  const sampleBucket = telemetrySampleBucketStart(effectiveEnd.toISOString(), sampleSeconds).toISOString();
+  const date = new Date(Date.UTC(
+    effectiveEnd.getUTCFullYear(),
+    effectiveEnd.getUTCMonth(),
+    effectiveEnd.getUTCDate()
+  )).toISOString().slice(0, 10);
+  return [
+    env.CF_TELEMETRY_ACCOUNT_ID,
+    env.CF_TELEMETRY_API_WORKER,
+    env.CF_TELEMETRY_WEB_WORKER ?? "",
+    env.CF_TELEMETRY_D1_DATABASE_ID,
+    env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? "",
+    date,
+    sampleBucket
+  ].join("\0");
+}
+
+async function loadCloudflareTelemetry(env: Env, generatedAt: string): Promise<CloudflareTelemetrySample> {
+  const end = new Date(generatedAt);
+  const effectiveEnd = Number.isNaN(end.getTime()) ? new Date() : end;
+  const windowStart = new Date(Date.UTC(
+    effectiveEnd.getUTCFullYear(),
+    effectiveEnd.getUTCMonth(),
+    effectiveEnd.getUTCDate()
+  ));
+  const date = windowStart.toISOString().slice(0, 10);
+  const webWorker = env.CF_TELEMETRY_WEB_WORKER;
+  const includeWebWorker = Boolean(webWorker && webWorker !== env.CF_TELEMETRY_API_WORKER);
+  const includeDoPeriodic = Boolean(env.CF_TELEMETRY_DO_NAMESPACE_NAME);
+  const variables = {
+    accountTag: env.CF_TELEMETRY_ACCOUNT_ID!,
+    apiScriptName: env.CF_TELEMETRY_API_WORKER!,
+    webScriptName: webWorker || env.CF_TELEMETRY_API_WORKER!,
+    databaseId: env.CF_TELEMETRY_D1_DATABASE_ID!,
+    doNamespaceName: env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? "__chaop_disabled__",
+    start: windowStart.toISOString(),
+    end: effectiveEnd.toISOString(),
+    dateStart: date,
+    dateEnd: date
+  };
+  const timeoutMs = positiveIntegerEnv(env.CF_TELEMETRY_TIMEOUT_MS, DEFAULT_CF_TELEMETRY_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(CLOUDFLARE_GRAPHQL_ENDPOINT, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.CF_TELEMETRY_API_TOKEN}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ query: CLOUDFLARE_TELEMETRY_QUERY, variables }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`GraphQL HTTP ${response.status}`);
+    }
+
+    const body = await response.json() as CloudflareGraphqlResponse;
+    if (body.errors?.length) {
+      throw new Error(body.errors.map((error) => error.message).join("; "));
+    }
+
+    const account = body.data?.viewer?.accounts?.[0];
+    if (!account) {
+      throw new Error("GraphQL account telemetry was empty");
+    }
+
+    const doInboundWebsocketMessages = sumGraphqlMetric(account.durableObjectsPeriodicGroups, "inboundWebsocketMsgCount");
+    const doRequests = sumGraphqlMetric(account.durableObjectsInvocationsAdaptiveGroups, "requests");
+    return {
+      windowStart: windowStart.toISOString(),
+      windowEnd: new Date(windowStart.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      updatedAt: effectiveEnd.toISOString(),
+      workerRequestsDaily:
+        sumGraphqlMetric(account.apiWorkerInvocations, "requests")
+        + (includeWebWorker ? sumGraphqlMetric(account.webWorkerInvocations, "requests") : 0),
+      durableObjectRequestEquivalentsDaily:
+        doRequests
+        + (includeDoPeriodic ? Math.ceil(doInboundWebsocketMessages / WS_INCOMING_MESSAGES_PER_DO_REQUEST) : 0),
+      d1RowsReadDaily: sumGraphqlMetric(account.d1AnalyticsAdaptiveGroups, "rowsRead"),
+      d1RowsWrittenDaily: sumGraphqlMetric(account.d1AnalyticsAdaptiveGroups, "rowsWritten")
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function sumGraphqlMetric(rows: CloudflareGraphqlMetricRow[] | undefined, field: string): number {
+  return (rows ?? []).reduce((total, row) => total + nonNegativeInteger(row.sum?.[field]), 0);
+}
+
+async function persistBudgetTelemetrySampleBestEffort(
+  env: Env,
+  telemetry: CloudflareTelemetrySample | undefined,
+  generatedAt: string
+): Promise<boolean> {
+  if (!env.DB || !telemetry) return false;
+
+  try {
+    const sampleSeconds = positiveIntegerEnv(env.CF_TELEMETRY_SAMPLE_SECONDS, DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS);
+    const sampledAt = telemetrySampleBucketStart(generatedAt, sampleSeconds).toISOString();
+    const selectorHash = cloudflareTelemetrySelectorHash(env);
+    const result = await env.DB.prepare(
+      `INSERT OR IGNORE INTO budget_telemetry_samples (
+         id, sample_type, selector_hash, sampled_at, window_start, window_end,
+         d1_rows_written_daily, d1_rows_read_daily, worker_requests_daily,
+         durable_object_requests_daily, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        `budget-telemetry:cloudflare_daily:${selectorHash}:${sampledAt}`,
+        "cloudflare_daily",
+        selectorHash,
+        sampledAt,
+        telemetry.windowStart,
+        telemetry.windowEnd,
+        telemetry.d1RowsWrittenDaily,
+        telemetry.d1RowsReadDaily,
+        telemetry.workerRequestsDaily,
+        telemetry.durableObjectRequestEquivalentsDaily,
+        generatedAt
+      )
+      .run();
+    return Boolean((result.meta as { changes?: number } | undefined)?.changes);
+  } catch (error) {
+    console.warn("Budget telemetry sample could not be persisted", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return false;
+  }
+}
+
+async function loadBudgetTelemetryHistoryBestEffort(
+  env: Env,
+  generatedAt: string,
+  options: { force?: boolean | undefined } = {}
+): Promise<BudgetTelemetryHistory | undefined> {
+  if (!env.DB) return undefined;
+
+  try {
+    const cacheKey = budgetTelemetryHistoryCacheKey(env, generatedAt);
+    const now = Date.now();
+    if (!options.force && budgetTelemetryHistoryCache?.key === cacheKey && budgetTelemetryHistoryCache.expiresAt > now) {
+      return budgetTelemetryHistoryCache.history;
+    }
+
+    const effectiveAt = safeDate(generatedAt);
+    const since = new Date(effectiveAt.getTime() - BUDGET_TELEMETRY_HISTORY_HOURS * 60 * 60 * 1000).toISOString();
+    const rows = await allRows<BudgetTelemetrySampleRow>(
+      env.DB.prepare(
+        `SELECT sampled_at, d1_rows_written_daily, d1_rows_read_daily,
+                worker_requests_daily, durable_object_requests_daily
+         FROM budget_telemetry_samples
+         WHERE sample_type = ? AND selector_hash = ? AND sampled_at >= ?
+         ORDER BY sampled_at DESC
+         LIMIT ?`
+      )
+        .bind("cloudflare_daily", cloudflareTelemetrySelectorHash(env), since, BUDGET_TELEMETRY_HISTORY_LIMIT)
+    );
+    const points = rows.reverse().map(budgetTelemetryPointFromRow);
+    const history: BudgetTelemetryHistory = {
+      source: "cloudflare_analytics",
+      latest_sample_at: points.at(-1)?.sampled_at,
+      points,
+      slopes: budgetTelemetrySlopes(points)
+    };
+    budgetTelemetryHistoryCache = {
+      key: cacheKey,
+      history,
+      expiresAt: now + positiveIntegerEnv(
+        env.CF_TELEMETRY_HISTORY_CACHE_SECONDS,
+        DEFAULT_BUDGET_TELEMETRY_HISTORY_CACHE_SECONDS
+      ) * 1000
+    };
+    return history;
+  } catch (error) {
+    console.warn("Budget telemetry history could not be loaded", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    budgetTelemetryHistoryCache = {
+      key: budgetTelemetryHistoryCacheKey(env, generatedAt),
+      history: undefined,
+      expiresAt: Date.now() + DEFAULT_CF_TELEMETRY_FAILURE_CACHE_SECONDS * 1000
+    };
+    return undefined;
+  }
+}
+
+function budgetTelemetryHistoryCacheKey(env: Env, generatedAt: string): string {
+  const sampleSeconds = positiveIntegerEnv(env.CF_TELEMETRY_SAMPLE_SECONDS, DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS);
+  const sampleBucket = telemetrySampleBucketStart(generatedAt, sampleSeconds).toISOString();
+  return [
+    cloudflareTelemetrySelectorHash(env),
+    sampleBucket
+  ].join("\0");
+}
+
+function cloudflareTelemetrySelectorHash(env: Env): string {
+  return stableStringHash([
+    env.CF_TELEMETRY_ACCOUNT_ID ?? "",
+    env.CF_TELEMETRY_API_WORKER ?? "",
+    env.CF_TELEMETRY_WEB_WORKER ?? "",
+    env.CF_TELEMETRY_D1_DATABASE_ID ?? "",
+    env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? ""
+  ].join("\0"));
+}
+
+function stableStringHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+function budgetTelemetryPointFromRow(row: BudgetTelemetrySampleRow): BudgetTelemetryPoint {
+  return {
+    sampled_at: row.sampled_at,
+    d1_rows_written_daily: nullableNonNegativeInteger(row.d1_rows_written_daily),
+    d1_rows_read_daily: nullableNonNegativeInteger(row.d1_rows_read_daily),
+    worker_requests_daily: nullableNonNegativeInteger(row.worker_requests_daily),
+    durable_object_requests_daily: nullableNonNegativeInteger(row.durable_object_requests_daily)
+  };
+}
+
+function budgetTelemetrySlopes(points: BudgetTelemetryPoint[]): BudgetTelemetrySlope[] {
+  return [
+    budgetTelemetrySlope(points, "15m", 15 * 60 * 1000),
+    budgetTelemetrySlope(points, "1h", 60 * 60 * 1000)
+  ];
+}
+
+function budgetTelemetrySlope(
+  points: BudgetTelemetryPoint[],
+  window: BudgetTelemetrySlope["window"],
+  windowMs: number
+): BudgetTelemetrySlope {
+  const eligible = points
+    .filter((point): point is BudgetTelemetryPoint & { d1_rows_written_daily: number } =>
+      point.d1_rows_written_daily !== null
+    )
+    .sort((left, right) => Date.parse(left.sampled_at) - Date.parse(right.sampled_at));
+  const latest = eligible.at(-1);
+  if (!latest) {
+    return emptyBudgetTelemetrySlope(window);
+  }
+
+  const latestAt = safeDate(latest.sampled_at);
+  const windowStartMs = latestAt.getTime() - windowMs;
+  const sameDay = utcDateKey(latestAt);
+  const windowPoints = eligible.filter((point) => {
+    const sampledAt = safeDate(point.sampled_at);
+    return sampledAt.getTime() >= windowStartMs && utcDateKey(sampledAt) === sameDay;
+  });
+  const first = windowPoints[0];
+  if (!first || windowPoints.length < 2) {
+    return {
+      ...emptyBudgetTelemetrySlope(window),
+      sample_count: windowPoints.length
+    };
+  }
+
+  const firstAt = safeDate(first.sampled_at);
+  const minutes = Math.max(0, (latestAt.getTime() - firstAt.getTime()) / 60_000);
+  const delta = Math.max(0, latest.d1_rows_written_daily - first.d1_rows_written_daily);
+  const perMinute = minutes > 0 ? Math.round((delta / minutes) * 10) / 10 : null;
+  const projected = perMinute === null
+    ? null
+    : Math.round(latest.d1_rows_written_daily + perMinute * minutesUntilUtcDayEnd(latestAt));
+
+  return {
+    window,
+    sample_count: windowPoints.length,
+    minutes: Math.round(minutes * 10) / 10,
+    d1_rows_written_delta: delta,
+    d1_rows_written_per_minute: perMinute,
+    projected_d1_rows_written_daily: projected
+  };
+}
+
+function emptyBudgetTelemetrySlope(window: BudgetTelemetrySlope["window"]): BudgetTelemetrySlope {
+  return {
+    window,
+    sample_count: 0,
+    minutes: 0,
+    d1_rows_written_delta: null,
+    d1_rows_written_per_minute: null,
+    projected_d1_rows_written_daily: null
+  };
+}
+
+function budgetD1ActivitySignals(
+  env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
+  generatedAt: string,
+  daily: UsageWindowRow | undefined,
+  telemetry: CloudflareTelemetrySample | undefined
+): BudgetD1Activity {
+  const model = budgetD1WriteModel(env);
+  const eventEstimate = daily ? nonNegativeInteger(daily.events_received) * model.budgeted_rows_written_per_event : null;
+  const measuredDaily = telemetry?.d1RowsWrittenDaily ?? null;
+  const residual = measuredDaily === null || eventEstimate === null ? null : Math.max(0, measuredDaily - eventEstimate);
+  return {
+    generated_at: generatedAt,
+    source: "d1_write_activity_signals",
+    signals: [
+      {
+        id: "cloudflare_d1_rows_written_daily",
+        label: "Measured D1 writes today",
+        detail: "Cloudflare GraphQL Analytics cumulative rows_written for the current UTC day.",
+        source: "cloudflare_analytics",
+        rows_written_daily: measuredDaily,
+        sampled: measuredDaily !== null,
+        updated_at: telemetry?.updatedAt
+      },
+      {
+        id: "estimated_event_persistence_daily",
+        label: "Estimated guarded event writes",
+        detail: "Current daily usage-window event count multiplied by the conservative schema-derived rows-written budget per event.",
+        source: daily ? "d1_usage_windows" : "schema_model",
+        rows_written_daily: eventEstimate,
+        sampled: eventEstimate !== null,
+        updated_at: daily?.updated_at
+      },
+      {
+        id: "estimated_non_event_residual_daily",
+        label: "Measured minus event estimate",
+        detail: "Residual writes after subtracting Chaop's persisted-event estimate. This can include indexes, control-plane rows, inventory sync, manual D1 work, and model error.",
+        source: "cloudflare_analytics",
+        rows_written_daily: residual,
+        sampled: residual !== null,
+        updated_at: telemetry?.updatedAt
+      }
+    ]
+  };
+}
+
+function telemetrySampleBucketStart(generatedAt: string, sampleSeconds: number): Date {
+  const timestamp = safeDate(generatedAt);
+  const bucketMs = Math.max(1, sampleSeconds) * 1000;
+  return new Date(Math.floor(timestamp.getTime() / bucketMs) * bucketMs);
+}
+
+function minutesUntilUtcDayEnd(timestamp: Date): number {
+  const end = new Date(Date.UTC(
+    timestamp.getUTCFullYear(),
+    timestamp.getUTCMonth(),
+    timestamp.getUTCDate() + 1
+  ));
+  return Math.max(0, (end.getTime() - timestamp.getTime()) / 60_000);
+}
+
+function utcDateKey(timestamp: Date): string {
+  return timestamp.toISOString().slice(0, 10);
+}
+
+function safeDate(value: string): Date {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+const CLOUDFLARE_TELEMETRY_QUERY = `query ChaopCloudflareTelemetry(
+  $accountTag: string!
+  $apiScriptName: string!
+  $webScriptName: string!
+  $databaseId: string!
+  $doNamespaceName: string!
+  $start: Time!
+  $end: Time!
+  $dateStart: Date!
+  $dateEnd: Date!
+) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      apiWorkerInvocations: workersInvocationsAdaptive(
+        limit: 1000
+        filter: { scriptName: $apiScriptName, datetime_geq: $start, datetime_leq: $end }
+      ) {
+        sum { requests }
+      }
+      webWorkerInvocations: workersInvocationsAdaptive(
+        limit: 1000
+        filter: { scriptName: $webScriptName, datetime_geq: $start, datetime_leq: $end }
+      ) {
+        sum { requests }
+      }
+      d1AnalyticsAdaptiveGroups(
+        limit: 1000
+        filter: { databaseId: $databaseId, date_geq: $dateStart, date_leq: $dateEnd }
+      ) {
+        sum { rowsRead rowsWritten }
+      }
+      durableObjectsInvocationsAdaptiveGroups(
+        limit: 1000
+        filter: { scriptName: $apiScriptName, datetime_geq: $start, datetime_leq: $end }
+      ) {
+        sum { requests }
+      }
+      durableObjectsPeriodicGroups(
+        limit: 1000
+        filter: { name: $doNamespaceName, datetime_geq: $start, datetime_leq: $end }
+      ) {
+        sum { inboundWebsocketMsgCount }
+      }
+    }
+  }
+}`;
+
 function emptyBudgetSummary(generatedAt: string): BudgetSummary {
+  const constraints = budgetConstraints({}, []);
   return {
     state: "normal",
     daily_used_pct: null,
@@ -4152,27 +4857,419 @@ function emptyBudgetSummary(generatedAt: string): BudgetSummary {
     source: "empty",
     generated_at: generatedAt,
     window_sample_count: 0,
-    windows: []
+    constraint_sample_count: 0,
+    windows: [],
+    constraints,
+    bottleneck_constraint: undefined,
+    d1_write_model: budgetD1WriteModel({})
   };
 }
 
-function budgetWindowSignalFromRow(row: UsageWindowRow): BudgetWindowSignal {
+function budgetWindowSignalFromRow(env: Env, row: UsageWindowRow): BudgetWindowSignal {
+  const budgetUnits = budgetUnitsForUsageWindow(env, row);
+  const eventsReceived = nonNegativeInteger(row.events_received);
   return {
     window_type: budgetWindowTypeFromString(row.window_type),
     window_start: row.window_start,
     window_end: row.window_end,
-    budget_state: budgetStateFromString(row.budget_state),
-    used_pct: normalisePct(row.used_pct),
-    events_received: nonNegativeInteger(row.events_received),
+    budget_state: budgetStateForUsageWindow(env, row),
+    used_pct: usedPctForCount(eventsReceived, budgetUnits),
+    budget_units: budgetUnits,
+    events_received: eventsReceived,
     events_compacted: nonNegativeInteger(row.events_compacted),
     events_delayed: nonNegativeInteger(row.events_delayed),
     local_spool_bytes: nonNegativeInteger(row.local_spool_bytes),
+    estimated_d1_rows_written: eventsReceived * D1_BUDGETED_ROWS_WRITTEN_PER_EVENT,
     updated_at: row.updated_at
   };
 }
 
-function windowPct(row: UsageWindowRow | undefined): number | null {
-  return row ? normalisePct(row.used_pct) : null;
+function localBudgetWindowBaselines(
+  env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
+  generatedAt: string
+): Map<BudgetWindowType, BudgetWindowSignal> {
+  const timestamp = new Date(generatedAt);
+  const safeTimestamp = Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
+  return new Map(
+    usageWindowSpecs(env, safeTimestamp)
+      .filter((spec) => spec.windowType === "four_hour" || spec.windowType === "burst")
+      .map((spec) => [spec.windowType, zeroBudgetWindowSignal(spec)])
+  );
+}
+
+function zeroBudgetWindowSignal(spec: UsageWindowSpec): BudgetWindowSignal {
+  return {
+    window_type: spec.windowType,
+    window_start: spec.windowStart,
+    window_end: spec.windowEnd,
+    budget_state: "normal",
+    used_pct: 0,
+    budget_units: spec.budgetUnits,
+    events_received: 0,
+    events_compacted: 0,
+    events_delayed: 0,
+    local_spool_bytes: 0,
+    estimated_d1_rows_written: 0,
+    updated_at: spec.windowStart
+  };
+}
+
+function budgetConstraints(
+  env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">,
+  windows: BudgetWindowSignal[],
+  telemetry?: CloudflareTelemetrySample | undefined,
+  localBaselines = new Map<BudgetWindowType, BudgetWindowSignal>()
+): BudgetConstraint[] {
+  const model = budgetD1WriteModel(env);
+  const windowsByType = new Map(windows.map((window) => [window.window_type, window]));
+  const fourHourWindow = windowsByType.get("four_hour");
+  const burstWindow = windowsByType.get("burst");
+  const fourHourBaseline = fourHourWindow ? undefined : localBaselines.get("four_hour");
+  const burstBaseline = burstWindow ? undefined : localBaselines.get("burst");
+  return [
+    d1WriteConstraint(
+      "d1_rows_written_daily",
+      "D1 rows written / day",
+      "Cloudflare Free D1 rows-written limit, converted to Chaop event capacity with the current schema-derived write model.",
+      "daily",
+      model.daily_budget_units,
+      windowsByType.get("daily"),
+      model.budgeted_rows_written_per_event,
+      telemetry?.d1RowsWrittenDaily
+    ),
+    d1WriteConstraint(
+      "d1_rows_written_four_hour",
+      "D1 rows written / 4h",
+      "Chaop local four-hour guardrail that prevents one busy period from consuming the full daily D1 rows-written posture.",
+      "four_hour",
+      model.four_hour_hard_budget_units,
+      fourHourWindow ?? fourHourBaseline,
+      model.budgeted_rows_written_per_event,
+      undefined,
+      fourHourBaseline ? "schema_model" : undefined,
+      model.four_hour_soft_budget_units
+    ),
+    d1WriteConstraint(
+      "d1_rows_written_burst",
+      "D1 rows written / minute",
+      "Chaop burst guardrail for short spikes, modelled from D1 rows written per persisted event.",
+      "burst",
+      model.burst_budget_units,
+      burstWindow ?? burstBaseline,
+      model.budgeted_rows_written_per_event,
+      undefined,
+      burstBaseline ? "schema_model" : undefined
+    ),
+    cloudflareTelemetryConstraint(
+      "worker_requests_daily",
+      "Worker requests / day",
+      "Cloudflare GraphQL Analytics API Worker request usage for the Chaop API and Web Workers.",
+      "daily",
+      "worker_request",
+      model.free_worker_requests_per_day,
+      telemetry?.workerRequestsDaily,
+      telemetry
+    ),
+    cloudflareTelemetryConstraint(
+      "durable_object_requests_daily",
+      "Durable Object requests / day",
+      "Cloudflare GraphQL Analytics API Durable Object request-equivalent usage, including periodic inbound WebSocket messages at the 20:1 request ratio when exposed.",
+      "daily",
+      "durable_object_request",
+      CLOUDFLARE_FREE_DURABLE_OBJECT_REQUESTS_PER_DAY,
+      telemetry?.durableObjectRequestEquivalentsDaily,
+      telemetry
+    ),
+    cloudflareTelemetryConstraint(
+      "d1_rows_read_daily",
+      "D1 rows read / day",
+      "Cloudflare GraphQL Analytics API D1 rows-read usage for the Chaop control database.",
+      "daily",
+      "d1_row_read",
+      CLOUDFLARE_FREE_D1_ROWS_READ_PER_DAY,
+      telemetry?.d1RowsReadDaily,
+      telemetry
+    )
+  ];
+}
+
+function d1WriteConstraint(
+  id: string,
+  label: string,
+  detail: string,
+  windowType: BudgetWindowType,
+  eventBudget: number,
+  window: BudgetWindowSignal | undefined,
+  rowsPerEvent: number,
+  telemetryUsedRows?: number | undefined,
+  localSource?: BudgetConstraint["source"] | undefined,
+  softEventBudget?: number | undefined
+): BudgetConstraint {
+  const limitUnits = eventBudget * rowsPerEvent;
+  const softLimitUnits = softEventBudget === undefined ? undefined : softEventBudget * rowsPerEvent;
+  const localUsedRows = window ? window.events_received * rowsPerEvent : null;
+  const usedUnits = d1RowsWrittenConstraintUsedUnits(localUsedRows, telemetryUsedRows);
+  const sampled = localSource === "schema_model" ? false : usedUnits !== null;
+  const source = d1RowsWrittenConstraintSource(localUsedRows, telemetryUsedRows, localSource);
+  return sampledConstraint({
+    id,
+    label,
+    detail,
+    windowType,
+    unit: "d1_row",
+    limitUnits,
+    usedUnits,
+    perEventUnits: rowsPerEvent,
+    state: usedUnits === null ? "missing" : budgetStateForUsageCount(usedUnits, thresholdSet(limitUnits, softLimitUnits)),
+    source,
+    sampled,
+    window
+  });
+}
+
+function d1RowsWrittenConstraintUsedUnits(localUsedRows: number | null, telemetryUsedRows: number | undefined): number | null {
+  if (telemetryUsedRows === undefined) return localUsedRows;
+  return localUsedRows === null ? telemetryUsedRows : Math.max(localUsedRows, telemetryUsedRows);
+}
+
+function d1RowsWrittenConstraintSource(
+  localUsedRows: number | null,
+  telemetryUsedRows: number | undefined,
+  localSource?: BudgetConstraint["source"] | undefined
+): BudgetConstraint["source"] | undefined {
+  if (telemetryUsedRows === undefined) return localSource;
+  if (localUsedRows !== null && localUsedRows > telemetryUsedRows) return localSource ?? "d1_usage_windows";
+  return "cloudflare_analytics";
+}
+
+function sampledConstraint({
+  id,
+  label,
+  detail,
+  windowType,
+  unit,
+  limitUnits,
+  usedUnits,
+  perEventUnits,
+  state,
+  source,
+  sampled,
+  window
+}: {
+  id: string;
+  label: string;
+  detail: string;
+  windowType: BudgetWindowType;
+  unit: BudgetConstraint["unit"];
+  limitUnits: number;
+  usedUnits: number | null;
+  perEventUnits: number;
+  state: BudgetConstraint["state"];
+  source?: BudgetConstraint["source"] | undefined;
+  sampled?: boolean | undefined;
+  window: BudgetWindowSignal | undefined;
+}): BudgetConstraint {
+  const remainingUnits = usedUnits === null ? null : Math.max(0, limitUnits - usedUnits);
+  const remainingRatio = remainingUnits === null ? null : ratio(remainingUnits, limitUnits);
+  return {
+    id,
+    label,
+    detail,
+    window_type: windowType,
+    unit,
+    hard: true,
+    sampled: sampled ?? usedUnits !== null,
+    state,
+    source: usedUnits === null ? "missing" : source ?? "d1_usage_windows",
+    limit_units: limitUnits,
+    used_units: usedUnits,
+    used_pct: usedUnits === null ? null : usedPctForUnits(usedUnits, limitUnits),
+    remaining_units: remainingUnits,
+    remaining_ratio: remainingRatio,
+    per_event_units: perEventUnits,
+    remaining_event_capacity: remainingUnits === null ? null : Math.floor(remainingUnits / perEventUnits),
+    window_start: window?.window_start,
+    window_end: window?.window_end,
+    updated_at: window?.updated_at
+  };
+}
+
+function cloudflareTelemetryConstraint(
+  id: string,
+  label: string,
+  detail: string,
+  windowType: BudgetConstraint["window_type"],
+  unit: BudgetConstraint["unit"],
+  limitUnits: number,
+  usedUnits: number | undefined,
+  telemetry: CloudflareTelemetrySample | undefined
+): BudgetConstraint {
+  if (usedUnits !== undefined) {
+    const remainingUnits = Math.max(0, limitUnits - usedUnits);
+    return {
+      id,
+      label,
+      detail,
+      window_type: windowType,
+      unit,
+      hard: true,
+      sampled: true,
+      state: budgetStateForUsageCount(usedUnits, thresholdSet(limitUnits)),
+      source: "cloudflare_analytics",
+      limit_units: limitUnits,
+      used_units: usedUnits,
+      used_pct: usedPctForUnits(usedUnits, limitUnits),
+      remaining_units: remainingUnits,
+      remaining_ratio: ratio(remainingUnits, limitUnits),
+      per_event_units: null,
+      remaining_event_capacity: null,
+      window_start: telemetry?.windowStart,
+      window_end: telemetry?.windowEnd,
+      updated_at: telemetry?.updatedAt
+    };
+  }
+
+  return {
+    id,
+    label,
+    detail,
+    window_type: windowType,
+    unit,
+    hard: true,
+    sampled: false,
+    state: "missing",
+    source: "missing",
+    limit_units: limitUnits,
+    used_units: null,
+    used_pct: null,
+    remaining_units: null,
+    remaining_ratio: null,
+    per_event_units: null,
+    remaining_event_capacity: null
+  };
+}
+
+function budgetBottleneckConstraint(constraints: BudgetConstraint[]): BudgetConstraint | undefined {
+  return constraints
+    .filter((constraint) =>
+      constraint.hard
+      && constraint.sampled
+      && constraint.remaining_ratio !== null
+      && constraint.state !== "missing"
+    )
+    .sort(compareBudgetConstraintsByRemainingRatio)[0];
+}
+
+function compareBudgetConstraintsByRemainingRatio(left: BudgetConstraint, right: BudgetConstraint): number {
+  const ratioDelta = (left.remaining_ratio ?? Number.POSITIVE_INFINITY) - (right.remaining_ratio ?? Number.POSITIVE_INFINITY);
+  if (ratioDelta !== 0) return ratioDelta;
+  const capacityDelta =
+    (left.remaining_event_capacity ?? Number.POSITIVE_INFINITY)
+    - (right.remaining_event_capacity ?? Number.POSITIVE_INFINITY);
+  if (capacityDelta !== 0) return capacityDelta;
+  return left.id.localeCompare(right.id);
+}
+
+function ratio(numerator: number, denominator: number): number {
+  if (denominator <= 0) return 0;
+  return Math.round((numerator / denominator) * 1000) / 1000;
+}
+
+function usedPctForUnits(usedUnits: number, limitUnits: number): number {
+  if (limitUnits <= 0) return 0;
+  return Math.round((usedUnits * 1000) / limitUnits) / 10;
+}
+
+function budgetD1WriteModel(env: Pick<Env, "CHAOP_DAILY_BUDGET_UNITS" | "CHAOP_4H_SOFT_BUDGET_UNITS" | "CHAOP_4H_HARD_BUDGET_UNITS" | "CHAOP_BURST_EVENTS_PER_MINUTE">): BudgetD1WriteModel {
+  const dailyBudget = positiveIntegerEnv(env.CHAOP_DAILY_BUDGET_UNITS, DEFAULT_DAILY_BUDGET_UNITS);
+  const fourHourSoftBudget = positiveIntegerEnv(env.CHAOP_4H_SOFT_BUDGET_UNITS, DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS);
+  const fourHourHardBudget = Math.max(
+    positiveIntegerEnv(env.CHAOP_4H_HARD_BUDGET_UNITS, DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS),
+    fourHourSoftBudget
+  );
+  const burstBudget = positiveIntegerEnv(env.CHAOP_BURST_EVENTS_PER_MINUTE, DEFAULT_BURST_EVENTS_PER_MINUTE);
+  return {
+    source: "schema_derived",
+    free_rows_written_per_day: CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY,
+    free_worker_requests_per_day: CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY,
+    budgeted_rows_written_per_event: D1_BUDGETED_ROWS_WRITTEN_PER_EVENT,
+    daily_budget_units: dailyBudget,
+    four_hour_soft_budget_units: fourHourSoftBudget,
+    four_hour_hard_budget_units: fourHourHardBudget,
+    burst_budget_units: burstBudget,
+    steady_persisted_event_rows_written: D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN,
+    first_event_in_minute_rows_written: D1_FIRST_EVENT_IN_MINUTE_ROWS_WRITTEN,
+    first_event_in_four_hour_rows_written: D1_FIRST_EVENT_IN_FOUR_HOUR_ROWS_WRITTEN,
+    first_event_in_day_rows_written: D1_FIRST_EVENT_IN_DAY_ROWS_WRITTEN,
+    backfill_rows_written_per_event: D1_BACKFILL_ROWS_WRITTEN_PER_EVENT,
+    backfill_same_minute_fixed_rows_written: D1_BACKFILL_SAME_MINUTE_FIXED_ROWS_WRITTEN,
+    command_lifecycle_without_task_rows_written: D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN,
+    command_lifecycle_with_task_rows_written: D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN,
+    components: [
+      {
+        id: "thread_sequence",
+        label: "Thread sequence update",
+        rows_written: D1_THREAD_SEQUENCE_UPDATE_ROWS,
+        frequency: "per persisted thread event",
+        detail: "Updates the threads row and idx_threads_workspace_updated."
+      },
+      {
+        id: "event_insert",
+        label: "Event insert",
+        rows_written: D1_EVENT_INSERT_ROWS,
+        frequency: "per persisted thread event",
+        detail: "Writes the events row, primary-key index, unique thread sequence index, and explicit thread sequence index."
+      },
+      {
+        id: "usage_windows",
+        label: "Usage-window accounting",
+        rows_written: D1_USAGE_WINDOW_COUNT * D1_USAGE_WINDOW_EXISTING_UPDATE_ROWS,
+        frequency: "per realtime event after current windows exist",
+        detail: "Updates daily, four-hour, and burst rows plus the latest-window index."
+      },
+      {
+        id: "command_lifecycle",
+        label: "Command lifecycle overhead",
+        rows_written: D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN - D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN,
+        frequency: "per command event with an attached task",
+        detail: "Updates command state, task state, and connector activity in addition to the persisted event."
+      },
+      {
+        id: "guardrail_budget",
+        label: "No-telemetry guardrail budget",
+        rows_written: D1_BUDGETED_ROWS_WRITTEN_PER_EVENT,
+        frequency: "per event for local fallback capacity",
+        detail: "Budgets an attached command lifecycle at a daily usage-window boundary when Cloudflare telemetry is unavailable or lower than the local estimate."
+      },
+      {
+        id: "backfill_batch",
+        label: "Backfill batch floor",
+        rows_written: D1_BACKFILL_ROWS_WRITTEN_PER_EVENT,
+        frequency: "per imported backfill event before fixed window updates",
+        detail: "Backfills update thread sequence and insert events per row, then update active usage windows once per batch."
+      }
+    ]
+  };
+}
+
+function windowPct(env: Env, row: UsageWindowRow | undefined): number | null {
+  return row ? usedPctForCount(nonNegativeInteger(row.events_received), budgetUnitsForUsageWindow(env, row)) : null;
+}
+
+function budgetStateForUsageWindow(env: Env, row: UsageWindowRow): BudgetState {
+  return budgetStateForUsageCount(nonNegativeInteger(row.events_received), usageWindowSpecForRow(env, row).thresholds);
+}
+
+function budgetUnitsForUsageWindow(env: Env, row: UsageWindowRow): number {
+  return usageWindowSpecForRow(env, row).budgetUnits;
+}
+
+function usageWindowSpecForRow(env: Env, row: UsageWindowRow): UsageWindowSpec {
+  const timestamp = new Date(row.window_start);
+  const safeTimestamp = Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
+  const windowType = budgetWindowTypeFromString(row.window_type);
+  return usageWindowSpecs(env, safeTimestamp).find((window) => window.windowType === windowType)
+    ?? usageWindowSpec(windowType, safeTimestamp.getTime(), safeTimestamp.getTime() + ONE_MINUTE_MS, 1, thresholdSet(1));
 }
 
 function budgetWindowTypeFromString(value: string): BudgetWindowType {
@@ -4192,14 +5289,13 @@ function worstBudgetState(states: BudgetState[]): BudgetState {
   );
 }
 
-function normalisePct(value: number | undefined): number {
-  if (value === undefined || !Number.isFinite(value)) return 0;
-  return Math.round(Math.max(0, value) * 10) / 10;
-}
-
 function nonNegativeInteger(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value)) return 0;
   return Math.max(0, Math.floor(value));
+}
+
+function nullableNonNegativeInteger(value: number | null | undefined): number | null {
+  return value === null || value === undefined ? null : nonNegativeInteger(value);
 }
 
 type ConnectorRow = {
@@ -4246,6 +5342,56 @@ type BudgetStateCountRow = {
   count: number;
 };
 
+type CloudflareTelemetrySample = {
+  windowStart: string;
+  windowEnd: string;
+  updatedAt: string;
+  workerRequestsDaily: number;
+  durableObjectRequestEquivalentsDaily: number;
+  d1RowsReadDaily: number;
+  d1RowsWrittenDaily: number;
+};
+
+type BudgetTelemetrySampleRow = {
+  sampled_at: string;
+  d1_rows_written_daily: number | null;
+  d1_rows_read_daily: number | null;
+  worker_requests_daily: number | null;
+  durable_object_requests_daily: number | null;
+};
+
+type CloudflareGraphqlMetricRow = {
+  sum?: Record<string, number | undefined> | undefined;
+};
+
+type CloudflareGraphqlResponse = {
+  data?: {
+    viewer?: {
+      accounts?: Array<{
+        apiWorkerInvocations?: CloudflareGraphqlMetricRow[];
+        webWorkerInvocations?: CloudflareGraphqlMetricRow[];
+        d1AnalyticsAdaptiveGroups?: CloudflareGraphqlMetricRow[];
+        durableObjectsInvocationsAdaptiveGroups?: CloudflareGraphqlMetricRow[];
+        durableObjectsPeriodicGroups?: CloudflareGraphqlMetricRow[];
+      }>;
+    };
+  };
+  errors?: Array<{ message: string }>;
+};
+
+type CloudflareTelemetryCacheEntry = {
+  key: string;
+  sample?: CloudflareTelemetrySample | undefined;
+  pending?: Promise<CloudflareTelemetrySample> | undefined;
+  expiresAt: number;
+};
+
+type BudgetTelemetryHistoryCacheEntry = {
+  key: string;
+  history?: BudgetTelemetryHistory | undefined;
+  expiresAt: number;
+};
+
 type UsageWindowSpec = {
   id: string;
   windowType: BudgetWindowType;
@@ -4262,9 +5408,18 @@ type UsageWindowThresholds = {
 };
 
 type UsageEventMetrics = {
+  eventsReceived: number;
   compacted: number;
   delayed: number;
   spoolBytes: number;
+};
+
+type EventUsageMetrics = Omit<UsageEventMetrics, "eventsReceived">;
+
+type UsageWindowAggregate = {
+  window: UsageWindowSpec;
+  metrics: UsageEventMetrics;
+  updatedAt: string;
 };
 
 type WorkspaceRow = {

@@ -2,6 +2,8 @@ import {
   createEnvelope,
   type AgentAppServerInstancesReport,
   type AgentCommandEvent,
+  type HostSessionAppServerEnsureDispatch,
+  type HostSessionAppServerEnsureResult,
   type HostSessionBackfillDispatch,
   type HostSessionBackfillResult,
   type AgentHostSessionsReport,
@@ -32,9 +34,12 @@ import {
 import type { Env } from "./types.js";
 
 const THREAD_CREATE_TIMEOUT_MS = 15_000;
+const HOST_SESSION_APP_SERVER_ENSURE_TIMEOUT_MS = 15_000;
 const HOST_SESSION_BACKFILL_TIMEOUT_MS = 15_000;
 const THREAD_ARCHIVE_SYNC_TIMEOUT_MS = 20_000;
 const APP_SERVER_REPORT_CACHE_MS = 60_000;
+const HOST_SESSIONS_REFRESH_COOLDOWN_MS = 60_000;
+const HOST_SESSIONS_REFRESH_DISPATCH_WAIT_MS = 30_000;
 
 type SocketAttachment = {
   socketType?: string;
@@ -42,6 +47,7 @@ type SocketAttachment = {
   connectedAt?: number;
   agentReady?: boolean;
   pendingHostSessionsDispatch?: boolean;
+  pendingHostSessionsDispatchDeadline?: number;
   activeCommandIds?: string[];
 };
 
@@ -62,6 +68,14 @@ export class WorkspaceDO implements DurableObject {
       reject: (error: Error) => void;
     }
   >();
+  private readonly pendingHostSessionAppServerEnsures = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      resolve: (result: HostSessionAppServerEnsureResult) => void;
+      reject: (error: Error) => void;
+    }
+  >();
   private readonly pendingThreadArchiveSyncs = new Map<
     string,
     {
@@ -77,6 +91,7 @@ export class WorkspaceDO implements DurableObject {
       acceptedAt: number;
     }
   >();
+  private readonly hostSessionsRefreshSentAt = new Map<string, number>();
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -99,6 +114,10 @@ export class WorkspaceDO implements DurableObject {
 
     if (url.pathname === "/internal/backfill-host-session") {
       return this.backfillHostSession(request);
+    }
+
+    if (url.pathname === "/internal/ensure-host-session-app-server") {
+      return this.ensureHostSessionAppServer(request);
     }
 
     if (url.pathname === "/internal/sync-thread-archive") {
@@ -191,7 +210,7 @@ export class WorkspaceDO implements DurableObject {
       const capabilitiesChanged = readyPayload
         ? await updateConnectorCapabilities(this.env, connectorId, readyPayload.capabilities)
         : false;
-      this.markAgentReady(ws, connectorId, readyPayload !== undefined && (!wasReady || capabilitiesChanged));
+      this.markAgentReady(ws, connectorId);
       ws.send(
         JSON.stringify(
           createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
@@ -201,10 +220,13 @@ export class WorkspaceDO implements DurableObject {
         )
       );
       if (readyPayload && (!wasReady || capabilitiesChanged)) {
+        this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
         await this.broadcastConnectorUpdate(connectorId);
+        await this.sendPendingCommandsAndReleased(ws, connectorId);
       }
       if (!readyPayload && !wasReady) {
         await markConnectorOnline(this.env, connectorId);
+        this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
         await this.broadcastConnectorUpdate(connectorId);
         await this.sendPendingCommandsAndReleased(ws, connectorId);
       }
@@ -225,7 +247,8 @@ export class WorkspaceDO implements DurableObject {
       this.broadcastToBrowsers(hostSessionsMessage({
         host_sessions: result.host_sessions,
         connector_id: connectorId,
-        synced_at: result.synced_at
+        synced_at: result.synced_at,
+        snapshot: result.snapshot
       }));
       for (const event of result.failed_events) {
         this.broadcastToBrowsers(threadEventMessage(event));
@@ -337,6 +360,19 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    if (message.kind === "host_session.app_server_ensure_result" && isHostSessionAppServerEnsureResult(message.payload)) {
+      this.resolveHostSessionAppServerEnsure(message.payload);
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            kind: "host_session.app_server_ensure_result",
+            request_id: message.payload.request_id
+          })
+        )
+      );
+      return;
+    }
+
     if (message.kind === "thread.archive_sync_result" && isThreadArchiveSyncResult(message.payload)) {
       this.resolveThreadArchiveSync(message.payload);
       ws.send(
@@ -410,9 +446,12 @@ export class WorkspaceDO implements DurableObject {
   }
 
   private async handleSocketGone(ws: WebSocket): Promise<void> {
-    const attachment = ws.deserializeAttachment() as { socketType?: string; connectorId?: string } | undefined;
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
     if (attachment?.socketType !== "agent" || !attachment.connectorId) {
       return;
+    }
+    if (attachment.pendingHostSessionsDispatch) {
+      this.hostSessionsRefreshSentAt.delete(attachment.connectorId);
     }
     const hasAuthenticatedPeer = hasPeerAgentSocket(this.ctx, attachment.connectorId, ws);
     const hasReadyPeer = hasReadyPeerAgentSocket(this.ctx, attachment.connectorId, ws);
@@ -452,16 +491,69 @@ export class WorkspaceDO implements DurableObject {
 
   private refreshHostSessions(): Response {
     const sockets = this.ctx.getWebSockets("agent");
+    const latestReadySocketByConnector = new Map<string, WebSocket>();
     for (const socket of sockets) {
-      socket.send(
-        JSON.stringify(
-          createEnvelope("host_sessions.refresh", { type: "worker", id: "workspace-do-global" }, {})
-        )
-      );
+      const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+      const connectorId = attachment?.connectorId;
+      if (!connectorId || !isReadyAgentSocket(socket, connectorId)) {
+        continue;
+      }
+      const previous = latestReadySocketByConnector.get(connectorId);
+      if (!previous || socketConnectedAt(socket) > socketConnectedAt(previous)) {
+        latestReadySocketByConnector.set(connectorId, socket);
+      }
     }
-    return new Response(JSON.stringify({ dispatched_to: sockets.length }), {
+
+    const now = Date.now();
+    let dispatchedTo = 0;
+    let debouncedConnectorCount = 0;
+    for (const [connectorId, socket] of latestReadySocketByConnector) {
+      const lastSentAt = this.hostSessionsRefreshSentAt.get(connectorId);
+      if (
+        lastSentAt !== undefined &&
+        now - lastSentAt < HOST_SESSIONS_REFRESH_COOLDOWN_MS
+      ) {
+        debouncedConnectorCount += 1;
+        continue;
+      }
+
+      if (this.dispatchHostSessionsRefreshToSocket(socket, connectorId, now)) {
+        dispatchedTo += 1;
+      } else {
+        debouncedConnectorCount += 1;
+      }
+    }
+    return new Response(JSON.stringify({
+      dispatched_to: dispatchedTo,
+      debounced_connector_count: debouncedConnectorCount,
+      cooldown_ms: HOST_SESSIONS_REFRESH_COOLDOWN_MS
+    }), {
       headers: { "content-type": "application/json; charset=utf-8" }
     });
+  }
+
+  private dispatchHostSessionsRefreshToSocket(socket: WebSocket, connectorId: string, now = Date.now()): boolean {
+    if (this.hasPendingHostSessionsDispatchForConnector(connectorId)) {
+      return false;
+    }
+    const lastSentAt = this.hostSessionsRefreshSentAt.get(connectorId);
+    if (
+      lastSentAt !== undefined &&
+      now - lastSentAt < HOST_SESSIONS_REFRESH_COOLDOWN_MS
+    ) {
+      return false;
+    }
+
+    socket.send(
+      JSON.stringify(
+        createEnvelope("host_sessions.refresh", { type: "worker", id: "workspace-do-global" }, {}, {
+          target: { type: "connector", id: connectorId }
+        })
+      )
+    );
+    this.hostSessionsRefreshSentAt.set(connectorId, now);
+    this.markHostSessionsRefreshPending(socket, connectorId);
+    return true;
   }
 
   private async createLocalThread(request: Request): Promise<Response> {
@@ -534,6 +626,43 @@ export class WorkspaceDO implements DurableObject {
         return jsonResponse({ error: result.error ?? "Connector could not backfill the host session" }, 502);
       }
       return jsonResponse({ events: result.events ?? [], truncated: result.truncated === true });
+    } catch (error) {
+      return jsonResponse({ error: error instanceof Error ? error.message : "Connector did not respond" }, 504);
+    }
+  }
+
+  private async ensureHostSessionAppServer(request: Request): Promise<Response> {
+    const payload = await request.json().catch(() => ({})) as Partial<HostSessionAppServerEnsureDispatch> & {
+      connector_id?: unknown;
+    };
+    const connectorId = typeof payload.connector_id === "string" ? payload.connector_id : undefined;
+    if (!connectorId) {
+      return jsonResponse({ error: "Missing connector_id" }, 400);
+    }
+    if (!isHostSessionAppServerEnsureDispatch(payload)) {
+      return jsonResponse({ error: "Invalid host session app-server ensure payload" }, 400);
+    }
+
+    const sockets = agentSocketsForConnector(this.ctx, connectorId);
+    const socket = sockets[0];
+    if (!socket) {
+      return jsonResponse({ error: "Connector is not connected" }, 404);
+    }
+
+    try {
+      const result = await this.waitForHostSessionAppServerEnsure(payload.request_id, () => {
+        socket.send(
+          JSON.stringify(
+            createEnvelope("host_session.app_server_ensure", { type: "worker", id: "workspace-do-global" }, payload, {
+              target: { type: "connector", id: connectorId }
+            })
+          )
+        );
+      });
+      if (!result.ok || !result.session) {
+        return jsonResponse({ error: result.error ?? "Connector could not attach the host session through app-server" }, 502);
+      }
+      return jsonResponse({ session: result.session });
     } catch (error) {
       return jsonResponse({ error: error instanceof Error ? error.message : "Connector did not respond" }, 504);
     }
@@ -636,6 +765,36 @@ export class WorkspaceDO implements DurableObject {
     pending.resolve(result);
   }
 
+  private async waitForHostSessionAppServerEnsure(
+    requestId: string,
+    send: () => void
+  ): Promise<HostSessionAppServerEnsureResult> {
+    return await new Promise<HostSessionAppServerEnsureResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingHostSessionAppServerEnsures.delete(requestId);
+        reject(new Error("Connector timed out while attaching the host session through app-server"));
+      }, HOST_SESSION_APP_SERVER_ENSURE_TIMEOUT_MS);
+      this.pendingHostSessionAppServerEnsures.set(requestId, { timer, resolve, reject });
+      try {
+        send();
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingHostSessionAppServerEnsures.delete(requestId);
+        reject(error instanceof Error ? error : new Error("Connector send failed"));
+      }
+    });
+  }
+
+  private resolveHostSessionAppServerEnsure(result: HostSessionAppServerEnsureResult): void {
+    const pending = this.pendingHostSessionAppServerEnsures.get(result.request_id);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingHostSessionAppServerEnsures.delete(result.request_id);
+    pending.resolve(result);
+  }
+
   private async waitForThreadArchiveSync(
     requestId: string,
     send: () => void
@@ -671,7 +830,10 @@ export class WorkspaceDO implements DurableObject {
     connectorId: string,
     options: { skipStaleExplicitCleanup?: boolean } = {}
   ): Promise<string[]> {
-    if (!isReadyAgentSocket(ws, connectorId) || hasPendingHostSessionsDispatch(ws, connectorId)) {
+    if (
+      !isReadyAgentSocket(ws, connectorId) ||
+      this.hasPendingHostSessionsDispatchForConnector(connectorId)
+    ) {
       return [];
     }
     let releasedConnectorIds: string[] = [];
@@ -707,6 +869,17 @@ export class WorkspaceDO implements DurableObject {
       }
     }
     return releasedConnectorIds;
+  }
+
+  private hasPendingHostSessionsDispatchForConnector(connectorId: string): boolean {
+    if (typeof this.ctx.getWebSockets !== "function") {
+      return false;
+    }
+    const taggedSockets = this.ctx.getWebSockets(`agent:${connectorId}`);
+    const sockets = taggedSockets.length > 0
+      ? taggedSockets
+      : this.ctx.getWebSockets("agent").filter((socket) => isAgentSocketForConnector(socket, connectorId));
+    return sockets.some((socket) => hasPendingHostSessionsDispatch(socket, connectorId));
   }
 
   private async sendPendingCommandsAndReleased(ws: WebSocket, connectorId: string): Promise<void> {
@@ -794,13 +967,27 @@ export class WorkspaceDO implements DurableObject {
 
   private markAgentReady(ws: WebSocket, connectorId: string, pendingHostSessionsDispatch = false): void {
     const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
-    ws.serializeAttachment({
+    const existingDeadline = attachment?.pendingHostSessionsDispatchDeadline;
+    const existingPending =
+      attachment?.pendingHostSessionsDispatch === true &&
+      typeof existingDeadline === "number" &&
+      existingDeadline > Date.now();
+    const nextPending = existingPending || pendingHostSessionsDispatch;
+    const nextAttachment: SocketAttachment = {
       ...attachment,
       socketType: "agent",
       connectorId,
       agentReady: true,
-      pendingHostSessionsDispatch: attachment?.pendingHostSessionsDispatch === true || pendingHostSessionsDispatch
-    });
+      pendingHostSessionsDispatch: nextPending
+    };
+    if (pendingHostSessionsDispatch) {
+      nextAttachment.pendingHostSessionsDispatchDeadline = Date.now() + HOST_SESSIONS_REFRESH_DISPATCH_WAIT_MS;
+    } else if (existingPending) {
+      nextAttachment.pendingHostSessionsDispatchDeadline = existingDeadline;
+    } else {
+      delete nextAttachment.pendingHostSessionsDispatchDeadline;
+    }
+    ws.serializeAttachment(nextAttachment);
   }
 
   private consumePendingHostSessionsDispatch(ws: WebSocket, connectorId: string): boolean {
@@ -813,11 +1000,24 @@ export class WorkspaceDO implements DurableObject {
     ) {
       return false;
     }
+    ws.serializeAttachment(withoutPendingHostSessionsDispatch(attachment));
+    return true;
+  }
+
+  private markHostSessionsRefreshPending(ws: WebSocket, connectorId: string): void {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
+    if (
+      attachment?.socketType !== "agent" ||
+      attachment.connectorId !== connectorId ||
+      attachment.agentReady !== true
+    ) {
+      return;
+    }
     ws.serializeAttachment({
       ...attachment,
-      pendingHostSessionsDispatch: false
+      pendingHostSessionsDispatch: true,
+      pendingHostSessionsDispatchDeadline: Date.now() + HOST_SESSIONS_REFRESH_DISPATCH_WAIT_MS
     });
-    return true;
   }
 
   private recordSocketCommand(ws: WebSocket, connectorId: string, commandId: string): void {
@@ -860,9 +1060,8 @@ export class WorkspaceDO implements DurableObject {
       return false;
     }
     ws.serializeAttachment({
-      ...attachment,
-      agentReady: false,
-      pendingHostSessionsDispatch: false
+      ...withoutPendingHostSessionsDispatch(attachment),
+      agentReady: false
     });
     return true;
   }
@@ -928,10 +1127,30 @@ function isAgentSocketForConnector(socket: WebSocket, connectorId: string): bool
 
 function hasPendingHostSessionsDispatch(socket: WebSocket, connectorId: string): boolean {
   const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
-  return (
+  const pending =
     attachment?.socketType === "agent" &&
     attachment.connectorId === connectorId &&
-    attachment.pendingHostSessionsDispatch === true
+    isActivePendingHostSessionsDispatch(attachment);
+  if (!pending && attachment?.pendingHostSessionsDispatch === true) {
+    socket.serializeAttachment(withoutPendingHostSessionsDispatch(attachment));
+  }
+  return pending;
+}
+
+function withoutPendingHostSessionsDispatch(attachment: SocketAttachment | undefined): SocketAttachment {
+  const next = {
+    ...attachment,
+    pendingHostSessionsDispatch: false
+  };
+  delete next.pendingHostSessionsDispatchDeadline;
+  return next;
+}
+
+function isActivePendingHostSessionsDispatch(attachment: SocketAttachment | undefined): boolean {
+  return (
+    attachment?.pendingHostSessionsDispatch === true &&
+    typeof attachment.pendingHostSessionsDispatchDeadline === "number" &&
+    attachment.pendingHostSessionsDispatchDeadline > Date.now()
   );
 }
 
@@ -1134,6 +1353,30 @@ function isHostSessionBackfillResult(value: unknown): value is HostSessionBackfi
     (record.error === undefined || typeof record.error === "string") &&
     (record.truncated === undefined || typeof record.truncated === "boolean") &&
     (record.events === undefined || (Array.isArray(record.events) && record.events.every(isAgentBackfillEvent)))
+  );
+}
+
+function isHostSessionAppServerEnsureDispatch(value: unknown): value is HostSessionAppServerEnsureDispatch {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    record.request_id.length > 0 &&
+    typeof record.session_id === "string" &&
+    record.session_id.length > 0 &&
+    (record.title === undefined || typeof record.title === "string") &&
+    (record.cwd === undefined || typeof record.cwd === "string")
+  );
+}
+
+function isHostSessionAppServerEnsureResult(value: unknown): value is HostSessionAppServerEnsureResult {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.request_id === "string" &&
+    typeof record.ok === "boolean" &&
+    (record.error === undefined || typeof record.error === "string") &&
+    (record.session === undefined || isAgentHostSession(record.session))
   );
 }
 

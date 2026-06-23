@@ -9,6 +9,7 @@ import {
   type CreateCommandResponse,
   type CreateLocalThreadRequest,
   type DetachHostSessionRequest,
+  type HostSessionAppServerEnsureResult,
   type HostSessionSummary,
   type LocalThreadCreateResult,
   type RefreshHostSessionsResponse,
@@ -30,15 +31,20 @@ import {
   archiveTaskInDb,
   attachCreatedLocalThreadInDb,
   attachHostSessionInDb,
+  bootstrapBudgetWindowsInDb,
   chooseConnectorForLocalThread,
   createCommandInDb,
   detachHostSessionInDb,
   ensureConnectorInventory,
   findAttachedHostSessionForTaskInDb,
+  hasLiveHostSessionAttachmentInDb,
   listThreadEventsInDb,
   loadBudgetSummaryFromDb,
   loadBootstrapFromDb,
+  loadHostSessionInDb,
+  markHostSessionAppServerPresentInDb,
   recordHostSessionBackfillEvents,
+  recordHostSessions,
   unarchiveTaskInDb
 } from "./db.js";
 import { budget, sampleBootstrap } from "./sample-data.js";
@@ -79,6 +85,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
     const summary = env.DB ? await loadBudgetSummaryFromDb(env) : budget;
     return json(request, env, summary);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/budget/bootstrap") {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+    const summary = await bootstrapBudgetWindowsInDb(env);
+    return json(request, env, summary, 201);
   }
 
   if (request.method === "POST" && url.pathname === "/connector/bootstrap") {
@@ -217,9 +233,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const archived = taskArchiveMatch[2] === "archive";
       const task = archived ? await archiveTaskInDb(env, taskId) : await unarchiveTaskInDb(env, taskId);
       const hostSession = await findAttachedHostSessionForTaskInDb(env, taskId);
-      const archiveSync = hostSession?.app_server_present === true
+      const archiveSync = hostSession && isAppServerHostSessionLineage(hostSession)
         ? await requestThreadArchiveSync(env, hostSession, archived)
         : undefined;
+      if (hostSession && !archived && archiveSync?.attempted === true && !archiveSync.error) {
+        await markHostSessionAppServerPresentInDb(env, hostSession);
+      }
       const response: TaskArchiveResponse = {
         task,
         archive_sync: archiveSync
@@ -243,10 +262,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
     if (!env.WORKSPACE_DO) return json(request, env, { error: "Workspace Durable Object binding is unavailable" }, 503);
 
-    const dispatchedTo = await requestHostSessionRefresh(env);
+    const refresh = await requestHostSessionRefresh(env);
     const response: RefreshHostSessionsResponse = {
       requested: true,
-      dispatched_to: dispatchedTo,
+      dispatched_to: refresh.dispatched_to,
+      debounced_connector_count: refresh.debounced_connector_count,
+      cooldown_ms: refresh.cooldown_ms,
       server_time: new Date().toISOString()
     };
     return json(request, env, response, 202);
@@ -290,10 +311,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     try {
+      const sessionId = decodeURIComponent(attachHostSessionMatch[1] ?? "");
+      const connectorId = await ensureHostSessionAppServerIfAvailable(env, sessionId, payload.value.connector_id);
       const attachment = await attachHostSessionInDb(
         env,
-        decodeURIComponent(attachHostSessionMatch[1] ?? ""),
-        payload.value.connector_id
+        sessionId,
+        connectorId ?? payload.value.connector_id
       );
       const { attachment_created: attachmentCreated, ...response } = attachment;
       const backfill = attachmentCreated
@@ -318,6 +341,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return json(request, env, response, 201);
     } catch (error) {
       if (error instanceof NotFoundError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      if (error instanceof ConnectorRpcError) {
         return json(request, env, { error: error.message }, error.status);
       }
       throw error;
@@ -522,16 +548,30 @@ async function broadcastThreadEvents(env: Env, events: ThreadEvent[]): Promise<v
   });
 }
 
-async function requestHostSessionRefresh(env: Env): Promise<number> {
-  if (!env.WORKSPACE_DO) return 0;
+async function requestHostSessionRefresh(env: Env): Promise<{
+  dispatched_to: number;
+  debounced_connector_count?: number | undefined;
+  cooldown_ms?: number | undefined;
+}> {
+  if (!env.WORKSPACE_DO) return { dispatched_to: 0 };
 
   const id = env.WORKSPACE_DO.idFromName("global");
   const stub = env.WORKSPACE_DO.get(id);
   const response = await stub.fetch("https://workspace-do/internal/refresh-host-sessions", {
     method: "POST"
   });
-  const body = await response.json().catch(() => ({})) as { dispatched_to?: unknown };
-  return typeof body.dispatched_to === "number" ? body.dispatched_to : 0;
+  const body = await response.json().catch(() => ({})) as {
+    dispatched_to?: unknown;
+    debounced_connector_count?: unknown;
+    cooldown_ms?: unknown;
+  };
+  return {
+    dispatched_to: typeof body.dispatched_to === "number" ? body.dispatched_to : 0,
+    debounced_connector_count: typeof body.debounced_connector_count === "number"
+      ? body.debounced_connector_count
+      : undefined,
+    cooldown_ms: typeof body.cooldown_ms === "number" ? body.cooldown_ms : undefined
+  };
 }
 
 class ConnectorRpcError extends Error {
@@ -571,6 +611,74 @@ async function requestLocalThreadCreate(
   }
   if (!body.session || !isAgentHostSession(body.session)) {
     throw new ConnectorRpcError("Connector returned an invalid local thread response", 502);
+  }
+  return body.session;
+}
+
+async function ensureHostSessionAppServerIfAvailable(
+  env: Env,
+  sessionId: string,
+  connectorId?: string
+): Promise<string | undefined> {
+  if (!env.DB) return connectorId;
+  const hostSession = await loadHostSessionInDb(env, sessionId, connectorId);
+  if (!hostSession) {
+    throw new NotFoundError("Host session not found");
+  }
+  if (await hasLiveHostSessionAttachmentInDb(env, hostSession)) {
+    return hostSession.connector_id;
+  }
+  if (!(await connectorHasCapability(env, hostSession.connector_id, "host_session_app_server_ensure"))) {
+    return hostSession.connector_id;
+  }
+
+  const session = await requestHostSessionAppServerEnsure(env, hostSession);
+  if (session.session_id !== hostSession.session_id) {
+    throw new ConnectorRpcError("Connector returned a different app-server host session", 502);
+  }
+  if (session.app_server_present !== true) {
+    throw new ConnectorRpcError("Connector did not return an app-server-backed host session", 502);
+  }
+  await recordHostSessions(
+    env,
+    hostSession.connector_id,
+    { sessions: [session], inventory_scope: "incremental", app_server_inventory_ok: true },
+    new Date().toISOString(),
+    { workspaceId: hostSession.workspace_id }
+  );
+  return hostSession.connector_id;
+}
+
+async function requestHostSessionAppServerEnsure(
+  env: Env,
+  hostSession: HostSessionSummary
+): Promise<AgentHostSession> {
+  if (!env.WORKSPACE_DO) {
+    throw new ConnectorRpcError("Workspace Durable Object binding is unavailable", 503);
+  }
+
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  const response = await stub.fetch("https://workspace-do/internal/ensure-host-session-app-server", {
+    method: "POST",
+    body: JSON.stringify({
+      connector_id: hostSession.connector_id,
+      request_id: `host-session-app-server-${cryptoRandomId().slice(0, 16)}`,
+      session_id: hostSession.session_id,
+      title: hostSession.title,
+      cwd: hostSession.cwd
+    })
+  });
+  const body = await response.json().catch(() => ({})) as Partial<HostSessionAppServerEnsureResult> & { error?: unknown };
+
+  if (!response.ok) {
+    const message = typeof body.error === "string"
+      ? body.error
+      : "Connector could not attach the host session through app-server";
+    throw new ConnectorRpcError(message, response.status);
+  }
+  if (!body.session || !isAgentHostSession(body.session)) {
+    throw new ConnectorRpcError("Connector returned an invalid app-server host session response", 502);
   }
   return body.session;
 }
@@ -642,6 +750,10 @@ async function requestThreadArchiveSync(
     archived,
     error: body.synced === false ? "No matching app-server thread was found" : undefined
   };
+}
+
+function isAppServerHostSessionLineage(hostSession: HostSessionSummary): boolean {
+  return hostSession.app_server_present === true || hostSession.title_source === "app_server";
 }
 
 async function requestAndRecordHostSessionBackfill(

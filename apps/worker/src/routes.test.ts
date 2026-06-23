@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { handleRequest } from "./routes.js";
+import { loadBudgetSummaryFromDb } from "./db.js";
 import type { Env } from "./types.js";
 
 const devEnv: Env = {
@@ -113,19 +114,30 @@ test("host session refresh dispatches to the workspace durable object", async ()
         get: () => ({
           fetch: async (input: RequestInfo | URL) => {
             internalPath = new URL(String(input)).pathname;
-            return new Response(JSON.stringify({ dispatched_to: 2 }), {
+            return new Response(JSON.stringify({
+              dispatched_to: 2,
+              debounced_connector_count: 1,
+              cooldown_ms: 60_000
+            }), {
               headers: { "content-type": "application/json; charset=utf-8" }
             });
           }
-        }) as DurableObjectStub
+        }) as unknown as DurableObjectStub
       } as unknown as DurableObjectNamespace
     }
   );
-  const body = (await response.json()) as { requested: boolean; dispatched_to: number };
+  const body = (await response.json()) as {
+    requested: boolean;
+    dispatched_to: number;
+    debounced_connector_count: number;
+    cooldown_ms: number;
+  };
 
   assert.equal(response.status, 202);
   assert.equal(body.requested, true);
   assert.equal(body.dispatched_to, 2);
+  assert.equal(body.debounced_connector_count, 1);
+  assert.equal(body.cooldown_ms, 60_000);
   assert.equal(internalPath, "/internal/refresh-host-sessions");
 });
 
@@ -221,7 +233,7 @@ test("local thread creation dispatches to an app-server capable connector and at
               { headers: { "content-type": "application/json; charset=utf-8" } }
             );
           }
-        }) as DurableObjectStub
+        }) as unknown as DurableObjectStub
       } as unknown as DurableObjectNamespace
     }
   );
@@ -347,6 +359,61 @@ test("task unarchive syncs attached app-server host session after updating D1", 
   });
   assert.equal(db.taskArchiveWrites, 1);
   assert.equal(db.threadArchiveWrites, 1);
+});
+
+test("task unarchive syncs app-server lineage after active inventory demotion", async () => {
+  let internalPath = "";
+  let dispatchBody: Record<string, unknown> | undefined;
+  const db = taskArchiveSyncDb({
+    initialArchivedAt: "2026-06-12T10:30:00.000Z",
+    appServerPresent: false,
+    titleSource: "app_server"
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/tasks/task-host-1/unarchive", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            dispatchBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            return new Response(JSON.stringify({ ok: true }), {
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+        }) as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    task: { id: string; archived_at?: string };
+    archive_sync?: { attempted: boolean; connector_id?: string; session_id?: string; archived: boolean };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(internalPath, "/internal/sync-thread-archive");
+  assert.equal(dispatchBody?.connector_id, "connector-online");
+  assert.equal(dispatchBody?.session_id, "thread-1");
+  assert.equal(dispatchBody?.archived, false);
+  assert.equal(body.task.id, "task-host-1");
+  assert.equal(body.task.archived_at, undefined);
+  assert.deepEqual(body.archive_sync, {
+    attempted: true,
+    connector_id: "connector-online",
+    session_id: "thread-1",
+    archived: false
+  });
+  assert.equal(db.taskArchiveWrites, 1);
+  assert.equal(db.threadArchiveWrites, 1);
+  assert.equal(db.appServerPresenceRestores, 1);
 });
 
 test("task archive reports D1-only fallback when app-server thread is not resolved", async () => {
@@ -700,6 +767,62 @@ test("host session attach imports bounded history backfill events", async () => 
   assert.equal(db.eventInserts, 30);
 });
 
+test("host session attach accounts successfully imported backfill events when later import fails", async () => {
+  const db = hostSessionAttachBackfillDb({ failBackfillAfterEventInserts: 1 });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => new Response(
+            JSON.stringify({
+              events: [
+                {
+                  kind: "command.output",
+                  priority: "P3",
+                  summary: "2026-06-12 10:01 - User: Event 1",
+                  idempotency_key: "rollout:session-1:1",
+                  created_at: "2026-06-12T10:01:00.000Z"
+                },
+                {
+                  kind: "command.output",
+                  priority: "P3",
+                  summary: "2026-06-12 10:02 - User: Event 2",
+                  idempotency_key: "rollout:session-1:2",
+                  created_at: "2026-06-12T10:02:00.000Z"
+                }
+              ],
+              truncated: false
+            }),
+            { headers: { "content-type": "application/json; charset=utf-8" } }
+          )
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    backfill?: { attempted: boolean; imported_event_count?: number; error?: string };
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.usageWindowUpserts, 3);
+  assert.equal(body.backfill?.attempted, true);
+  assert.equal(body.backfill?.imported_event_count, 0);
+  assert.match(body.backfill?.error ?? "", /Injected backfill sequence failure/);
+});
+
 test("host session attach skips backfill when connector lacks capability", async () => {
   const db = hostSessionAttachBackfillDb({ supportsBackfill: false });
   const response = await handleRequest(
@@ -736,6 +859,324 @@ test("host session attach skips backfill when connector lacks capability", async
   assert.equal(body.events, undefined);
   assert.equal(body.backfill, undefined);
   assert.equal(db.eventInserts, 0);
+});
+
+test("host session attach resumes available app-server session before attachment", async () => {
+  let internalPath = "";
+  let dispatchBody: Record<string, unknown> | undefined;
+  const db = hostSessionAttachBackfillDb({ supportsAppServer: true, supportsBackfill: false });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+            internalPath = new URL(String(input)).pathname;
+            dispatchBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            return new Response(
+              JSON.stringify({
+                session: {
+                  session_id: "session-1",
+                  title: "Recovered app-server title",
+                  title_source: "app_server",
+                  app_server_present: true,
+                  cwd: "/workspace/project",
+                  updated_at: "2026-06-12T10:05:00.000Z"
+                }
+              }),
+              { headers: { "content-type": "application/json; charset=utf-8" } }
+            );
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    host_session: {
+      app_server_present?: boolean;
+      title?: string;
+      title_source?: string;
+      attached_thread_id?: string;
+    };
+    events?: unknown[];
+    backfill?: unknown;
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(internalPath, "/internal/ensure-host-session-app-server");
+  assert.equal(dispatchBody?.connector_id, "connector-online");
+  assert.equal(dispatchBody?.session_id, "session-1");
+  assert.equal(dispatchBody?.title, "Existing session");
+  assert.equal(dispatchBody?.cwd, "/workspace/project");
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.host_session.app_server_present, true);
+  assert.equal(body.host_session.title, "Recovered app-server title");
+  assert.equal(body.host_session.title_source, "app_server");
+  assert.equal(body.events, undefined);
+  assert.equal(body.backfill, undefined);
+});
+
+test("host session attach re-ensures stored app-server sessions before attachment", async () => {
+  let ensureRequestCount = 0;
+  const db = hostSessionAttachBackfillDb({
+    supportsAppServer: true,
+    supportsBackfill: false,
+    appServerPresent: true
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            ensureRequestCount += 1;
+            return new Response(
+              JSON.stringify({
+                session: {
+                  session_id: "session-1",
+                  title: "Recovered app-server title",
+                  title_source: "app_server",
+                  app_server_present: true,
+                  cwd: "/workspace/project",
+                  updated_at: "2026-06-12T10:05:00.000Z"
+                }
+              }),
+              { headers: { "content-type": "application/json; charset=utf-8" } }
+            );
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    host_session: { app_server_present?: boolean; title?: string; attached_thread_id?: string };
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(ensureRequestCount, 1);
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.host_session.app_server_present, true);
+  assert.equal(body.host_session.title, "Recovered app-server title");
+});
+
+test("host session attach rejects mismatched app-server ensure sessions", async () => {
+  const db = hostSessionAttachBackfillDb({ supportsAppServer: true, supportsBackfill: false });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => new Response(
+            JSON.stringify({
+              session: {
+                session_id: "session-other",
+                title: "Wrong app-server title",
+                title_source: "app_server",
+                app_server_present: true,
+                cwd: "/workspace/project",
+                updated_at: "2026-06-12T10:05:00.000Z"
+              }
+            }),
+            { headers: { "content-type": "application/json; charset=utf-8" } }
+          )
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as { error?: string };
+
+  assert.equal(response.status, 502);
+  assert.match(body.error ?? "", /different app-server host session/);
+});
+
+test("host session attach reuses the app-server ensured connector when connector id is omitted", async () => {
+  const db = hostSessionAttachBackfillDb({ supportsAppServer: true, supportsBackfill: false });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({})
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => new Response(
+            JSON.stringify({
+              session: {
+                session_id: "session-1",
+                title: "Recovered app-server title",
+                title_source: "app_server",
+                app_server_present: true,
+                cwd: "/workspace/project",
+                updated_at: "2026-06-12T10:05:00.000Z"
+              }
+            }),
+            { headers: { "content-type": "application/json; charset=utf-8" } }
+          )
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+
+  assert.equal(response.status, 201);
+  assert.deepEqual(db.hostSessionLookupConnectorIds, [
+    undefined,
+    "connector-online",
+    "connector-online",
+    "connector-online"
+  ]);
+});
+
+test("host session attach falls back without the app-server ensure capability", async () => {
+  const db = hostSessionAttachBackfillDb({
+    supportsAppServer: true,
+    supportsAppServerEnsure: false,
+    supportsBackfill: false
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not receive app-server ensure requests without the ensure capability");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    host_session: {
+      app_server_present?: boolean;
+      title?: string;
+      title_source?: string;
+      attached_thread_id?: string;
+    };
+    events?: unknown[];
+    backfill?: unknown;
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.host_session.app_server_present, false);
+  assert.equal(body.host_session.title, "Existing session");
+  assert.equal(body.host_session.title_source, "metadata");
+  assert.equal(body.events, undefined);
+  assert.equal(body.backfill, undefined);
+});
+
+test("host session attach resumes app-server session when stored attachment rows are stale", async () => {
+  let internalPath = "";
+  const db = hostSessionAttachBackfillDb({
+    alreadyAttached: true,
+    missingAttachedRows: true,
+    supportsAppServer: true,
+    supportsBackfill: false
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL) => {
+            internalPath = new URL(String(input)).pathname;
+            return new Response(
+              JSON.stringify({
+                session: {
+                  session_id: "session-1",
+                  title: "Recovered app-server title",
+                  title_source: "app_server",
+                  app_server_present: true,
+                  cwd: "/workspace/project",
+                  updated_at: "2026-06-12T10:05:00.000Z"
+                }
+              }),
+              { headers: { "content-type": "application/json; charset=utf-8" } }
+            );
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    host_session: {
+      app_server_present?: boolean;
+      title?: string;
+      title_source?: string;
+      attached_thread_id?: string;
+    };
+    events?: unknown[];
+    backfill?: unknown;
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(internalPath, "/internal/ensure-host-session-app-server");
+  assert.equal(body.host_session.attached_thread_id, "thread-host-session-1-connector-online");
+  assert.equal(body.host_session.app_server_present, true);
+  assert.equal(body.host_session.title, "Recovered app-server title");
+  assert.equal(body.host_session.title_source, "app_server");
+  assert.equal(body.events, undefined);
+  assert.equal(body.backfill, undefined);
 });
 
 test("host session attach skips backfill when connector is degraded", async () => {
@@ -777,7 +1218,7 @@ test("host session attach skips backfill when connector is degraded", async () =
 });
 
 test("host session attach skips backfill when the session is already attached", async () => {
-  const db = hostSessionAttachBackfillDb({ alreadyAttached: true });
+  const db = hostSessionAttachBackfillDb({ alreadyAttached: true, supportsAppServer: true });
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/session-1/attach", {
       method: "POST",
@@ -795,7 +1236,7 @@ test("host session attach skips backfill when the session is already attached", 
         idFromName: () => ({}) as DurableObjectId,
         get: () => ({
           fetch: async () => {
-            throw new Error("DO should not receive backfill requests for existing attachments");
+            throw new Error("DO should not receive ensure or backfill requests for existing attachments");
           }
         }) as unknown as DurableObjectStub
       } as unknown as DurableObjectNamespace
@@ -1139,30 +1580,156 @@ test("usage summary returns bounded D1 budget windows", async () => {
     compacted_event_count: number;
     local_spool_bytes: number;
     window_sample_count: number;
-    windows: Array<{ window_type: string; used_pct: number; events_received: number }>;
+    d1_write_model: {
+      budgeted_rows_written_per_event: number;
+      daily_budget_units: number;
+      four_hour_hard_budget_units: number;
+      burst_budget_units: number;
+      command_lifecycle_with_task_rows_written: number;
+    };
+    constraint_sample_count: number;
+    bottleneck_constraint: {
+      id: string;
+      used_pct: number;
+      remaining_ratio: number;
+      remaining_event_capacity: number;
+    };
+    constraints: Array<{
+      id: string;
+      sampled: boolean;
+      state: string;
+      used_pct: number | null;
+      remaining_ratio: number | null;
+      remaining_event_capacity: number | null;
+    }>;
+    windows: Array<{
+      window_type: string;
+      used_pct: number;
+      budget_units: number;
+      events_received: number;
+      estimated_d1_rows_written: number;
+      budget_state: string;
+    }>;
   };
 
   assert.equal(response.status, 200);
   assert.equal(body.source, "d1_usage_windows");
-  assert.equal(body.state, "hard_limited");
-  assert.equal(body.daily_used_pct, 125.4);
-  assert.equal(body.four_hour_used_pct, 88.9);
-  assert.equal(body.burst_used_pct, 21);
+  assert.equal(body.state, "throttled");
+  assert.equal(body.daily_used_pct, 26);
+  assert.equal(body.four_hour_used_pct, 37.4);
+  assert.equal(body.burst_used_pct, 4.7);
   assert.equal(body.delayed_event_count, 8);
   assert.equal(body.compacted_event_count, 55);
   assert.equal(body.local_spool_bytes, 4096);
   assert.equal(body.window_sample_count, 3);
+  assert.equal(body.constraint_sample_count, 3);
   assert.deepEqual(
-    body.windows.map((window) => [window.window_type, window.used_pct, window.events_received]),
     [
-      ["daily", 125.4, 1000],
-      ["four_hour", 88.9, 240],
-      ["burst", 21, 18]
+      body.d1_write_model.budgeted_rows_written_per_event,
+      body.d1_write_model.daily_budget_units,
+      body.d1_write_model.four_hour_hard_budget_units,
+      body.d1_write_model.burst_budget_units,
+      body.d1_write_model.command_lifecycle_with_task_rows_written
+    ],
+    [26, 3846, 641, 384, 20]
+  );
+  assert.deepEqual(
+    [
+      body.bottleneck_constraint.id,
+      body.bottleneck_constraint.used_pct,
+      body.bottleneck_constraint.remaining_ratio,
+      body.bottleneck_constraint.remaining_event_capacity
+    ],
+    ["d1_rows_written_four_hour", 37.4, 0.626, 401]
+  );
+  assert.deepEqual(
+    body.constraints.map((constraint) => [
+      constraint.id,
+      constraint.sampled,
+      constraint.state,
+      constraint.used_pct,
+      constraint.remaining_ratio,
+      constraint.remaining_event_capacity
+    ]),
+    [
+      ["d1_rows_written_daily", true, "normal", 26, 0.74, 2846],
+      ["d1_rows_written_four_hour", true, "normal", 37.4, 0.626, 401],
+      ["d1_rows_written_burst", true, "normal", 4.7, 0.953, 366],
+      ["worker_requests_daily", false, "missing", null, null, null],
+      ["durable_object_requests_daily", false, "missing", null, null, null],
+      ["d1_rows_read_daily", false, "missing", null, null, null]
+    ]
+  );
+  assert.deepEqual(
+    body.windows.map((window) => [
+      window.window_type,
+      window.used_pct,
+      window.budget_units,
+      window.events_received,
+      window.estimated_d1_rows_written,
+      window.budget_state
+    ]),
+    [
+      ["daily", 26, 3846, 1000, 26000, "normal"],
+      ["four_hour", 37.4, 641, 240, 6240, "normal"],
+      ["burst", 4.7, 384, 18, 468, "normal"]
     ]
   );
 });
 
-test("usage summary marks missing D1 budget windows as unsampled", async () => {
+test("usage summary respects the four-hour soft D1 budget constraint", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/usage-summary", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: budgetSummaryDb([], {
+        windowOverrides: {
+          daily: { events_received: 100 },
+          four_hour: { events_received: 500 },
+          burst: { events_received: 10 }
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    state: string;
+    bottleneck_constraint: { id: string; state: string; used_pct: number; remaining_ratio: number };
+    constraints: Array<{ id: string; state: string; used_pct: number | null }>;
+    windows: Array<{ window_type: string; budget_state: string; used_pct: number }>;
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.state, "throttled");
+  assert.deepEqual(
+    [body.bottleneck_constraint.id, body.bottleneck_constraint.state, body.bottleneck_constraint.used_pct],
+    ["d1_rows_written_four_hour", "throttled", 78]
+  );
+  assert.deepEqual(
+    body.constraints.map((constraint) => [constraint.id, constraint.state, constraint.used_pct]),
+    [
+      ["d1_rows_written_daily", "normal", 2.6],
+      ["d1_rows_written_four_hour", "throttled", 78],
+      ["d1_rows_written_burst", "normal", 2.6],
+      ["worker_requests_daily", "missing", null],
+      ["durable_object_requests_daily", "missing", null],
+      ["d1_rows_read_daily", "missing", null]
+    ]
+  );
+  assert.deepEqual(
+    body.windows.map((window) => [window.window_type, window.budget_state, window.used_pct]),
+    [
+      ["daily", "normal", 2.6],
+      ["four_hour", "throttled", 78],
+      ["burst", "normal", 2.6]
+    ]
+  );
+});
+
+test("usage summary treats missing short D1 budget windows as zero local baselines", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/usage-summary", {
       headers: {
@@ -1181,20 +1748,39 @@ test("usage summary marks missing D1 budget windows as unsampled", async () => {
     four_hour_used_pct: number | null;
     burst_used_pct: number | null;
     window_sample_count: number;
-    windows: Array<{ window_type: string; used_pct: number }>;
+    constraint_sample_count: number;
+    bottleneck_constraint: { id: string; remaining_ratio: number };
+    constraints: Array<{ id: string; sampled: boolean; source: string; used_pct: number | null }>;
+    windows: Array<{ window_type: string; used_pct: number; budget_units: number }>;
   };
 
   assert.equal(response.status, 200);
   assert.equal(body.source, "d1_usage_windows");
-  assert.equal(body.state, "hard_limited");
+  assert.equal(body.state, "throttled");
   assert.equal(body.daily_used_pct, null);
-  assert.equal(body.four_hour_used_pct, 88.9);
-  assert.equal(body.burst_used_pct, null);
+  assert.equal(body.four_hour_used_pct, 37.4);
+  assert.equal(body.burst_used_pct, 0);
   assert.equal(body.window_sample_count, 1);
-  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct]), [["four_hour", 88.9]]);
+  assert.equal(body.constraint_sample_count, 1);
+  assert.deepEqual(
+    [body.bottleneck_constraint.id, body.bottleneck_constraint.remaining_ratio],
+    ["d1_rows_written_four_hour", 0.626]
+  );
+  assert.deepEqual(
+    body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_pct]),
+    [
+      ["d1_rows_written_daily", false, "missing", null],
+      ["d1_rows_written_four_hour", true, "d1_usage_windows", 37.4],
+      ["d1_rows_written_burst", false, "schema_model", 0],
+      ["worker_requests_daily", false, "missing", null],
+      ["durable_object_requests_daily", false, "missing", null],
+      ["d1_rows_read_daily", false, "missing", null]
+    ]
+  );
+  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct, window.budget_units]), [["four_hour", 37.4, 641]]);
 });
 
-test("usage summary ignores expired D1 budget windows", async () => {
+test("usage summary reports zero short-window baselines when no current D1 budget windows exist", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/usage-summary", {
       headers: {
@@ -1212,16 +1798,537 @@ test("usage summary ignores expired D1 budget windows", async () => {
     four_hour_used_pct: number | null;
     burst_used_pct: number | null;
     window_sample_count: number;
+    constraint_sample_count: number;
+    bottleneck_constraint?: { id: string; source: string; used_pct: number };
+    constraints: Array<{ id: string; sampled: boolean; source: string; used_pct: number | null }>;
     windows: unknown[];
   };
 
   assert.equal(response.status, 200);
   assert.equal(body.source, "empty");
   assert.equal(body.daily_used_pct, null);
-  assert.equal(body.four_hour_used_pct, null);
-  assert.equal(body.burst_used_pct, null);
+  assert.equal(body.four_hour_used_pct, 0);
+  assert.equal(body.burst_used_pct, 0);
   assert.equal(body.window_sample_count, 0);
+  assert.equal(body.constraint_sample_count, 0);
+  assert.equal(body.bottleneck_constraint, undefined);
+  assert.deepEqual(
+    body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_pct]),
+    [
+      ["d1_rows_written_daily", false, "missing", null],
+      ["d1_rows_written_four_hour", false, "schema_model", 0],
+      ["d1_rows_written_burst", false, "schema_model", 0],
+      ["worker_requests_daily", false, "missing", null],
+      ["durable_object_requests_daily", false, "missing", null],
+      ["d1_rows_read_daily", false, "missing", null]
+    ]
+  );
   assert.deepEqual(body.windows, []);
+});
+
+test("budget bootstrap opens zero-count current usage windows", async () => {
+  const db = budgetBootstrapDb();
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/budget/bootstrap", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+  const body = (await response.json()) as {
+    source: string;
+    state: string;
+    window_sample_count: number;
+    constraint_sample_count: number;
+    bottleneck_constraint: { id: string };
+    constraints: Array<{ id: string; sampled: boolean; used_pct: number | null; used_units: number | null }>;
+    windows: Array<{ window_type: string; used_pct: number; events_received: number }>;
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(db.usageWindowUpserts, 3);
+  assert.equal(body.source, "d1_usage_windows");
+  assert.equal(body.state, "normal");
+  assert.equal(body.window_sample_count, 3);
+  assert.equal(body.constraint_sample_count, 3);
+  assert.equal(body.bottleneck_constraint.id, "d1_rows_written_burst");
+  assert.deepEqual(
+    body.windows.map((window) => [window.window_type, window.used_pct, window.events_received]),
+    [
+      ["daily", 0, 0],
+      ["four_hour", 0, 0],
+      ["burst", 0, 0]
+    ]
+  );
+  assert.deepEqual(
+    body.constraints
+      .filter((constraint) => constraint.id.startsWith("d1_rows_written_"))
+      .map((constraint) => [constraint.id, constraint.sampled, constraint.used_pct, constraint.used_units]),
+    [
+      ["d1_rows_written_daily", true, 0, 0],
+      ["d1_rows_written_four_hour", true, 0, 0],
+      ["d1_rows_written_burst", true, 0, 0]
+    ]
+  );
+});
+
+test("usage summary samples Cloudflare telemetry constraints when configured", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedBody: { variables?: Record<string, unknown> } | undefined;
+  globalThis.fetch = (async (input, init) => {
+    assert.equal(String(input), "https://api.cloudflare.com/client/v4/graphql");
+    requestedBody = JSON.parse(String(init?.body ?? "{}")) as { variables?: Record<string, unknown> };
+    assert.equal(init?.headers && typeof init.headers === "object" && "authorization" in init.headers
+      ? (init.headers as Record<string, string>).authorization
+      : undefined, "Bearer telemetry-token");
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 20 } }],
+              webWorkerInvocations: [{ sum: { requests: 5 } }],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 1234, rowsWritten: 96 } }],
+              durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 40 } }],
+              durableObjectsPeriodicGroups: [{ sum: { inboundWebsocketMsgCount: 41 } }]
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] }),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "account-1",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_WEB_WORKER: "chaop-web",
+        CF_TELEMETRY_D1_DATABASE_ID: "database-1",
+        CF_TELEMETRY_DO_NAMESPACE_NAME: "WorkspaceDO"
+      }
+    );
+    const body = (await response.json()) as {
+      source: string;
+      constraint_sample_count: number;
+      bottleneck_constraint: { id: string; source: string };
+      constraints: Array<{ id: string; sampled: boolean; source: string; used_units: number | null }>;
+      telemetry_history: {
+        latest_sample_at?: string;
+        points: Array<{ sampled_at: string; d1_rows_written_daily: number | null }>;
+        slopes: Array<{ window: string; sample_count: number; d1_rows_written_delta: number | null }>;
+      };
+      d1_activity: {
+        signals: Array<{ id: string; sampled: boolean; rows_written_daily: number | null }>;
+      };
+    };
+
+    assert.equal(response.status, 200);
+    const variables = requestedBody?.variables ?? {};
+    assert.equal(variables.accountTag, "account-1");
+    assert.equal(variables.apiScriptName, "chaop-api");
+    assert.equal(variables.webScriptName, "chaop-web");
+    assert.equal(variables.databaseId, "database-1");
+    assert.equal(variables.doNamespaceName, "WorkspaceDO");
+    assert.match(String(variables.start), /^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/);
+    assert.match(String(variables.end), /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(variables.dateStart, String(variables.start).slice(0, 10));
+    assert.equal(variables.dateEnd, String(variables.start).slice(0, 10));
+    assert.deepEqual({
+      accountTag: variables.accountTag,
+      apiScriptName: variables.apiScriptName,
+      webScriptName: variables.webScriptName,
+      databaseId: variables.databaseId,
+      doNamespaceName: variables.doNamespaceName
+    }, {
+      accountTag: "account-1",
+      apiScriptName: "chaop-api",
+      webScriptName: "chaop-web",
+      databaseId: "database-1",
+      doNamespaceName: "WorkspaceDO"
+    });
+    assert.equal(body.source, "cloudflare_analytics");
+    assert.equal(body.constraint_sample_count, 4);
+    assert.deepEqual([body.bottleneck_constraint.id, body.bottleneck_constraint.source], [
+      "d1_rows_written_daily",
+      "cloudflare_analytics"
+    ]);
+    assert.deepEqual(
+      body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_units]),
+      [
+        ["d1_rows_written_daily", true, "cloudflare_analytics", 96],
+        ["d1_rows_written_four_hour", false, "schema_model", 0],
+        ["d1_rows_written_burst", false, "schema_model", 0],
+        ["worker_requests_daily", true, "cloudflare_analytics", 25],
+        ["durable_object_requests_daily", true, "cloudflare_analytics", 43],
+        ["d1_rows_read_daily", true, "cloudflare_analytics", 1234]
+      ]
+    );
+    assert.equal(body.telemetry_history.points.length, 1);
+    assert.equal(body.telemetry_history.points[0]!.d1_rows_written_daily, 96);
+    assert.deepEqual(
+      body.telemetry_history.slopes.map((slope) => [slope.window, slope.sample_count, slope.d1_rows_written_delta]),
+      [
+        ["15m", 1, null],
+        ["1h", 1, null]
+      ]
+    );
+    assert.deepEqual(
+      body.d1_activity.signals.map((signal) => [signal.id, signal.sampled, signal.rows_written_daily]),
+      [
+        ["cloudflare_d1_rows_written_daily", true, 96],
+        ["estimated_event_persistence_daily", false, null],
+        ["estimated_non_event_residual_daily", false, null]
+      ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("usage summary keeps local D1 write estimate when telemetry is lower", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 20 } }],
+            webWorkerInvocations: [{ sum: { requests: 5 } }],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 1234, rowsWritten: 96 } }],
+            durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 40 } }],
+            durableObjectsPeriodicGroups: [{ sum: { inboundWebsocketMsgCount: 41 } }]
+          }
+        ]
+      }
+    }
+  }), {
+    headers: { "content-type": "application/json; charset=utf-8" }
+  })) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: budgetSummaryDb(),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "account-1",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_WEB_WORKER: "chaop-web",
+        CF_TELEMETRY_D1_DATABASE_ID: "database-1",
+        CF_TELEMETRY_DO_NAMESPACE_NAME: "WorkspaceDO"
+      }
+    );
+    const body = (await response.json()) as {
+      constraint_sample_count: number;
+      bottleneck_constraint: { id: string; source: string; used_units: number };
+      constraints: Array<{ id: string; sampled: boolean; source: string; used_units: number | null }>;
+      d1_activity: {
+        signals: Array<{ id: string; sampled: boolean; rows_written_daily: number | null }>;
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.constraint_sample_count, 6);
+    assert.deepEqual(
+      [body.bottleneck_constraint.id, body.bottleneck_constraint.source, body.bottleneck_constraint.used_units],
+      ["d1_rows_written_four_hour", "d1_usage_windows", 6240]
+    );
+    assert.deepEqual(
+      body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_units]),
+      [
+        ["d1_rows_written_daily", true, "d1_usage_windows", 26000],
+        ["d1_rows_written_four_hour", true, "d1_usage_windows", 6240],
+        ["d1_rows_written_burst", true, "d1_usage_windows", 468],
+        ["worker_requests_daily", true, "cloudflare_analytics", 25],
+        ["durable_object_requests_daily", true, "cloudflare_analytics", 43],
+        ["d1_rows_read_daily", true, "cloudflare_analytics", 1234]
+      ]
+    );
+    assert.deepEqual(
+      body.d1_activity.signals.map((signal) => [signal.id, signal.sampled, signal.rows_written_daily]),
+      [
+        ["cloudflare_d1_rows_written_daily", true, 96],
+        ["estimated_event_persistence_daily", true, 26000],
+        ["estimated_non_event_residual_daily", true, 0]
+      ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("usage summary keeps Cloudflare telemetry constraints missing when the query fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  console.warn = () => undefined;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ errors: [{ message: "denied" }] }), {
+    status: 403,
+    headers: { "content-type": "application/json; charset=utf-8" }
+  })) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] }),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "account-1",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_D1_DATABASE_ID: "database-1"
+      }
+    );
+    const body = (await response.json()) as {
+      source: string;
+      constraint_sample_count: number;
+      constraints: Array<{ id: string; sampled: boolean; used_units: number | null }>;
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.source, "empty");
+    assert.equal(body.constraint_sample_count, 0);
+    assert.deepEqual(
+      body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.used_units]),
+      [
+        ["d1_rows_written_daily", false, null],
+        ["d1_rows_written_four_hour", false, 0],
+        ["d1_rows_written_burst", false, 0],
+        ["worker_requests_daily", false, null],
+        ["durable_object_requests_daily", false, null],
+        ["d1_rows_read_daily", false, null]
+      ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
+});
+
+test("usage summary caches Cloudflare telemetry samples within the configured TTL", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 10 } }],
+              webWorkerInvocations: [{ sum: { requests: 2 } }],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten: 24 } }],
+              durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 5 } }],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const env: Env = {
+    ...devEnv,
+    DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] }),
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "account-cache",
+    CF_TELEMETRY_API_WORKER: "chaop-api",
+    CF_TELEMETRY_WEB_WORKER: "chaop-web-cache",
+    CF_TELEMETRY_D1_DATABASE_ID: "database-cache",
+    CF_TELEMETRY_CACHE_SECONDS: "300"
+  };
+
+  try {
+    const first = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: { origin: "https://app.example.com" }
+      }),
+      env
+    );
+    const second = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: { origin: "https://app.example.com" }
+      }),
+      env
+    );
+    const firstBody = (await first.json()) as {
+      constraints: Array<{ id: string; used_units: number | null }>;
+    };
+    const secondBody = (await second.json()) as {
+      constraints: Array<{ id: string; used_units: number | null }>;
+    };
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(fetchCount, 1);
+    assert.deepEqual(firstBody.constraints, secondBody.constraints);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("budget telemetry cache expires on sample bucket boundaries", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: fetchCount } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: fetchCount * 100, rowsWritten: fetchCount * 10 } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const env: Env = {
+    ...devEnv,
+    DB: budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] }),
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "account-bucket-cache",
+    CF_TELEMETRY_API_WORKER: "chaop-api",
+    CF_TELEMETRY_D1_DATABASE_ID: "database-bucket-cache",
+    CF_TELEMETRY_CACHE_SECONDS: "300",
+    CF_TELEMETRY_SAMPLE_SECONDS: "300"
+  };
+
+  try {
+    await loadBudgetSummaryFromDb(env, "2026-06-15T09:04:59.000Z");
+    const second = await loadBudgetSummaryFromDb(env, "2026-06-15T09:05:00.000Z");
+
+    assert.equal(fetchCount, 2);
+    assert.equal(second.telemetry_history?.points.at(-1)?.d1_rows_written_daily, 20);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("budget telemetry samples are scoped by telemetry selectors", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: fetchCount } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: fetchCount * 100, rowsWritten: fetchCount * 10 } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const db = budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] });
+  const baseEnv: Env = {
+    ...devEnv,
+    DB: db,
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "account-selector-cache",
+    CF_TELEMETRY_D1_DATABASE_ID: "database-selector-cache",
+    CF_TELEMETRY_CACHE_SECONDS: "300",
+    CF_TELEMETRY_SAMPLE_SECONDS: "300"
+  };
+
+  try {
+    await loadBudgetSummaryFromDb(
+      {
+        ...baseEnv,
+        CF_TELEMETRY_API_WORKER: "chaop-api-a"
+      },
+      "2026-06-15T09:04:00.000Z"
+    );
+    const second = await loadBudgetSummaryFromDb(
+      {
+        ...baseEnv,
+        CF_TELEMETRY_API_WORKER: "chaop-api-b"
+      },
+      "2026-06-15T09:04:00.000Z"
+    );
+
+    assert.equal(fetchCount, 2);
+    assert.equal(second.telemetry_history?.points.at(-1)?.d1_rows_written_daily, 20);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("budget telemetry history keeps the latest bounded samples", async () => {
+  const samples = Array.from({ length: 305 }, (_, index) => {
+    const sampledAt = new Date(Date.UTC(2026, 5, 15, 8, index, 0)).toISOString();
+    return {
+      id: `sample-${index}`,
+      sample_type: "cloudflare_daily",
+      sampled_at: sampledAt,
+      window_start: "2026-06-15T00:00:00.000Z",
+      window_end: "2026-06-16T00:00:00.000Z",
+      d1_rows_written_daily: index,
+      d1_rows_read_daily: index * 10,
+      worker_requests_daily: index * 2,
+      durable_object_requests_daily: index * 3,
+      created_at: sampledAt
+    };
+  });
+  const body = await loadBudgetSummaryFromDb(
+    {
+      ...devEnv,
+      DB: budgetSummaryDb([], {
+        expiredWindowTypes: ["daily", "four_hour", "burst"],
+        telemetrySamples: samples
+      })
+    },
+    "2026-06-15T13:05:00.000Z"
+  );
+  const points = body.telemetry_history?.points ?? [];
+
+  assert.equal(points.length, 300);
+  assert.equal(points[0]!.d1_rows_written_daily, 5);
+  assert.equal(points.at(-1)!.d1_rows_written_daily, 304);
+  assert.equal(body.telemetry_history?.latest_sample_at, "2026-06-15T13:04:00.000Z");
 });
 
 test("agent bootstrap rejects invalid secret", async () => {
@@ -2071,8 +3178,13 @@ function readOnlyBootstrapDb(): D1Database {
 
 function budgetSummaryDb(
   omitWindowTypes: string[] = [],
-  options: { expiredWindowTypes?: string[] | undefined } = {}
+  options: {
+    expiredWindowTypes?: string[] | undefined;
+    telemetrySamples?: Record<string, unknown>[] | undefined;
+    windowOverrides?: Record<string, Record<string, unknown>> | undefined;
+  } = {}
 ): D1Database {
+  const telemetrySamples: Record<string, unknown>[] = [...(options.telemetrySamples ?? [])];
   const windows: Record<string, Record<string, unknown>> = {
     daily: {
       id: "usage-daily",
@@ -2114,6 +3226,9 @@ function budgetSummaryDb(
       updated_at: "2026-06-15T09:01:00.000Z"
     }
   };
+  for (const [windowType, overrides] of Object.entries(options.windowOverrides ?? {})) {
+    windows[windowType] = { ...windows[windowType], ...overrides };
+  }
   for (const windowType of omitWindowTypes) {
     delete windows[windowType];
   }
@@ -2160,9 +3275,158 @@ function budgetSummaryDb(
         };
       }
 
+      if (/INSERT OR IGNORE INTO budget_telemetry_samples/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            sampleType: string,
+            selectorHash: string,
+            sampledAt: string,
+            windowStart: string,
+            windowEnd: string,
+            d1RowsWrittenDaily: number | null,
+            d1RowsReadDaily: number | null,
+            workerRequestsDaily: number | null,
+            durableObjectRequestsDaily: number | null,
+            createdAt: string
+          ) {
+            return {
+              async run() {
+                if (telemetrySamples.some((sample) => sample.id === id)) {
+                  return { meta: { changes: 0 } };
+                }
+                telemetrySamples.push({
+                  id,
+                  sample_type: sampleType,
+                  selector_hash: selectorHash,
+                  sampled_at: sampledAt,
+                  window_start: windowStart,
+                  window_end: windowEnd,
+                  d1_rows_written_daily: d1RowsWrittenDaily,
+                  d1_rows_read_daily: d1RowsReadDaily,
+                  worker_requests_daily: workerRequestsDaily,
+                  durable_object_requests_daily: durableObjectRequestsDaily,
+                  created_at: createdAt
+                });
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM budget_telemetry_samples/.test(sql)) {
+        const descending = /ORDER BY sampled_at DESC/.test(sql);
+        return {
+          bind(sampleType: string, selectorHash: string, since: string, limit: number) {
+            return {
+              async all() {
+                const results = telemetrySamples
+                  .filter((sample) =>
+                    sample.sample_type === sampleType &&
+                    String(sample.selector_hash ?? selectorHash) === selectorHash &&
+                    String(sample.sampled_at) >= since
+                  )
+                  .sort((left, right) => descending
+                    ? String(right.sampled_at).localeCompare(String(left.sampled_at))
+                    : String(left.sampled_at).localeCompare(String(right.sampled_at)))
+                  .slice(0, limit);
+                return { results };
+              }
+            };
+          }
+        };
+      }
+
       throw new Error(`Unexpected SQL in budget summary fake: ${sql}`);
     }
   } as unknown as D1Database;
+}
+
+function budgetBootstrapDb(): D1Database & { readonly usageWindowUpserts: number } {
+  const windows = new Map<string, Record<string, unknown>>();
+  let usageWindowUpserts = 0;
+
+  return {
+    prepare(sql: string) {
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return {
+          bind(...args: unknown[]) {
+            return {
+              async run() {
+                usageWindowUpserts += 1;
+                windows.set(String(args[1]), {
+                  id: args[0],
+                  window_type: args[1],
+                  window_start: args[2],
+                  window_end: args[3],
+                  budget_state: args[4],
+                  used_pct: args[5],
+                  events_received: args[6],
+                  events_compacted: args[7],
+                  events_delayed: args[8],
+                  local_spool_bytes: args[9],
+                  updated_at: args[10]
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM usage_windows/.test(sql)) {
+        assert.match(sql, /WHERE window_type = \?/);
+        return {
+          bind(windowType: string, windowStartAt: string, windowEndAt: string) {
+            return {
+              async first() {
+                assert.equal(windowEndAt, windowStartAt);
+                const row = windows.get(windowType);
+                if (!row) return undefined;
+                assert.equal(String(row.window_start) <= windowStartAt, true);
+                assert.equal(String(row.window_end) > windowStartAt, true);
+                return row;
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM connectors/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        return {
+          async all() {
+            return { results: [] };
+          }
+        };
+      }
+
+      if (/FROM tasks/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        return {
+          async all() {
+            return { results: [] };
+          }
+        };
+      }
+
+      if (/FROM budget_telemetry_samples/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async all() {
+                return { results: [] };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in budget bootstrap fake: ${sql}`);
+    },
+    get usageWindowUpserts() {
+      return usageWindowUpserts;
+    }
+  } as unknown as D1Database & { readonly usageWindowUpserts: number };
 }
 
 function commandTargetDb(
@@ -2199,7 +3463,7 @@ function commandTargetDb(
           bind() {
             return {
               async run() {
-                return { success: true };
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -2439,7 +3703,7 @@ function commandTargetDb(
           bind() {
             return {
               async run() {
-                return { success: true };
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -2612,7 +3876,7 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
                   attached_thread_id: null,
                   updated_at: updatedAt
                 });
-                return { success: true };
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -2837,7 +4101,11 @@ function taskArchiveSyncDb(
     titleSource?: string | undefined;
     appServerPresent?: boolean | undefined;
   } = {}
-): D1Database & { readonly taskArchiveWrites: number; readonly threadArchiveWrites: number } {
+): D1Database & {
+  readonly taskArchiveWrites: number;
+  readonly threadArchiveWrites: number;
+  readonly appServerPresenceRestores: number;
+} {
   const connectorStatus = options.connectorStatus ?? "online";
   const supportsArchive = options.supportsArchive ?? true;
   const supportsAppServerThreads = options.supportsAppServerThreads ?? false;
@@ -2886,7 +4154,8 @@ function taskArchiveSyncDb(
   };
   const counters = {
     taskArchiveWrites: 0,
-    threadArchiveWrites: 0
+    threadArchiveWrites: 0,
+    appServerPresenceRestores: 0
   };
 
   const db = {
@@ -3002,6 +4271,26 @@ function taskArchiveSyncDb(
         };
       }
 
+      if (/UPDATE host_sessions/.test(sql) && /SET app_server_present = 1/.test(sql)) {
+        return {
+          bind(updatedAt: string, hostSessionId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(hostSessionId, "host-session-1");
+            return {
+              async run() {
+                if (hostSession.app_server_present === 1) {
+                  return { meta: { changes: 0 } };
+                }
+                hostSession.app_server_present = 1;
+                hostSession.updated_at = updatedAt;
+                counters.appServerPresenceRestores += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get taskArchiveWrites() {
@@ -3009,21 +4298,39 @@ function taskArchiveSyncDb(
     },
     get threadArchiveWrites() {
       return counters.threadArchiveWrites;
+    },
+    get appServerPresenceRestores() {
+      return counters.appServerPresenceRestores;
     }
   };
 
-  return db as D1Database & { readonly taskArchiveWrites: number; readonly threadArchiveWrites: number };
+  return db as D1Database & {
+    readonly taskArchiveWrites: number;
+    readonly threadArchiveWrites: number;
+    readonly appServerPresenceRestores: number;
+  };
 }
 
 function hostSessionAttachBackfillDb(
   options: {
     connectorStatus?: string | undefined;
     supportsBackfill?: boolean | undefined;
+    supportsAppServer?: boolean | undefined;
+    supportsAppServerEnsure?: boolean | undefined;
+    appServerPresent?: boolean | undefined;
     alreadyAttached?: boolean | undefined;
+    missingAttachedRows?: boolean | undefined;
+    failBackfillAfterEventInserts?: number | undefined;
   } = {}
-): D1Database & { readonly eventInserts: number } {
+): D1Database & {
+  readonly eventInserts: number;
+  readonly hostSessionLookupConnectorIds: Array<string | undefined>;
+  readonly usageWindowUpserts: number;
+} {
   const connectorStatus = options.connectorStatus ?? "online";
   const supportsBackfill = options.supportsBackfill ?? true;
+  const supportsAppServer = options.supportsAppServer ?? false;
+  const supportsAppServerEnsure = options.supportsAppServerEnsure ?? supportsAppServer;
   const threadId = "thread-host-session-1-connector-online";
   const taskId = "task-host-session-1-connector-online";
   const session = {
@@ -3034,12 +4341,13 @@ function hostSessionAttachBackfillDb(
     session_id: "session-1",
     title: "Existing session",
     title_source: "metadata",
+    app_server_present: options.appServerPresent ? 1 : 0,
     cwd: "/workspace/project",
     attached_task_id: options.alreadyAttached ? taskId : null as string | null,
     attached_thread_id: options.alreadyAttached ? threadId : null as string | null,
     updated_at: "2026-06-12T10:00:00.000Z"
   };
-  let threadRow: Record<string, unknown> | undefined = options.alreadyAttached
+  let threadRow: Record<string, unknown> | undefined = options.alreadyAttached && !options.missingAttachedRows
     ? {
       id: threadId,
       workspace_id: "workspace-api",
@@ -3050,7 +4358,7 @@ function hostSessionAttachBackfillDb(
       updated_at: "2026-06-12T10:00:00.000Z"
     }
     : undefined;
-  let taskRow: Record<string, unknown> | undefined = options.alreadyAttached
+  let taskRow: Record<string, unknown> | undefined = options.alreadyAttached && !options.missingAttachedRows
     ? {
       id: taskId,
       workspace_id: "workspace-api",
@@ -3067,16 +4375,21 @@ function hostSessionAttachBackfillDb(
     }
     : undefined;
   let eventInsertCount = 0;
+  let usageWindowUpsertCount = 0;
   let sequenceUpdates = 0;
   const insertedEvents = new Set<string>();
+  const hostSessionLookupConnectorIds: Array<string | undefined> = [];
 
   const db = {
     prepare(sql: string) {
       if (/SELECT hs\.id, hs\.connector_id/.test(sql) && /FROM host_sessions hs/.test(sql)) {
         return {
-          bind(sessionId: string, connectorId: string) {
+          bind(sessionId: string, connectorId?: string) {
             assert.equal(sessionId, "session-1");
-            assert.equal(connectorId, "connector-online");
+            hostSessionLookupConnectorIds.push(connectorId);
+            if (connectorId !== undefined) {
+              assert.equal(connectorId, "connector-online");
+            }
             return {
               async first() {
                 return session;
@@ -3096,9 +4409,80 @@ function hostSessionAttachBackfillDb(
                 if (connectorStatus !== "online") {
                   return null;
                 }
+                const capabilities = [
+                  ...(supportsBackfill ? ["host_session_backfill_v2"] : []),
+                  ...(supportsAppServer ? ["codex_app_server_exec"] : []),
+                  ...(supportsAppServerEnsure ? ["host_session_app_server_ensure"] : [])
+                ];
                 return {
-                  capabilities_json: JSON.stringify(supportsBackfill ? ["host_session_backfill_v2"] : [])
+                  capabilities_json: JSON.stringify(capabilities)
                 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT hostname/.test(sql) && /FROM connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { hostname: "mac-studio.local" };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT workspace_id/.test(sql) && /FROM workspace_connectors/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { workspace_id: "workspace-api" };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO host_sessions/.test(sql)) {
+        return {
+          bind(
+            hostSessionId: string,
+            connectorId: string,
+            hostname: string,
+            workspaceId: string,
+            sessionId: string,
+            title: string,
+            titleSource: string,
+            appServerPresent: number,
+            cwd: string | null,
+            discoveredAt: string,
+            updatedAt: string
+          ) {
+            assert.equal(hostSessionId, "host-session-session-1-connector-online");
+            assert.equal(connectorId, "connector-online");
+            assert.equal(hostname, "mac-studio.local");
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(sessionId, "session-1");
+            assert.equal(title, "Recovered app-server title");
+            assert.equal(titleSource, "app_server");
+            assert.equal(appServerPresent, 1);
+            assert.equal(cwd, "/workspace/project");
+            assert.match(discoveredAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(updatedAt, "2026-06-12T10:05:00.000Z");
+            return {
+              async run() {
+                session.title = title;
+                session.title_source = titleSource;
+                session.app_server_present = appServerPresent;
+                session.cwd = cwd ?? "/workspace/project";
+                session.updated_at = updatedAt;
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -3110,7 +4494,7 @@ function hostSessionAttachBackfillDb(
           bind(threadId: string, workspaceId: string, title: string, createdAt: string, updatedAt: string) {
             assert.equal(threadId, "thread-host-session-1-connector-online");
             assert.equal(workspaceId, "workspace-api");
-            assert.equal(title, "Existing session");
+            assert.equal(title, session.title);
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
             return {
@@ -3145,7 +4529,7 @@ function hostSessionAttachBackfillDb(
             assert.equal(taskId, "task-host-session-1-connector-online");
             assert.equal(workspaceId, "workspace-api");
             assert.equal(threadId, "thread-host-session-1-connector-online");
-            assert.equal(title, "Existing session");
+            assert.equal(title, session.title);
             assert.equal(connectorId, "connector-online");
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
@@ -3236,6 +4620,12 @@ function hostSessionAttachBackfillDb(
             assert.equal(threadId, "thread-host-session-1-connector-online");
             return {
               async first() {
+                if (
+                  options.failBackfillAfterEventInserts !== undefined &&
+                  eventInsertCount >= options.failBackfillAfterEventInserts
+                ) {
+                  throw new Error("Injected backfill sequence failure");
+                }
                 sequenceUpdates += 1;
                 return { last_seq: sequenceUpdates };
               }
@@ -3278,17 +4668,60 @@ function hostSessionAttachBackfillDb(
       }
 
       if (/INSERT INTO usage_windows/.test(sql)) {
-        return usageWindowUpsertFake();
+        return usageWindowUpsertFake(() => {
+          usageWindowUpsertCount += 1;
+        });
+      }
+
+      if (/INSERT INTO host_session_syncs/.test(sql)) {
+        return {
+          bind(connectorId: string, syncedAt: string, reportedSessionCount: number, storedSessionCount: number) {
+            assert.equal(connectorId, "connector-online");
+            assert.match(syncedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(reportedSessionCount, 1);
+            assert.equal(storedSessionCount, 1);
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql) && /last_seen_at/.test(sql)) {
+        return {
+          bind(lastSeenAt: string, updatedAt: string, connectorId: string) {
+            assert.match(lastSeenAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
       }
 
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get eventInserts() {
       return eventInsertCount;
+    },
+    get usageWindowUpserts() {
+      return usageWindowUpsertCount;
+    },
+    get hostSessionLookupConnectorIds() {
+      return hostSessionLookupConnectorIds;
     }
   };
 
-  return db as D1Database & { readonly eventInserts: number };
+  return db as D1Database & {
+    readonly eventInserts: number;
+    readonly hostSessionLookupConnectorIds: Array<string | undefined>;
+    readonly usageWindowUpserts: number;
+  };
 }
 
 function hostSessionDetachDb(options: {
@@ -3733,11 +5166,12 @@ function hostSessionDetachDb(options: {
   } as unknown as D1Database & typeof counters;
 }
 
-function usageWindowUpsertFake() {
+function usageWindowUpsertFake(onRun?: () => void) {
   return {
     bind() {
       return {
         async run() {
+          onRun?.();
           return { success: true };
         }
       };

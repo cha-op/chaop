@@ -215,6 +215,21 @@ main {
   max-width: 100%;
 }
 
+.sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #475569;
+  font-size: 0.86rem;
+  line-height: 1;
+}
+
+.sync-toggle input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+}
+
 .sync-meta,
 .sync-note {
   color: #64748b;
@@ -283,6 +298,11 @@ h2 {
 .chip.restarting {
   background: #fef3c7;
   color: #92400e;
+}
+
+.chip.missing {
+  background: #e2e8f0;
+  color: #475569;
 }
 
 .status.offline,
@@ -754,10 +774,165 @@ textarea {
   max-width: 720px;
 }
 
+.budget-bottleneck {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto;
+  gap: 8px 20px;
+  border-top: 1px solid #dbe5ef;
+  border-bottom: 1px solid #dbe5ef;
+  margin: 20px 0;
+  padding: 16px 0;
+  max-width: 720px;
+}
+
+.budget-bottleneck div {
+  display: grid;
+  gap: 4px;
+}
+
+.budget-bottleneck span,
+.budget-bottleneck small {
+  color: #64748b;
+}
+
+.budget-bottleneck strong {
+  font-size: 1rem;
+}
+
+.budget-bottleneck small {
+  grid-column: 1 / -1;
+}
+
+.budget-bottleneck.missing strong {
+  color: #64748b;
+}
+
+.budget-trend {
+  display: grid;
+  gap: 12px;
+  max-width: 720px;
+  margin: 0 0 24px;
+  border-bottom: 1px solid #dbe5ef;
+  padding-bottom: 18px;
+}
+
+.budget-trend h3,
+.budget-activity h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.budget-trend-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: start;
+}
+
+.budget-trend-header div {
+  display: grid;
+  gap: 4px;
+}
+
+.budget-trend-header span,
+.budget-trend p,
+.budget-slopes small,
+.budget-activity small {
+  color: #64748b;
+}
+
+.budget-trend p {
+  margin: 0;
+}
+
+.budget-trend-chart {
+  width: 100%;
+  aspect-ratio: 32 / 9;
+  min-height: 150px;
+  overflow: visible;
+}
+
+.budget-trend-chart line {
+  stroke: #cbd5e1;
+  stroke-width: 1;
+}
+
+.budget-trend-chart polyline {
+  fill: none;
+  stroke: #0f766e;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 3;
+}
+
+.budget-trend-chart circle {
+  fill: #0f766e;
+  stroke: #ffffff;
+  stroke-width: 2;
+}
+
+.budget-trend-chart text {
+  fill: #64748b;
+  font-size: 12px;
+}
+
+.budget-slopes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.budget-slopes div,
+.budget-activity article {
+  display: grid;
+  gap: 4px;
+  border-top: 1px solid #e5e7eb;
+  padding-top: 10px;
+}
+
+.budget-slopes span,
+.budget-activity span {
+  color: #64748b;
+}
+
+.budget-trend.missing {
+  color: #64748b;
+}
+
+.budget-activity {
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.budget-activity > div {
+  display: grid;
+  gap: 12px;
+}
+
+.budget-activity article {
+  grid-template-columns: minmax(140px, 1fr) auto;
+  gap: 4px 12px;
+}
+
+.budget-activity article.missing span,
+.budget-activity article.missing strong {
+  color: #64748b;
+}
+
+.budget-activity small {
+  grid-column: 1 / -1;
+}
+
 .budget-bar div {
   display: flex;
   justify-content: space-between;
   margin-bottom: 8px;
+}
+
+.budget-bar.missing span,
+.budget-bar.missing strong {
+  color: #64748b;
 }
 
 .budget-windows {
@@ -767,12 +942,21 @@ textarea {
   max-width: 720px;
 }
 
+.budget-windows.secondary {
+  margin-top: 18px;
+}
+
 .budget-windows div {
   display: grid;
   grid-template-columns: minmax(120px, 1fr) auto;
   gap: 4px 16px;
   border-top: 1px solid #e5e7eb;
   padding-top: 10px;
+}
+
+.budget-windows div.missing span,
+.budget-windows div.missing strong {
+  color: #64748b;
 }
 
 .budget-windows small {
@@ -845,5 +1029,21 @@ meter {
 
   .panel.primary {
     min-height: auto;
+  }
+}
+
+@media (max-width: 640px) {
+  .budget-trend-header,
+  .budget-bottleneck {
+    grid-template-columns: 1fr;
+  }
+
+  .budget-trend-header {
+    display: grid;
+  }
+
+  .budget-slopes,
+  .budget-activity article {
+    grid-template-columns: 1fr;
   }
 }

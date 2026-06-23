@@ -1,6 +1,8 @@
 .DS_Store
 .env
 .env.*
+cf-telemetry.txt
+cf-deploy.txt
 .codex-tmp/
 **/.codex-tmp/
 .dev.vars

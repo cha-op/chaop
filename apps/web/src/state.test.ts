@@ -30,6 +30,7 @@ import {
   mergeBootstrapPayload,
   mergeAppServerInstances,
   mergeConnectorSummaries,
+  mergeHostSessions,
   normaliseCommandMode,
   primaryAppServerInstanceForConnector
 } from "./state.ts";
@@ -64,6 +65,57 @@ test("mergeBootstrapPayload keeps realtime host sessions newer than bootstrap sy
   const merged = mergeBootstrapPayload(current, incoming);
 
   assert.deepEqual(merged.host_sessions, [currentSession]);
+});
+
+test("mergeHostSessions keeps newer attached state over stale realtime inventory", () => {
+  const attachedSession = hostSession("session-app-server", {
+    app_server_present: true,
+    attached_task_id: "task-api",
+    attached_thread_id: "thread-api",
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+  const staleInventorySession = hostSession("session-app-server", {
+    app_server_present: false,
+    updated_at: "2026-06-12T10:01:00.000Z"
+  });
+
+  const merged = mergeHostSessions([staleInventorySession], [attachedSession], {
+    snapshotConnectorId: "connector-1"
+  });
+
+  assert.deepEqual(merged, [attachedSession]);
+});
+
+test("mergeHostSessions removes omitted connector sessions from realtime snapshots", () => {
+  const reportedSession = hostSession("session-reported", {
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+  const omittedSession = hostSession("session-omitted", {
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+  const otherConnectorSession = hostSession("session-other-connector", {
+    connector_id: "connector-2",
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+
+  const merged = mergeHostSessions([reportedSession], [omittedSession, otherConnectorSession], {
+    snapshotConnectorId: "connector-1"
+  });
+
+  assert.deepEqual(merged, [reportedSession, otherConnectorSession]);
+});
+
+test("mergeHostSessions preserves omitted connector sessions from non-snapshot updates", () => {
+  const reportedSession = hostSession("session-reported", {
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+  const omittedSession = hostSession("session-omitted", {
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+
+  const merged = mergeHostSessions([reportedSession], [omittedSession]);
+
+  assert.deepEqual(merged, [reportedSession, omittedSession]);
 });
 
 test("mergeBootstrapPayload keeps newer app-server instance state over stale bootstrap", () => {
@@ -120,6 +172,102 @@ test("budgetSourceLabel reports unknown source for legacy budget payloads", () =
   delete (budget as Partial<typeof budget>).source;
 
   assert.equal(budgetSourceLabel(budget), "Summary source not reported by this control plane.");
+});
+
+test("budgetSourceLabel describes live sampled budget constraints", () => {
+  const budget = {
+    ...payload().budget,
+    source: "d1_usage_windows" as const,
+    window_sample_count: 2,
+    constraint_sample_count: 3,
+    constraints: Array.from({ length: 6 }, (_, index) => ({
+      id: `constraint-${index}`,
+      label: `Constraint ${index}`,
+      detail: "Test constraint",
+      window_type: "daily" as const,
+      unit: "d1_row" as const,
+      hard: true,
+      sampled: index < 3,
+      state: index < 3 ? "normal" as const : "missing" as const,
+      source: index < 3 ? "d1_usage_windows" as const : "missing" as const,
+      limit_units: 100,
+      used_units: index < 3 ? 10 : null,
+      used_pct: index < 3 ? 10 : null,
+      remaining_units: index < 3 ? 90 : null,
+      remaining_ratio: index < 3 ? 0.9 : null,
+      per_event_units: index < 3 ? 10 : null,
+      remaining_event_capacity: index < 3 ? 9 : null
+    }))
+  };
+
+  assert.equal(
+    budgetSourceLabel(budget),
+    "Live database summary from 2 bounded usage windows and 3/6 sampled budget constraints."
+  );
+});
+
+test("budgetSourceLabel describes Cloudflare analytics-only budget constraints", () => {
+  const budget = {
+    ...payload().budget,
+    source: "cloudflare_analytics" as const,
+    window_sample_count: 0,
+    constraint_sample_count: 4,
+    constraints: Array.from({ length: 6 }, (_, index) => ({
+      id: `constraint-${index}`,
+      label: `Constraint ${index}`,
+      detail: "Test constraint",
+      window_type: "daily" as const,
+      unit: "worker_request" as const,
+      hard: true,
+      sampled: index < 4,
+      state: index < 4 ? "normal" as const : "missing" as const,
+      source: index < 4 ? "cloudflare_analytics" as const : "missing" as const,
+      limit_units: 100,
+      used_units: index < 4 ? 10 : null,
+      used_pct: index < 4 ? 10 : null,
+      remaining_units: index < 4 ? 90 : null,
+      remaining_ratio: index < 4 ? 0.9 : null,
+      per_event_units: null,
+      remaining_event_capacity: null
+    }))
+  };
+
+  assert.equal(
+    budgetSourceLabel(budget),
+    "Cloudflare analytics summary with 4/6 sampled budget constraints; no Chaop usage windows are open yet."
+  );
+});
+
+test("budgetSourceLabel describes local model baselines", () => {
+  const budget = {
+    ...payload().budget,
+    source: "cloudflare_analytics" as const,
+    window_sample_count: 0,
+    constraint_sample_count: 6,
+    constraints: Array.from({ length: 6 }, (_, index) => ({
+      id: `constraint-${index}`,
+      label: `Constraint ${index}`,
+      detail: "Test constraint",
+      window_type: "daily" as const,
+      unit: "d1_row" as const,
+      hard: true,
+      sampled: true,
+      state: "normal" as const,
+      source: index === 1 || index === 2 ? "schema_model" as const : "cloudflare_analytics" as const,
+      limit_units: 100,
+      used_units: index === 1 || index === 2 ? 0 : 10,
+      used_pct: index === 1 || index === 2 ? 0 : 10,
+      remaining_units: index === 1 || index === 2 ? 100 : 90,
+      remaining_ratio: index === 1 || index === 2 ? 1 : 0.9,
+      per_event_units: index === 1 || index === 2 ? 10 : null,
+      remaining_event_capacity: index === 1 || index === 2 ? 10 : null
+    }))
+  };
+
+  assert.equal(
+    budgetSourceLabel(budget),
+    "Cloudflare analytics summary with 6/6 sampled budget constraints, including 2 local model baselines; no Chaop usage windows are open yet."
+  );
 });
 
 test("budgetPctLabel distinguishes missing samples from zero usage", () => {

@@ -28,9 +28,44 @@ export type BudgetState =
   | "hard_limited"
   | "recovery";
 
-export type BudgetMetricSource = "sample" | "d1_usage_windows" | "empty";
+export type BudgetMetricSource = "sample" | "d1_usage_windows" | "cloudflare_analytics" | "empty";
 
 export type BudgetWindowType = "daily" | "four_hour" | "burst";
+
+export type BudgetConstraintWindow = BudgetWindowType | "monthly";
+
+export type BudgetConstraintUnit =
+  | "event"
+  | "d1_row"
+  | "d1_row_read"
+  | "worker_request"
+  | "durable_object_request"
+  | "byte"
+  | "operation";
+
+export type BudgetConstraintState = BudgetState | "missing";
+
+export type BudgetConstraint = {
+  id: string;
+  label: string;
+  detail: string;
+  window_type: BudgetConstraintWindow;
+  unit: BudgetConstraintUnit;
+  hard: boolean;
+  sampled: boolean;
+  state: BudgetConstraintState;
+  source: "sample" | "d1_usage_windows" | "schema_model" | "cloudflare_limit" | "cloudflare_analytics" | "missing";
+  limit_units: number | null;
+  used_units: number | null;
+  used_pct: number | null;
+  remaining_units: number | null;
+  remaining_ratio: number | null;
+  per_event_units: number | null;
+  remaining_event_capacity: number | null;
+  window_start?: string | undefined;
+  window_end?: string | undefined;
+  updated_at?: string | undefined;
+};
 
 export type BudgetWindowSignal = {
   window_type: BudgetWindowType;
@@ -38,11 +73,81 @@ export type BudgetWindowSignal = {
   window_end: string;
   budget_state: BudgetState;
   used_pct: number;
+  budget_units?: number | undefined;
   events_received: number;
   events_compacted: number;
   events_delayed: number;
   local_spool_bytes: number;
+  estimated_d1_rows_written?: number | undefined;
   updated_at: string;
+};
+
+export type BudgetD1WriteModelComponent = {
+  id: string;
+  label: string;
+  rows_written: number;
+  frequency: string;
+  detail: string;
+};
+
+export type BudgetD1WriteModel = {
+  source: "schema_derived";
+  free_rows_written_per_day: number;
+  free_worker_requests_per_day: number;
+  budgeted_rows_written_per_event: number;
+  daily_budget_units: number;
+  four_hour_soft_budget_units: number;
+  four_hour_hard_budget_units: number;
+  burst_budget_units: number;
+  steady_persisted_event_rows_written: number;
+  first_event_in_minute_rows_written: number;
+  first_event_in_four_hour_rows_written: number;
+  first_event_in_day_rows_written: number;
+  backfill_rows_written_per_event: number;
+  backfill_same_minute_fixed_rows_written: number;
+  command_lifecycle_without_task_rows_written: number;
+  command_lifecycle_with_task_rows_written: number;
+  components: BudgetD1WriteModelComponent[];
+};
+
+export type BudgetTelemetryPoint = {
+  sampled_at: string;
+  d1_rows_written_daily: number | null;
+  d1_rows_read_daily: number | null;
+  worker_requests_daily: number | null;
+  durable_object_requests_daily: number | null;
+};
+
+export type BudgetTelemetrySlope = {
+  window: "15m" | "1h";
+  sample_count: number;
+  minutes: number;
+  d1_rows_written_delta: number | null;
+  d1_rows_written_per_minute: number | null;
+  projected_d1_rows_written_daily: number | null;
+};
+
+export type BudgetTelemetryHistory = {
+  source: "cloudflare_analytics";
+  latest_sample_at?: string | undefined;
+  points: BudgetTelemetryPoint[];
+  slopes: BudgetTelemetrySlope[];
+};
+
+export type BudgetD1ActivitySignal = {
+  id: string;
+  label: string;
+  detail: string;
+  source: "cloudflare_analytics" | "d1_usage_windows" | "schema_model";
+  rows_written_daily: number | null;
+  sampled: boolean;
+  updated_at?: string | undefined;
+};
+
+export type BudgetD1Activity = {
+  generated_at: string;
+  source: "d1_write_activity_signals";
+  signals: BudgetD1ActivitySignal[];
 };
 
 export type RealtimeMode =
@@ -261,6 +366,8 @@ export type HostSessionSyncSummary = {
 export type RefreshHostSessionsResponse = {
   requested: true;
   dispatched_to: number;
+  debounced_connector_count?: number | undefined;
+  cooldown_ms?: number | undefined;
   server_time: string;
 };
 
@@ -347,7 +454,13 @@ export type BudgetSummary = {
   source?: BudgetMetricSource | undefined;
   generated_at?: string | undefined;
   window_sample_count?: number | undefined;
+  constraint_sample_count?: number | undefined;
   windows?: BudgetWindowSignal[] | undefined;
+  constraints?: BudgetConstraint[] | undefined;
+  bottleneck_constraint?: BudgetConstraint | undefined;
+  d1_write_model?: BudgetD1WriteModel | undefined;
+  telemetry_history?: BudgetTelemetryHistory | undefined;
+  d1_activity?: BudgetD1Activity | undefined;
 };
 
 export type BootstrapPayload = {
@@ -485,6 +598,20 @@ export type ThreadArchiveSyncResult = {
   request_id: string;
   ok: boolean;
   synced?: boolean | undefined;
+  error?: string | undefined;
+};
+
+export type HostSessionAppServerEnsureDispatch = {
+  request_id: string;
+  session_id: string;
+  title?: string | undefined;
+  cwd?: string | undefined;
+};
+
+export type HostSessionAppServerEnsureResult = {
+  request_id: string;
+  ok: boolean;
+  session?: AgentHostSession | undefined;
   error?: string | undefined;
 };
 

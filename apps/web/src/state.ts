@@ -26,14 +26,28 @@ const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], 
 
 export function budgetSourceLabel(budget: BudgetSummary): string {
   const windowSampleCount = budget.window_sample_count ?? (budget.windows ?? []).length;
+  const constraintSampleCount = budget.constraint_sample_count ?? budget.constraints?.filter((constraint) => constraint.sampled).length ?? 0;
+  const constraintCount = budget.constraints?.length ?? 0;
+  const schemaModelCount = budget.constraints?.filter((constraint) => constraint.source === "schema_model" && constraint.sampled).length ?? 0;
   if (budget.source === "d1_usage_windows") {
-    return `Live database summary from ${windowSampleCount} bounded usage windows.`;
+    if (!budget.constraints) {
+      return `Live database summary from ${windowSampleCount} bounded usage windows; detailed constraints are not reported by this control plane.`;
+    }
+    const baseline = schemaModelCount > 0 ? `, including ${schemaModelCount} local model baselines` : "";
+    return `Live database summary from ${windowSampleCount} bounded usage windows and ${constraintSampleCount}/${constraintCount} sampled budget constraints${baseline}.`;
+  }
+  if (budget.source === "cloudflare_analytics") {
+    const baseline = schemaModelCount > 0 ? `, including ${schemaModelCount} local model baselines` : "";
+    return `Cloudflare analytics summary with ${constraintSampleCount}/${constraintCount} sampled budget constraints${baseline}; no Chaop usage windows are open yet.`;
   }
   if (budget.source === "sample") {
     return "Sample data for local development.";
   }
   if (budget.source === undefined) {
     return "Summary source not reported by this control plane.";
+  }
+  if (schemaModelCount > 0) {
+    return `No D1 or Cloudflare usage samples yet; ${schemaModelCount} local short-window baselines are shown as 0.`;
   }
   return "No usage windows recorded yet.";
 }
@@ -398,17 +412,26 @@ function mergeById<T extends { id: string }>(
   return Array.from(merged.values());
 }
 
-function mergeHostSessions(
+export function mergeHostSessions(
   incoming: HostSessionSummary[],
-  current: HostSessionSummary[]
+  current: HostSessionSummary[],
+  options: { snapshotConnectorId?: string | undefined } = {}
 ): HostSessionSummary[] {
   const merged = new Map<string, HostSessionSummary>();
+  const incomingIds = new Set(incoming.map((item) => item.id));
 
   for (const item of incoming) {
     merged.set(item.id, item);
   }
 
   for (const item of current) {
+    if (
+      options.snapshotConnectorId !== undefined &&
+      item.connector_id === options.snapshotConnectorId &&
+      !incomingIds.has(item.id)
+    ) {
+      continue;
+    }
     const existing = merged.get(item.id);
     if (existing) {
       merged.set(item.id, newerByUpdatedAt(existing, item));

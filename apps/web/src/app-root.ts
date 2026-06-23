@@ -6,6 +6,7 @@ import {
   type AppServerInstanceSummary,
   type AppServerInstancesUpdatePayload,
   type BootstrapPayload,
+  type BudgetConstraint,
   type BudgetSummary,
   type CommandSummary,
   type ConnectorSummary,
@@ -13,6 +14,7 @@ import {
   type CreateLocalThreadResponse,
   type HostSessionsUpdatePayload,
   type HostSessionSummary,
+  type RefreshHostSessionsResponse,
   type TaskState,
   type TaskSummary,
   type ThreadEvent,
@@ -22,6 +24,7 @@ import {
   ApiError,
   archiveTask,
   attachHostSession,
+  bootstrapBudgetSamples as requestBudgetBootstrap,
   browserSocketUrl,
   createCommand,
   createLocalThread,
@@ -55,6 +58,7 @@ import {
   mergeBootstrapPayload,
   mergeAppServerInstances,
   mergeConnectorSummaries,
+  mergeHostSessions,
   normaliseCommandMode,
   type CommandExecutionMode
 } from "./state.js";
@@ -71,6 +75,7 @@ type RealtimeAppServerInstancesPayload = AppServerInstancesUpdatePayload;
 
 const FALLBACK_POLL_MS = 10_000;
 const BUDGET_REFRESH_MS = 60_000;
+const HOST_SESSIONS_AUTO_REFRESH_MS = 60_000;
 const SOCKET_RECONNECT_MS = 3_000;
 const SHOW_CODEX_CLI_FALLBACK = import.meta.env.VITE_CHAOP_SHOW_CODEX_CLI_FALLBACK === "true";
 
@@ -123,6 +128,9 @@ export class ChaopApp extends LitElement {
   private hostSessionsRefreshSummary: string | undefined;
 
   @state()
+  private hostSessionsAutoRefresh = false;
+
+  @state()
   private newThreadTitle = "New Codex thread";
 
   @state()
@@ -142,6 +150,8 @@ export class ChaopApp extends LitElement {
   private pollTimer: number | undefined;
 
   private budgetTimer: number | undefined;
+
+  private hostSessionsAutoTimer: number | undefined;
 
   private reconnectTimer: number | undefined;
 
@@ -172,6 +182,8 @@ export class ChaopApp extends LitElement {
     window.clearInterval(this.clockTimer);
     this.disconnectRealtime();
     this.stopBudgetPolling();
+    this.stopHostSessionsAutoRefresh();
+    this.hostSessionsAutoRefresh = false;
     super.disconnectedCallback();
   }
 
@@ -234,7 +246,12 @@ export class ChaopApp extends LitElement {
   }
 
   private readonly onHashChange = (): void => {
-    this.view = viewFromHash();
+    const nextView = viewFromHash();
+    if (this.view === "host-sessions" && nextView !== "host-sessions") {
+      this.hostSessionsAutoRefresh = false;
+      this.stopHostSessionsAutoRefresh();
+    }
+    this.view = nextView;
     const nextThreadId = threadIdFromHash();
     if (nextThreadId !== this.selectedThreadId) {
       this.commandModeExplicit = false;
@@ -254,6 +271,8 @@ export class ChaopApp extends LitElement {
 
   private renderTopBar() {
     const budget = this.data!.budget;
+    const bottleneck = budgetBottleneckConstraint(budget);
+    const budgetChipState = budgetCompactState(budget, bottleneck);
     return html`
       <header class="topbar">
         <div>
@@ -262,8 +281,7 @@ export class ChaopApp extends LitElement {
         </div>
         <div class="topbar-status">
           <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
-          <span class="chip ${budget.state}">4h ${budgetPctLabel(budget.four_hour_used_pct)}</span>
-          <span class="chip ${budget.state}">Day ${budgetPctLabel(budget.daily_used_pct)}</span>
+          <span class="chip ${budgetChipState}">${budgetCompactLabel(bottleneck)}</span>
           <span class="identity">${this.data!.user.email}</span>
         </div>
       </header>
@@ -543,6 +561,14 @@ export class ChaopApp extends LitElement {
               >
                 ${this.hostSessionsRefreshState === "refreshing" ? "Refreshing..." : "Refresh"}
               </button>
+              <label class="sync-toggle" title="Request host inventory at most once per minute while this page is open.">
+                <input
+                  type="checkbox"
+                  .checked=${this.hostSessionsAutoRefresh}
+                  @change=${this.toggleHostSessionsAutoRefresh}
+                />
+                Auto 60s
+              </label>
               <span class="sync-meta">${formatSyncStatus(lastSyncedAt, this.clockNow)}</span>
               <span>${unattached.length} available</span>
             </div>
@@ -672,30 +698,75 @@ export class ChaopApp extends LitElement {
   private renderBudgetBoard() {
     const budget = this.data!.budget;
     const windows = budgetWindows(budget);
+    const constraints = budgetConstraints(budget);
+    const bottleneck = budgetBottleneckConstraint(budget);
     const newestWindow = newestBudgetWindowUpdatedAt(budget);
     const generatedAt = budget.generated_at ?? this.data!.server_time;
     const windowSampleCount = budget.window_sample_count ?? windows.length;
+    const constraintSampleCount = budget.constraint_sample_count ?? constraints.filter((constraint) => constraint.sampled).length;
     return html`
       <section class="page-grid budget-grid">
         <section class="panel primary">
           <div class="section-heading">
             <h2>Cost posture</h2>
-            <span class="chip ${budget.state}">${budget.state.replace("_", " ")}</span>
+            <div class="section-actions">
+              <button type="button" @click=${this.bootstrapBudgetSamples}>Bootstrap</button>
+              <span class="chip ${budget.state}">${budget.state.replace("_", " ")}</span>
+            </div>
           </div>
-          <p class="panel-subtle">${budgetSourceLabel(budget)}</p>
+          <p class="panel-subtle">
+            ${budgetSourceLabel(budget)}
+            <br>
+            Daily Cloudflare rows are current UTC-day analytics; 4h/minute rows are Chaop local schema-model windows, with unopened current windows shown as 0.
+          </p>
+          ${bottleneck
+            ? html`
+                <article class="budget-bottleneck">
+                  <div>
+                    <span>Current bottleneck</span>
+                    <strong>${bottleneck.label}</strong>
+                  </div>
+                  <div>
+                    <span>Remaining</span>
+                    <strong>${budgetRemainingLabel(bottleneck)}</strong>
+                  </div>
+                  <small>${bottleneck.detail}</small>
+                </article>
+              `
+            : html`
+                <article class="budget-bottleneck missing">
+                  <div>
+                    <span>Current bottleneck</span>
+                    <strong>missing</strong>
+                  </div>
+                  <small>No sampled hard budget constraint is available yet.</small>
+                </article>
+              `}
+          ${budgetTelemetryTrend(budget)}
           <div class="budget-bars">
-            ${budgetBar("4-hour window", budget.four_hour_used_pct)}
-            ${budgetBar("Daily budget", budget.daily_used_pct)}
-            ${budgetBar("Burst window", budget.burst_used_pct)}
+            ${constraints.map((constraint) => budgetConstraintBar(constraint))}
           </div>
-          <div class="budget-windows" aria-label="Sampled usage windows">
+          <div class="budget-windows" aria-label="Sampled budget constraints">
+            ${constraints.map(
+              (constraint) => html`
+                <div class=${constraint.sampled ? "" : "missing"}>
+                  <span>${constraint.label}</span>
+                  <strong>${budgetPctLabel(constraint.used_pct)}</strong>
+                  <small title=${constraint.updated_at ? formatAbsoluteIso(constraint.updated_at) : constraint.detail}>
+                    ${budgetConstraintDetail(constraint)}
+                  </small>
+                </div>
+              `
+            )}
+          </div>
+          <div class="budget-windows secondary" aria-label="Sampled usage windows">
             ${windows.map(
               (window) => html`
                 <div>
                   <span>${budgetWindowLabel(window.window_type)}</span>
                   <strong>${budgetPctLabel(window.used_pct)}</strong>
                   <small title=${formatAbsoluteIso(window.updated_at)}>
-                    ${window.events_received.toLocaleString("en-GB")} events, updated
+                    ${budgetWindowDetail(window)}, updated
                     ${formatRelativeIso(window.updated_at, this.clockNow)}
                   </small>
                 </div>
@@ -706,12 +777,13 @@ export class ChaopApp extends LitElement {
         <aside class="panel">
           <div class="section-heading">
             <h2>Reliability</h2>
-            <span>${windowSampleCount} windows</span>
+            <span>${budgetConstraintSampleLabel(constraintSampleCount, constraints.length)}</span>
           </div>
           <dl class="facts">
             <div><dt>Delayed events</dt><dd>${budget.delayed_event_count}</dd></div>
             <div><dt>Compacted events</dt><dd>${budget.compacted_event_count}</dd></div>
             <div><dt>Local spool</dt><dd>${formatBytes(budget.local_spool_bytes)}</dd></div>
+            <div><dt>Usage windows</dt><dd>${windowSampleCount}</dd></div>
             <div>
               <dt>Generated</dt>
               <dd title=${formatAbsoluteIso(generatedAt)}>${formatRelativeIso(generatedAt, this.clockNow)}</dd>
@@ -722,7 +794,16 @@ export class ChaopApp extends LitElement {
                 ${newestWindow ? formatRelativeIso(newestWindow, this.clockNow) : "none"}
               </dd>
             </div>
+            ${budget.d1_write_model
+              ? html`
+                  <div><dt>D1 rows/event</dt><dd>${budget.d1_write_model.budgeted_rows_written_per_event}</dd></div>
+                  <div><dt>D1 free rows/day</dt><dd>${budget.d1_write_model.free_rows_written_per_day.toLocaleString("en-GB")}</dd></div>
+                  <div><dt>Command event</dt><dd>${budget.d1_write_model.command_lifecycle_with_task_rows_written} rows</dd></div>
+                  <div><dt>Backfill floor</dt><dd>${budget.d1_write_model.backfill_rows_written_per_event} rows/event</dd></div>
+                `
+              : nothing}
           </dl>
+          ${budgetD1ActivitySignals(budget)}
         </aside>
       </section>
     `;
@@ -895,21 +976,75 @@ export class ChaopApp extends LitElement {
   }
 
   private readonly refreshHostSessionInventory = async (): Promise<void> => {
+    await this.requestHostSessionInventory();
+  };
+
+  private readonly toggleHostSessionsAutoRefresh = (event: Event): void => {
+    const enabled = (event.target as HTMLInputElement).checked;
+    this.hostSessionsAutoRefresh = enabled;
+    if (enabled) {
+      this.startHostSessionsAutoRefresh();
+      void this.requestHostSessionInventory();
+    } else {
+      this.stopHostSessionsAutoRefresh();
+    }
+  };
+
+  private startHostSessionsAutoRefresh(): void {
+    this.stopHostSessionsAutoRefresh();
+    this.hostSessionsAutoTimer = window.setInterval(() => {
+      if (this.view !== "host-sessions" || !this.hostSessionsAutoRefresh) {
+        this.stopHostSessionsAutoRefresh();
+        this.hostSessionsAutoRefresh = false;
+        return;
+      }
+      void this.requestHostSessionInventory();
+    }, HOST_SESSIONS_AUTO_REFRESH_MS);
+  }
+
+  private stopHostSessionsAutoRefresh(): void {
+    if (this.hostSessionsAutoTimer !== undefined) {
+      window.clearInterval(this.hostSessionsAutoTimer);
+      this.hostSessionsAutoTimer = undefined;
+    }
+  }
+
+  private async requestHostSessionInventory(): Promise<void> {
+    if (this.hostSessionsRefreshState === "refreshing") return;
     this.actionError = undefined;
     this.actionNotice = undefined;
     this.hostSessionsRefreshState = "refreshing";
     this.hostSessionsRefreshSummary = undefined;
     try {
       const response = await refreshHostSessions();
-      this.hostSessionsRefreshSummary = refreshSummary(response.dispatched_to);
-      await this.load();
-      window.setTimeout(() => void this.load(), 1_200);
-      window.setTimeout(() => void this.load(), 2_500);
+      this.hostSessionsRefreshSummary = refreshSummary(response);
+      if (response.dispatched_to > 0 && this.realtimeState !== "live") {
+        window.setTimeout(() => {
+          void this.load().catch((error) => {
+            this.actionError = actionErrorMessage("Host session refresh load failed", error);
+          });
+        }, 2_000);
+      }
       this.hostSessionsRefreshState = "idle";
     } catch (error) {
       this.hostSessionsRefreshState = "failed";
       this.actionError = actionErrorMessage("Host session refresh failed", error);
-      await this.load().catch(() => undefined);
+    }
+  }
+
+  private readonly bootstrapBudgetSamples = async (): Promise<void> => {
+    this.actionError = undefined;
+    this.actionNotice = undefined;
+    try {
+      const budget = await requestBudgetBootstrap();
+      if (!this.data) return;
+      this.data = {
+        ...this.data,
+        budget
+      };
+      this.actionNotice = "Budget samples bootstrapped.";
+    } catch (error) {
+      this.actionError = actionErrorMessage("Budget bootstrap failed", error);
     }
   };
 
@@ -1225,19 +1360,11 @@ export class ChaopApp extends LitElement {
       this.hostSessionsRealtimeSyncedAt = newerIso(this.hostSessionsRealtimeSyncedAt, payload.synced_at);
       this.hostSessionsRefreshState = "idle";
     }
-    const hostSessions = payload.host_sessions;
-    const incomingIds = new Set(hostSessions.map((session) => session.id));
     this.data = {
       ...this.data,
-      host_sessions: [
-        ...hostSessions,
-        ...this.data.host_sessions.filter((session) => {
-          if (payload.snapshot && payload.connector_id && session.connector_id === payload.connector_id) {
-            return false;
-          }
-          return !incomingIds.has(session.id);
-        })
-      ]
+      host_sessions: mergeHostSessions(payload.host_sessions, this.data.host_sessions, {
+        snapshotConnectorId: payload.snapshot ? payload.connector_id : undefined
+      })
     };
     this.ensureCommandMode();
   }
@@ -1388,10 +1515,22 @@ function instanceTooltip(instance: AppServerInstanceSummary, nowMs: number): str
   return `${formatMode(instance.scope)} ${formatMode(instance.endpoint_type)} app-server, ${instance.active_turn_count} active turns, changed ${changed}, seen ${seen}`;
 }
 
-function refreshSummary(dispatchedTo: number): string {
-  if (dispatchedTo === 0) return "No online connector accepted the refresh request.";
-  if (dispatchedTo === 1) return "Refresh requested from 1 online connector.";
-  return `Refresh requested from ${dispatchedTo} online connectors.`;
+function refreshSummary(response: RefreshHostSessionsResponse): string {
+  const debouncedCount = response.debounced_connector_count ?? 0;
+  if (response.dispatched_to === 0 && debouncedCount > 0) {
+    const cooldown = response.cooldown_ms ? ` for ${formatAge(response.cooldown_ms)}` : "";
+    const connectorLabel = debouncedCount === 1 ? "connector" : "connectors";
+    return `Refresh already requested recently on ${debouncedCount} online ${connectorLabel}${cooldown}.`;
+  }
+  if (response.dispatched_to === 0) return "No online connector accepted the refresh request.";
+  const dispatchedLabel = response.dispatched_to === 1
+    ? "Refresh requested from 1 online connector"
+    : `Refresh requested from ${response.dispatched_to} online connectors`;
+  if (debouncedCount === 0) return `${dispatchedLabel}.`;
+  const debouncedLabel = debouncedCount === 1
+    ? "1 connector was already cooling down"
+    : `${debouncedCount} connectors were already cooling down`;
+  return `${dispatchedLabel}; ${debouncedLabel}.`;
 }
 
 function formatSyncStatus(iso: string | undefined, nowMs: number): string {
@@ -1446,8 +1585,166 @@ function newestBudgetWindowUpdatedAt(budget: BudgetSummary): string | undefined 
   }, undefined);
 }
 
+function budgetConstraints(budget: BudgetSummary): BudgetConstraint[] {
+  if (budget.constraints) return budget.constraints;
+  const windowsByType = new Map(budgetWindows(budget).map((window) => [window.window_type, window]));
+  return [
+    legacyBudgetConstraint(
+      "legacy_daily",
+      "Daily budget",
+      "Legacy daily usage percentage from a control plane that does not report detailed constraints.",
+      "daily",
+      budget.daily_used_pct,
+      windowsByType.get("daily"),
+      budget.state
+    ),
+    legacyBudgetConstraint(
+      "legacy_four_hour",
+      "4-hour window",
+      "Legacy four-hour usage percentage from a control plane that does not report detailed constraints.",
+      "four_hour",
+      budget.four_hour_used_pct,
+      windowsByType.get("four_hour"),
+      budget.state
+    ),
+    legacyBudgetConstraint(
+      "legacy_burst",
+      "Burst window",
+      "Legacy burst usage percentage from a control plane that does not report detailed constraints.",
+      "burst",
+      budget.burst_used_pct,
+      windowsByType.get("burst"),
+      budget.state
+    )
+  ];
+}
+
+function legacyBudgetConstraint(
+  id: string,
+  label: string,
+  detail: string,
+  windowType: BudgetConstraint["window_type"],
+  usedPct: number | null | undefined,
+  window: BudgetWindow | undefined,
+  summaryState: BudgetSummary["state"]
+): BudgetConstraint {
+  const limitUnits = window?.budget_units ?? null;
+  const usedUnits = window?.events_received ?? null;
+  const remainingUnits = limitUnits === null || usedUnits === null ? null : Math.max(0, limitUnits - usedUnits);
+  const remainingRatio = usedPct === null || usedPct === undefined || !Number.isFinite(usedPct)
+    ? null
+    : Math.max(0, Math.round((1 - usedPct / 100) * 1000) / 1000);
+  return {
+    id,
+    label,
+    detail,
+    window_type: windowType,
+    unit: "event",
+    hard: true,
+    sampled: usedPct !== null && usedPct !== undefined,
+    state: window?.budget_state ?? (usedPct === null || usedPct === undefined ? "missing" : summaryState),
+    source: usedPct === null || usedPct === undefined ? "missing" : "d1_usage_windows",
+    limit_units: limitUnits,
+    used_units: usedUnits,
+    used_pct: usedPct ?? null,
+    remaining_units: remainingUnits,
+    remaining_ratio: remainingRatio,
+    per_event_units: 1,
+    remaining_event_capacity: remainingUnits,
+    window_start: window?.window_start,
+    window_end: window?.window_end,
+    updated_at: window?.updated_at
+  };
+}
+
+function budgetBottleneckConstraint(budget: BudgetSummary): BudgetConstraint | undefined {
+  return budget.bottleneck_constraint ?? budgetConstraints(budget)
+    .filter((constraint) =>
+      constraint.hard
+      && constraint.sampled
+      && constraint.remaining_ratio !== null
+      && constraint.state !== "missing"
+    )
+    .sort(compareBudgetConstraintsByRemainingRatio)[0];
+}
+
+function compareBudgetConstraintsByRemainingRatio(left: BudgetConstraint, right: BudgetConstraint): number {
+  const ratioDelta = (left.remaining_ratio ?? Number.POSITIVE_INFINITY) - (right.remaining_ratio ?? Number.POSITIVE_INFINITY);
+  if (ratioDelta !== 0) return ratioDelta;
+  const capacityDelta =
+    (left.remaining_event_capacity ?? Number.POSITIVE_INFINITY)
+    - (right.remaining_event_capacity ?? Number.POSITIVE_INFINITY);
+  if (capacityDelta !== 0) return capacityDelta;
+  return left.id.localeCompare(right.id);
+}
+
 function budgetWindows(budget: BudgetSummary): BudgetWindow[] {
   return budget.windows ?? [];
+}
+
+function budgetWindowDetail(window: BudgetWindow): string {
+  const events = `${window.events_received.toLocaleString("en-GB")} events`;
+  const budget = window.budget_units === undefined
+    ? ""
+    : ` / ${window.budget_units.toLocaleString("en-GB")} units`;
+  const estimatedRows = window.estimated_d1_rows_written === undefined
+    ? ""
+    : `, ${window.estimated_d1_rows_written.toLocaleString("en-GB")} modelled D1 rows`;
+  return `${events}${budget}${estimatedRows}`;
+}
+
+function budgetConstraintDetail(constraint: BudgetConstraint): string {
+  if (!constraint.sampled) {
+    const limit = constraint.limit_units === null ? "unknown limit" : `${formatCount(constraint.limit_units)} ${budgetConstraintUnitLabel(constraint.unit)}`;
+    return `limit ${limit}; usage sample missing`;
+  }
+  const used = constraint.used_units === null ? "missing" : formatCount(constraint.used_units);
+  const limit = constraint.limit_units === null ? "unknown" : formatCount(constraint.limit_units);
+  const remaining = constraint.remaining_units === null ? "missing" : formatCount(constraint.remaining_units);
+  const capacity = constraint.remaining_event_capacity === null
+    ? ""
+    : `, ${formatCount(constraint.remaining_event_capacity)} events left`;
+  const source = constraint.source === "schema_model" ? "; local model baseline" : "";
+  return `${used} / ${limit} ${budgetConstraintUnitLabel(constraint.unit)}, ${remaining} remaining${capacity}${source}`;
+}
+
+function budgetConstraintSampleLabel(sampled: number, total: number): string {
+  return total === 0 ? "no constraints" : `${sampled}/${total} constraints`;
+}
+
+function budgetRemainingLabel(constraint: BudgetConstraint): string {
+  if (constraint.remaining_ratio === null) return "missing";
+  const percent = budgetPctLabel(constraint.remaining_ratio * 100);
+  const capacity = constraint.remaining_event_capacity === null
+    ? ""
+    : `, ${formatCount(constraint.remaining_event_capacity)} events`;
+  return `${percent}${capacity}`;
+}
+
+function budgetCompactLabel(constraint: BudgetConstraint | undefined): string {
+  if (!constraint || constraint.remaining_ratio === null) return "Budget missing";
+  return `Budget ${budgetPctLabel(constraint.remaining_ratio * 100)} left`;
+}
+
+function budgetCompactState(budget: BudgetSummary, constraint: BudgetConstraint | undefined): BudgetSummary["state"] | "missing" {
+  if (constraint || budget.state !== "normal") return budget.state;
+  return "missing";
+}
+
+function budgetConstraintUnitLabel(unit: BudgetConstraint["unit"]): string {
+  return {
+    event: "events",
+    d1_row: "D1 rows written",
+    d1_row_read: "D1 rows read",
+    worker_request: "Worker requests",
+    durable_object_request: "DO requests",
+    byte: "bytes",
+    operation: "operations"
+  }[unit];
+}
+
+function formatCount(value: number): string {
+  return value.toLocaleString("en-GB");
 }
 
 function newerIso(current: string | undefined, incoming: string): string {
@@ -1566,11 +1863,147 @@ function isRealtimeAppServerInstancesPayload(value: unknown): value is RealtimeA
   );
 }
 
-function budgetBar(label: string, value: number | null | undefined) {
+function budgetTelemetryTrend(budget: BudgetSummary) {
+  const history = budget.telemetry_history;
+  const points = (history?.points ?? []).filter(
+    (point): point is BudgetTelemetryPointWithWrites => point.d1_rows_written_daily !== null
+  );
+  const latest = points.at(-1);
+  const slopes = history?.slopes ?? [];
+  const limit = budget.d1_write_model?.free_rows_written_per_day ?? 100_000;
+
+  if (!history || points.length === 0) {
+    return html`
+      <section class="budget-trend missing">
+        <div>
+          <h3>D1 rows written trend</h3>
+          <span>missing</span>
+        </div>
+        <p>No Cloudflare telemetry samples have been persisted yet.</p>
+      </section>
+    `;
+  }
+
+  const plotted = budgetTelemetryPlot(points, limit);
   return html`
-    <div class="budget-bar">
-      <div><span>${label}</span><strong>${budgetPctLabel(value)}</strong></div>
-      <meter min="0" max="100" value=${meterPct(value)}></meter>
+    <section class="budget-trend">
+      <div class="budget-trend-header">
+        <div>
+          <h3>D1 rows written trend</h3>
+          <span>${points.length.toLocaleString("en-GB")} samples</span>
+        </div>
+        <strong title=${latest ? formatAbsoluteIso(latest.sampled_at) : ""}>
+          ${latest ? formatCount(latest.d1_rows_written_daily) : "missing"}
+        </strong>
+      </div>
+      <svg class="budget-trend-chart" viewBox="0 0 640 180" role="img" aria-label="D1 rows written over time">
+        <line x1="44" y1="150" x2="620" y2="150"></line>
+        <line x1="44" y1="24" x2="44" y2="150"></line>
+        <polyline points=${plotted.polyline}></polyline>
+        ${plotted.points.map(
+          (point) => html`<circle cx=${point.x} cy=${point.y} r="3"><title>${formatCount(point.value)} rows at ${formatAbsoluteIso(point.sampled_at)}</title></circle>`
+        )}
+        <text x="44" y="18">${formatCount(plotted.yMax)}</text>
+        <text x="44" y="170">${formatTimeLabel(points[0]!.sampled_at)}</text>
+        <text x="620" y="170" text-anchor="end">${formatTimeLabel(points.at(-1)!.sampled_at)}</text>
+      </svg>
+      <div class="budget-slopes">
+        ${slopes.map((slope) => html`
+          <div>
+            <span>${slope.window}</span>
+            <strong>${budgetSlopePrimaryLabel(slope)}</strong>
+            <small>${budgetSlopeSecondaryLabel(slope)}</small>
+          </div>
+        `)}
+      </div>
+    </section>
+  `;
+}
+
+function budgetTelemetryPlot(points: BudgetTelemetryPointWithWrites[], limit: number): {
+  yMax: number;
+  polyline: string;
+  points: Array<{ x: number; y: number; value: number; sampled_at: string }>;
+} {
+  const chart = {
+    left: 44,
+    right: 620,
+    top: 24,
+    bottom: 150
+  };
+  const timestamps = points.map((point) => Date.parse(point.sampled_at)).filter(Number.isFinite);
+  const minX = Math.min(...timestamps);
+  const maxX = Math.max(...timestamps);
+  const yMax = Math.max(limit, ...points.map((point) => point.d1_rows_written_daily), 1);
+  const plotted = points.map((point, index) => {
+    const timestamp = Date.parse(point.sampled_at);
+    const x = maxX === minX
+      ? chart.left + (chart.right - chart.left) / 2
+      : chart.left + ((timestamp - minX) / (maxX - minX)) * (chart.right - chart.left);
+    const y = chart.bottom - (point.d1_rows_written_daily / yMax) * (chart.bottom - chart.top);
+    return {
+      x: Math.round(x * 10) / 10,
+      y: Math.round(y * 10) / 10,
+      value: point.d1_rows_written_daily,
+      sampled_at: point.sampled_at,
+      index
+    };
+  });
+  return {
+    yMax,
+    polyline: plotted.map((point) => `${point.x},${point.y}`).join(" "),
+    points: plotted
+  };
+}
+
+function budgetSlopePrimaryLabel(slope: BudgetTelemetrySlope): string {
+  if (slope.d1_rows_written_delta === null || slope.d1_rows_written_per_minute === null) return "missing";
+  return `${formatCount(slope.d1_rows_written_delta)} rows`;
+}
+
+function budgetSlopeSecondaryLabel(slope: BudgetTelemetrySlope): string {
+  if (slope.d1_rows_written_per_minute === null || slope.projected_d1_rows_written_daily === null) {
+    return `${slope.sample_count} samples`;
+  }
+  return `${slope.d1_rows_written_per_minute.toLocaleString("en-GB")} rows/min, projected ${formatCount(slope.projected_d1_rows_written_daily)}`;
+}
+
+function budgetD1ActivitySignals(budget: BudgetSummary) {
+  const signals = budget.d1_activity?.signals ?? [];
+  if (signals.length === 0) return nothing;
+  return html`
+    <section class="budget-activity">
+      <h3>D1 write activity</h3>
+      <div>
+        ${signals.map((signal) => html`
+          <article class=${signal.sampled ? "" : "missing"}>
+            <span>${signal.label}</span>
+            <strong>${signal.rows_written_daily === null ? "missing" : formatCount(signal.rows_written_daily)}</strong>
+            <small title=${signal.updated_at ? formatAbsoluteIso(signal.updated_at) : signal.detail}>${signal.detail}</small>
+          </article>
+        `)}
+      </div>
+    </section>
+  `;
+}
+
+function formatTimeLabel(iso: string): string {
+  const timestamp = new Date(iso);
+  if (Number.isNaN(timestamp.getTime())) return "unknown";
+  return timestamp.toLocaleTimeString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function budgetConstraintBar(constraint: BudgetConstraint) {
+  return html`
+    <div class="budget-bar ${constraint.sampled ? "" : "missing"}">
+      <div>
+        <span>${constraint.label}</span>
+        <strong>${constraint.sampled ? budgetPctLabel(constraint.used_pct) : "missing"}</strong>
+      </div>
+      <meter min="0" max="100" value=${meterPct(constraint.used_pct)}></meter>
     </div>
   `;
 }
@@ -1586,3 +2019,7 @@ function formatBytes(bytes: number): string {
 }
 
 type BudgetWindow = NonNullable<BudgetSummary["windows"]>[number];
+type BudgetTelemetryPointWithWrites = NonNullable<BudgetSummary["telemetry_history"]>["points"][number] & {
+  d1_rows_written_daily: number;
+};
+type BudgetTelemetrySlope = NonNullable<BudgetSummary["telemetry_history"]>["slopes"][number];

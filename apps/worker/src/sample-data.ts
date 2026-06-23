@@ -207,6 +207,166 @@ export const budget: BudgetSummary = {
   source: "sample",
   generated_at: "2026-06-09T21:58:05.000Z",
   window_sample_count: 3,
+  constraint_sample_count: 3,
+  d1_write_model: {
+    source: "schema_derived",
+    free_rows_written_per_day: 100000,
+    free_worker_requests_per_day: 100000,
+      budgeted_rows_written_per_event: 26,
+      daily_budget_units: 3846,
+      four_hour_soft_budget_units: 481,
+      four_hour_hard_budget_units: 641,
+      burst_budget_units: 384,
+    steady_persisted_event_rows_written: 12,
+    first_event_in_minute_rows_written: 14,
+    first_event_in_four_hour_rows_written: 16,
+    first_event_in_day_rows_written: 18,
+    backfill_rows_written_per_event: 6,
+    backfill_same_minute_fixed_rows_written: 6,
+    command_lifecycle_without_task_rows_written: 16,
+    command_lifecycle_with_task_rows_written: 20,
+    components: []
+  },
+  bottleneck_constraint: {
+    id: "d1_rows_written_daily",
+    label: "D1 rows written / day",
+    detail: "Cloudflare Free D1 rows-written limit, converted to Chaop event capacity with the current schema-derived write model.",
+    window_type: "daily",
+    unit: "d1_row",
+    hard: true,
+    sampled: true,
+    state: "conservative",
+    source: "sample",
+    limit_units: 100000,
+    used_units: 75000,
+    used_pct: 75,
+    remaining_units: 25000,
+    remaining_ratio: 0.25,
+    per_event_units: 26,
+    remaining_event_capacity: 961,
+    window_start: "2026-06-09T00:00:00.000Z",
+    window_end: "2026-06-10T00:00:00.000Z",
+    updated_at: "2026-06-09T21:58:05.000Z"
+  },
+  constraints: [
+    {
+      id: "d1_rows_written_daily",
+      label: "D1 rows written / day",
+      detail: "Cloudflare Free D1 rows-written limit, converted to Chaop event capacity with the current schema-derived write model.",
+      window_type: "daily",
+      unit: "d1_row",
+      hard: true,
+      sampled: true,
+      state: "conservative",
+      source: "sample",
+      limit_units: 100000,
+      used_units: 75000,
+      used_pct: 75,
+      remaining_units: 25000,
+      remaining_ratio: 0.25,
+      per_event_units: 26,
+      remaining_event_capacity: 961,
+      window_start: "2026-06-09T00:00:00.000Z",
+      window_end: "2026-06-10T00:00:00.000Z",
+      updated_at: "2026-06-09T21:58:05.000Z"
+    },
+    {
+      id: "d1_rows_written_four_hour",
+      label: "D1 rows written / 4h",
+      detail: "Chaop local four-hour guardrail that prevents one busy period from consuming the full daily D1 rows-written posture.",
+      window_type: "four_hour",
+      unit: "d1_row",
+      hard: true,
+      sampled: true,
+      state: "conservative",
+      source: "sample",
+      limit_units: 16666,
+      used_units: 10322,
+      used_pct: 61.9,
+      remaining_units: 6344,
+      remaining_ratio: 0.381,
+      per_event_units: 26,
+      remaining_event_capacity: 244,
+      window_start: "2026-06-09T18:00:00.000Z",
+      window_end: "2026-06-09T22:00:00.000Z",
+      updated_at: "2026-06-09T21:58:05.000Z"
+    },
+    {
+      id: "d1_rows_written_burst",
+      label: "D1 rows written / minute",
+      detail: "Chaop burst guardrail for short spikes, modelled from D1 rows written per persisted event.",
+      window_type: "burst",
+      unit: "d1_row",
+      hard: true,
+      sampled: true,
+      state: "normal",
+      source: "sample",
+      limit_units: 9984,
+      used_units: 1794,
+      used_pct: 18,
+      remaining_units: 8190,
+      remaining_ratio: 0.82,
+      per_event_units: 26,
+      remaining_event_capacity: 315,
+      window_start: "2026-06-09T21:57:00.000Z",
+      window_end: "2026-06-09T21:58:00.000Z",
+      updated_at: "2026-06-09T21:58:05.000Z"
+    },
+    {
+      id: "worker_requests_daily",
+      label: "Worker requests / day",
+      detail: "Cloudflare Worker request usage is not sampled by Chaop yet; keep Cloudflare budget alerts enabled.",
+      window_type: "daily",
+      unit: "worker_request",
+      hard: false,
+      sampled: false,
+      state: "missing",
+      source: "missing",
+      limit_units: 100000,
+      used_units: null,
+      used_pct: null,
+      remaining_units: null,
+      remaining_ratio: null,
+      per_event_units: null,
+      remaining_event_capacity: null
+    },
+    {
+      id: "durable_object_requests_daily",
+      label: "Durable Object requests / day",
+      detail: "Durable Object request usage, including incoming WebSocket message billing at Cloudflare's 20:1 compute-request ratio, is not sampled by Chaop yet.",
+      window_type: "daily",
+      unit: "durable_object_request",
+      hard: false,
+      sampled: false,
+      state: "missing",
+      source: "missing",
+      limit_units: 100000,
+      used_units: null,
+      used_pct: null,
+      remaining_units: null,
+      remaining_ratio: null,
+      per_event_units: null,
+      remaining_event_capacity: null
+    },
+    {
+      id: "d1_rows_read_daily",
+      label: "D1 rows read / day",
+      detail: "Cloudflare D1 rows-read usage is not sampled by Chaop yet.",
+      window_type: "daily",
+      unit: "d1_row_read",
+      hard: false,
+      sampled: false,
+      state: "missing",
+      source: "missing",
+      limit_units: 5000000,
+      used_units: null,
+      used_pct: null,
+      remaining_units: null,
+      remaining_ratio: null,
+      per_event_units: null,
+      remaining_event_capacity: null
+    }
+  ],
   windows: [
     {
       window_type: "daily",
@@ -214,10 +374,12 @@ export const budget: BudgetSummary = {
       window_end: "2026-06-10T00:00:00.000Z",
       budget_state: "conservative",
       used_pct: 75,
-      events_received: 1420,
+      budget_units: 3846,
+      events_received: 2885,
       events_compacted: 318,
       events_delayed: 42,
       local_spool_bytes: 134217728,
+      estimated_d1_rows_written: 75010,
       updated_at: "2026-06-09T21:58:05.000Z"
     },
     {
@@ -225,11 +387,13 @@ export const budget: BudgetSummary = {
       window_start: "2026-06-09T18:00:00.000Z",
       window_end: "2026-06-09T22:00:00.000Z",
       budget_state: "conservative",
-      used_pct: 62,
-      events_received: 410,
+      used_pct: 61.9,
+      budget_units: 641,
+      events_received: 397,
       events_compacted: 92,
       events_delayed: 18,
       local_spool_bytes: 67108864,
+      estimated_d1_rows_written: 10322,
       updated_at: "2026-06-09T21:58:05.000Z"
     },
     {
@@ -238,13 +402,107 @@ export const budget: BudgetSummary = {
       window_end: "2026-06-09T21:58:00.000Z",
       budget_state: "normal",
       used_pct: 18,
-      events_received: 24,
+      budget_units: 384,
+      events_received: 69,
       events_compacted: 4,
       events_delayed: 0,
       local_spool_bytes: 0,
+      estimated_d1_rows_written: 1794,
       updated_at: "2026-06-09T21:58:05.000Z"
     }
-  ]
+  ],
+  telemetry_history: {
+    source: "cloudflare_analytics",
+    latest_sample_at: "2026-06-09T21:55:00.000Z",
+    points: [
+      {
+        sampled_at: "2026-06-09T20:55:00.000Z",
+        d1_rows_written_daily: 60200,
+        d1_rows_read_daily: 1804000,
+        worker_requests_daily: 820,
+        durable_object_requests_daily: 2100
+      },
+      {
+        sampled_at: "2026-06-09T21:10:00.000Z",
+        d1_rows_written_daily: 64100,
+        d1_rows_read_daily: 1821000,
+        worker_requests_daily: 890,
+        durable_object_requests_daily: 2200
+      },
+      {
+        sampled_at: "2026-06-09T21:25:00.000Z",
+        d1_rows_written_daily: 69000,
+        d1_rows_read_daily: 1855000,
+        worker_requests_daily: 940,
+        durable_object_requests_daily: 2290
+      },
+      {
+        sampled_at: "2026-06-09T21:40:00.000Z",
+        d1_rows_written_daily: 72300,
+        d1_rows_read_daily: 1873000,
+        worker_requests_daily: 990,
+        durable_object_requests_daily: 2380
+      },
+      {
+        sampled_at: "2026-06-09T21:55:00.000Z",
+        d1_rows_written_daily: 75000,
+        d1_rows_read_daily: 1886000,
+        worker_requests_daily: 1040,
+        durable_object_requests_daily: 2460
+      }
+    ],
+    slopes: [
+      {
+        window: "15m",
+        sample_count: 2,
+        minutes: 15,
+        d1_rows_written_delta: 2700,
+        d1_rows_written_per_minute: 180,
+        projected_d1_rows_written_daily: 97800
+      },
+      {
+        window: "1h",
+        sample_count: 5,
+        minutes: 60,
+        d1_rows_written_delta: 14800,
+        d1_rows_written_per_minute: 246.7,
+        projected_d1_rows_written_daily: 106200
+      }
+    ]
+  },
+  d1_activity: {
+    generated_at: "2026-06-09T21:58:05.000Z",
+    source: "d1_write_activity_signals",
+    signals: [
+      {
+        id: "cloudflare_d1_rows_written_daily",
+        label: "Measured D1 writes today",
+        detail: "Cloudflare GraphQL Analytics cumulative rows_written for the current UTC day.",
+        source: "cloudflare_analytics",
+        rows_written_daily: 75010,
+        sampled: true,
+        updated_at: "2026-06-09T21:55:00.000Z"
+      },
+        {
+          id: "estimated_event_persistence_daily",
+          label: "Estimated guarded event writes",
+          detail: "Current daily usage-window event count multiplied by the conservative schema-derived rows-written budget per event.",
+        source: "d1_usage_windows",
+        rows_written_daily: 75000,
+        sampled: true,
+        updated_at: "2026-06-09T21:58:05.000Z"
+      },
+      {
+        id: "estimated_non_event_residual_daily",
+        label: "Measured minus event estimate",
+        detail: "Residual writes after subtracting Chaop's persisted-event estimate.",
+        source: "cloudflare_analytics",
+        rows_written_daily: 0,
+        sampled: true,
+        updated_at: "2026-06-09T21:55:00.000Z"
+      }
+    ]
+  }
 };
 
 export const events: ThreadEvent[] = [

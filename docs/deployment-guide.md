@@ -31,6 +31,8 @@ Official references:
 
 - Wrangler configuration: https://developers.cloudflare.com/workers/wrangler/configuration/
 - Wrangler environment variables: https://developers.cloudflare.com/workers/wrangler/system-environment-variables/
+- Cloudflare API token permissions: https://developers.cloudflare.com/fundamentals/api/reference/permissions/
+- Cloudflare GraphQL Analytics API: https://developers.cloudflare.com/analytics/graphql-api/
 - D1 Wrangler commands: https://developers.cloudflare.com/d1/wrangler-commands/
 - R2 Wrangler commands: https://developers.cloudflare.com/r2/reference/wrangler-commands/
 - Cloudflare Access self-hosted apps: https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/
@@ -54,10 +56,16 @@ CHAOP_ACCESS_ALLOWED_GROUPS=
 CHAOP_FIRST_CONNECTOR_NAME=
 CHAOP_FIRST_CONNECTOR_HOSTNAME=
 CHAOP_FIRST_WORKSPACE_ROOT=
-CHAOP_DAILY_BUDGET_UNITS=100
-CHAOP_4H_SOFT_BUDGET_UNITS=20
-CHAOP_4H_HARD_BUDGET_UNITS=35
-CHAOP_BURST_EVENTS_PER_MINUTE=600
+CHAOP_DAILY_BUDGET_UNITS=3846
+CHAOP_4H_SOFT_BUDGET_UNITS=481
+CHAOP_4H_HARD_BUDGET_UNITS=641
+CHAOP_BURST_EVENTS_PER_MINUTE=384
+CF_TELEMETRY_ACCOUNT_ID=
+CF_TELEMETRY_API_WORKER=chaop-api
+CF_TELEMETRY_WEB_WORKER=chaop-web
+CF_TELEMETRY_D1_DATABASE_ID=
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO
+CF_TELEMETRY_CACHE_SECONDS=300
 ```
 
 Provide these secrets through a secure channel only:
@@ -67,6 +75,7 @@ CLOUDFLARE_API_TOKEN=
 AGENT_BOOTSTRAP_SECRET=
 CF_ACCESS_CLIENT_ID=
 CF_ACCESS_CLIENT_SECRET=
+CF_TELEMETRY_API_TOKEN=
 ```
 
 ### Deployment-instance values
@@ -183,10 +192,16 @@ CHAOP_ACCESS_ALLOWED_GROUPS=
 CHAOP_FIRST_CONNECTOR_NAME=mac-studio
 CHAOP_FIRST_CONNECTOR_HOSTNAME=mac-studio.local
 CHAOP_FIRST_WORKSPACE_ROOT=/Users/you/Program
-CHAOP_DAILY_BUDGET_UNITS=100
-CHAOP_4H_SOFT_BUDGET_UNITS=20
-CHAOP_4H_HARD_BUDGET_UNITS=35
-CHAOP_BURST_EVENTS_PER_MINUTE=600
+CHAOP_DAILY_BUDGET_UNITS=3846
+CHAOP_4H_SOFT_BUDGET_UNITS=481
+CHAOP_4H_HARD_BUDGET_UNITS=641
+CHAOP_BURST_EVENTS_PER_MINUTE=384
+CF_TELEMETRY_ACCOUNT_ID=...
+CF_TELEMETRY_API_WORKER=chaop-api
+CF_TELEMETRY_WEB_WORKER=chaop-web
+CF_TELEMETRY_D1_DATABASE_ID=...
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO
+CF_TELEMETRY_CACHE_SECONDS=300
 ```
 
 Do not commit this file.
@@ -233,6 +248,44 @@ DB -> chaop-control
 ARTIFACTS -> chaop-artifacts
 WorkspaceDO -> Durable Object namespace
 ```
+
+### Deploy the API Worker from the ops repository
+
+Keep deployment-instance values and local secret material in the private ops repository, not in this repository:
+
+```text
+../<private-ops-repo>/deployments/<environment>/chaop.env
+../<private-ops-repo>/secrets/cloudflare-deploy.token
+../<private-ops-repo>/secrets/cloudflare-telemetry.token
+```
+
+Use the checked-in API deployment script once the private deployment profile contains the required non-secret values:
+
+```bash
+CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < ../<private-ops-repo>/secrets/cloudflare-deploy.token)" \
+CHAOP_DEPLOY_ENV_FILE=../<private-ops-repo>/deployments/<environment>/chaop.env \
+CF_TELEMETRY_WEB_WORKER=chaop-web \
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO \
+pnpm deploy:api
+```
+
+The deployment profile contains deployment-instance values such as domains, resource names, D1/R2 bindings, and Access configuration. The deploy token stays as an ignored file under the private ops repository's `secrets/` directory and is passed only to the current Wrangler process. The script writes a temporary Wrangler config under `.codex-tmp/deploy/api/`, applies remote D1 migrations, then deploys the API Worker.
+
+The generated Worker runtime vars include `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. They are required because the Worker verifies Cloudflare Access JWTs after Access forwards an authenticated browser or service-token request.
+
+The generated Worker runtime vars also include non-secret Cloudflare telemetry selectors when they are available:
+
+```text
+CF_TELEMETRY_ACCOUNT_ID
+CF_TELEMETRY_API_WORKER
+CF_TELEMETRY_WEB_WORKER
+CF_TELEMETRY_D1_DATABASE_ID
+CF_TELEMETRY_DO_NAMESPACE_NAME
+CF_TELEMETRY_TIMEOUT_MS
+CF_TELEMETRY_CACHE_SECONDS
+```
+
+The API deploy script defaults `CF_TELEMETRY_ACCOUNT_ID` from `CLOUDFLARE_ACCOUNT_ID`, `CF_TELEMETRY_API_WORKER` from the deployed API Worker name, and `CF_TELEMETRY_D1_DATABASE_ID` from `CHAOP_D1_DATABASE_ID`. Set `CF_TELEMETRY_WEB_WORKER` when the GUI Worker has a separate script name. Set `CF_TELEMETRY_DO_NAMESPACE_NAME` to the Durable Object analytics `name` dimension, normally `WorkspaceDO`, if you want incoming WebSocket message counts folded into Durable Object request equivalents. `CF_TELEMETRY_TIMEOUT_MS` defaults to 5000 milliseconds. `CF_TELEMETRY_CACHE_SECONDS` defaults to 300 seconds, with failed queries retried after at most 60 seconds. Keep the token itself as a Worker secret, not as a Wrangler var.
 
 ### Configure split domains
 
@@ -306,6 +359,31 @@ pnpm wrangler secret put ACCESS_TEAM_DOMAIN
 ```
 
 The implementation may store non-secret config in Wrangler vars, but secrets stay in Cloudflare secret storage.
+
+Cloudflare telemetry is optional. To enable it, create a separate read-only Cloudflare API token with this account permission:
+
+```text
+Account Analytics: Read
+```
+
+Do not reuse the deployment token for runtime telemetry unless you accept that the Worker would hold deploy-capable permissions. After the first API deploy has generated `.codex-tmp/deploy/api/wrangler.jsonc`, write the telemetry token as a Worker secret:
+
+```bash
+CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < ../<private-ops-repo>/secrets/cloudflare-deploy.token)" \
+pnpm --filter @chaop/worker exec wrangler secret put CF_TELEMETRY_API_TOKEN \
+  --config .codex-tmp/deploy/api/wrangler.jsonc \
+  < ../<private-ops-repo>/secrets/cloudflare-telemetry.token
+```
+
+Then redeploy the API Worker so the runtime environment and secret revision are active:
+
+```bash
+CLOUDFLARE_API_TOKEN="$(tr -d '\r\n' < ../<private-ops-repo>/secrets/cloudflare-deploy.token)" \
+CHAOP_DEPLOY_ENV_FILE=../<private-ops-repo>/deployments/<environment>/chaop.env \
+CF_TELEMETRY_WEB_WORKER=chaop-web \
+CF_TELEMETRY_DO_NAMESPACE_NAME=WorkspaceDO \
+pnpm deploy:api
+```
 
 ### Prepare the first connector
 
@@ -405,7 +483,7 @@ When a user explicitly attaches a Host Session, the Worker asks that session's c
 
 Use `session_inventory.managed_app_server.enabled = true` when Chaop should manage one dedicated local Codex app-server listener for this connector. The connector starts `codex app-server` with the configured `execution.codex_profile`, `execution.codex_model`, `session_inventory.managed_app_server.extra_args`, and `--listen <listen_url>` when the listener is absent, health-checks the listener before advertising app-server capabilities, and retries after `restart_backoff_seconds` if the child exits or fails startup. Managed listener URLs must bind to `localhost`, `127.0.0.1`, or `::1`; the connector refuses non-loopback hosts instead of exposing the app-server protocol to a LAN interface. If you already manage the listener with another service manager, leave managed mode disabled and set `session_inventory.app_server_url` to the external listener instead.
 
-In managed mode, the connector advertises `app_server_threads` and `app_server_archive` only while the managed app-server URL is healthy enough to initialise the protocol, and advertises `codex_app_server_exec` only when that URL is healthy and `execution.mode = "app_server"`. It refreshes those capabilities through `agent.ready` after connecting to the Worker, so a degraded managed listener stops being selected for new app-server work. With an externally managed `session_inventory.app_server_url`, capability advertisement follows the configured URL and the external service manager is responsible for keeping the listener healthy. This is separate from the CLI-only `codex_exec` capability. The Worker rejects new local thread requests when no online app-server connector has `app_server_threads`. Attached app-server command execution requires the owning connector to advertise `codex_app_server_exec`; Chaop rejects command creation or leasing instead of falling back to `codex_exec` on a different connector. Archive/unarchive remains D1-only when the connector does not advertise `app_server_archive`; when it does, Chaop updates D1 first, then the connector resolves the stored Codex session id to an app-server thread id before calling `thread/archive` or `thread/unarchive`. Sync failures are returned to the Browser as warnings instead of blocking the local archive state. Keep `app_server_timeout_seconds` short so a stopped app-server cannot stall connector startup, thread creation, command setup, or archive synchronisation longer than necessary.
+In managed mode, the connector advertises `app_server_threads` and `app_server_archive` only while the managed app-server URL is healthy enough to initialise the protocol, and advertises `codex_app_server_exec` plus `host_session_app_server_ensure` only when that URL is healthy and `execution.mode = "app_server"`. It refreshes those capabilities through `agent.ready` after connecting to the Worker, so a degraded managed listener stops being selected for new app-server work. With an externally managed `session_inventory.app_server_url`, capability advertisement follows the configured URL and the external service manager is responsible for keeping the listener healthy. This is separate from the CLI-only `codex_exec` capability. The Worker rejects new local thread requests when no online app-server connector has `app_server_threads`. Attached app-server command execution requires the owning connector to advertise `codex_app_server_exec`; Chaop rejects command creation or leasing instead of falling back to `codex_exec` on a different connector. Host Session attach only sends the app-server resume/ensure control message when the connector advertises `host_session_app_server_ensure`; older app-server execution connectors keep the D1-only attach path instead of timing out on an unknown control envelope. Archive/unarchive remains D1-only when the connector does not advertise `app_server_archive`; when it does, Chaop updates D1 first, then the connector resolves the stored Codex session id to an app-server thread id before calling `thread/archive` or `thread/unarchive`. Sync failures are returned to the Browser as warnings instead of blocking the local archive state. Keep `app_server_timeout_seconds` short so a stopped app-server cannot stall connector startup, thread creation, command setup, Host Session attach, or archive synchronisation longer than necessary.
 
 When a scheduled or upgrade-marker restart is pending, the connector reports the managed instance as `draining` and temporarily removes app-server execution/thread/archive capabilities from `agent.ready`. That keeps the control plane from assigning new app-server work while existing active turns finish. Once `active_turn_count` reaches zero, the connector restarts the managed listener, health-checks it, then advertises app-server capabilities again and resumes ordinary inventory reports. If active turns do not finish before `drain_timeout_seconds`, the connector forces the restart and reports the timeout in AppServerInstance state. Keep the drain timeout long enough for normal turns, but finite enough that an abandoned turn cannot block an upgrade forever.
 
@@ -426,7 +504,7 @@ Then set the matching private connector config:
 app_server_url = "ws://127.0.0.1:9876"
 ```
 
-`report_interval_seconds` controls the periodic local rescan interval; the connector only sends the periodic report when the inventory changes. The Host Sessions refresh button asks online connectors to rescan and report immediately. App-server inventory reports are treated as complete only when the app-server list call succeeds, all `thread/list` pages are exhausted, and the combined Host Session report is not truncated by `max_sessions`; transient app-server list failures or truncated reports do not clear known app-server presence for existing Host Sessions.
+Host Session inventory is demand-driven by default. The connector does not periodically rescan local Codex sessions while idle; the Host Sessions refresh button asks online connectors to rescan and report immediately, and the Browser can opt into a one-minute auto-refresh while the Host Sessions page is open. The Durable Object debounces refresh requests per connector, so multiple browser listeners do not increase connector rescan frequency. User actions that create, attach, archive, or otherwise mutate local sessions may still trigger one immediate inventory report to keep the UI coherent. `report_interval_seconds` is retained for private compatibility and future connector-side auto modes, but it is not the default idle polling path. App-server inventory reports are treated as complete only when the app-server list call succeeds, all `thread/list` pages are exhausted, and the combined Host Session report is not truncated by `max_sessions`; transient app-server list failures or truncated reports do not clear known app-server presence for existing Host Sessions.
 
 Create local files outside the repository:
 

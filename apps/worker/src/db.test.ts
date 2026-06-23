@@ -1031,6 +1031,68 @@ test("recordHostSessions preserves stored sessions outside the latest top-N repo
   });
 });
 
+test("recordHostSessions skips unchanged host session rows", async () => {
+  const db = hostSessionsInventoryDb();
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Attached session",
+          title_source: "history",
+          cwd: "/workspace/attached",
+          updated_at: "2026-06-12T10:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 0);
+  assert.equal(db.hostSessionWrites, 0);
+  assert.deepEqual(db.sync, {
+    connectorId: "connector-online",
+    reported: 1,
+    stored: 1
+  });
+});
+
+test("recordHostSessions includes unchanged reported rows in full snapshot payloads", async () => {
+  const db = hostSessionsInventoryDb();
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "full",
+      app_server_inventory_ok: true,
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Attached session",
+          title_source: "history",
+          cwd: "/workspace/attached",
+          updated_at: "2026-06-12T10:00:00.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 1);
+  assert.equal(result.host_sessions[0]?.session_id, "session-attached");
+  assert.equal(result.snapshot, true);
+  assert.equal(db.hostSessionWrites, 0);
+  assert.deepEqual(db.sync, {
+    connectorId: "connector-online",
+    reported: 1,
+    stored: 1
+  });
+});
+
 test("recordHostSessions clears app-server-only sessions omitted from inventory reports", async () => {
   const db = hostSessionsInventoryDb({
     initialAppServerPresent: 1,
@@ -1057,6 +1119,7 @@ test("recordHostSessions clears app-server-only sessions omitted from inventory 
   );
 
   assert.equal(result.host_sessions.length, 2);
+  assert.equal(result.snapshot, true);
   assert.equal(db.hasSession("session-attached"), true);
   assert.equal(db.appServerPresentOf("session-attached"), 0);
   assert.equal(db.demotedSessions, 1);
@@ -1086,6 +1149,7 @@ test("recordHostSessions preserves app-server-only sessions from legacy reports 
   );
 
   assert.equal(result.host_sessions.length, 1);
+  assert.equal(result.snapshot, false);
   assert.equal(db.hasSession("session-attached"), true);
   assert.equal(db.appServerPresentOf("session-attached"), 1);
   assert.equal(db.demotedSessions, 0);
@@ -1116,6 +1180,7 @@ test("recordHostSessions preserves app-server-only sessions from full reports wi
   );
 
   assert.equal(result.host_sessions.length, 1);
+  assert.equal(result.snapshot, false);
   assert.equal(db.hasSession("session-attached"), true);
   assert.equal(db.appServerPresentOf("session-attached"), 1);
   assert.equal(db.demotedSessions, 0);
@@ -1180,9 +1245,46 @@ test("recordHostSessions preserves app-server presence when app-server inventory
   );
 
   assert.equal(result.host_sessions.length, 1);
+  assert.equal(result.snapshot, false);
   assert.equal(db.titleOf("session-attached"), "Metadata title during app-server outage");
   assert.equal(db.appServerPresentOf("session-attached"), 1);
   assert.equal(db.demotedSessions, 0);
+});
+
+test("recordHostSessions does not mark truncated full reports as browser snapshots", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "app_server"
+  });
+  const sessions = Array.from({ length: 201 }, (_, index) => ({
+    session_id: `session-${index}`,
+    title: `Session ${index}`,
+    title_source: "metadata" as const,
+    cwd: `/workspace/session-${index}`,
+    updated_at: "2026-06-12T11:00:00.000Z"
+  }));
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "full",
+      app_server_inventory_ok: true,
+      sessions
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 200);
+  assert.equal(result.snapshot, false);
+  assert.equal(db.hasSession("session-attached"), true);
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
+  assert.deepEqual(db.sync, {
+    connectorId: "connector-online",
+    reported: 200,
+    stored: 200
+  });
 });
 
 test("recordHostSessions preserves app-server presence without explicit app-server inventory evidence", async () => {
@@ -1365,18 +1467,34 @@ test("recordHostSessionBackfillEvents imports events idempotently", async () => 
       summary: "2026-06-12 10:00 - User: Inspect failure",
       idempotency_key: "rollout:session-1:1",
       created_at: "2026-06-12T10:00:00.000Z"
+    },
+    {
+      kind: "command.output" as const,
+      priority: "P3" as const,
+      summary: "2026-06-12 10:00 - Assistant: Found fix",
+      idempotency_key: "rollout:session-1:2",
+      created_at: "2026-06-12T10:00:30.000Z"
     }
   ];
 
-  const first = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events);
-  const second = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events);
+  const first = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events, "2026-06-23T09:15:30.000Z");
+  const second = await recordHostSessionBackfillEvents({ DB: db } as Env, hostSession, events, "2026-06-23T09:16:30.000Z");
 
-  assert.equal(first.length, 1);
+  assert.equal(first.length, 2);
   assert.equal(first[0]?.seq, 1);
+  assert.equal(first[1]?.seq, 2);
   assert.equal(second.length, 0);
-  assert.equal(db.eventInserts, 1);
-  assert.equal(db.sequenceUpdates, 1);
+  assert.equal(db.eventInserts, 2);
+  assert.equal(db.sequenceUpdates, 2);
   assert.equal(db.usageWindowUpserts, 3);
+  assert.deepEqual(db.usageWindowBinds.map((args) => args[2]), [
+    "2026-06-23T00:00:00.000Z",
+    "2026-06-23T08:00:00.000Z",
+    "2026-06-23T09:15:00.000Z"
+  ]);
+  assert.deepEqual(db.usageWindowBinds.map((args) => args[6]), [2, 2, 2]);
+  assert.deepEqual(db.usageWindowBinds.map((args) => args[7]), [2, 2, 2]);
+  assert.deepEqual(db.usageWindowBinds.map((args) => args[8]), [2, 2, 2]);
 });
 
 test("recordHostSessionBackfillEvents does not return events ignored during insert", async () => {
@@ -1640,7 +1758,8 @@ function usageWindowUpsertFake(onRun?: (args: unknown[]) => void) {
       assert.match(windowEnd as string, /^\d{4}-\d{2}-\d{2}T/);
       assert.equal(["normal", "conservative", "throttled", "hard_limited"].includes(budgetState as string), true);
       assert.equal(typeof usedPct, "number");
-      assert.equal(eventsReceived, 1);
+      assert.equal(typeof eventsReceived, "number");
+      assert.equal((eventsReceived as number) >= 1, true);
       assert.equal(typeof eventsCompacted, "number");
       assert.equal(typeof eventsDelayed, "number");
       assert.equal(typeof localSpoolBytes, "number");
@@ -3225,6 +3344,7 @@ function hostSessionsInventoryDb(options: {
   const counters = {
     sync: undefined as { connectorId: string; reported: number; stored: number } | undefined,
     demotedSessions: 0,
+    hostSessionWrites: 0,
     hasSession(sessionId: string) {
       return sessions.has(sessionId);
     },
@@ -3294,7 +3414,7 @@ function hostSessionsInventoryDb(options: {
             return {
               async run() {
                 const existing = sessions.get(sessionId);
-                sessions.set(sessionId, {
+                const next = {
                   id,
                   connector_id: connectorId,
                   hostname,
@@ -3310,8 +3430,20 @@ function hostSessionsInventoryDb(options: {
                   attached_task_id: existing?.attached_task_id ?? null,
                   attached_thread_id: existing?.attached_thread_id ?? null,
                   updated_at: updatedAt
-                });
-                return { success: true };
+                };
+                const changed = !existing ||
+                  existing.hostname !== next.hostname ||
+                  existing.workspace_id !== next.workspace_id ||
+                  existing.title !== next.title ||
+                  existing.title_source !== next.title_source ||
+                  existing.app_server_present !== next.app_server_present ||
+                  existing.cwd !== next.cwd ||
+                  existing.updated_at !== next.updated_at;
+                if (changed) {
+                  sessions.set(sessionId, next);
+                  counters.hostSessionWrites += 1;
+                }
+                return { success: true, meta: { changes: changed ? 1 : 0 } };
               }
             };
           }
@@ -3457,6 +3589,9 @@ function hostSessionsInventoryDb(options: {
     },
     get demotedSessions() {
       return counters.demotedSessions;
+    },
+    get hostSessionWrites() {
+      return counters.hostSessionWrites;
     }
   };
 
@@ -3469,12 +3604,14 @@ function hostSessionBackfillDb(
   readonly eventInserts: number;
   readonly sequenceUpdates: number;
   readonly usageWindowUpserts: number;
+  readonly usageWindowBinds: unknown[][];
 } {
   const inserted = new Set<string>();
   const counters = {
     eventInserts: 0,
     sequenceUpdates: 0,
-    usageWindowUpserts: 0
+    usageWindowUpserts: 0,
+    usageWindowBinds: [] as unknown[][]
   };
   const db = {
     prepare(sql: string) {
@@ -3542,12 +3679,12 @@ function hostSessionBackfillDb(
             assert.match(eventId, /^event-backfill-session-1-/);
             assert.equal(workspaceId, "workspace-api");
             assert.equal(threadId, "thread-1");
-            assert.equal(seq, 1);
+            assert.equal(seq, counters.sequenceUpdates);
             assert.equal(kind, "command.output");
             assert.equal(priority, "P3");
-            assert.equal(summary, "2026-06-12 10:00 - User: Inspect failure");
-            assert.equal(idempotencyKey, "rollout:session-1:1");
-            assert.equal(createdAt, "2026-06-12T10:00:00.000Z");
+            assert.match(summary, /^2026-06-12 10:00 - /);
+            assert.match(idempotencyKey, /^rollout:session-1:[12]$/);
+            assert.match(createdAt, /^2026-06-12T10:00:(00|30)\.000Z$/);
             return {
               async run() {
                 if (options.ignoreInserts) {
@@ -3563,8 +3700,9 @@ function hostSessionBackfillDb(
       }
 
       if (/INSERT INTO usage_windows/.test(sql)) {
-        return usageWindowUpsertFake(() => {
+        return usageWindowUpsertFake((args) => {
           counters.usageWindowUpserts += 1;
+          counters.usageWindowBinds.push(args);
         });
       }
 
@@ -3578,6 +3716,9 @@ function hostSessionBackfillDb(
     },
     get usageWindowUpserts() {
       return counters.usageWindowUpserts;
+    },
+    get usageWindowBinds() {
+      return counters.usageWindowBinds;
     }
   };
 
@@ -3585,6 +3726,7 @@ function hostSessionBackfillDb(
     readonly eventInserts: number;
     readonly sequenceUpdates: number;
     readonly usageWindowUpserts: number;
+    readonly usageWindowBinds: unknown[][];
   };
 }
 

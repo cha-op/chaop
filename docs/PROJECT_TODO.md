@@ -14,6 +14,7 @@
 - [done] Add old-session history backfill for attached Host Sessions without uploading broad local transcripts by default.
 - [done] Sync Chaop archive/unarchive actions to local Codex app-server archive state through the connector, while keeping local history files read-only.
 - [done] Add real Codex app-server protocol execution for Chaop threads attached to local app-server Host Sessions.
+- [done] Attach historical rollout sessions that are absent from app-server `thread/list` by resolving the local rollout path and calling app-server `thread/resume`.
 - [done] PR0: Merge the tracked Web deploy script with full tests, three review lanes, and resolved GitHub conversations.
 - [done] PR1: Clean up execution UX and capability wording so `codex_exec` is private fallback only.
 - [done] PR2: Add connector-managed single app-server lifecycle.
@@ -23,3 +24,9 @@
 - [done] PR6: Add drain, scheduled restart, and upgrade flow.
 - [done] PR7: Add the multi-instance and thread placement foundation.
 - [done] PR8: Replace Budget Board placeholders with real bounded usage/cost metrics.
+- [in_progress] Close and merge the current app-server attach/resume PR after the full test gate, three review lanes, and resolved GitHub conversations.
+- [planned] PR A: Add a dogfood safety gate with visible cost posture, guarded write/refresh actions, and an emergency pause or stop path.
+- [planned] PR B: Add the Thread Centre chat MVP for managed app-server threads, prompt submission, live progress, and assistant final-answer rendering.
+- [planned] PR C: Add human-in-the-loop approval/input handling for Codex app-server turns.
+- [planned] PR D: Add the persistent connector dogfood runbook and operational scripts for start, stop, observation, and recovery.
+- [planned] PR E: Harden dogfood E2E and cost telemetry gates, adding exact D1 write attribution only if unexplained write growth reappears.

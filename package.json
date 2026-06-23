@@ -8,7 +8,8 @@
     "typecheck": "pnpm --filter @chaop/protocol build && pnpm --filter @chaop/worker typecheck && pnpm --filter @chaop/web typecheck",
     "dev:web": "pnpm --filter @chaop/web dev",
     "dev:worker": "pnpm --filter @chaop/worker dev",
-    "deploy:web": "node scripts/deploy-web.mjs"
+    "deploy:web": "node scripts/deploy-web.mjs",
+    "deploy:api": "node scripts/deploy-api.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
