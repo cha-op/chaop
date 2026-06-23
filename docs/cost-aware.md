@@ -78,6 +78,8 @@ Codex prompts are passed over stdin for `codex_exec` and through `turn/start` fo
 
 Host Session inventory is quiet while the connector is idle. The Browser Host Sessions page has a manual refresh button and an opt-in one-minute auto-refresh; the Durable Object deduplicates those refresh requests per connector so extra browser windows do not increase connector rescan frequency. User actions that mutate Host Sessions, such as creating or attaching a local thread, can still trigger one immediate inventory report so the UI does not stay stale.
 
+The dogfood guard separates current-command cleanup from new work dispatch. Terminal connector events such as `command.finished` and `command.failed` can still close an in-flight command during a pause or hard limit, but pending command lease/dispatch checks `command_create` safety again before starting another turn. `conservative` posture blocks broad Host Session refresh only; it still allows already accepted focused command dispatch.
+
 ## Cost Controls To Keep
 
 - Keep one Rust connector per host and aggregate local logical agents behind it.

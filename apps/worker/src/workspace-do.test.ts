@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { BudgetState } from "@chaop/protocol";
 import {
   agentSocketsForConnector,
   appServerInstancesMessage,
@@ -1068,6 +1069,56 @@ test("agent.ready skips automatic host session refresh while dogfood safety bloc
   assert.equal(attachment.pendingHostSessionsDispatch, false);
 });
 
+test("agent.ready dispatches pending commands while conservative posture blocks host session refresh", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({ pendingCommand: true, safetyBudgetState: "conservative" });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.ready",
+    payload: { capabilities: ["placeholder_commands"] }
+  }));
+
+  assert.equal(db.capabilityUpdates, 1);
+  assert.equal(db.pendingDispatchQueries, 1);
+  assert.equal(db.commandLeases, 1);
+  assert.equal(sent.length, 2);
+  assert.equal(browserSent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; capabilities?: string[] };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.ready");
+  assert.deepEqual(ack.payload?.capabilities, ["placeholder_commands"]);
+  const dispatch = JSON.parse(sent[1] ?? "{}") as {
+    kind?: string;
+    payload?: { command?: { id?: string } };
+  };
+  assert.equal(dispatch.kind, "command.dispatch");
+  assert.equal(dispatch.payload?.command?.id, "command-1");
+  const attachment = agentSocket.deserializeAttachment() as {
+    pendingHostSessionsDispatch?: boolean;
+  };
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
 test("agent.ready does not dispatch while a peer socket has host-session refresh pending", async () => {
   const staleSent: string[] = [];
   const refreshingSent: string[] = [];
@@ -1824,12 +1875,13 @@ test("terminal agent events bypass dogfood safety block and clear socket activit
     socketType: "agent",
     connectorId: "connector-online",
     connectedAt: 300,
-    agentReady: false,
+    agentReady: true,
     activeCommandIds: ["command-1"]
   }, sent);
   const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
   const ctx = {
     getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
       if (tag === "browser") return [browserSocket];
       assert.fail(`unexpected websocket tag: ${tag}`);
     }
@@ -1870,7 +1922,7 @@ test("terminal agent events bypass dogfood safety block and clear socket activit
   assert.equal(browserEvent.kind, "thread.event");
   assert.equal(browserEvent.payload?.event?.kind, "command.finished");
   assert.equal(browserEvent.payload?.event?.summary, "Finished while paused");
-  assert.equal(db.safetyQueries, 0);
+  assert.ok(db.safetyQueries > 0);
   assert.equal(db.commandUpdates, 1);
   assert.equal(db.eventInserts, 1);
 });
@@ -2386,7 +2438,7 @@ function dogfoodSafetyBlockedTerminalAgentEventDb(): D1Database & {
   };
 }
 
-function safetyQueryStatement(sql: string, options: { paused?: boolean } = {}) {
+function safetyQueryStatement(sql: string, options: { paused?: boolean; budgetState?: BudgetState } = {}) {
   if (/SELECT value_json, updated_at FROM control_plane_settings/.test(sql)) {
     return {
       bind(key: string) {
@@ -2436,7 +2488,7 @@ function safetyQueryStatement(sql: string, options: { paused?: boolean } = {}) {
   if (/FROM connectors/.test(sql) && /GROUP BY budget_state/.test(sql)) {
     return {
       async all() {
-        return { results: [] };
+        return { results: options.budgetState ? [{ budget_state: options.budgetState, count: 1 }] : [] };
       }
     };
   }
@@ -3508,6 +3560,9 @@ function staleReleaseDispatchDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/FROM commands cmd/.test(sql) && /cmd\.lease_target_host_session_id IS NOT NULL/.test(sql)) {
         return {
           bind(
@@ -3725,6 +3780,7 @@ function readyGatedDispatchDb(options: {
   initialUpdatedAt?: string;
   pendingCommand?: boolean;
   safetyPaused?: boolean;
+  safetyBudgetState?: BudgetState;
 } = {}): D1Database & {
   readonly capabilityUpdates: number;
   readonly connectorOnlineUpdates: number;
@@ -3770,10 +3826,10 @@ function readyGatedDispatchDb(options: {
   };
   return {
     prepare(sql: string) {
-      const safetyStatement = safetyQueryStatement(
-        sql,
-        options.safetyPaused === undefined ? {} : { paused: options.safetyPaused }
-      );
+      const safetyOptions: { paused?: boolean; budgetState?: BudgetState } = {};
+      if (options.safetyPaused !== undefined) safetyOptions.paused = options.safetyPaused;
+      if (options.safetyBudgetState !== undefined) safetyOptions.budgetState = options.safetyBudgetState;
+      const safetyStatement = safetyQueryStatement(sql, safetyOptions);
       if (safetyStatement) return safetyStatement;
 
       if (/UPDATE connectors/.test(sql) && /capabilities_json = \?/.test(sql)) {

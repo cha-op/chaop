@@ -222,23 +222,23 @@ export class WorkspaceDO implements DurableObject {
         )
       );
       if (readyPayload && (!wasReady || capabilitiesChanged)) {
-        const canRefreshHostSessions = await this.canRefreshHostSessions();
-        if (canRefreshHostSessions) {
+        const refreshDecision = await this.hostSessionRefreshDecision();
+        if (refreshDecision.refreshAllowed) {
           this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
         }
         await this.broadcastConnectorUpdate(connectorId);
-        if (canRefreshHostSessions) {
+        if (refreshDecision.pendingDispatchAllowed) {
           await this.sendPendingCommandsAndReleased(ws, connectorId);
         }
       }
       if (!readyPayload && !wasReady) {
         await markConnectorOnline(this.env, connectorId);
-        const canRefreshHostSessions = await this.canRefreshHostSessions();
-        if (canRefreshHostSessions) {
+        const refreshDecision = await this.hostSessionRefreshDecision();
+        if (refreshDecision.refreshAllowed) {
           this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
         }
         await this.broadcastConnectorUpdate(connectorId);
-        if (canRefreshHostSessions) {
+        if (refreshDecision.pendingDispatchAllowed) {
           await this.sendPendingCommandsAndReleased(ws, connectorId);
         }
       }
@@ -588,13 +588,20 @@ export class WorkspaceDO implements DurableObject {
     return true;
   }
 
-  private async canRefreshHostSessions(): Promise<boolean> {
+  private async hostSessionRefreshDecision(): Promise<{
+    refreshAllowed: boolean;
+    pendingDispatchAllowed: boolean;
+  }> {
     try {
       await assertDogfoodSafetyActionAllowed(this.env, "host_session_refresh");
-      return true;
+      return { refreshAllowed: true, pendingDispatchAllowed: true };
     } catch (error) {
       if (error instanceof DogfoodSafetyError) {
-        return false;
+        const conservativeRefreshOnlyBlock = error.guard.budget_state === "conservative";
+        return {
+          refreshAllowed: false,
+          pendingDispatchAllowed: conservativeRefreshOnlyBlock
+        };
       }
       throw error;
     }
@@ -872,12 +879,15 @@ export class WorkspaceDO implements DurableObject {
   private async sendPendingCommands(
     ws: WebSocket,
     connectorId: string,
-    options: { skipStaleExplicitCleanup?: boolean } = {}
+    options: { skipSafetyCheck?: boolean; skipStaleExplicitCleanup?: boolean } = {}
   ): Promise<string[]> {
     if (
       !isReadyAgentSocket(ws, connectorId) ||
       this.hasPendingHostSessionsDispatchForConnector(connectorId)
     ) {
+      return [];
+    }
+    if (!options.skipSafetyCheck && !(await this.canDispatchPendingCommands())) {
       return [];
     }
     let releasedConnectorIds: string[] = [];
@@ -944,6 +954,9 @@ export class WorkspaceDO implements DurableObject {
   }
 
   private async sendPendingCommandsToAgents(connectorId?: string): Promise<WebSocket[]> {
+    if (!(await this.canDispatchPendingCommands())) {
+      return [];
+    }
     if (connectorId) {
       const sockets = this.ctx.getWebSockets(`agent:${connectorId}`);
       if (sockets.some((socket) => hasPendingHostSessionsDispatch(socket, connectorId))) {
@@ -964,7 +977,10 @@ export class WorkspaceDO implements DurableObject {
         readySockets.map((socket) => {
           const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
           return attachment?.connectorId
-            ? this.sendPendingCommands(socket, attachment.connectorId, { skipStaleExplicitCleanup: true })
+            ? this.sendPendingCommands(socket, attachment.connectorId, {
+              skipSafetyCheck: true,
+              skipStaleExplicitCleanup: true
+            })
             : undefined;
         })
       );
@@ -1003,10 +1019,25 @@ export class WorkspaceDO implements DurableObject {
     await Promise.all(readySockets.map((socket) => {
       const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
       return attachment?.connectorId
-        ? this.sendPendingCommands(socket, attachment.connectorId, { skipStaleExplicitCleanup: true })
+        ? this.sendPendingCommands(socket, attachment.connectorId, {
+          skipSafetyCheck: true,
+          skipStaleExplicitCleanup: true
+        })
         : undefined;
     }));
     return readySockets;
+  }
+
+  private async canDispatchPendingCommands(): Promise<boolean> {
+    try {
+      await assertDogfoodSafetyActionAllowed(this.env, "command_create");
+      return true;
+    } catch (error) {
+      if (error instanceof DogfoodSafetyError) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   private markAgentReady(ws: WebSocket, connectorId: string, pendingHostSessionsDispatch = false): void {

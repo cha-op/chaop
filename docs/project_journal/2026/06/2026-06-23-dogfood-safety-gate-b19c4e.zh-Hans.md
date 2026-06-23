@@ -44,6 +44,8 @@ superseded_by:
 - 自动 `agent.ready` Host Session refresh dispatch 现在也会走同一个 `host_session_refresh` safety action；当 refresh 被挡住时，同一轮 ready cycle 也不会继续派发 pending command。
 - Server-side safety posture 已从持久化 telemetry sample 改为短缓存 live Cloudflare telemetry best-effort；受保护 action path 不会因此持久化 telemetry sample。
 - 已把 safety 文案从宽泛的 “dogfood writes” 收窄为 “guarded dogfood actions”，避免把仍需保留的 cleanup paths 误描述为同一类受阻动作。
+- 已把 conservative Host Session refresh block 和 focused pending command dispatch 拆开，避免 conservative posture 卡住已经接受的工作。
+- 每次 pending command lease/dispatch 前都会重新检查 `command_create` safety，因此 terminal command cleanup 不会在 dogfood safety pause、hard limit 或 throttled 状态下启动下一条 pending command。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

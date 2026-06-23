@@ -44,6 +44,8 @@ superseded_by:
 - Guarded automatic `agent.ready` Host Session refresh dispatches with the same `host_session_refresh` safety action, and skipped pending command dispatch in the same ready cycle when the refresh is blocked.
 - Switched server-side safety posture from persisted telemetry samples to short-cached live Cloudflare telemetry best-effort, without persisting telemetry from guarded action paths.
 - Narrowed safety copy from broad "dogfood writes" wording to "guarded dogfood actions" so cleanup paths that remain intentionally available are not misrepresented.
+- Split conservative Host Session refresh blocking from focused pending command dispatch so a conservative posture does not strand already accepted work.
+- Re-checked `command_create` safety before every pending command lease/dispatch, so terminal command cleanup cannot start another pending command while dogfood safety is paused, hard-limited, or throttled.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

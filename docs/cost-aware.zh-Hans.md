@@ -78,6 +78,8 @@ App-server execution 当前只会把 lifecycle events 和最终 assistant messag
 
 Connector 空闲时 Host Session inventory 会保持静默。Browser 的 Host Sessions 页面提供手动 refresh 按钮，以及显式启用的一分钟自动刷新；Durable Object 会按 connector 去重这些 refresh 请求，所以额外打开的浏览器窗口不会提高 connector 重扫频率。创建或 attach 本机 thread 这类会修改 Host Sessions 的用户动作，仍然可以触发一次即时 inventory report，避免 UI 长时间停留在旧状态。
 
+Dogfood guard 会区分当前 command cleanup 和新 work dispatch。`command.finished`、`command.failed` 这类终态 connector events 在 pause 或 hard limit 期间仍然可以关闭正在运行的 command；但 pending command 在 lease/dispatch 前会重新检查 `command_create` safety，避免继续启动下一轮工作。`conservative` posture 只阻止宽泛 Host Session refresh；已经被接受的 focused command dispatch 仍然允许继续。
+
 ## 后续需要保留的成本控制
 
 - 每台 host 保持一个 Rust connector，本机多个逻辑 agent 都从它聚合。
