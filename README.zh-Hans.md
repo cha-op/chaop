@@ -27,6 +27,7 @@ pnpm dev:web
 中文文档入口：
 
 - `docs/deployment-guide.zh-Hans.md`
+- `docs/e2e-smoke.zh-Hans.md`
 - `docs/cost-aware.zh-Hans.md`
 - `docs/ux-visual-directions.zh-Hans.md`
 - `docs/PROJECT_STATE.zh-Hans.md`

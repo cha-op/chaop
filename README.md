@@ -27,6 +27,7 @@ The committed Worker config is production-safe. The local `dev:worker` script bu
 Documentation entrypoints use British English at the canonical paths. Simplified Chinese counterparts use the same basename with a `.zh-Hans.md` suffix.
 
 - `docs/deployment-guide.md`
+- `docs/e2e-smoke.md`
 - `docs/cost-aware.md`
 - `docs/ux-visual-directions.md`
 - `docs/PROJECT_STATE.md`

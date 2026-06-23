@@ -20,6 +20,7 @@
 - Archive/unarchive actions for attached Host Session tasks update Chaop's D1 task/thread state first, then try to synchronise resolvable Codex app-server threads through connector `thread/archive` and `thread/unarchive`; sync failures are reported as warnings, and non-app-server sessions remain D1-only.
 - Attaching an unused local Codex session through a connector with `host_session_app_server_ensure` now resumes it through app-server before creating the Chaop task/thread attachment, so Thread Centre can use the managed app-server command path immediately.
 - The nine-PR app-server lifecycle roadmap is implemented through the Budget Board real-metrics slice.
+- Deployed E2E smoke now has a documented Access-cookie browser path and a repo-local skill for repeatable low-cost API, Web, browser, and Budget Board validation.
 - Completed workstream state lives in `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.md`.
 
 ## Recovery Pointers
@@ -36,6 +37,8 @@
 - App-server restart flow source: `docs/project_journal/2026/06/2026-06-14-app-server-restart-flow-c7e2a4.md`
 - App-server attach resume source: `docs/project_journal/2026/06/2026-06-15-app-server-attach-resume-f4c9a8.md`
 - Cost-aware source: `docs/cost-aware.md`
+- Deployed E2E smoke source: `docs/e2e-smoke.md`
+- Deployed E2E smoke and cost check journal: `docs/project_journal/2026/06/2026-06-23-deployed-e2e-smoke-cost-check-7c9d1e.md`
 - Local journal index: optional generated `docs/project_journal/INDEX.md`; do not commit it.
 
 ## Global Blockers
