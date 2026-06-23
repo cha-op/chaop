@@ -220,11 +220,13 @@ export class WorkspaceDO implements DurableObject {
         )
       );
       if (readyPayload && (!wasReady || capabilitiesChanged)) {
+        this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
         await this.broadcastConnectorUpdate(connectorId);
         await this.sendPendingCommandsAndReleased(ws, connectorId);
       }
       if (!readyPayload && !wasReady) {
         await markConnectorOnline(this.env, connectorId);
+        this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
         await this.broadcastConnectorUpdate(connectorId);
         await this.sendPendingCommandsAndReleased(ws, connectorId);
       }
@@ -511,16 +513,11 @@ export class WorkspaceDO implements DurableObject {
         continue;
       }
 
-      socket.send(
-        JSON.stringify(
-          createEnvelope("host_sessions.refresh", { type: "worker", id: "workspace-do-global" }, {}, {
-            target: { type: "connector", id: connectorId }
-          })
-        )
-      );
-      this.hostSessionsRefreshSentAt.set(connectorId, now);
-      this.markHostSessionsRefreshPending(socket, connectorId);
-      dispatchedTo += 1;
+      if (this.dispatchHostSessionsRefreshToSocket(socket, connectorId, now)) {
+        dispatchedTo += 1;
+      } else {
+        debouncedConnectorCount += 1;
+      }
     }
     return new Response(JSON.stringify({
       dispatched_to: dispatchedTo,
@@ -529,6 +526,30 @@ export class WorkspaceDO implements DurableObject {
     }), {
       headers: { "content-type": "application/json; charset=utf-8" }
     });
+  }
+
+  private dispatchHostSessionsRefreshToSocket(socket: WebSocket, connectorId: string, now = Date.now()): boolean {
+    if (this.hasPendingHostSessionsDispatchForConnector(connectorId)) {
+      return false;
+    }
+    const lastSentAt = this.hostSessionsRefreshSentAt.get(connectorId);
+    if (
+      lastSentAt !== undefined &&
+      now - lastSentAt < HOST_SESSIONS_REFRESH_COOLDOWN_MS
+    ) {
+      return false;
+    }
+
+    socket.send(
+      JSON.stringify(
+        createEnvelope("host_sessions.refresh", { type: "worker", id: "workspace-do-global" }, {}, {
+          target: { type: "connector", id: connectorId }
+        })
+      )
+    );
+    this.hostSessionsRefreshSentAt.set(connectorId, now);
+    this.markHostSessionsRefreshPending(socket, connectorId);
+    return true;
   }
 
   private async createLocalThread(request: Request): Promise<Response> {

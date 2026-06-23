@@ -770,7 +770,7 @@ test("agentSocketsForConnector prefers the newest ready agent socket", () => {
   assert.deepEqual(agentSocketsForConnector(ctx, "connector-1"), [freshSocket, oldSocket]);
 });
 
-test("agent.ready enables pending command dispatch without host session inventory", async () => {
+test("agent.ready refreshes host sessions before pending command dispatch", async () => {
   const sent: string[] = [];
   const browserSent: string[] = [];
   const agentSocket = mutableSocketWithAttachment({
@@ -805,8 +805,8 @@ test("agent.ready enables pending command dispatch without host session inventor
   }));
 
   assert.equal(db.capabilityUpdates, 1);
-  assert.equal(db.pendingDispatchQueries, 1);
-  assert.equal(db.commandLeases, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
   assert.equal(sent.length, 2);
   assert.equal(browserSent.length, 1);
   const ack = JSON.parse(sent[0] ?? "{}") as {
@@ -816,12 +816,12 @@ test("agent.ready enables pending command dispatch without host session inventor
   assert.equal(ack.kind, "server.ack");
   assert.equal(ack.payload?.kind, "agent.ready");
   assert.deepEqual(ack.payload?.capabilities, ["placeholder_commands"]);
-  const dispatch = JSON.parse(sent[1] ?? "{}") as {
+  const refresh = JSON.parse(sent[1] ?? "{}") as {
     kind?: string;
-    payload?: { command?: { id?: string } };
+    target?: { type?: string; id?: string };
   };
-  assert.equal(dispatch.kind, "command.dispatch");
-  assert.equal(dispatch.payload?.command?.id, "command-1");
+  assert.equal(refresh.kind, "host_sessions.refresh");
+  assert.deepEqual(refresh.target, { type: "connector", id: "connector-online" });
   const connectorUpdate = JSON.parse(browserSent[0] ?? "{}") as {
     kind?: string;
     payload?: { connectors?: Array<{ id?: string; capabilities?: string[] }> };
@@ -830,14 +830,39 @@ test("agent.ready enables pending command dispatch without host session inventor
   assert.equal(connectorUpdate.payload?.connectors?.[0]?.id, "connector-online");
   assert.deepEqual(connectorUpdate.payload?.connectors?.[0]?.capabilities, ["placeholder_commands"]);
 
-  const afterReady = await workspace.fetch(new Request("https://workspace-do/internal/dispatch-pending", {
-    method: "POST",
-    body: JSON.stringify({ connector_id: "connector-online" })
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.host_sessions",
+    payload: {
+      sessions: [
+        {
+          session_id: "session-1",
+          title: "Inventory title",
+          title_source: "metadata",
+          updated_at: "2026-06-13T10:01:00.000Z"
+        }
+      ],
+      inventory_scope: "incremental",
+      app_server_inventory_ok: true
+    }
   }));
-  assert.equal((await afterReady.json() as { dispatched_to?: number }).dispatched_to, 1);
-  assert.equal(db.pendingDispatchQueries, 2);
+
+  assert.equal(db.pendingDispatchQueries, 1);
   assert.equal(db.commandLeases, 1);
-  assert.equal(sent.length, 2);
+  assert.equal(sent.length, 4);
+  assert.equal(browserSent.length, 2);
+  const hostSessionsAck = JSON.parse(sent[2] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; count?: number };
+  };
+  assert.equal(hostSessionsAck.kind, "server.ack");
+  assert.equal(hostSessionsAck.payload?.kind, "agent.host_sessions");
+  assert.equal(hostSessionsAck.payload?.count, 1);
+  const dispatch = JSON.parse(sent[3] ?? "{}") as {
+    kind?: string;
+    payload?: { command?: { id?: string } };
+  };
+  assert.equal(dispatch.kind, "command.dispatch");
+  assert.equal(dispatch.payload?.command?.id, "command-1");
 
   await workspace.webSocketMessage(agentSocket, JSON.stringify({
     kind: "agent.ready",
@@ -845,10 +870,10 @@ test("agent.ready enables pending command dispatch without host session inventor
   }));
 
   assert.equal(db.capabilityUpdates, 1);
-  assert.equal(db.pendingDispatchQueries, 2);
-  assert.equal(sent.length, 3);
-  assert.equal(browserSent.length, 1);
-  const duplicateAck = JSON.parse(sent[2] ?? "{}") as {
+  assert.equal(db.pendingDispatchQueries, 1);
+  assert.equal(sent.length, 5);
+  assert.equal(browserSent.length, 2);
+  const duplicateAck = JSON.parse(sent[4] ?? "{}") as {
     kind?: string;
     payload?: { kind?: string; capabilities?: string[] };
   };
@@ -868,10 +893,10 @@ test("agent.ready enables pending command dispatch without host session inventor
   }));
 
   assert.equal(db.capabilityUpdates, 1);
-  assert.equal(db.pendingDispatchQueries, 3);
+  assert.equal(db.pendingDispatchQueries, 2);
   assert.equal(replacementSent.length, 1);
-  assert.equal(browserSent.length, 2);
-  const replacementUpdate = JSON.parse(browserSent[1] ?? "{}") as {
+  assert.equal(browserSent.length, 3);
+  const replacementUpdate = JSON.parse(browserSent[2] ?? "{}") as {
     kind?: string;
     payload?: { connectors?: Array<{ id?: string; status?: string; capabilities?: string[] }> };
   };
@@ -1340,8 +1365,8 @@ test("legacy agent.ready without capabilities remains dispatch-ready", async () 
 
   assert.equal(db.capabilityUpdates, 0);
   assert.equal(db.connectorOnlineUpdates, 1);
-  assert.equal(db.pendingDispatchQueries, 1);
-  assert.equal(sent.length, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(sent.length, 2);
   assert.equal(browserSent.length, 1);
   const ack = JSON.parse(sent[0] ?? "{}") as {
     kind?: string;
@@ -1350,6 +1375,12 @@ test("legacy agent.ready without capabilities remains dispatch-ready", async () 
   assert.equal(ack.kind, "server.ack");
   assert.equal(ack.payload?.kind, "agent.ready");
   assert.deepEqual(ack.payload?.capabilities, []);
+  const refresh = JSON.parse(sent[1] ?? "{}") as {
+    kind?: string;
+    target?: { type?: string; id?: string };
+  };
+  assert.equal(refresh.kind, "host_sessions.refresh");
+  assert.deepEqual(refresh.target, { type: "connector", id: "connector-online" });
   const connectorUpdate = JSON.parse(browserSent[0] ?? "{}") as {
     kind?: string;
     payload?: { connectors?: Array<{ id?: string; status?: string }> };
@@ -1362,9 +1393,9 @@ test("legacy agent.ready without capabilities remains dispatch-ready", async () 
     method: "POST",
     body: JSON.stringify({ connector_id: "connector-online" })
   }));
-  assert.equal((await afterReady.json() as { dispatched_to?: number }).dispatched_to, 1);
+  assert.equal((await afterReady.json() as { dispatched_to?: number }).dispatched_to, 0);
   assert.equal(db.connectorOnlineUpdates, 1);
-  assert.equal(db.pendingDispatchQueries, 2);
+  assert.equal(db.pendingDispatchQueries, 0);
 });
 
 test("ensure host session app-server dispatches to the selected agent socket and resolves the result", async () => {

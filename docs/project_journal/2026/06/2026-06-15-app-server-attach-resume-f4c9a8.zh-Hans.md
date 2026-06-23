@@ -32,6 +32,8 @@ superseded_by:
 - Archive/unarchive sync 在 source 和 target `thread/list` 都 miss 后也会使用 rollout path resume，然后对 resume 返回的真实 app-server `thread.id` 执行 archive/unarchive。
 - Review follow-up 会拒绝 session id 不匹配的 app-server ensure response，path-based attach 和 command resume 会使用 rollout 里的 cwd，并且 page-budgeted `thread/list` miss 后会继续尝试 rollout resume。
 - Review follow-up 还会在 active inventory 把 `app_server_present` 降级后，继续保留 app-server lineage session 的 archive/unarchive sync，因此已归档的 app-server thread 可以通过 connector 重新 unarchive 回本机。
+- unarchive sync 成功后，如果 active-only inventory 曾经把 attached Host Session 的 D1 `app_server_present` 标记降级，会把它恢复为 true，因此下一条 managed app-server command 会被接受。
+- Review follow-up 会在 `agent.ready` 后、pending command dispatch 前请求一次带 debounce 的 Host Sessions refresh，因此新创建的本机 sessions 不需要恢复高频 connector inventory polling 也能变得可见。
 - 当 D1 当前没有 usage windows 时，Budget summary 会把核心百分比保持为 `missing`，避免用误导性的 0 baseline 表示未知用量。
 
 ## 验证

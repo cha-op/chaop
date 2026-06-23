@@ -42,6 +42,7 @@ import {
   loadBudgetSummaryFromDb,
   loadBootstrapFromDb,
   loadHostSessionInDb,
+  markHostSessionAppServerPresentInDb,
   recordHostSessionBackfillEvents,
   recordHostSessions,
   unarchiveTaskInDb
@@ -235,6 +236,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const archiveSync = hostSession && isAppServerHostSessionLineage(hostSession)
         ? await requestThreadArchiveSync(env, hostSession, archived)
         : undefined;
+      if (hostSession && !archived && archiveSync?.attempted === true && !archiveSync.error) {
+        await markHostSessionAppServerPresentInDb(env, hostSession);
+      }
       const response: TaskArchiveResponse = {
         task,
         archive_sync: archiveSync

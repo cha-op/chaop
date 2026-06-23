@@ -636,6 +636,23 @@ export async function recordHostSessions(
   };
 }
 
+export async function markHostSessionAppServerPresentInDb(
+  env: Env,
+  hostSession: HostSessionSummary,
+  updatedAt = new Date().toISOString()
+): Promise<void> {
+  if (!env.DB || hostSession.app_server_present === true) return;
+
+  await env.DB.prepare(
+    `UPDATE host_sessions
+     SET app_server_present = 1, updated_at = ?
+     WHERE id = ?
+       AND app_server_present <> 1`
+  )
+    .bind(updatedAt, hostSession.id)
+    .run();
+}
+
 async function cleanupUnavailableAppServerHostSession(
   env: Env,
   hostSession: HostSessionSummary,
@@ -4489,16 +4506,18 @@ async function persistBudgetTelemetrySampleBestEffort(
   try {
     const sampleSeconds = positiveIntegerEnv(env.CF_TELEMETRY_SAMPLE_SECONDS, DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS);
     const sampledAt = telemetrySampleBucketStart(generatedAt, sampleSeconds).toISOString();
+    const selectorHash = cloudflareTelemetrySelectorHash(env);
     const result = await env.DB.prepare(
       `INSERT OR IGNORE INTO budget_telemetry_samples (
-         id, sample_type, sampled_at, window_start, window_end,
+         id, sample_type, selector_hash, sampled_at, window_start, window_end,
          d1_rows_written_daily, d1_rows_read_daily, worker_requests_daily,
          durable_object_requests_daily, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
-        `budget-telemetry:cloudflare_daily:${sampledAt}`,
+        `budget-telemetry:cloudflare_daily:${selectorHash}:${sampledAt}`,
         "cloudflare_daily",
+        selectorHash,
         sampledAt,
         telemetry.windowStart,
         telemetry.windowEnd,
@@ -4539,11 +4558,11 @@ async function loadBudgetTelemetryHistoryBestEffort(
         `SELECT sampled_at, d1_rows_written_daily, d1_rows_read_daily,
                 worker_requests_daily, durable_object_requests_daily
          FROM budget_telemetry_samples
-         WHERE sample_type = ? AND sampled_at >= ?
+         WHERE sample_type = ? AND selector_hash = ? AND sampled_at >= ?
          ORDER BY sampled_at DESC
          LIMIT ?`
       )
-        .bind("cloudflare_daily", since, BUDGET_TELEMETRY_HISTORY_LIMIT)
+        .bind("cloudflare_daily", cloudflareTelemetrySelectorHash(env), since, BUDGET_TELEMETRY_HISTORY_LIMIT)
     );
     const points = rows.reverse().map(budgetTelemetryPointFromRow);
     const history: BudgetTelemetryHistory = {
@@ -4578,10 +4597,28 @@ function budgetTelemetryHistoryCacheKey(env: Env, generatedAt: string): string {
   const sampleSeconds = positiveIntegerEnv(env.CF_TELEMETRY_SAMPLE_SECONDS, DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS);
   const sampleBucket = telemetrySampleBucketStart(generatedAt, sampleSeconds).toISOString();
   return [
-    env.CF_TELEMETRY_ACCOUNT_ID ?? "",
-    env.CF_TELEMETRY_D1_DATABASE_ID ?? "",
+    cloudflareTelemetrySelectorHash(env),
     sampleBucket
   ].join("\0");
+}
+
+function cloudflareTelemetrySelectorHash(env: Env): string {
+  return stableStringHash([
+    env.CF_TELEMETRY_ACCOUNT_ID ?? "",
+    env.CF_TELEMETRY_API_WORKER ?? "",
+    env.CF_TELEMETRY_WEB_WORKER ?? "",
+    env.CF_TELEMETRY_D1_DATABASE_ID ?? "",
+    env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? ""
+  ].join("\0"));
+}
+
+function stableStringHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
 function budgetTelemetryPointFromRow(row: BudgetTelemetrySampleRow): BudgetTelemetryPoint {

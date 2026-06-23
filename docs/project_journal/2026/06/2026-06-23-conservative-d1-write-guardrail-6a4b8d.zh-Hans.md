@@ -27,6 +27,7 @@ superseded_by:
 - tracked Wrangler defaults 已更新到保守 event capacities，避免新的通用部署继承旧的乐观阈值。
 - 部署指南示例也使用同一组保守 capacities，因为 deploy profile 中的值会覆盖 Worker runtime vars。
 - Review follow-up 会在 D1 rows-written constraint state 中保留 four-hour soft budget，并按导入时间记录 Host Session backfill usage windows，同时在 thread history 里保留原始 event timestamp。
+- Review follow-up 会按 selector hash 划分已持久化的 Cloudflare telemetry samples，因此切换 account、Worker、D1 或 Durable Object telemetry selector 时不会复用旧 sample bucket。
 
 ## 验证
 - `pnpm --filter @chaop/worker test`
@@ -35,3 +36,4 @@ superseded_by:
 - 已增加 Cloudflare telemetry 低于本地 D1 write estimate 的覆盖。
 - 已更新 schema-model zero baselines，不再把它们计为 sampled constraints。
 - 已增加 four-hour soft-limit constraint state 和 import-time backfill budget windows 的覆盖。
+- 已增加 telemetry selector-scoped sample bucket 的覆盖。

@@ -413,6 +413,7 @@ test("task unarchive syncs app-server lineage after active inventory demotion", 
   });
   assert.equal(db.taskArchiveWrites, 1);
   assert.equal(db.threadArchiveWrites, 1);
+  assert.equal(db.appServerPresenceRestores, 1);
 });
 
 test("task archive reports D1-only fallback when app-server thread is not resolved", async () => {
@@ -2182,6 +2183,64 @@ test("budget telemetry cache expires on sample bucket boundaries", async () => {
   }
 });
 
+test("budget telemetry samples are scoped by telemetry selectors", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: fetchCount } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: fetchCount * 100, rowsWritten: fetchCount * 10 } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const db = budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] });
+  const baseEnv: Env = {
+    ...devEnv,
+    DB: db,
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "account-selector-cache",
+    CF_TELEMETRY_D1_DATABASE_ID: "database-selector-cache",
+    CF_TELEMETRY_CACHE_SECONDS: "300",
+    CF_TELEMETRY_SAMPLE_SECONDS: "300"
+  };
+
+  try {
+    await loadBudgetSummaryFromDb(
+      {
+        ...baseEnv,
+        CF_TELEMETRY_API_WORKER: "chaop-api-a"
+      },
+      "2026-06-15T09:04:00.000Z"
+    );
+    const second = await loadBudgetSummaryFromDb(
+      {
+        ...baseEnv,
+        CF_TELEMETRY_API_WORKER: "chaop-api-b"
+      },
+      "2026-06-15T09:04:00.000Z"
+    );
+
+    assert.equal(fetchCount, 2);
+    assert.equal(second.telemetry_history?.points.at(-1)?.d1_rows_written_daily, 20);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("budget telemetry history keeps the latest bounded samples", async () => {
   const samples = Array.from({ length: 305 }, (_, index) => {
     const sampledAt = new Date(Date.UTC(2026, 5, 15, 8, index, 0)).toISOString();
@@ -3165,6 +3224,7 @@ function budgetSummaryDb(
           bind(
             id: string,
             sampleType: string,
+            selectorHash: string,
             sampledAt: string,
             windowStart: string,
             windowEnd: string,
@@ -3182,6 +3242,7 @@ function budgetSummaryDb(
                 telemetrySamples.push({
                   id,
                   sample_type: sampleType,
+                  selector_hash: selectorHash,
                   sampled_at: sampledAt,
                   window_start: windowStart,
                   window_end: windowEnd,
@@ -3201,11 +3262,15 @@ function budgetSummaryDb(
       if (/FROM budget_telemetry_samples/.test(sql)) {
         const descending = /ORDER BY sampled_at DESC/.test(sql);
         return {
-          bind(sampleType: string, since: string, limit: number) {
+          bind(sampleType: string, selectorHash: string, since: string, limit: number) {
             return {
               async all() {
                 const results = telemetrySamples
-                  .filter((sample) => sample.sample_type === sampleType && String(sample.sampled_at) >= since)
+                  .filter((sample) =>
+                    sample.sample_type === sampleType &&
+                    String(sample.selector_hash ?? selectorHash) === selectorHash &&
+                    String(sample.sampled_at) >= since
+                  )
                   .sort((left, right) => descending
                     ? String(right.sampled_at).localeCompare(String(left.sampled_at))
                     : String(left.sampled_at).localeCompare(String(right.sampled_at)))
@@ -3980,7 +4045,11 @@ function taskArchiveSyncDb(
     titleSource?: string | undefined;
     appServerPresent?: boolean | undefined;
   } = {}
-): D1Database & { readonly taskArchiveWrites: number; readonly threadArchiveWrites: number } {
+): D1Database & {
+  readonly taskArchiveWrites: number;
+  readonly threadArchiveWrites: number;
+  readonly appServerPresenceRestores: number;
+} {
   const connectorStatus = options.connectorStatus ?? "online";
   const supportsArchive = options.supportsArchive ?? true;
   const supportsAppServerThreads = options.supportsAppServerThreads ?? false;
@@ -4029,7 +4098,8 @@ function taskArchiveSyncDb(
   };
   const counters = {
     taskArchiveWrites: 0,
-    threadArchiveWrites: 0
+    threadArchiveWrites: 0,
+    appServerPresenceRestores: 0
   };
 
   const db = {
@@ -4145,6 +4215,26 @@ function taskArchiveSyncDb(
         };
       }
 
+      if (/UPDATE host_sessions/.test(sql) && /SET app_server_present = 1/.test(sql)) {
+        return {
+          bind(updatedAt: string, hostSessionId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(hostSessionId, "host-session-1");
+            return {
+              async run() {
+                if (hostSession.app_server_present === 1) {
+                  return { meta: { changes: 0 } };
+                }
+                hostSession.app_server_present = 1;
+                hostSession.updated_at = updatedAt;
+                counters.appServerPresenceRestores += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
     },
     get taskArchiveWrites() {
@@ -4152,10 +4242,17 @@ function taskArchiveSyncDb(
     },
     get threadArchiveWrites() {
       return counters.threadArchiveWrites;
+    },
+    get appServerPresenceRestores() {
+      return counters.appServerPresenceRestores;
     }
   };
 
-  return db as D1Database & { readonly taskArchiveWrites: number; readonly threadArchiveWrites: number };
+  return db as D1Database & {
+    readonly taskArchiveWrites: number;
+    readonly threadArchiveWrites: number;
+    readonly appServerPresenceRestores: number;
+  };
 }
 
 function hostSessionAttachBackfillDb(

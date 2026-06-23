@@ -32,6 +32,8 @@ superseded_by:
 - Archive/unarchive sync now uses rollout path resume after source and target `thread/list` misses, then mutates the real app-server `thread.id` returned by resume.
 - Review follow-up rejects app-server ensure responses for a different session id, uses rollout cwd for path-based attach and command resumes, and falls back to rollout resume after page-budgeted `thread/list` misses.
 - Review follow-up also keeps archive/unarchive sync available for app-server lineage sessions after active inventory demotes `app_server_present`, so an archived app-server thread can be unarchived back through the connector.
+- Successful unarchive sync restores the attached Host Session's D1 `app_server_present` marker when active-only inventory had previously demoted it, so the next managed app-server command is accepted.
+- Review follow-up requests a debounced Host Sessions refresh after `agent.ready` before pending command dispatch, so newly created local sessions become visible without restoring high-frequency connector inventory polling.
 - Budget summary keeps headline percentages as `missing` when D1 has no current usage windows, instead of reporting a misleading zero baseline.
 
 ## Validation
