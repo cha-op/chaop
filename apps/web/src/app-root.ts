@@ -740,6 +740,8 @@ export class ChaopApp extends LitElement {
               <span class="chip realtime">Attached</span>
               <button
                 type="button"
+                title=${this.safetyButtonTitle("host_session_detach")}
+                ?disabled=${this.safetyBlocked("host_session_detach")}
                 @click=${(event: Event) => {
                   event.stopPropagation();
                   void this.detachSession(session);
@@ -1098,6 +1100,7 @@ export class ChaopApp extends LitElement {
   private async detachSession(session: HostSessionSummary): Promise<void> {
     this.actionError = undefined;
     this.actionNotice = undefined;
+    if (!this.guardSafetyAction("host_session_detach")) return;
     try {
       const response = await detachHostSession(session.session_id, { connector_id: session.connector_id });
       this.mergeDetachedSession(response);
