@@ -46,6 +46,9 @@ superseded_by:
 - 已把 safety 文案从宽泛的 “dogfood writes” 收窄为 “guarded dogfood actions”，避免把仍需保留的 cleanup paths 误描述为同一类受阻动作。
 - 已把 conservative Host Session refresh block 和 focused pending command dispatch 拆开，避免 conservative posture 卡住已经接受的工作。
 - 每次 pending command lease/dispatch 前都会重新检查 `command_create` safety，因此 terminal command cleanup 不会在 dogfood safety pause、hard limit 或 throttled 状态下启动下一条 pending command。
+- 当 safety 挡住非终态 connector progress events 时，已经 dispatch 的 command 现在会被标记为 failed，避免 paused 或 hard-limited command 一直停在 leased 或 running。
+- malformed emergency-pause setting rows 现在会 fail closed，与 pause state 无法读取时的行为保持一致。
+- 已移除 tracked journal entries 中的本机验证路径。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`
@@ -53,7 +56,7 @@ superseded_by:
 - `pnpm test`
 - `pnpm build`
 - `cargo fmt --check`
-- `python3 /Users/joey/.codex/personal-sync/overlays/private/releases/5f1ab3fa5d9f7d534507216a2d6f765694f9b710/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo .`
+- `project-journal validate --repo .`
 - `git diff --check`
 
 ## 下一步

@@ -2076,6 +2076,36 @@ test("safety posture fails closed when pause state cannot be read", async () => 
   assert.equal(body.safety.actions.every((guard) => guard.state === "blocked"), true);
 });
 
+test("safety posture fails closed when pause state row is malformed", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        malformedPauseRow: true
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      paused: boolean;
+      paused_reason?: string | undefined;
+      actions: Array<{ state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "hard_limited");
+  assert.equal(body.safety.paused, true);
+  assert.match(body.safety.paused_reason ?? "", /malformed/);
+  assert.equal(body.safety.actions.every((guard) => guard.state === "blocked"), true);
+});
+
 test("safety pause and resume update the operator guard state", async () => {
   const db = safetyPauseDb();
   const pause = await handleRequest(
@@ -3579,6 +3609,7 @@ type DogfoodSafetyFakeOptions = {
   paused?: boolean | undefined;
   pauseReadError?: string | undefined;
   pauseReason?: string | undefined;
+  malformedPauseRow?: boolean | undefined;
   usageWindows?: Record<string, Record<string, unknown> | undefined> | undefined;
   telemetrySample?: Record<string, unknown> | undefined;
   connectorBudgetStates?: string[] | undefined;
@@ -3596,6 +3627,12 @@ function dogfoodSafetyQueryFake(
         return {
           async first() {
             if (options.pauseReadError) throw new Error(options.pauseReadError);
+            if (options.malformedPauseRow) {
+              return {
+                value_json: JSON.stringify({ paused: "true" }),
+                updated_at: "2026-06-15T09:00:00.000Z"
+              };
+            }
             if (!options.paused) return undefined;
             const updatedAt = "2026-06-15T09:00:00.000Z";
             return {
@@ -3696,6 +3733,12 @@ function safetyPauseDb(options: DogfoodSafetyFakeOptions = {}): D1Database {
             return {
               async first() {
                 if (options.pauseReadError) throw new Error(options.pauseReadError);
+                if (options.malformedPauseRow) {
+                  return {
+                    value_json: JSON.stringify({ paused: "true" }),
+                    updated_at: pauseUpdatedAt
+                  };
+                }
                 if (!paused) return undefined;
                 return {
                   value_json: JSON.stringify({

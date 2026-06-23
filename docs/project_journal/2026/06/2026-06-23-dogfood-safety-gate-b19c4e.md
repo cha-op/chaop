@@ -46,6 +46,9 @@ superseded_by:
 - Narrowed safety copy from broad "dogfood writes" wording to "guarded dogfood actions" so cleanup paths that remain intentionally available are not misrepresented.
 - Split conservative Host Session refresh blocking from focused pending command dispatch so a conservative posture does not strand already accepted work.
 - Re-checked `command_create` safety before every pending command lease/dispatch, so terminal command cleanup cannot start another pending command while dogfood safety is paused, hard-limited, or throttled.
+- Failed already dispatched commands when safety blocks non-terminal connector progress events, so paused or hard-limited commands do not stay leased or running until disconnect.
+- Treated malformed emergency-pause setting rows as fail-closed, matching unreadable pause state behaviour.
+- Removed machine-local validation paths from the tracked journal entries.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`
@@ -53,7 +56,7 @@ superseded_by:
 - `pnpm test`
 - `pnpm build`
 - `cargo fmt --check`
-- `python3 /Users/joey/.codex/personal-sync/overlays/private/releases/5f1ab3fa5d9f7d534507216a2d6f765694f9b710/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo .`
+- `project-journal validate --repo .`
 - `git diff --check`
 
 ## Next Steps

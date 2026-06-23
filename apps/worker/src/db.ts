@@ -3002,7 +3002,12 @@ async function failRejectedExplicitAppServerStartLease(
 export async function failActiveCommandsForConnector(
   env: Env,
   connectorId: string,
-  options: { commandIds?: string[]; refreshConnectorActivity?: boolean; now?: string } = {}
+  options: {
+    commandIds?: string[];
+    failureSummary?: string;
+    refreshConnectorActivity?: boolean;
+    now?: string;
+  } = {}
 ): Promise<ThreadEvent[]> {
   if (!env.DB) return [];
 
@@ -3059,7 +3064,7 @@ export async function failActiveCommandsForConnector(
         command_id: command.id,
         kind: "command.failed",
         priority: "P1",
-        summary: "Connector disconnected before the command completed."
+        summary: options.failureSummary ?? "Connector disconnected before the command completed."
       });
       if (event) {
         events.push(event);
@@ -4982,7 +4987,14 @@ async function loadDogfoodSafetyPause(
       .first<{ value_json: string; updated_at: string }>();
     if (!row) return undefined;
     const parsed = JSON.parse(row.value_json) as unknown;
-    if (!isRecord(parsed) || parsed.paused !== true) return undefined;
+    if (!isRecord(parsed) || typeof parsed.paused !== "boolean") {
+      return {
+        paused: true,
+        reason: "Dogfood safety pause state is malformed; guarded dogfood actions are blocked until the control-plane setting is corrected.",
+        updated_at: row.updated_at
+      };
+    }
+    if (!parsed.paused) return undefined;
     return {
       paused: true,
       reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
