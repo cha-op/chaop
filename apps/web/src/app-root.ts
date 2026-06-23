@@ -1103,6 +1103,7 @@ export class ChaopApp extends LitElement {
       this.mergeDetachedSession(response);
       await this.load();
     } catch (error) {
+      this.mergeSafetyPostureFromError(error);
       this.actionError = actionErrorMessage("Detach failed", error);
     }
   }
