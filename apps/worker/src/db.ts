@@ -76,7 +76,8 @@ const D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN =
   D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN + D1_COMMAND_STATE_UPDATE_ROWS + D1_CONNECTOR_ACTIVITY_UPDATE_ROWS;
 const D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN =
   D1_COMMAND_LIFECYCLE_WITHOUT_TASK_ROWS_WRITTEN + D1_TASK_STATE_UPDATE_ROWS;
-const D1_BUDGETED_ROWS_WRITTEN_PER_EVENT = D1_STEADY_PERSISTED_EVENT_ROWS_WRITTEN;
+// Local guardrails use the common attached-command lifecycle so missing telemetry stays conservative.
+const D1_BUDGETED_ROWS_WRITTEN_PER_EVENT = D1_COMMAND_LIFECYCLE_WITH_TASK_ROWS_WRITTEN;
 const DEFAULT_DAILY_BUDGET_UNITS = Math.floor(CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY / D1_BUDGETED_ROWS_WRITTEN_PER_EVENT);
 const DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS = Math.max(1, Math.floor(DEFAULT_DAILY_BUDGET_UNITS / 6));
 const DEFAULT_FOUR_HOUR_SOFT_BUDGET_UNITS = Math.max(1, Math.ceil(DEFAULT_FOUR_HOUR_HARD_BUDGET_UNITS * 0.75));
@@ -4675,8 +4676,8 @@ function budgetD1ActivitySignals(
       },
       {
         id: "estimated_event_persistence_daily",
-        label: "Estimated persisted event writes",
-        detail: "Current daily usage-window event count multiplied by the schema-derived steady rows-written per event.",
+        label: "Estimated guarded event writes",
+        detail: "Current daily usage-window event count multiplied by the conservative schema-derived rows-written budget per event.",
         source: daily ? "d1_usage_windows" : "schema_model",
         rows_written_daily: eventEstimate,
         sampled: eventEstimate !== null,

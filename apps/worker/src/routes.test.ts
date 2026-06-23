@@ -1409,9 +1409,9 @@ test("usage summary returns bounded D1 budget windows", async () => {
   assert.equal(response.status, 200);
   assert.equal(body.source, "d1_usage_windows");
   assert.equal(body.state, "throttled");
-  assert.equal(body.daily_used_pct, 12);
-  assert.equal(body.four_hour_used_pct, 17.3);
-  assert.equal(body.burst_used_pct, 2.2);
+  assert.equal(body.daily_used_pct, 20);
+  assert.equal(body.four_hour_used_pct, 28.8);
+  assert.equal(body.burst_used_pct, 3.6);
   assert.equal(body.delayed_event_count, 8);
   assert.equal(body.compacted_event_count, 55);
   assert.equal(body.local_spool_bytes, 4096);
@@ -1425,7 +1425,7 @@ test("usage summary returns bounded D1 budget windows", async () => {
       body.d1_write_model.burst_budget_units,
       body.d1_write_model.command_lifecycle_with_task_rows_written
     ],
-    [12, 8333, 1388, 833, 20]
+    [20, 5000, 833, 500, 20]
   );
   assert.deepEqual(
     [
@@ -1434,7 +1434,7 @@ test("usage summary returns bounded D1 budget windows", async () => {
       body.bottleneck_constraint.remaining_ratio,
       body.bottleneck_constraint.remaining_event_capacity
     ],
-    ["d1_rows_written_four_hour", 17.3, 0.827, 1148]
+    ["d1_rows_written_four_hour", 28.8, 0.712, 593]
   );
   assert.deepEqual(
     body.constraints.map((constraint) => [
@@ -1446,9 +1446,9 @@ test("usage summary returns bounded D1 budget windows", async () => {
       constraint.remaining_event_capacity
     ]),
     [
-      ["d1_rows_written_daily", true, "normal", 12, 0.88, 7333],
-      ["d1_rows_written_four_hour", true, "normal", 17.3, 0.827, 1148],
-      ["d1_rows_written_burst", true, "normal", 2.2, 0.978, 815],
+      ["d1_rows_written_daily", true, "normal", 20, 0.8, 4000],
+      ["d1_rows_written_four_hour", true, "normal", 28.8, 0.712, 593],
+      ["d1_rows_written_burst", true, "normal", 3.6, 0.964, 482],
       ["worker_requests_daily", false, "missing", null, null, null],
       ["durable_object_requests_daily", false, "missing", null, null, null],
       ["d1_rows_read_daily", false, "missing", null, null, null]
@@ -1464,9 +1464,9 @@ test("usage summary returns bounded D1 budget windows", async () => {
       window.budget_state
     ]),
     [
-      ["daily", 12, 8333, 1000, 12000, "normal"],
-      ["four_hour", 17.3, 1388, 240, 2880, "normal"],
-      ["burst", 2.2, 833, 18, 216, "normal"]
+      ["daily", 20, 5000, 1000, 20000, "normal"],
+      ["four_hour", 28.8, 833, 240, 4800, "normal"],
+      ["burst", 3.6, 500, 18, 360, "normal"]
     ]
   );
 });
@@ -1500,26 +1500,26 @@ test("usage summary treats missing short D1 budget windows as zero local baselin
   assert.equal(body.source, "d1_usage_windows");
   assert.equal(body.state, "throttled");
   assert.equal(body.daily_used_pct, null);
-  assert.equal(body.four_hour_used_pct, 17.3);
+  assert.equal(body.four_hour_used_pct, 28.8);
   assert.equal(body.burst_used_pct, 0);
   assert.equal(body.window_sample_count, 1);
   assert.equal(body.constraint_sample_count, 2);
   assert.deepEqual(
     [body.bottleneck_constraint.id, body.bottleneck_constraint.remaining_ratio],
-    ["d1_rows_written_four_hour", 0.827]
+    ["d1_rows_written_four_hour", 0.712]
   );
   assert.deepEqual(
     body.constraints.map((constraint) => [constraint.id, constraint.sampled, constraint.source, constraint.used_pct]),
     [
       ["d1_rows_written_daily", false, "missing", null],
-      ["d1_rows_written_four_hour", true, "d1_usage_windows", 17.3],
+      ["d1_rows_written_four_hour", true, "d1_usage_windows", 28.8],
       ["d1_rows_written_burst", true, "schema_model", 0],
       ["worker_requests_daily", false, "missing", null],
       ["durable_object_requests_daily", false, "missing", null],
       ["d1_rows_read_daily", false, "missing", null]
     ]
   );
-  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct, window.budget_units]), [["four_hour", 17.3, 1388]]);
+  assert.deepEqual(body.windows.map((window) => [window.window_type, window.used_pct, window.budget_units]), [["four_hour", 28.8, 833]]);
 });
 
 test("usage summary reports zero short-window baselines when no current D1 budget windows exist", async () => {
