@@ -23,8 +23,9 @@ superseded_by:
 ## 实现说明
 - `POST /api/host-sessions/refresh` 现在会返回 dispatched、debounced 和 cooldown counts，Browser 可以说明一次 refresh 为什么 fan out 或为什么被冷却。
 - `WorkspaceDO` 请求 inventory 时会为每个 connector 选择最新的 ready socket，然后把这个 socket 标记为 Host Session refresh pending，让 command dispatch 继续等待这次本机快照。
-- Full Host Session inventory report 现在会带着 `snapshot: true` 广播给 browser，因此 live browser state 可以剪掉该 connector 已经 omitted 的 stale sessions。
+- 可靠的 full Host Session inventory report 现在会带着 `snapshot: true` 广播给 browser，因此 live browser state 可以剪掉该 connector 已经 omitted 的 stale sessions。
 - Full Host Session snapshot payload 会同时包含 unchanged reported sessions 和 changed rows，因此 Browser 不会剪掉本轮 report 中存在、但没有触发 D1 update 的 sessions。
+- app-server inventory failed、缺少 app-server evidence 或被截断的 full Host Session report 现在会作为 non-snapshot update 广播，因此 Browser 会保留 D1 已保留的 app-server sessions，直到可靠 full report 到达。
 - Review follow-up：Host Session refresh pending guard 现在有有界等待时间，所以 inventory report 卡住或缺失时不会永远阻塞 command dispatch。
 - Review follow-up：如果 connector socket 在持有 pending Host Session refresh 时断开，Durable Object 会清理这个 connector 的 refresh cooldown，因此 reconnect 后可以立刻重新请求 inventory。
 - Review follow-up：Host Session sync metadata 现在会把已存储的 reported sessions 和实际发生变更的 rows 分开计数，unchanged inventory report 不会再发布 `stored_session_count = 0`。
@@ -38,6 +39,7 @@ superseded_by:
 - reconnect cooldown 修复后再次运行 `pnpm --filter @chaop/worker test`。
 - full-inventory browser snapshot 修复后再次运行 `pnpm --filter @chaop/worker test`。
 - unchanged-row snapshot payload 修复后再次运行 `pnpm --filter @chaop/worker test`。
+- reliable-snapshot downgrade 修复后运行 `pnpm --filter @chaop/worker test` 和 `pnpm --filter @chaop/web test`。
 - `cargo test --workspace`
 - `pnpm test`
 - `pnpm build`

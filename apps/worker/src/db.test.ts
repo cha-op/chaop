@@ -1084,6 +1084,7 @@ test("recordHostSessions includes unchanged reported rows in full snapshot paylo
 
   assert.equal(result.host_sessions.length, 1);
   assert.equal(result.host_sessions[0]?.session_id, "session-attached");
+  assert.equal(result.snapshot, true);
   assert.equal(db.hostSessionWrites, 0);
   assert.deepEqual(db.sync, {
     connectorId: "connector-online",
@@ -1118,6 +1119,7 @@ test("recordHostSessions clears app-server-only sessions omitted from inventory 
   );
 
   assert.equal(result.host_sessions.length, 2);
+  assert.equal(result.snapshot, true);
   assert.equal(db.hasSession("session-attached"), true);
   assert.equal(db.appServerPresentOf("session-attached"), 0);
   assert.equal(db.demotedSessions, 1);
@@ -1147,6 +1149,7 @@ test("recordHostSessions preserves app-server-only sessions from legacy reports 
   );
 
   assert.equal(result.host_sessions.length, 1);
+  assert.equal(result.snapshot, false);
   assert.equal(db.hasSession("session-attached"), true);
   assert.equal(db.appServerPresentOf("session-attached"), 1);
   assert.equal(db.demotedSessions, 0);
@@ -1177,6 +1180,7 @@ test("recordHostSessions preserves app-server-only sessions from full reports wi
   );
 
   assert.equal(result.host_sessions.length, 1);
+  assert.equal(result.snapshot, false);
   assert.equal(db.hasSession("session-attached"), true);
   assert.equal(db.appServerPresentOf("session-attached"), 1);
   assert.equal(db.demotedSessions, 0);
@@ -1241,9 +1245,46 @@ test("recordHostSessions preserves app-server presence when app-server inventory
   );
 
   assert.equal(result.host_sessions.length, 1);
+  assert.equal(result.snapshot, false);
   assert.equal(db.titleOf("session-attached"), "Metadata title during app-server outage");
   assert.equal(db.appServerPresentOf("session-attached"), 1);
   assert.equal(db.demotedSessions, 0);
+});
+
+test("recordHostSessions does not mark truncated full reports as browser snapshots", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "app_server"
+  });
+  const sessions = Array.from({ length: 201 }, (_, index) => ({
+    session_id: `session-${index}`,
+    title: `Session ${index}`,
+    title_source: "metadata" as const,
+    cwd: `/workspace/session-${index}`,
+    updated_at: "2026-06-12T11:00:00.000Z"
+  }));
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "full",
+      app_server_inventory_ok: true,
+      sessions
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.host_sessions.length, 200);
+  assert.equal(result.snapshot, false);
+  assert.equal(db.hasSession("session-attached"), true);
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
+  assert.deepEqual(db.sync, {
+    connectorId: "connector-online",
+    reported: 200,
+    stored: 200
+  });
 });
 
 test("recordHostSessions preserves app-server presence without explicit app-server inventory evidence", async () => {

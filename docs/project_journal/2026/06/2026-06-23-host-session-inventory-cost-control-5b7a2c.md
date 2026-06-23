@@ -23,8 +23,9 @@ superseded_by:
 ## Implementation Notes
 - `POST /api/host-sessions/refresh` now returns dispatched, debounced, and cooldown counts so the Browser can show why a refresh did or did not fan out.
 - `WorkspaceDO` chooses the newest ready socket per connector when requesting inventory, then marks that socket as pending Host Session refresh so command dispatch continues to wait for the requested local snapshot.
-- Full Host Session inventory reports are now broadcast to browsers with `snapshot: true`, so live browser state can prune stale omitted connector sessions.
+- Reliable full Host Session inventory reports are now broadcast to browsers with `snapshot: true`, so live browser state can prune stale omitted connector sessions.
 - Full Host Session snapshot payloads include unchanged reported sessions as well as changed rows, so the Browser does not prune sessions that were present in the report but did not require a D1 update.
+- Full Host Session reports with failed app-server inventory, missing app-server evidence, or truncation are now broadcast as non-snapshot updates, so the Browser preserves D1-retained app-server sessions until a reliable full report arrives.
 - Review follow-up: pending Host Session refresh guards now expire after a bounded wait, so a stuck or missing inventory report cannot block command dispatch forever.
 - Review follow-up: if a connector socket disconnects while it owns a pending Host Session refresh, the Durable Object clears that connector's refresh cooldown so a reconnect can request inventory immediately.
 - Review follow-up: Host Session sync metadata now records stored reported sessions separately from changed rows, so unchanged inventory reports no longer publish `stored_session_count = 0`.
@@ -38,6 +39,7 @@ superseded_by:
 - `pnpm --filter @chaop/worker test` after the reconnect cooldown fix.
 - `pnpm --filter @chaop/worker test` after the full-inventory browser snapshot fix.
 - `pnpm --filter @chaop/worker test` after the unchanged-row snapshot payload fix.
+- `pnpm --filter @chaop/worker test` and `pnpm --filter @chaop/web test` after the reliable-snapshot downgrade fix.
 - `cargo test --workspace`
 - `pnpm test`
 - `pnpm build`

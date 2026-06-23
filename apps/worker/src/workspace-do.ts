@@ -248,7 +248,7 @@ export class WorkspaceDO implements DurableObject {
         host_sessions: result.host_sessions,
         connector_id: connectorId,
         synced_at: result.synced_at,
-        snapshot: message.payload.inventory_scope === "full"
+        snapshot: result.snapshot
       }));
       for (const event of result.failed_events) {
         this.broadcastToBrowsers(threadEventMessage(event));

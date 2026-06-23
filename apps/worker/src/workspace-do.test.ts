@@ -130,6 +130,61 @@ test("full agent host session reports are broadcast as browser snapshots", async
   assert.equal(update.payload?.snapshot, true);
 });
 
+test("full host session reports are not browser snapshots when app-server inventory failed", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, { DB: readyGatedDispatchDb() } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.host_sessions",
+    payload: {
+      sessions: [
+        {
+          session_id: "session-1",
+          title: "Inventory title",
+          title_source: "metadata",
+          cwd: "/tmp/project",
+          updated_at: "2026-06-13T10:01:00.000Z"
+        }
+      ],
+      inventory_scope: "full",
+      app_server_inventory_ok: false
+    }
+  }));
+
+  const ack = JSON.parse(agentSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; count?: number };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.host_sessions");
+  assert.equal(ack.payload?.count, 1);
+
+  const update = JSON.parse(browserSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { snapshot?: boolean; connector_id?: string };
+  };
+  assert.equal(update.kind, "host_sessions.updated");
+  assert.equal(update.payload?.connector_id, "connector-online");
+  assert.equal(update.payload?.snapshot, false);
+});
+
 test("connectorsMessage wraps connector capability updates for browser consumers", () => {
   const message = connectorsMessage({
     connectors: [

@@ -460,8 +460,22 @@ export async function recordHostSessions(
   report: AgentHostSessionsReport,
   syncedAt = new Date().toISOString(),
   options: { workspaceId?: string | undefined } = {}
-): Promise<{ host_sessions: HostSessionSummary[]; synced_at: string; released_connector_ids: string[]; failed_events: ThreadEvent[] }> {
-  if (!env.DB) return { host_sessions: [], synced_at: syncedAt, released_connector_ids: [], failed_events: [] };
+): Promise<{
+  host_sessions: HostSessionSummary[];
+  synced_at: string;
+  released_connector_ids: string[];
+  failed_events: ThreadEvent[];
+  snapshot: boolean;
+}> {
+  if (!env.DB) {
+    return {
+      host_sessions: [],
+      synced_at: syncedAt,
+      released_connector_ids: [],
+      failed_events: [],
+      snapshot: false
+    };
+  }
 
   const connector = await env.DB.prepare(
     `SELECT hostname
@@ -471,7 +485,15 @@ export async function recordHostSessions(
   )
     .bind(connectorId)
     .first<{ hostname: string }>();
-  if (!connector) return { host_sessions: [], synced_at: syncedAt, released_connector_ids: [], failed_events: [] };
+  if (!connector) {
+    return {
+      host_sessions: [],
+      synced_at: syncedAt,
+      released_connector_ids: [],
+      failed_events: [],
+      snapshot: false
+    };
+  }
 
   const workspace = await env.DB.prepare(
     `SELECT workspace_id
@@ -637,7 +659,8 @@ export async function recordHostSessions(
       : upserted,
     synced_at: syncedAt,
     released_connector_ids: [...releasedConnectorIds],
-    failed_events: failedEvents
+    failed_events: failedEvents,
+    snapshot: canClearMissingAppServerSessions
   };
 }
 

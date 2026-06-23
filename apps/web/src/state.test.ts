@@ -105,6 +105,19 @@ test("mergeHostSessions removes omitted connector sessions from realtime snapsho
   assert.deepEqual(merged, [reportedSession, otherConnectorSession]);
 });
 
+test("mergeHostSessions preserves omitted connector sessions from non-snapshot updates", () => {
+  const reportedSession = hostSession("session-reported", {
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+  const omittedSession = hostSession("session-omitted", {
+    updated_at: "2026-06-12T10:02:00.000Z"
+  });
+
+  const merged = mergeHostSessions([reportedSession], [omittedSession]);
+
+  assert.deepEqual(merged, [reportedSession, omittedSession]);
+});
+
 test("mergeBootstrapPayload keeps newer app-server instance state over stale bootstrap", () => {
   const currentInstance = appServerInstance("app-server-1", "degraded", "2026-06-12T10:02:00.000Z");
   const incomingInstance = appServerInstance("app-server-1", "healthy", "2026-06-12T10:01:00.000Z");
