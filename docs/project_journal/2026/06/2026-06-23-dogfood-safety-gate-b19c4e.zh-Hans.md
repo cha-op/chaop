@@ -57,6 +57,7 @@ superseded_by:
 - 无 D1 的 sample mode 只保留 read-only safety：sample refresh 会被 sample safety 阻挡，pause/resume 必须有真实 D1 binding。
 - Server 返回 safety block 并带回新 posture 后，Host Session auto-refresh 会立刻停止。
 - 已修复同一 Cloudflare telemetry bucket 内的持久化路径：累计 counters 增长时会更新既有 bucket row，让后续 write guards 与最近一次显式 safety 或 budget refresh 对齐。
+- 受保护写路径读取 telemetry 时现在会按当前 UTC 日分别取每个 metric 的已持久化最大累计 counter，因此后续更低的 Cloudflare sample 不会放松更早触发的 hard limit。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`
@@ -68,5 +69,4 @@ superseded_by:
 - `git diff --check`
 
 ## 下一步
-- 提交并推送最新 review fix。
 - 重新运行三路 review，并在 merge 前 resolve 所有 GitHub conversations。

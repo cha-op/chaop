@@ -57,6 +57,7 @@ superseded_by:
 - Kept no-D1 sample-mode safety read-only: sample refresh is blocked by sample safety, while pause/resume requires a real D1 binding.
 - Stopped Host Session auto-refresh immediately after a server safety block returns updated safety posture.
 - Fixed the same-bucket Cloudflare telemetry persistence path so cumulative counters update the existing bucket row, keeping later write guards aligned with the latest explicit safety or budget refresh.
+- Tightened guarded write telemetry reads to use the current UTC day's persisted maximum cumulative counters per metric, so a later lower Cloudflare sample cannot relax an earlier hard limit.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`
@@ -68,5 +69,4 @@ superseded_by:
 - `git diff --check`
 
 ## Next Steps
-- Commit and push the latest review fix.
 - Rerun the three review lanes and resolve every GitHub conversation before merge.

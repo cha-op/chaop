@@ -2463,6 +2463,75 @@ test("command creation safety guard uses persisted Cloudflare telemetry samples"
   }
 });
 
+test("command creation safety guard uses daily max persisted telemetry samples", async () => {
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const tomorrowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const highSampleAt = new Date(todayStart.getTime() + 9 * 60 * 60 * 1000).toISOString();
+  const lowerSampleAt = new Date(todayStart.getTime() + 9 * 60 * 60 * 1000 + 5 * 60 * 1000).toISOString();
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, {
+        safety: {
+          telemetrySamples: [
+            {
+              id: "sample-high",
+              sample_type: "cloudflare_daily",
+              sampled_at: highSampleAt,
+              window_start: todayStart.toISOString(),
+              window_end: tomorrowStart.toISOString(),
+              d1_rows_written_daily: 120_000,
+              d1_rows_read_daily: 100,
+              worker_requests_daily: 20,
+              durable_object_requests_daily: 40,
+              created_at: highSampleAt
+            },
+            {
+              id: "sample-lower-later",
+              sample_type: "cloudflare_daily",
+              sampled_at: lowerSampleAt,
+              window_start: todayStart.toISOString(),
+              window_end: tomorrowStart.toISOString(),
+              d1_rows_written_daily: 40_000,
+              d1_rows_read_daily: 120,
+              worker_requests_daily: 30,
+              durable_object_requests_daily: 50,
+              created_at: lowerSampleAt
+            }
+          ]
+        }
+      }),
+      CF_TELEMETRY_API_TOKEN: "telemetry-token",
+      CF_TELEMETRY_ACCOUNT_ID: "telemetry-account",
+      CF_TELEMETRY_API_WORKER: "chaop-api",
+      CF_TELEMETRY_D1_DATABASE_ID: "telemetry-database"
+    }
+  );
+  const body = (await response.json()) as {
+    guard: { action: string; state: string; budget_state: string; used_units?: number };
+    safety: { state: string; bottleneck_constraint?: { used_units?: number | null } };
+  };
+
+  assert.equal(response.status, 429);
+  assert.equal(body.guard.action, "command_create");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.guard.budget_state, "hard_limited");
+  assert.equal(body.safety.state, "hard_limited");
+  assert.equal(body.safety.bottleneck_constraint?.used_units, 120_000);
+});
+
 test("pause state read failures block command creation before command writes", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/commands", {
@@ -3967,13 +4036,16 @@ function dogfoodSafetyQueryFake(
         return {
           async first() {
             if (options.telemetrySample) return options.telemetrySample;
-            return (options.telemetrySamples ?? [])
+            const samples = (options.telemetrySamples ?? [])
               .filter((sample) =>
                 sample.sample_type === sampleType &&
                 String(sample.selector_hash ?? selectorHash) === selectorHash &&
                 sample.window_start === windowStart
-              )
-              .sort((left, right) =>
+              );
+            if (/MAX\(d1_rows_written_daily\)/.test(sql)) {
+              return aggregateTelemetrySamples(samples);
+            }
+            return samples.sort((left, right) =>
                 String(right.sampled_at).localeCompare(String(left.sampled_at))
               )[0];
           }
@@ -4053,6 +4125,36 @@ function budgetStateCountRows(states: string[]): Array<{ budget_state: string; c
     counts.set(state, (counts.get(state) ?? 0) + 1);
   }
   return [...counts.entries()].map(([budget_state, count]) => ({ budget_state, count }));
+}
+
+function aggregateTelemetrySamples(samples: Record<string, unknown>[]): Record<string, unknown> | undefined {
+  if (samples.length === 0) return undefined;
+  const latest = samples.reduce((current, sample) =>
+    String(sample.sampled_at).localeCompare(String(current.sampled_at)) > 0 ? sample : current
+  );
+  return {
+    sampled_at: latest.sampled_at,
+    window_start: latest.window_start,
+    window_end: samples.reduce((current, sample) =>
+      String(sample.window_end).localeCompare(String(current)) > 0 ? sample.window_end : current,
+    latest.window_end),
+    d1_rows_written_daily: samples.reduce(
+      (current, sample) => maxTelemetryCounter(current, sample.d1_rows_written_daily),
+      null as unknown
+    ),
+    d1_rows_read_daily: samples.reduce(
+      (current, sample) => maxTelemetryCounter(current, sample.d1_rows_read_daily),
+      null as unknown
+    ),
+    worker_requests_daily: samples.reduce(
+      (current, sample) => maxTelemetryCounter(current, sample.worker_requests_daily),
+      null as unknown
+    ),
+    durable_object_requests_daily: samples.reduce(
+      (current, sample) => maxTelemetryCounter(current, sample.durable_object_requests_daily),
+      null as unknown
+    )
+  };
 }
 
 function upsertTelemetrySample(

@@ -283,7 +283,7 @@ export async function loadDogfoodSafetyPostureFromDb(
 
   const telemetryPromise = options.refreshCloudflareTelemetry
     ? loadCloudflareTelemetryBestEffort(env, effectiveGeneratedAt)
-    : loadLatestPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt);
+    : loadMaxPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt);
   const [pause, daily, fourHour, burst, connectorStates, taskStates, telemetry] = await Promise.all([
     loadDogfoodSafetyPause(env, effectiveGeneratedAt),
     currentUsageWindow(env, "daily", effectiveGeneratedAt),
@@ -4572,7 +4572,7 @@ async function loadCloudflareTelemetryBestEffort(
   }
 }
 
-async function loadLatestPersistedCloudflareTelemetrySample(
+async function loadMaxPersistedCloudflareTelemetrySample(
   env: Env,
   generatedAt: string
 ): Promise<CloudflareTelemetrySample | undefined> {
@@ -4586,12 +4586,14 @@ async function loadLatestPersistedCloudflareTelemetrySample(
       effectiveAt.getUTCDate()
     )).toISOString();
     const row = await env.DB.prepare(
-      `SELECT sampled_at, window_start, window_end,
-              d1_rows_written_daily, d1_rows_read_daily,
-              worker_requests_daily, durable_object_requests_daily
+      `SELECT MAX(sampled_at) AS sampled_at, window_start, MAX(window_end) AS window_end,
+              MAX(d1_rows_written_daily) AS d1_rows_written_daily,
+              MAX(d1_rows_read_daily) AS d1_rows_read_daily,
+              MAX(worker_requests_daily) AS worker_requests_daily,
+              MAX(durable_object_requests_daily) AS durable_object_requests_daily
        FROM budget_telemetry_samples
        WHERE sample_type = ? AND selector_hash = ? AND window_start = ?
-       ORDER BY sampled_at DESC
+       GROUP BY window_start
        LIMIT 1`
     )
       .bind("cloudflare_daily", cloudflareTelemetrySelectorHash(env), windowStart)
