@@ -21,6 +21,7 @@
 - 通过声明 `host_session_app_server_ensure` 的 connector attach 未被使用的本机 Codex session 时，现在会先通过 app-server resume，再创建 Chaop task/thread attachment，因此 Thread Centre 可以立即使用 managed app-server command path。
 - 九个 PR 的 app-server lifecycle roadmap 已实现到 Budget Board real-metrics 切片。
 - Deployed E2E smoke 现在有已记录的 Access-cookie browser path，以及 repo-local skill，用于重复执行低成本 API、Web、browser 和 Budget Board 验证。
+- 下一轮 dogfood usability roadmap 已记录，会先保证成本安全，再推进 managed app-server Thread Centre chat MVP、human-in-the-loop turns 和 persistent connector operations。
 - 已完成的工作流状态记录在 `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.zh-Hans.md`。
 
 ## 恢复入口
@@ -39,6 +40,7 @@
 - 成本治理来源：`docs/cost-aware.zh-Hans.md`
 - Deployed E2E smoke 来源：`docs/e2e-smoke.zh-Hans.md`
 - Deployed E2E smoke 和成本检查 journal：`docs/project_journal/2026/06/2026-06-23-deployed-e2e-smoke-cost-check-7c9d1e.zh-Hans.md`
+- Dogfood usability roadmap：`docs/project_journal/2026/06/2026-06-23-dogfood-usability-roadmap-3f8a91.zh-Hans.md`
 - 本地索引：可生成 `docs/project_journal/INDEX.md`，但不要提交。
 
 ## 全局阻塞项

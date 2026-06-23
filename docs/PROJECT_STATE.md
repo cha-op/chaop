@@ -21,6 +21,7 @@
 - Attaching an unused local Codex session through a connector with `host_session_app_server_ensure` now resumes it through app-server before creating the Chaop task/thread attachment, so Thread Centre can use the managed app-server command path immediately.
 - The nine-PR app-server lifecycle roadmap is implemented through the Budget Board real-metrics slice.
 - Deployed E2E smoke now has a documented Access-cookie browser path and a repo-local skill for repeatable low-cost API, Web, browser, and Budget Board validation.
+- The next dogfood usability roadmap is recorded and prioritises cost safety first, then a managed app-server Thread Centre chat MVP, human-in-the-loop turns, and persistent connector operations.
 - Completed workstream state lives in `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.md`.
 
 ## Recovery Pointers
@@ -39,6 +40,7 @@
 - Cost-aware source: `docs/cost-aware.md`
 - Deployed E2E smoke source: `docs/e2e-smoke.md`
 - Deployed E2E smoke and cost check journal: `docs/project_journal/2026/06/2026-06-23-deployed-e2e-smoke-cost-check-7c9d1e.md`
+- Dogfood usability roadmap: `docs/project_journal/2026/06/2026-06-23-dogfood-usability-roadmap-3f8a91.md`
 - Local journal index: optional generated `docs/project_journal/INDEX.md`; do not commit it.
 
 ## Global Blockers

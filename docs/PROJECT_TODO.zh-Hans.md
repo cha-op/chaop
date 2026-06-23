@@ -24,3 +24,9 @@
 - [done] PR6：增加 drain、scheduled restart 和 upgrade flow。
 - [done] PR7：增加 multi-instance 和 thread placement foundation。
 - [done] PR8：用真实且 bounded 的 usage/cost metrics 替换 Budget Board placeholder。
+- [in_progress] 在完整 test gate、三路 review 和 GitHub conversations resolved 后，收尾并合并当前 app-server attach/resume PR。
+- [planned] PR A：增加 dogfood safety gate，覆盖可见 cost posture、受保护的 write/refresh actions，以及 emergency pause 或 stop path。
+- [planned] PR B：增加 Thread Centre chat MVP，支持 managed app-server threads、prompt submission、live progress 和 assistant final-answer rendering。
+- [planned] PR C：为 Codex app-server turns 增加 human-in-the-loop approval/input handling。
+- [planned] PR D：增加 persistent connector dogfood runbook 和用于 start、stop、observation、recovery 的 operational scripts。
+- [planned] PR E：强化 dogfood E2E 和 cost telemetry gates；只有再次出现无法解释的写入增长时，才加入精确 D1 write attribution。
