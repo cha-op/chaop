@@ -484,6 +484,7 @@ export async function recordHostSessions(
     .first<{ workspace_id: string }>();
   const workspaceId = options.workspaceId ?? workspace?.workspace_id ?? DEFAULT_WORKSPACE_ID;
   const upserted: HostSessionSummary[] = [];
+  let storedReportedSessionCount = 0;
   const releasedConnectorIds = new Set<string>();
   const failedEvents: ThreadEvent[] = [];
   const reportedSessions = report.sessions.slice(0, 200);
@@ -549,10 +550,14 @@ export async function recordHostSessions(
       )
       .run();
     if (!((result.meta as { changes?: number } | undefined)?.changes)) {
+      if (previous) {
+        storedReportedSessionCount += 1;
+      }
       continue;
     }
     const stored = await findHostSession(env, session.session_id, connectorId);
     if (stored) {
+      storedReportedSessionCount += 1;
       upserted.push(stored);
       if (
         previous?.app_server_present === true &&
@@ -612,7 +617,7 @@ export async function recordHostSessions(
        reported_session_count = excluded.reported_session_count,
        stored_session_count = excluded.stored_session_count`
   )
-    .bind(connectorId, syncedAt, reportedSessions.length, upserted.length)
+    .bind(connectorId, syncedAt, reportedSessions.length, storedReportedSessionCount)
     .run();
 
   await env.DB.prepare(

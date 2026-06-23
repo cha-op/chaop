@@ -39,6 +39,7 @@ const HOST_SESSION_BACKFILL_TIMEOUT_MS = 15_000;
 const THREAD_ARCHIVE_SYNC_TIMEOUT_MS = 20_000;
 const APP_SERVER_REPORT_CACHE_MS = 60_000;
 const HOST_SESSIONS_REFRESH_COOLDOWN_MS = 60_000;
+const HOST_SESSIONS_REFRESH_DISPATCH_WAIT_MS = 30_000;
 
 type SocketAttachment = {
   socketType?: string;
@@ -46,6 +47,7 @@ type SocketAttachment = {
   connectedAt?: number;
   agentReady?: boolean;
   pendingHostSessionsDispatch?: boolean;
+  pendingHostSessionsDispatchDeadline?: number;
   activeCommandIds?: string[];
 };
 
@@ -940,13 +942,27 @@ export class WorkspaceDO implements DurableObject {
 
   private markAgentReady(ws: WebSocket, connectorId: string, pendingHostSessionsDispatch = false): void {
     const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
-    ws.serializeAttachment({
+    const existingDeadline = attachment?.pendingHostSessionsDispatchDeadline;
+    const existingPending =
+      attachment?.pendingHostSessionsDispatch === true &&
+      typeof existingDeadline === "number" &&
+      existingDeadline > Date.now();
+    const nextPending = existingPending || pendingHostSessionsDispatch;
+    const nextAttachment: SocketAttachment = {
       ...attachment,
       socketType: "agent",
       connectorId,
       agentReady: true,
-      pendingHostSessionsDispatch: attachment?.pendingHostSessionsDispatch === true || pendingHostSessionsDispatch
-    });
+      pendingHostSessionsDispatch: nextPending
+    };
+    if (pendingHostSessionsDispatch) {
+      nextAttachment.pendingHostSessionsDispatchDeadline = Date.now() + HOST_SESSIONS_REFRESH_DISPATCH_WAIT_MS;
+    } else if (existingPending) {
+      nextAttachment.pendingHostSessionsDispatchDeadline = existingDeadline;
+    } else {
+      delete nextAttachment.pendingHostSessionsDispatchDeadline;
+    }
+    ws.serializeAttachment(nextAttachment);
   }
 
   private consumePendingHostSessionsDispatch(ws: WebSocket, connectorId: string): boolean {
@@ -959,10 +975,7 @@ export class WorkspaceDO implements DurableObject {
     ) {
       return false;
     }
-    ws.serializeAttachment({
-      ...attachment,
-      pendingHostSessionsDispatch: false
-    });
+    ws.serializeAttachment(withoutPendingHostSessionsDispatch(attachment));
     return true;
   }
 
@@ -977,7 +990,8 @@ export class WorkspaceDO implements DurableObject {
     }
     ws.serializeAttachment({
       ...attachment,
-      pendingHostSessionsDispatch: true
+      pendingHostSessionsDispatch: true,
+      pendingHostSessionsDispatchDeadline: Date.now() + HOST_SESSIONS_REFRESH_DISPATCH_WAIT_MS
     });
   }
 
@@ -1021,9 +1035,8 @@ export class WorkspaceDO implements DurableObject {
       return false;
     }
     ws.serializeAttachment({
-      ...attachment,
-      agentReady: false,
-      pendingHostSessionsDispatch: false
+      ...withoutPendingHostSessionsDispatch(attachment),
+      agentReady: false
     });
     return true;
   }
@@ -1089,10 +1102,30 @@ function isAgentSocketForConnector(socket: WebSocket, connectorId: string): bool
 
 function hasPendingHostSessionsDispatch(socket: WebSocket, connectorId: string): boolean {
   const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
-  return (
+  const pending =
     attachment?.socketType === "agent" &&
     attachment.connectorId === connectorId &&
-    attachment.pendingHostSessionsDispatch === true
+    isActivePendingHostSessionsDispatch(attachment);
+  if (!pending && attachment?.pendingHostSessionsDispatch === true) {
+    socket.serializeAttachment(withoutPendingHostSessionsDispatch(attachment));
+  }
+  return pending;
+}
+
+function withoutPendingHostSessionsDispatch(attachment: SocketAttachment | undefined): SocketAttachment {
+  const next = {
+    ...attachment,
+    pendingHostSessionsDispatch: false
+  };
+  delete next.pendingHostSessionsDispatchDeadline;
+  return next;
+}
+
+function isActivePendingHostSessionsDispatch(attachment: SocketAttachment | undefined): boolean {
+  return (
+    attachment?.pendingHostSessionsDispatch === true &&
+    typeof attachment.pendingHostSessionsDispatchDeadline === "number" &&
+    attachment.pendingHostSessionsDispatchDeadline > Date.now()
   );
 }
 

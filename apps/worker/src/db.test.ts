@@ -1056,7 +1056,7 @@ test("recordHostSessions skips unchanged host session rows", async () => {
   assert.deepEqual(db.sync, {
     connectorId: "connector-online",
     reported: 1,
-    stored: 0
+    stored: 1
   });
 });
 

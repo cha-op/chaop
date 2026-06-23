@@ -895,7 +895,8 @@ test("agent.ready does not dispatch while a peer socket has host-session refresh
     connectorId: "connector-online",
     connectedAt: 400,
     agentReady: true,
-    pendingHostSessionsDispatch: true
+    pendingHostSessionsDispatch: true,
+    pendingHostSessionsDispatchDeadline: Date.now() + 60_000
   }, refreshingSent);
   const browserSocket = mutableSocketWithAttachment({
     socketType: "browser"
@@ -1069,7 +1070,8 @@ test("dispatch-pending defers stale cleanup while host-session refresh is pendin
     connectorId: "connector-online",
     connectedAt: 300,
     agentReady: true,
-    pendingHostSessionsDispatch: true
+    pendingHostSessionsDispatch: true,
+    pendingHostSessionsDispatchDeadline: Date.now() + 60_000
   }, sent);
   const ctx = {
     getWebSockets(tag?: string) {
@@ -1090,6 +1092,44 @@ test("dispatch-pending defers stale cleanup while host-session refresh is pendin
   assert.equal(db.staleExplicitCleanupQueries, 0);
   assert.equal(db.pendingDispatchQueries, 0);
   assert.equal(sent.length, 0);
+});
+
+test("dispatch-pending ignores expired host-session refresh guards", async () => {
+  const sent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    pendingHostSessionsDispatch: true,
+    pendingHostSessionsDispatchDeadline: Date.now() - 1_000
+  }, sent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({ pendingCommand: true });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  const response = await workspace.fetch(new Request("https://workspace-do/internal/dispatch-pending", {
+    method: "POST",
+    body: JSON.stringify({ connector_id: "connector-online" })
+  }));
+
+  assert.equal((await response.json() as { dispatched_to?: number }).dispatched_to, 1);
+  assert.equal(db.staleExplicitCleanupQueries, 1);
+  assert.equal(db.pendingDispatchQueries, 1);
+  assert.equal(db.commandLeases, 1);
+  assert.equal(sent.length, 1);
+  const dispatched = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command?: { id?: string } };
+  };
+  assert.equal(dispatched.kind, "command.dispatch");
+  assert.equal(dispatched.payload?.command?.id, "command-1");
 });
 
 test("dispatch-pending dispatches released attached commands to replacement connectors", async () => {
@@ -1184,7 +1224,8 @@ test("global dispatch-pending defers connector while host-session refresh is pen
     connectorId: "connector-online",
     connectedAt: 350,
     agentReady: true,
-    pendingHostSessionsDispatch: true
+    pendingHostSessionsDispatch: true,
+    pendingHostSessionsDispatchDeadline: Date.now() + 60_000
   }, sent);
   const ctx = {
     getWebSockets(tag?: string) {
@@ -1593,7 +1634,8 @@ test("rejected starts with generated final events defer pending dispatch during 
     connectorId: "connector-online",
     connectedAt: 400,
     agentReady: true,
-    pendingHostSessionsDispatch: true
+    pendingHostSessionsDispatch: true,
+    pendingHostSessionsDispatchDeadline: Date.now() + 60_000
   }, refreshingSent);
   const db = rejectedStartedEventWithFailedResultDb();
   const workspace = new WorkspaceDO({
