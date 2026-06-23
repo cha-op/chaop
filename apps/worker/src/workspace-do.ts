@@ -222,15 +222,25 @@ export class WorkspaceDO implements DurableObject {
         )
       );
       if (readyPayload && (!wasReady || capabilitiesChanged)) {
-        this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
+        const canRefreshHostSessions = await this.canRefreshHostSessions();
+        if (canRefreshHostSessions) {
+          this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
+        }
         await this.broadcastConnectorUpdate(connectorId);
-        await this.sendPendingCommandsAndReleased(ws, connectorId);
+        if (canRefreshHostSessions) {
+          await this.sendPendingCommandsAndReleased(ws, connectorId);
+        }
       }
       if (!readyPayload && !wasReady) {
         await markConnectorOnline(this.env, connectorId);
-        this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
+        const canRefreshHostSessions = await this.canRefreshHostSessions();
+        if (canRefreshHostSessions) {
+          this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
+        }
         await this.broadcastConnectorUpdate(connectorId);
-        await this.sendPendingCommandsAndReleased(ws, connectorId);
+        if (canRefreshHostSessions) {
+          await this.sendPendingCommandsAndReleased(ws, connectorId);
+        }
       }
       return;
     }
@@ -576,6 +586,18 @@ export class WorkspaceDO implements DurableObject {
     this.hostSessionsRefreshSentAt.set(connectorId, now);
     this.markHostSessionsRefreshPending(socket, connectorId);
     return true;
+  }
+
+  private async canRefreshHostSessions(): Promise<boolean> {
+    try {
+      await assertDogfoodSafetyActionAllowed(this.env, "host_session_refresh");
+      return true;
+    } catch (error) {
+      if (error instanceof DogfoodSafetyError) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   private async createLocalThread(request: Request): Promise<Response> {

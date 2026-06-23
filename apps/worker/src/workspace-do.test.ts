@@ -1016,6 +1016,58 @@ test("agent.ready refreshes host sessions before pending command dispatch", asyn
   assert.deepEqual(replacementUpdate.payload?.connectors?.[0]?.capabilities, ["placeholder_commands"]);
 });
 
+test("agent.ready skips automatic host session refresh while dogfood safety blocks refresh", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({ pendingCommand: true, safetyPaused: true });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.ready",
+    payload: { capabilities: ["placeholder_commands"] }
+  }));
+
+  assert.equal(db.capabilityUpdates, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
+  assert.equal(sent.length, 1);
+  assert.equal(browserSent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; capabilities?: string[] };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.ready");
+  assert.deepEqual(ack.payload?.capabilities, ["placeholder_commands"]);
+  const attachment = agentSocket.deserializeAttachment() as {
+    socketType?: string;
+    connectorId?: string;
+    connectedAt?: number;
+    agentReady?: boolean;
+    pendingHostSessionsDispatch?: boolean;
+  };
+  assert.equal(attachment.socketType, "agent");
+  assert.equal(attachment.connectorId, "connector-online");
+  assert.equal(attachment.connectedAt, 300);
+  assert.equal(attachment.agentReady, true);
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
 test("agent.ready does not dispatch while a peer socket has host-session refresh pending", async () => {
   const staleSent: string[] = [];
   const refreshingSent: string[] = [];
@@ -3672,6 +3724,7 @@ function readyGatedDispatchDb(options: {
   initialStatus?: "online" | "offline" | "degraded";
   initialUpdatedAt?: string;
   pendingCommand?: boolean;
+  safetyPaused?: boolean;
 } = {}): D1Database & {
   readonly capabilityUpdates: number;
   readonly connectorOnlineUpdates: number;
@@ -3717,6 +3770,12 @@ function readyGatedDispatchDb(options: {
   };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(
+        sql,
+        options.safetyPaused === undefined ? {} : { paused: options.safetyPaused }
+      );
+      if (safetyStatement) return safetyStatement;
+
       if (/UPDATE connectors/.test(sql) && /capabilities_json = \?/.test(sql)) {
         return {
           bind(

@@ -1922,7 +1922,7 @@ test("safety posture reports conservative inventory guard without blocking focus
   );
 });
 
-test("safety posture treats null persisted telemetry fields as missing", async () => {
+test("safety posture treats missing live telemetry as allowed", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/safety-posture", {
       headers: {
@@ -1931,17 +1931,7 @@ test("safety posture treats null persisted telemetry fields as missing", async (
     }),
     {
       ...devEnv,
-      DB: safetyPauseDb({
-        telemetrySample: {
-          sampled_at: "2026-06-15T09:00:00.000Z",
-          window_start: "2026-06-15T00:00:00.000Z",
-          window_end: "2026-06-16T00:00:00.000Z",
-          d1_rows_written_daily: null,
-          d1_rows_read_daily: null,
-          worker_requests_daily: null,
-          durable_object_requests_daily: null
-        }
-      })
+      DB: safetyPauseDb()
     }
   );
   const body = (await response.json()) as {
@@ -1956,6 +1946,67 @@ test("safety posture treats null persisted telemetry fields as missing", async (
   assert.equal(body.safety.state, "normal");
   assert.equal(body.safety.bottleneck_constraint, undefined);
   assert.equal(body.safety.actions.every((guard) => guard.state === "allowed"), true);
+});
+
+test("safety posture uses live Cloudflare telemetry for hard limits", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedBody: { variables?: Record<string, unknown> } | undefined;
+  globalThis.fetch = (async (input, init) => {
+    assert.equal(String(input), "https://api.cloudflare.com/client/v4/graphql");
+    requestedBody = JSON.parse(String(init?.body ?? "{}")) as { variables?: Record<string, unknown> };
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 20 } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten: 120_000 } }],
+              durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 40 } }],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/safety-posture", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: safetyPauseDb(),
+        CF_TELEMETRY_API_TOKEN: "safety-telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "safety-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-safety",
+        CF_TELEMETRY_D1_DATABASE_ID: "safety-database"
+      }
+    );
+    const body = (await response.json()) as {
+      safety: {
+        state: string;
+        bottleneck_constraint?: { id?: string; state?: string; source?: string };
+        actions: Array<{ action: string; state: string }>;
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(requestedBody?.variables?.accountTag, "safety-account");
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.id, "d1_rows_written_daily");
+    assert.equal(body.safety.bottleneck_constraint?.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.source, "cloudflare_analytics");
+    assert.equal(body.safety.actions.every((guard) => guard.state === "blocked"), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("safety posture includes connector and task budget states", async () => {

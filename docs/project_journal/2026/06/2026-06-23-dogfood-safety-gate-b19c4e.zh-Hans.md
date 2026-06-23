@@ -41,6 +41,8 @@ superseded_by:
 - 已修复第二条 review 发现的问题：emergency-pause state 无法读取时现在会 fail closed，而不是继续允许受保护的写入。
 - 已新增 `agent_event` guard；当 dogfood safety 暂停或进入 hard limit 时，运行中的 connector WebSocket events 会在 D1 event persistence 前被拒绝。
 - 已细化 `agent_event` 行为：pause 或 hard limit 期间会挡住高频非终态 events，但 `command.finished` / `command.failed` 仍可关闭 command 并清理 socket activity。
+- 自动 `agent.ready` Host Session refresh dispatch 现在也会走同一个 `host_session_refresh` safety action；当 refresh 被挡住时，同一轮 ready cycle 也不会继续派发 pending command。
+- Server-side safety posture 已从持久化 telemetry sample 改为短缓存 live Cloudflare telemetry best-effort；受保护 action path 不会因此持久化 telemetry sample。
 - 已把 safety 文案从宽泛的 “dogfood writes” 收窄为 “guarded dogfood actions”，避免把仍需保留的 cleanup paths 误描述为同一类受阻动作。
 
 ## 本地验证

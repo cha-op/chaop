@@ -287,7 +287,7 @@ export async function loadDogfoodSafetyPostureFromDb(
     snapshots.tasks
       ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
       : listTaskBudgetStates(env),
-    loadLatestPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt)
+    loadCloudflareTelemetryBestEffort(env, effectiveGeneratedAt)
   ]);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
@@ -5001,47 +5001,6 @@ async function loadDogfoodSafetyPause(
   }
 }
 
-async function loadLatestPersistedCloudflareTelemetrySample(
-  env: Env,
-  generatedAt: string
-): Promise<CloudflareTelemetrySample | undefined> {
-  if (!env.DB) return undefined;
-  try {
-    const effectiveAt = safeDate(generatedAt);
-    const dayStart = new Date(Date.UTC(
-      effectiveAt.getUTCFullYear(),
-      effectiveAt.getUTCMonth(),
-      effectiveAt.getUTCDate()
-    )).toISOString();
-    const row = await env.DB.prepare(
-      `SELECT sampled_at, window_start, window_end,
-              d1_rows_written_daily, d1_rows_read_daily,
-              worker_requests_daily, durable_object_requests_daily
-       FROM budget_telemetry_samples
-       WHERE sample_type = ? AND selector_hash = ? AND window_start = ?
-       ORDER BY sampled_at DESC
-       LIMIT 1`
-    )
-      .bind("cloudflare_daily", cloudflareTelemetrySelectorHash(env), dayStart)
-      .first<BudgetTelemetrySampleWithWindowRow>();
-    if (!row) return undefined;
-    return {
-      windowStart: row.window_start,
-      windowEnd: row.window_end,
-      updatedAt: row.sampled_at,
-      workerRequestsDaily: optionalNonNegativeInteger(row.worker_requests_daily),
-      durableObjectRequestEquivalentsDaily: optionalNonNegativeInteger(row.durable_object_requests_daily),
-      d1RowsReadDaily: optionalNonNegativeInteger(row.d1_rows_read_daily),
-      d1RowsWrittenDaily: optionalNonNegativeInteger(row.d1_rows_written_daily)
-    };
-  } catch (error) {
-    console.warn("Persisted Cloudflare telemetry sample could not be loaded", {
-      message: error instanceof Error ? error.message : String(error)
-    });
-    return undefined;
-  }
-}
-
 function dogfoodSafetyPosture({
   generatedAt,
   paused,
@@ -5710,11 +5669,6 @@ type BudgetTelemetrySampleRow = {
   d1_rows_read_daily: number | null;
   worker_requests_daily: number | null;
   durable_object_requests_daily: number | null;
-};
-
-type BudgetTelemetrySampleWithWindowRow = BudgetTelemetrySampleRow & {
-  window_start: string;
-  window_end: string;
 };
 
 type DogfoodSafetyPauseSetting = {

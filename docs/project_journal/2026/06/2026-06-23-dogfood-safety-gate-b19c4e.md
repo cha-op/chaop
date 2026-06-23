@@ -41,6 +41,8 @@ superseded_by:
 - Fixed a second review finding by making unreadable emergency-pause state fail closed instead of allowing guarded writes.
 - Added the `agent_event` guard so running connector WebSocket events are rejected before D1 event persistence when dogfood safety is paused or hard-limited.
 - Refined `agent_event` handling so noisy non-terminal events are blocked during pause or hard limit, while terminal `command.finished` / `command.failed` events can still close the command and clear socket activity.
+- Guarded automatic `agent.ready` Host Session refresh dispatches with the same `host_session_refresh` safety action, and skipped pending command dispatch in the same ready cycle when the refresh is blocked.
+- Switched server-side safety posture from persisted telemetry samples to short-cached live Cloudflare telemetry best-effort, without persisting telemetry from guarded action paths.
 - Narrowed safety copy from broad "dogfood writes" wording to "guarded dogfood actions" so cleanup paths that remain intentionally available are not misrepresented.
 
 ## Local Validation
