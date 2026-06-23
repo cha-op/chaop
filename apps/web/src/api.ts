@@ -21,7 +21,8 @@ import { fallbackBootstrap } from "./sample-data.js";
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
-    message: string
+    message: string,
+    public readonly payload?: unknown
   ) {
     super(message);
     this.name = "ApiError";
@@ -193,24 +194,25 @@ async function postJson<T>(path: string, request: unknown): Promise<T> {
 }
 
 async function responseError(response: Response, fallback: string): Promise<ApiError> {
-  const message = await responseErrorMessage(response);
-  return new ApiError(response.status, `${fallback}: ${message ?? `HTTP ${response.status}`}`);
+  const error = await responseErrorPayload(response);
+  return new ApiError(response.status, `${fallback}: ${error.message ?? `HTTP ${response.status}`}`, error.payload);
 }
 
-async function responseErrorMessage(response: Response): Promise<string | undefined> {
+async function responseErrorPayload(response: Response): Promise<{ message?: string | undefined; payload?: unknown }> {
   const contentType = response.headers.get("content-type") ?? "";
   try {
     if (contentType.includes("application/json")) {
       const body = (await response.json()) as unknown;
       if (typeof body === "object" && body !== null && typeof (body as { error?: unknown }).error === "string") {
-        return (body as { error: string }).error;
+        return { message: (body as { error: string }).error, payload: body };
       }
+      return { payload: body };
     }
 
     const text = await response.text();
-    return text.trim() || undefined;
+    return { message: text.trim() || undefined };
   } catch {
-    return undefined;
+    return {};
   }
 }
 

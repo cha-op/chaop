@@ -951,6 +951,7 @@ export class ChaopApp extends LitElement {
       await this.load();
     } catch (error) {
       this.commandState = "failed";
+      this.mergeSafetyPostureFromError(error);
       this.actionError = actionErrorMessage("Command failed", error);
     }
   };
@@ -1033,6 +1034,7 @@ export class ChaopApp extends LitElement {
       });
     } catch (error) {
       this.newThreadState = "failed";
+      this.mergeSafetyPostureFromError(error);
       this.actionError = actionErrorMessage("Thread creation failed", error);
       return;
     }
@@ -1062,6 +1064,7 @@ export class ChaopApp extends LitElement {
       this.actionNotice = archiveSyncNotice(action, response);
       await this.load();
     } catch (error) {
+      this.mergeSafetyPostureFromError(error);
       this.actionError = actionErrorMessage(`${action} failed`, error);
     }
   }
@@ -1080,6 +1083,7 @@ export class ChaopApp extends LitElement {
       }
       this.openThread(response.thread.id);
     } catch (error) {
+      this.mergeSafetyPostureFromError(error);
       this.actionError = actionErrorMessage("Attach failed", error);
     }
   }
@@ -1160,6 +1164,7 @@ export class ChaopApp extends LitElement {
       this.hostSessionsRefreshState = "idle";
     } catch (error) {
       this.hostSessionsRefreshState = "failed";
+      this.mergeSafetyPostureFromError(error);
       this.actionError = actionErrorMessage("Host session refresh failed", error);
     }
   }
@@ -1179,6 +1184,7 @@ export class ChaopApp extends LitElement {
       };
       this.actionNotice = "Budget samples bootstrapped.";
     } catch (error) {
+      this.mergeSafetyPostureFromError(error);
       this.actionError = actionErrorMessage("Budget bootstrap failed", error);
     }
   };
@@ -1214,6 +1220,11 @@ export class ChaopApp extends LitElement {
       ...this.data,
       safety
     };
+  }
+
+  private mergeSafetyPostureFromError(error: unknown): void {
+    if (!(error instanceof ApiError) || !isSafetyPosturePayload(error.payload)) return;
+    this.mergeSafetyPosture(error.payload.safety);
   }
 
   private mergeDetachedSession(response: Awaited<ReturnType<typeof detachHostSession>>): void {
@@ -1916,6 +1927,17 @@ function actionErrorMessage(prefix: string, error: unknown): string {
     return `${prefix}: ${error.message}`;
   }
   return prefix;
+}
+
+function isSafetyPosturePayload(value: unknown): value is { safety: BootstrapPayload["safety"] } {
+  if (typeof value !== "object" || value === null) return false;
+  const safety = (value as { safety?: unknown }).safety;
+  if (typeof safety !== "object" || safety === null) return false;
+  return (
+    typeof (safety as { state?: unknown }).state === "string"
+    && typeof (safety as { paused?: unknown }).paused === "boolean"
+    && Array.isArray((safety as { actions?: unknown }).actions)
+  );
 }
 
 function cleanApiErrorMessage(message: string): string {

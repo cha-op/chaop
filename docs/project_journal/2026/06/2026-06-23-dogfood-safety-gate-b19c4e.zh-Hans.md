@@ -5,7 +5,7 @@ status: active
 created: 2026-06-23
 updated: 2026-06-23
 branch: wip/dogfood-safety-gate
-pr:
+pr: 19
 supersedes:
 superseded_by:
 ---
@@ -36,6 +36,8 @@ superseded_by:
 - 已实现 protocol safety posture、Worker guard、emergency pause/resume API，以及 Browser safety strip。
 - 已在 server 侧保护 command creation、local thread creation、Host Session refresh、app-server attach、task archive/unarchive 和 budget bootstrap。
 - 已补充 conservative posture、emergency pause/resume、blocked command creation、blocked Host Session refresh、migration coverage、null telemetry handling，以及 Browser safety helper behaviour 的测试。
+- 已修复第一条 review 发现的问题：dogfood safety posture 和 server-side guard decisions 现在会纳入 connector 与 active task 的 budget states。
+- Browser API error 现在会保留结构化 safety payload，因此 server-side safety block 可以立即更新本地 UI posture。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`
@@ -47,5 +49,5 @@ superseded_by:
 - `git diff --check`
 
 ## 下一步
-- 创建 review anchor commit，并运行三路 review。
-- 推送 PR，刷新部署 API/Web，运行 deployed E2E smoke，然后在 merge 前 resolve review conversations。
+- 提交并推送这次 review fix。
+- 刷新部署 API/Web，运行 deployed E2E smoke，然后重新运行三路 review，并在 merge 前 resolve 所有 GitHub conversations。

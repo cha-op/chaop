@@ -5,7 +5,7 @@ status: active
 created: 2026-06-23
 updated: 2026-06-23
 branch: wip/dogfood-safety-gate
-pr:
+pr: 19
 supersedes:
 superseded_by:
 ---
@@ -36,6 +36,8 @@ superseded_by:
 - Implemented the protocol safety posture, Worker guard, emergency pause/resume API, and Browser safety strip.
 - Guarded command creation, local thread creation, Host Session refresh, app-server attach, task archive/unarchive, and budget bootstrap from the server side.
 - Added tests for conservative posture, emergency pause/resume, blocked command creation, blocked Host Session refresh, migration coverage, null telemetry handling, and Browser safety helper behaviour.
+- Fixed the first review finding by including connector and active task budget states in the dogfood safety posture and server-side guard decisions.
+- Preserved structured safety payloads in Browser API errors so a server-side safety block immediately updates the local UI posture.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`
@@ -47,5 +49,5 @@ superseded_by:
 - `git diff --check`
 
 ## Next Steps
-- Create the review anchor commit and run the three review lanes.
-- Push the PR, deploy the API/Web refresh, run deployed E2E smoke, then resolve review conversations before merge.
+- Commit and push the review fix.
+- Refresh the API/Web deployment, run deployed E2E smoke, then rerun the three review lanes and resolve every GitHub conversation before merge.

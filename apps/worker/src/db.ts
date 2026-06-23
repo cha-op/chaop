@@ -180,7 +180,7 @@ export async function loadBootstrapFromDb(
     listRecentEvents(env)
   ]);
   const budgetSummary = await loadBudgetSummaryFromDb(env, undefined, { connectors, tasks });
-  const safety = await loadDogfoodSafetyPostureFromDb(env, budgetSummary.generated_at);
+  const safety = await loadDogfoodSafetyPostureFromDb(env, budgetSummary.generated_at, { connectors, tasks });
 
   return {
     user,
@@ -264,7 +264,8 @@ export async function loadBudgetSummaryFromDb(
 
 export async function loadDogfoodSafetyPostureFromDb(
   env: Env,
-  generatedAt = new Date().toISOString()
+  generatedAt = new Date().toISOString(),
+  snapshots: { connectors?: ConnectorSummary[] | undefined; tasks?: TaskSummary[] | undefined } = {}
 ): Promise<DogfoodSafetyPosture> {
   const effectiveGeneratedAt = generatedAt ?? new Date().toISOString();
   if (!env.DB) {
@@ -275,11 +276,17 @@ export async function loadDogfoodSafetyPostureFromDb(
     });
   }
 
-  const [pause, daily, fourHour, burst, telemetry] = await Promise.all([
+  const [pause, daily, fourHour, burst, connectorStates, taskStates, telemetry] = await Promise.all([
     loadDogfoodSafetyPause(env),
     currentUsageWindow(env, "daily", effectiveGeneratedAt),
     currentUsageWindow(env, "four_hour", effectiveGeneratedAt),
     currentUsageWindow(env, "burst", effectiveGeneratedAt),
+    snapshots.connectors
+      ? Promise.resolve(connectorBudgetStateCounts(snapshots.connectors))
+      : listConnectorBudgetStates(env),
+    snapshots.tasks
+      ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
+      : listTaskBudgetStates(env),
     loadLatestPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt)
   ]);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
@@ -293,7 +300,11 @@ export async function loadDogfoodSafetyPostureFromDb(
   return dogfoodSafetyPosture({
     generatedAt: effectiveGeneratedAt,
     paused: pause,
-    constraints
+    constraints,
+    budgetStates: [
+      ...connectorStates.map((row) => budgetStateFromString(row.budget_state)),
+      ...taskStates.map((row) => budgetStateFromString(row.budget_state))
+    ]
   });
 }
 
@@ -5027,19 +5038,22 @@ async function loadLatestPersistedCloudflareTelemetrySample(
 function dogfoodSafetyPosture({
   generatedAt,
   paused,
-  constraints
+  constraints,
+  budgetStates = []
 }: {
   generatedAt: string;
   paused: DogfoodSafetyPauseSetting | undefined;
   constraints: BudgetConstraint[];
+  budgetStates?: BudgetState[] | undefined;
 }): DogfoodSafetyPosture {
   const bottleneck = budgetBottleneckConstraint(constraints);
   const sampledStates = constraints
     .filter((constraint) => constraint.sampled && constraint.hard && constraint.state !== "missing")
     .map((constraint) => constraint.state as BudgetState);
-  const state = paused ? "hard_limited" : worstBudgetState(sampledStates);
+  const state = paused ? "hard_limited" : worstBudgetState([...sampledStates, ...budgetStates]);
+  const visibleBottleneck = dogfoodSafetyBottleneckForState(state, bottleneck);
   const actions = DOGFOOD_SAFETY_ACTIONS.map((action) =>
-    dogfoodSafetyGuard(action, state, paused, bottleneck)
+    dogfoodSafetyGuard(action, state, paused, visibleBottleneck)
   );
   return {
     state,
@@ -5048,10 +5062,20 @@ function dogfoodSafetyPosture({
     paused_by: paused?.updated_by,
     paused_at: paused?.updated_at,
     generated_at: generatedAt,
-    summary: dogfoodSafetySummary(state, paused, bottleneck),
-    bottleneck_constraint: bottleneck,
+    summary: dogfoodSafetySummary(state, paused, visibleBottleneck),
+    bottleneck_constraint: visibleBottleneck,
     actions
   };
+}
+
+function dogfoodSafetyBottleneckForState(
+  state: BudgetState,
+  bottleneck: BudgetConstraint | undefined
+): BudgetConstraint | undefined {
+  if (!bottleneck) return undefined;
+  if (bottleneck.state === "missing") return undefined;
+  if (state === "normal" || state === "recovery") return bottleneck;
+  return BUDGET_STATE_RANK[bottleneck.state] >= BUDGET_STATE_RANK[state] ? bottleneck : undefined;
 }
 
 function dogfoodSafetyGuard(

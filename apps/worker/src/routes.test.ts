@@ -1957,6 +1957,43 @@ test("safety posture treats null persisted telemetry fields as missing", async (
   assert.equal(body.safety.actions.every((guard) => guard.state === "allowed"), true);
 });
 
+test("safety posture includes connector and task budget states", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        connectorBudgetStates: ["normal", "throttled"],
+        taskBudgetStates: ["hard_limited"]
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      bottleneck_constraint?: unknown;
+      actions: Array<{ action: string; state: string; reason: string; budget_state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "hard_limited");
+  assert.equal(body.safety.bottleneck_constraint, undefined);
+  assert.equal(body.safety.actions.every((guard) => guard.state === "blocked"), true);
+  assert.equal(
+    body.safety.actions.find((guard) => guard.action === "command_create")?.budget_state,
+    "hard_limited"
+  );
+  assert.match(
+    body.safety.actions.find((guard) => guard.action === "command_create")!.reason,
+    /Cost posture is hard limited/
+  );
+});
+
 test("safety pause and resume update the operator guard state", async () => {
   const db = safetyPauseDb();
   const pause = await handleRequest(
@@ -2043,6 +2080,42 @@ test("safety pause blocks command creation before command writes", async () => {
   assert.equal(body.guard.action, "command_create");
   assert.equal(body.guard.state, "blocked");
   assert.equal(body.safety.paused, true);
+});
+
+test("connector budget state blocks command creation before command writes", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, {
+        safety: {
+          connectorBudgetStates: ["throttled"]
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string; budget_state: string };
+    safety: { state: string };
+  };
+
+  assert.equal(response.status, 429);
+  assert.equal(body.guard.action, "command_create");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.guard.budget_state, "throttled");
+  assert.equal(body.safety.state, "throttled");
+  assert.match(body.error, /Cost posture is throttled/);
 });
 
 test("conservative safety posture blocks host session inventory refresh before Durable Object dispatch", async () => {
@@ -3383,10 +3456,13 @@ function readOnlyBootstrapDb(): D1Database {
 
 type DogfoodSafetyFakeOptions = {
   includeUsageWindows?: boolean | undefined;
+  includeBudgetStateCounts?: boolean | undefined;
   paused?: boolean | undefined;
   pauseReason?: string | undefined;
   usageWindows?: Record<string, Record<string, unknown> | undefined> | undefined;
   telemetrySample?: Record<string, unknown> | undefined;
+  connectorBudgetStates?: string[] | undefined;
+  taskBudgetStates?: string[] | undefined;
 };
 
 function dogfoodSafetyQueryFake(
@@ -3449,7 +3525,39 @@ function dogfoodSafetyQueryFake(
     };
   }
 
+  if (
+    options.includeBudgetStateCounts !== false
+    && /FROM connectors/.test(sql)
+    && /GROUP BY budget_state/.test(sql)
+  ) {
+    return {
+      async all() {
+        return { results: budgetStateCountRows(options.connectorBudgetStates ?? []) };
+      }
+    };
+  }
+
+  if (
+    options.includeBudgetStateCounts !== false
+    && /FROM tasks/.test(sql)
+    && /GROUP BY budget_state/.test(sql)
+  ) {
+    return {
+      async all() {
+        return { results: budgetStateCountRows(options.taskBudgetStates ?? []) };
+      }
+    };
+  }
+
   return undefined;
+}
+
+function budgetStateCountRows(states: string[]): Array<{ budget_state: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const state of states) {
+    counts.set(state, (counts.get(state) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([budget_state, count]) => ({ budget_state, count }));
 }
 
 function safetyPauseDb(options: DogfoodSafetyFakeOptions = {}): D1Database {
@@ -3617,7 +3725,10 @@ function budgetSummaryDb(
 
   return {
     prepare(sql: string) {
-      const safetyQuery = dogfoodSafetyQueryFake(sql, { includeUsageWindows: false });
+      const safetyQuery = dogfoodSafetyQueryFake(sql, {
+        includeUsageWindows: false,
+        includeBudgetStateCounts: false
+      });
       if (safetyQuery) return safetyQuery;
 
       if (/FROM usage_windows/.test(sql)) {
