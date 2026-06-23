@@ -43,6 +43,7 @@ superseded_by:
 - `pnpm build`
 - Project journal validator.
 - `git diff --check`
+- Deployed API/Web smoke after the complete host-session snapshot fix passed: direct health/bootstrap/assets passed, browser shell bootstrap returned `200`, and Budget Board telemetry reported `normal` with Cloudflare Analytics as the source.
 - Internal `codex-readonly` review found that connector-level pending inventory needed to gate all peer sockets for the same connector; the follow-up fix adds that guard and regression tests.
 - Second internal `codex-readonly` review after the fix returned `LGTM`.
 

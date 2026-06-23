@@ -43,6 +43,7 @@ superseded_by:
 - `pnpm build`
 - Project journal validator。
 - `git diff --check`
+- complete host-session snapshot 修复后的 API/Web deployed smoke 已通过：direct health/bootstrap/assets 通过，browser shell bootstrap 返回 `200`，Budget Board telemetry 显示 `normal` 且 source 为 Cloudflare Analytics。
 - Internal `codex-readonly` review 发现 connector-level pending inventory 需要拦住同一 connector 的所有 peer sockets；后续修复已经加入该 guard 和回归测试。
 - 修复后的第二轮 internal `codex-readonly` review 返回 `LGTM`。
 
