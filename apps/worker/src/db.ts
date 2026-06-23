@@ -1325,66 +1325,69 @@ export async function recordHostSessionBackfillEvents(
   }
 
   const imported: ThreadEvent[] = [];
-  for (let index = 0; index < events.length; index += 1) {
-    const event = events[index]!;
-    const eventId = stableBackfillEventId(hostSession, event);
-    const existing = await env.DB.prepare(
-      "SELECT id FROM events WHERE id = ? LIMIT 1"
-    )
-      .bind(eventId)
-      .first<{ id: string }>();
-    if (existing) {
-      continue;
-    }
-
-    const now = new Date().toISOString();
-    const createdAt = normaliseBackfillCreatedAt(event.created_at);
-    const sequence = await env.DB.prepare(
-      `UPDATE threads
-       SET last_seq = last_seq + 1, updated_at = ?
-       WHERE id = ?
-       RETURNING last_seq`
-    )
-      .bind(now, thread.id)
-      .first<{ last_seq: number }>();
-    if (!sequence) {
-      continue;
-    }
-
-    const summary = event.summary.split(/\s+/).join(" ").trim().slice(0, 600);
-    const stored: ThreadEvent = {
-      id: eventId,
-      thread_id: thread.id,
-      seq: sequence.last_seq,
-      kind: event.kind,
-      priority: event.priority,
-      summary,
-      created_at: createdAt
-    };
-
-    const insertResult = await env.DB.prepare(
-      `INSERT OR IGNORE INTO events (
-         id, workspace_id, thread_id, command_id, seq, kind, priority, summary, idempotency_key, created_at
-       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(
-        stored.id,
-        thread.workspace_id,
-        stored.thread_id,
-        stored.seq,
-        stored.kind,
-        stored.priority,
-        stored.summary,
-        event.idempotency_key,
-        stored.created_at
+  try {
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index]!;
+      const eventId = stableBackfillEventId(hostSession, event);
+      const existing = await env.DB.prepare(
+        "SELECT id FROM events WHERE id = ? LIMIT 1"
       )
-      .run();
-    if (insertResult.meta?.changes === 0) {
-      continue;
+        .bind(eventId)
+        .first<{ id: string }>();
+      if (existing) {
+        continue;
+      }
+
+      const now = new Date().toISOString();
+      const createdAt = normaliseBackfillCreatedAt(event.created_at);
+      const sequence = await env.DB.prepare(
+        `UPDATE threads
+         SET last_seq = last_seq + 1, updated_at = ?
+         WHERE id = ?
+         RETURNING last_seq`
+      )
+        .bind(now, thread.id)
+        .first<{ last_seq: number }>();
+      if (!sequence) {
+        continue;
+      }
+
+      const summary = event.summary.split(/\s+/).join(" ").trim().slice(0, 600);
+      const stored: ThreadEvent = {
+        id: eventId,
+        thread_id: thread.id,
+        seq: sequence.last_seq,
+        kind: event.kind,
+        priority: event.priority,
+        summary,
+        created_at: createdAt
+      };
+
+      const insertResult = await env.DB.prepare(
+        `INSERT OR IGNORE INTO events (
+           id, workspace_id, thread_id, command_id, seq, kind, priority, summary, idempotency_key, created_at
+         ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          stored.id,
+          thread.workspace_id,
+          stored.thread_id,
+          stored.seq,
+          stored.kind,
+          stored.priority,
+          stored.summary,
+          event.idempotency_key,
+          stored.created_at
+        )
+        .run();
+      if (insertResult.meta?.changes === 0) {
+        continue;
+      }
+      imported.push(stored);
     }
-    imported.push(stored);
+  } finally {
+    await recordUsageWindowsForEventsBestEffort(env, imported, accountedAt);
   }
-  await recordUsageWindowsForEventsBestEffort(env, imported, accountedAt);
 
   return imported;
 }

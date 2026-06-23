@@ -27,6 +27,7 @@ superseded_by:
 - Tracked Wrangler defaults were updated to the conservative event capacities so new generic deployments do not inherit the older optimistic thresholds.
 - Deployment guide examples use the same conservative capacities because deploy profiles override Worker runtime vars when present.
 - Review follow-up keeps the four-hour soft budget in the D1 rows-written constraint state and charges Host Session backfill usage windows at import time, while preserving original event timestamps in thread history.
+- Review follow-up also accounts successfully imported Host Session backfill events in a best-effort `finally` path, so a later partial import failure does not skip D1 write-guard accounting for events already persisted.
 - Review follow-up scopes persisted Cloudflare telemetry samples by selector hash so changing account, Worker, D1, or Durable Object telemetry selectors cannot reuse stale sample buckets.
 
 ## Validation
@@ -36,4 +37,5 @@ superseded_by:
 - Added coverage for Cloudflare telemetry lower than the local D1 write estimate.
 - Updated coverage so schema-model zero baselines no longer count as sampled constraints.
 - Added coverage for four-hour soft-limit constraint state and import-time backfill budget windows.
+- Added coverage for partial Host Session backfill failures after at least one event insert.
 - Added coverage for telemetry selector-scoped sample buckets.

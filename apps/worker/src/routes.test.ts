@@ -122,7 +122,7 @@ test("host session refresh dispatches to the workspace durable object", async ()
               headers: { "content-type": "application/json; charset=utf-8" }
             });
           }
-        }) as DurableObjectStub
+        }) as unknown as DurableObjectStub
       } as unknown as DurableObjectNamespace
     }
   );
@@ -233,7 +233,7 @@ test("local thread creation dispatches to an app-server capable connector and at
               { headers: { "content-type": "application/json; charset=utf-8" } }
             );
           }
-        }) as DurableObjectStub
+        }) as unknown as DurableObjectStub
       } as unknown as DurableObjectNamespace
     }
   );
@@ -765,6 +765,62 @@ test("host session attach imports bounded history backfill events", async () => 
     truncated: true
   });
   assert.equal(db.eventInserts, 30);
+});
+
+test("host session attach accounts successfully imported backfill events when later import fails", async () => {
+  const db = hostSessionAttachBackfillDb({ failBackfillAfterEventInserts: 1 });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/attach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => new Response(
+            JSON.stringify({
+              events: [
+                {
+                  kind: "command.output",
+                  priority: "P3",
+                  summary: "2026-06-12 10:01 - User: Event 1",
+                  idempotency_key: "rollout:session-1:1",
+                  created_at: "2026-06-12T10:01:00.000Z"
+                },
+                {
+                  kind: "command.output",
+                  priority: "P3",
+                  summary: "2026-06-12 10:02 - User: Event 2",
+                  idempotency_key: "rollout:session-1:2",
+                  created_at: "2026-06-12T10:02:00.000Z"
+                }
+              ],
+              truncated: false
+            }),
+            { headers: { "content-type": "application/json; charset=utf-8" } }
+          )
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    backfill?: { attempted: boolean; imported_event_count?: number; error?: string };
+  };
+
+  assert.equal(response.status, 201);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.usageWindowUpserts, 3);
+  assert.equal(body.backfill?.attempted, true);
+  assert.equal(body.backfill?.imported_event_count, 0);
+  assert.match(body.backfill?.error ?? "", /Injected backfill sequence failure/);
 });
 
 test("host session attach skips backfill when connector lacks capability", async () => {
@@ -4264,8 +4320,13 @@ function hostSessionAttachBackfillDb(
     appServerPresent?: boolean | undefined;
     alreadyAttached?: boolean | undefined;
     missingAttachedRows?: boolean | undefined;
+    failBackfillAfterEventInserts?: number | undefined;
   } = {}
-): D1Database & { readonly eventInserts: number; readonly hostSessionLookupConnectorIds: Array<string | undefined> } {
+): D1Database & {
+  readonly eventInserts: number;
+  readonly hostSessionLookupConnectorIds: Array<string | undefined>;
+  readonly usageWindowUpserts: number;
+} {
   const connectorStatus = options.connectorStatus ?? "online";
   const supportsBackfill = options.supportsBackfill ?? true;
   const supportsAppServer = options.supportsAppServer ?? false;
@@ -4314,6 +4375,7 @@ function hostSessionAttachBackfillDb(
     }
     : undefined;
   let eventInsertCount = 0;
+  let usageWindowUpsertCount = 0;
   let sequenceUpdates = 0;
   const insertedEvents = new Set<string>();
   const hostSessionLookupConnectorIds: Array<string | undefined> = [];
@@ -4558,6 +4620,12 @@ function hostSessionAttachBackfillDb(
             assert.equal(threadId, "thread-host-session-1-connector-online");
             return {
               async first() {
+                if (
+                  options.failBackfillAfterEventInserts !== undefined &&
+                  eventInsertCount >= options.failBackfillAfterEventInserts
+                ) {
+                  throw new Error("Injected backfill sequence failure");
+                }
                 sequenceUpdates += 1;
                 return { last_seq: sequenceUpdates };
               }
@@ -4600,7 +4668,9 @@ function hostSessionAttachBackfillDb(
       }
 
       if (/INSERT INTO usage_windows/.test(sql)) {
-        return usageWindowUpsertFake();
+        return usageWindowUpsertFake(() => {
+          usageWindowUpsertCount += 1;
+        });
       }
 
       if (/INSERT INTO host_session_syncs/.test(sql)) {
@@ -4639,12 +4709,19 @@ function hostSessionAttachBackfillDb(
     get eventInserts() {
       return eventInsertCount;
     },
+    get usageWindowUpserts() {
+      return usageWindowUpsertCount;
+    },
     get hostSessionLookupConnectorIds() {
       return hostSessionLookupConnectorIds;
     }
   };
 
-  return db as D1Database & { readonly eventInserts: number; readonly hostSessionLookupConnectorIds: Array<string | undefined> };
+  return db as D1Database & {
+    readonly eventInserts: number;
+    readonly hostSessionLookupConnectorIds: Array<string | undefined>;
+    readonly usageWindowUpserts: number;
+  };
 }
 
 function hostSessionDetachDb(options: {
@@ -5089,11 +5166,12 @@ function hostSessionDetachDb(options: {
   } as unknown as D1Database & typeof counters;
 }
 
-function usageWindowUpsertFake() {
+function usageWindowUpsertFake(onRun?: () => void) {
   return {
     bind() {
       return {
         async run() {
+          onRun?.();
           return { success: true };
         }
       };
