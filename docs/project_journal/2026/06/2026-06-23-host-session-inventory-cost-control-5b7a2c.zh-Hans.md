@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-23
 updated: 2026-06-23
 branch: wip/app-server-attach-resume
-pr:
+pr: 18
 supersedes:
 superseded_by:
 ---
@@ -24,6 +24,7 @@ superseded_by:
 - `POST /api/host-sessions/refresh` 现在会返回 dispatched、debounced 和 cooldown counts，Browser 可以说明一次 refresh 为什么 fan out 或为什么被冷却。
 - `WorkspaceDO` 请求 inventory 时会为每个 connector 选择最新的 ready socket，然后把这个 socket 标记为 Host Session refresh pending，让 command dispatch 继续等待这次本机快照。
 - Review follow-up：Host Session refresh pending guard 现在有有界等待时间，所以 inventory report 卡住或缺失时不会永远阻塞 command dispatch。
+- Review follow-up：如果 connector socket 在持有 pending Host Session refresh 时断开，Durable Object 会清理这个 connector 的 refresh cooldown，因此 reconnect 后可以立刻重新请求 inventory。
 - Review follow-up：Host Session sync metadata 现在会把已存储的 reported sessions 和实际发生变更的 rows 分开计数，unchanged inventory report 不会再发布 `stored_session_count = 0`。
 - Rust connector 不再在普通 `agent.ready` 更新或 idle read tick 后发送 Host Session inventory。显式 `host_sessions.refresh` 请求和用户动作路径仍然会发送一次 report。
 - Browser 不再在 refresh 请求后连续做三次 bootstrap reload。WebSocket live 时等待 realtime Host Sessions update；WebSocket 不在线时只做一次延迟 bootstrap 读取作为 fallback。
@@ -32,6 +33,7 @@ superseded_by:
 - `pnpm --filter @chaop/protocol test`
 - `pnpm --filter @chaop/web test`
 - `pnpm --filter @chaop/worker test`
+- reconnect cooldown 修复后再次运行 `pnpm --filter @chaop/worker test`。
 - `cargo test --workspace`
 - `pnpm test`
 - `pnpm build`

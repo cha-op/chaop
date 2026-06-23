@@ -1340,6 +1340,55 @@ test("host session refresh sends once per connector and debounces repeated reque
   assert.equal(otherSent.length, 1);
 });
 
+test("host session refresh cooldown is cleared when pending connector socket reconnects", async () => {
+  const firstSent: string[] = [];
+  const reconnectSent: string[] = [];
+  const firstSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true
+  }, firstSent);
+  const reconnectSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 400,
+    agentReady: true
+  }, reconnectSent);
+  let sockets = [firstSocket];
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent") return sockets;
+      if (tag === "agent:connector-online") return sockets;
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, {} as Env);
+
+  const first = await workspace.fetch(new Request("https://workspace-do/internal/refresh-host-sessions", {
+    method: "POST"
+  }));
+  assert.equal((await first.json() as { dispatched_to?: number }).dispatched_to, 1);
+  assert.equal(firstSent.length, 1);
+
+  sockets = [firstSocket, reconnectSocket];
+  await workspace.webSocketClose(firstSocket);
+  sockets = [reconnectSocket];
+
+  const second = await workspace.fetch(new Request("https://workspace-do/internal/refresh-host-sessions", {
+    method: "POST"
+  }));
+  const secondBody = await second.json() as {
+    dispatched_to?: number;
+    debounced_connector_count?: number;
+  };
+
+  assert.equal(secondBody.dispatched_to, 1);
+  assert.equal(secondBody.debounced_connector_count, 0);
+  assert.equal(reconnectSent.length, 1);
+  assert.equal((JSON.parse(reconnectSent[0] ?? "{}") as { kind?: string }).kind, "host_sessions.refresh");
+});
+
 test("legacy agent.ready without capabilities remains dispatch-ready", async () => {
   const sent: string[] = [];
   const browserSent: string[] = [];

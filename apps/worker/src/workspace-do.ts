@@ -445,9 +445,12 @@ export class WorkspaceDO implements DurableObject {
   }
 
   private async handleSocketGone(ws: WebSocket): Promise<void> {
-    const attachment = ws.deserializeAttachment() as { socketType?: string; connectorId?: string } | undefined;
+    const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
     if (attachment?.socketType !== "agent" || !attachment.connectorId) {
       return;
+    }
+    if (attachment.pendingHostSessionsDispatch) {
+      this.hostSessionsRefreshSentAt.delete(attachment.connectorId);
     }
     const hasAuthenticatedPeer = hasPeerAgentSocket(this.ctx, attachment.connectorId, ws);
     const hasReadyPeer = hasReadyPeerAgentSocket(this.ctx, attachment.connectorId, ws);

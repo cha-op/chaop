@@ -31,6 +31,7 @@ superseded_by:
 - Managed app-server command execution 在 active `thread/list` miss 后也会使用同一个 rollout path fallback，然后用 app-server resume 返回的真实 `thread.id` 启动 turn。
 - Archive/unarchive sync 在 source 和 target `thread/list` 都 miss 后也会使用 rollout path resume，然后对 resume 返回的真实 app-server `thread.id` 执行 archive/unarchive。
 - Review follow-up 会拒绝 session id 不匹配的 app-server ensure response，path-based attach 和 command resume 会使用 rollout 里的 cwd，并且 page-budgeted `thread/list` miss 后会继续尝试 rollout resume。
+- Review follow-up 也会在返回 ensured Host Session 前校验 app-server `thread/resume` response 的 session id，避免 stale 或异常 app-server response 把错误的本机 session attach 进来。
 - Review follow-up 还会在 active inventory 把 `app_server_present` 降级后，继续保留 app-server lineage session 的 archive/unarchive sync，因此已归档的 app-server thread 可以通过 connector 重新 unarchive 回本机。
 - unarchive sync 成功后，如果 active-only inventory 曾经把 attached Host Session 的 D1 `app_server_present` 标记降级，会把它恢复为 true，因此下一条 managed app-server command 会被接受。
 - Review follow-up 会在 `agent.ready` 后、pending command dispatch 前请求一次带 debounce 的 Host Sessions refresh，因此新创建的本机 sessions 不需要恢复高频 connector inventory polling 也能变得可见。
@@ -40,6 +41,7 @@ superseded_by:
 - `pnpm --filter @chaop/worker test`
 - `cargo test -p chaop-agent`
 - `cargo test -p chaop-agent session_inventory -- --nocapture`
+- `cargo test -p chaop-agent ensure_host_session_rejects_mismatched_resume_session_id -- --test-threads=1`
 - `pnpm --dir apps/web test`
 - `pnpm --dir apps/worker test -- routes.test.ts`
 - `pnpm test`

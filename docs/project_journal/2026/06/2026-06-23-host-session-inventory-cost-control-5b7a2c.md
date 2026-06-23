@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-23
 updated: 2026-06-23
 branch: wip/app-server-attach-resume
-pr:
+pr: 18
 supersedes:
 superseded_by:
 ---
@@ -24,6 +24,7 @@ superseded_by:
 - `POST /api/host-sessions/refresh` now returns dispatched, debounced, and cooldown counts so the Browser can show why a refresh did or did not fan out.
 - `WorkspaceDO` chooses the newest ready socket per connector when requesting inventory, then marks that socket as pending Host Session refresh so command dispatch continues to wait for the requested local snapshot.
 - Review follow-up: pending Host Session refresh guards now expire after a bounded wait, so a stuck or missing inventory report cannot block command dispatch forever.
+- Review follow-up: if a connector socket disconnects while it owns a pending Host Session refresh, the Durable Object clears that connector's refresh cooldown so a reconnect can request inventory immediately.
 - Review follow-up: Host Session sync metadata now records stored reported sessions separately from changed rows, so unchanged inventory reports no longer publish `stored_session_count = 0`.
 - The Rust connector no longer sends Host Session inventory after ordinary `agent.ready` updates or idle read ticks. Explicit `host_sessions.refresh` requests and user-action paths still send one report.
 - The Browser avoids the previous three immediate bootstrap reloads after a refresh request. When the WebSocket is live it waits for the realtime Host Sessions update; when it is not live it performs one delayed bootstrap read as a fallback.
@@ -32,6 +33,7 @@ superseded_by:
 - `pnpm --filter @chaop/protocol test`
 - `pnpm --filter @chaop/web test`
 - `pnpm --filter @chaop/worker test`
+- `pnpm --filter @chaop/worker test` after the reconnect cooldown fix.
 - `cargo test --workspace`
 - `pnpm test`
 - `pnpm build`

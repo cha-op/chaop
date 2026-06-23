@@ -2382,7 +2382,8 @@ fn ensure_app_server_host_session_at(
             )
             .into());
         };
-        let resume_cwd = rollout_resume_cwd(&rollout_path, session_id)?.unwrap_or_else(|| cwd.to_owned());
+        let resume_cwd =
+            rollout_resume_cwd(&rollout_path, session_id)?.unwrap_or_else(|| cwd.to_owned());
         serde_json::json!({
             "threadId": session_id,
             "path": rollout_path.to_string_lossy(),
@@ -2400,6 +2401,13 @@ fn ensure_app_server_host_session_at(
         deadline,
     )?;
     let resumed = app_server_thread_from_response(&response)?;
+    if resumed.session_id != session_id {
+        return Err(format!(
+            "app-server thread/resume returned session {} while attaching session {session_id}",
+            resumed.session_id
+        )
+        .into());
+    }
     let cwd = resumed.cwd.or_else(|| Some(cwd.to_owned()));
     Ok(AgentHostSession {
         session_id: session_id.to_owned(),
@@ -2486,7 +2494,10 @@ fn scan_app_server_thread_id_for_ensure(
             } else if allow_exhausted_miss {
                 Ok(None)
             } else {
-                Err("app-server host session attach exceeded page budget while resolving thread id".into())
+                Err(
+                    "app-server host session attach exceeded page budget while resolving thread id"
+                        .into(),
+                )
             }
         }
     }
@@ -3600,6 +3611,73 @@ mod tests {
     }
 
     #[test]
+    fn ensure_host_session_rejects_mismatched_resume_session_id() {
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "thread-live-1",
+                            "sessionId": "session-1",
+                            "name": "Recovered title",
+                            "cwd": "/tmp/project",
+                            "updatedAt": 1781263443
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-other",
+                        "name": "Wrong session",
+                        "cwd": "/tmp/project",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let error = ensure_app_server_host_session_at(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            None,
+            None,
+            1,
+        )
+        .expect_err("mismatched app-server session id should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("returned session session-other while attaching session session-1")
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("thread/list request")
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/list")
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("thread/resume request")
+                .get("method")
+                .and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
     fn resumes_archived_host_session_through_resolved_app_server_thread_id() {
         let (url, requests) = run_fake_app_server_with_requests(vec![
             json!({
@@ -3861,7 +3939,9 @@ mod tests {
     #[test]
     fn resumes_unlisted_host_session_from_rollout_path() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let rollout_path = tempdir.path().join("sessions/2026/06/16/rollout-session-1.jsonl");
+        let rollout_path = tempdir
+            .path()
+            .join("sessions/2026/06/16/rollout-session-1.jsonl");
         fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
         fs::write(
             &rollout_path,
