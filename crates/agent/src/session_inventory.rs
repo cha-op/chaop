@@ -2019,15 +2019,6 @@ fn handle_app_server_turn_request(
         }
         Err(error) => return Err(error),
     };
-    if response.dispatch.auto_resolved {
-        let event =
-            turn_interaction_resolution_event(&response.dispatch, request_payload.as_ref())?;
-        channels.event_sender.send(event).map_err(|_| {
-            AppServerCommandError::Other(
-                "turn interaction resolution event channel closed".to_owned(),
-            )
-        })?;
-    }
     let result =
         match app_server_turn_interaction_result(method, params, &response.dispatch.response) {
             Ok(result) => result,
@@ -2049,6 +2040,15 @@ fn handle_app_server_turn_request(
         return Err(AppServerCommandError::Other(error.to_string()));
     }
     acknowledge_turn_interaction_delivery(response.delivery_ack, true);
+    if response.dispatch.auto_resolved {
+        let event =
+            turn_interaction_resolution_event(&response.dispatch, request_payload.as_ref())?;
+        channels.event_sender.send(event).map_err(|_| {
+            AppServerCommandError::Other(
+                "turn interaction resolution event channel closed".to_owned(),
+            )
+        })?;
+    }
     Ok(true)
 }
 
@@ -2292,19 +2292,23 @@ fn turn_interaction_payload(
         if let Some(network_context) = network_approval_context_from_request(params) {
             payload.insert("network_approval_context".to_owned(), network_context);
         }
-        if let Some(available_decisions) = available_approval_decisions_from_request(params) {
-            if available_decisions
-                .as_array()
-                .map(|decisions| decisions.is_empty())
-                .unwrap_or(true)
-            {
-                return Err(AppServerCommandError::Other(
-                    "app-server approval request did not include any valid approval decisions"
-                        .to_owned(),
-                ));
-            }
-            payload.insert("available_decisions".to_owned(), available_decisions);
+        let Some(available_decisions) = available_approval_decisions_from_request(params) else {
+            return Err(AppServerCommandError::Other(
+                "app-server approval request did not include any valid approval decisions"
+                    .to_owned(),
+            ));
+        };
+        if available_decisions
+            .as_array()
+            .map(|decisions| decisions.is_empty())
+            .unwrap_or(true)
+        {
+            return Err(AppServerCommandError::Other(
+                "app-server approval request did not include any valid approval decisions"
+                    .to_owned(),
+            ));
         }
+        payload.insert("available_decisions".to_owned(), available_decisions);
     }
     if let Some(grant_root) = grant_root.filter(|value| !value.trim().is_empty()) {
         payload.insert("grant_root".to_owned(), json!(grant_root));
@@ -7567,6 +7571,35 @@ mod tests {
     }
 
     #[test]
+    fn app_server_command_rejects_missing_available_decisions() {
+        let params = json!({
+            "threadId": "thread-live-1",
+            "turnId": "turn-1",
+            "itemId": "item-approval-1",
+            "reason": "Needs write access",
+            "command": "touch requested.txt",
+            "cwd": "/tmp/project"
+        });
+
+        let error = match super::turn_interaction_event(
+            "item/commandExecution/requestApproval",
+            &json!(82),
+            &params,
+        ) {
+            Ok(_) => panic!("missing approval decisions should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            super::AppServerCommandError::Other(
+                "app-server approval request did not include any valid approval decisions"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn app_server_command_forwards_permissions_approval_details() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
@@ -7587,7 +7620,8 @@ mod tests {
                         "read": ["/tmp/project"],
                         "write": ["/tmp/project/package-lock.json"]
                     }
-                }
+                },
+                "availableDecisions": ["accept", "acceptForSession", "decline", "cancel"]
             }
         }));
         let config = AgentConfig {

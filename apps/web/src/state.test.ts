@@ -1127,7 +1127,8 @@ test("threadTurnsForDisplay hides pending interactions after terminal events", (
           app_server_turn_id: "app-turn-1",
           title: "Approve command execution",
           command: "touch requested.txt",
-          cwd: "/tmp/project"
+          cwd: "/tmp/project",
+          available_decisions: ["accept", "decline", "cancel"]
         }
       }),
       event("event-3", "command-1", 3, "command.failed", "Codex app-server turn failed.")

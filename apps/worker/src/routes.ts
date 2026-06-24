@@ -52,6 +52,7 @@ import {
   loadBootstrapFromDb,
   loadDogfoodSafetyPostureFromDb,
   loadHostSessionInDb,
+  markTurnInteractionResolutionDispatchStartedInDb,
   markHostSessionAppServerPresentInDb,
   markTurnInteractionResolutionDeliveredInDb,
   prepareTurnInteractionResolutionInDb,
@@ -392,6 +393,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const dispatch = preparation.dispatch;
       let connectorDelivered = preparation.already_delivered;
       if (!connectorDelivered) {
+        try {
+          await markTurnInteractionResolutionDispatchStartedInDb(env, dispatch.command_id, dispatch.interaction_id);
+        } catch (error) {
+          await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+          throw error;
+        }
         try {
           await requestTurnInteractionResolution(env, dispatch);
           connectorDelivered = true;

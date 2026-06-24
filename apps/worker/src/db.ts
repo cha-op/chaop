@@ -1661,6 +1661,22 @@ export async function prepareTurnInteractionResolutionInDb(
   if (response.kind === "input" && row.kind !== "input.requested") {
     throw new CommandTargetError("Turn interaction is not an input request", 400);
   }
+  const deliveredClaim = await findTurnInteractionResolutionClaim(env, row.command_id, payload.interaction_id);
+  if (claimDeliveredAt(deliveredClaim)) {
+    const resolution = turnInteractionResolutionFromClaim(deliveredClaim, payload);
+    if (!resolution) {
+      throw new CommandTargetError("Turn interaction delivery recovery payload is unavailable", 409);
+    }
+    return {
+      dispatch: {
+        command_id: row.command_id,
+        interaction_id: payload.interaction_id,
+        response
+      },
+      already_delivered: true,
+      resolution
+    };
+  }
   if (turnInteractionAutoResolutionExpired(payload, row.created_at)) {
     throw new CommandTargetError("Turn interaction auto-resolution deadline has expired", 409);
   }
@@ -4263,7 +4279,7 @@ async function claimTurnInteractionResolution(
     .run();
   if (result.meta?.changes === 0) {
     const claim = await findTurnInteractionResolutionClaim(env, commandId, interactionId);
-    if (claim && typeof claim.delivered_at === "string" && claim.delivered_at.trim().length > 0) {
+    if (claimDeliveredAt(claim)) {
       const deliveredResolution = turnInteractionResolutionFromClaim(claim, request);
       if (!deliveredResolution) {
         throw new CommandTargetError("Turn interaction delivery recovery payload is unavailable", 409);
@@ -4291,11 +4307,12 @@ async function findTurnInteractionResolutionClaim(
   response_json: string | null;
   resolution_summary: string | null;
   resolution_payload_json: string | null;
+  dispatch_started_at: string | null;
   delivered_at: string | null;
 } | undefined> {
   const row = await env.DB!.prepare(
     `SELECT command_id, interaction_id, response_kind, response_json,
-            resolution_summary, resolution_payload_json, delivered_at
+            resolution_summary, resolution_payload_json, dispatch_started_at, delivered_at
      FROM turn_interaction_resolution_claims
      WHERE command_id = ?
        AND interaction_id = ?
@@ -4309,9 +4326,16 @@ async function findTurnInteractionResolutionClaim(
       response_json: string | null;
       resolution_summary: string | null;
       resolution_payload_json: string | null;
+      dispatch_started_at: string | null;
       delivered_at: string | null;
     }>();
   return row ?? undefined;
+}
+
+function claimDeliveredAt<T extends { delivered_at: string | null }>(
+  claim: T | null | undefined
+): claim is T & { delivered_at: string } {
+  return typeof claim?.delivered_at === "string" && claim.delivered_at.trim().length > 0;
 }
 
 function parseClaimedTurnInteractionResponse(responseJson: string | null): ResolveTurnInteractionRequest | undefined {
@@ -4402,6 +4426,21 @@ export async function markTurnInteractionResolutionDeliveredInDb(
     .run();
 }
 
+export async function markTurnInteractionResolutionDispatchStartedInDb(
+  env: Env,
+  commandId: string,
+  interactionId: string
+): Promise<void> {
+  await env.DB!.prepare(
+    `UPDATE turn_interaction_resolution_claims
+     SET dispatch_started_at = COALESCE(dispatch_started_at, ?)
+     WHERE command_id = ?
+       AND interaction_id = ?`
+  )
+    .bind(new Date().toISOString(), commandId, interactionId)
+    .run();
+}
+
 async function deleteStaleTurnInteractionResolutionClaim(
   env: Env,
   commandId: string,
@@ -4414,6 +4453,7 @@ async function deleteStaleTurnInteractionResolutionClaim(
        AND interaction_id = ?
        AND created_at < ?
        AND delivered_at IS NULL
+       AND dispatch_started_at IS NULL
        AND NOT EXISTS (
          SELECT 1
          FROM events
@@ -4454,12 +4494,9 @@ function isTurnInteractionRequestPayload(value: unknown): value is TurnInteracti
       value.questions.length > 0 &&
       value.questions.every(isTurnInteractionInputQuestionValue);
   }
-  if (value.available_decisions !== undefined) {
-    return Array.isArray(value.available_decisions) &&
-      value.available_decisions.length > 0 &&
-      value.available_decisions.every(isTurnInteractionApprovalDecisionValue);
-  }
-  return true;
+  return Array.isArray(value.available_decisions) &&
+    value.available_decisions.length > 0 &&
+    value.available_decisions.every(isTurnInteractionApprovalDecisionValue);
 }
 
 function isTurnInteractionInputQuestionValue(value: unknown): boolean {

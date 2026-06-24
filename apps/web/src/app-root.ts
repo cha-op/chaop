@@ -2083,9 +2083,7 @@ function formatMode(mode: string): string {
 function approvalDecisionsForPayload(
   payload: PendingTurnInteraction["payload"]
 ): TurnInteractionApprovalDecision[] {
-  return payload.available_decisions !== undefined
-    ? payload.available_decisions
-    : ["accept", "acceptForSession", "decline", "cancel"];
+  return payload.available_decisions ?? [];
 }
 
 function approvalDecisionLabel(decision: TurnInteractionApprovalDecision): string {

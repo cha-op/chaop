@@ -400,6 +400,7 @@ export function fallbackBootstrap(): BootstrapPayload {
           detail: "Needs read access to inspect local configuration.",
           command: "cat ./config/local.json",
           cwd: "sample-workspace",
+          available_decisions: ["accept", "decline", "cancel"],
           requested_permissions: {
             fileSystem: {
               read: ["config/local.json"]

@@ -2370,7 +2370,8 @@ test("dogfood safety pause rejects hidden turn interaction requests instead of f
         request_kind: "approval",
         app_server_thread_id: "app-thread-1",
         app_server_turn_id: "app-turn-1",
-        title: "Approve command execution"
+        title: "Approve command execution",
+        available_decisions: ["accept", "decline", "cancel"]
       }
     }
   }));
