@@ -40,7 +40,7 @@ export async function loadBootstrap(): Promise<BootstrapPayload> {
     }
     return (await response.json()) as BootstrapPayload;
   } catch (error) {
-    if (import.meta.env.DEV) {
+    if (devFallbackEnabled()) {
       return fallbackBootstrap();
     }
     throw error;
@@ -58,7 +58,7 @@ export async function loadUsageSummary(): Promise<BudgetSummary> {
     }
     return (await response.json()) as BudgetSummary;
   } catch (error) {
-    if (import.meta.env.DEV) {
+    if (devFallbackEnabled()) {
       return fallbackBootstrap().budget;
     }
     throw error;
@@ -70,14 +70,21 @@ export async function bootstrapBudgetSamples(): Promise<BudgetSummary> {
 }
 
 export async function loadSafetyPosture(): Promise<DogfoodSafetyPostureResponse> {
-  const response = await fetch(apiUrl("/api/safety-posture"), {
-    credentials: "include",
-    headers: devHeaders()
-  });
-  if (!response.ok) {
-    throw await responseError(response, "Safety posture failed");
+  try {
+    const response = await fetch(apiUrl("/api/safety-posture"), {
+      credentials: "include",
+      headers: devHeaders()
+    });
+    if (!response.ok) {
+      throw await responseError(response, "Safety posture failed");
+    }
+    return (await response.json()) as DogfoodSafetyPostureResponse;
+  } catch (error) {
+    if (devFallbackEnabled()) {
+      return { safety: fallbackBootstrap().safety };
+    }
+    throw error;
   }
-  return (await response.json()) as DogfoodSafetyPostureResponse;
 }
 
 export async function pauseDogfoodSafety(
@@ -151,7 +158,7 @@ export async function loadThreadEvents(threadId: string): Promise<ThreadEventsRe
 
     return (await response.json()) as ThreadEventsResponse;
   } catch (error) {
-    if (import.meta.env.DEV) {
+    if (devFallbackEnabled()) {
       return { events: [] };
     }
     throw error;
@@ -217,5 +224,9 @@ async function responseErrorPayload(response: Response): Promise<{ message?: str
 }
 
 function devHeaders(): HeadersInit {
-  return import.meta.env.DEV ? { "x-chaop-dev-user": "operator@example.com" } : {};
+  return devFallbackEnabled() ? { "x-chaop-dev-user": "operator@example.com" } : {};
+}
+
+function devFallbackEnabled(): boolean {
+  return import.meta.env?.DEV === true;
 }

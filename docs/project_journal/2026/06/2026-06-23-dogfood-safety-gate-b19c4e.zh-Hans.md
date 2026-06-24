@@ -72,6 +72,7 @@ superseded_by:
 - safety pause 或 hard limit 期间现在仍会记录 `command.started` event，让已经派发的 command 离开会过期的 lease state；高频 progress output 仍可被丢弃以减少写入。
 - safety resume 后现在会 best-effort 触发一次全局 pending-command dispatch，避免 operator 解除 pause 后，已排队工作还要等其他 connector event 才继续。
 - live telemetry 的 daily high-water fallback 现在会保留到 UTC 日结束，因此 telemetry sample 持久化失败后，短 bucket TTL 过期也不会放松同一天已经触发的 hard limit。
+- `loadSafetyPosture()` 现在也具备和启动响应、用量摘要相同的本地开发 fallback；Vite sample mode 下 Worker API 不可用时，预算板刷新仍能继续使用 sample safety。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

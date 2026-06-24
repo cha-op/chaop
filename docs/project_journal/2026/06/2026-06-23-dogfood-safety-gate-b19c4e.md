@@ -72,6 +72,7 @@ superseded_by:
 - Preserved `command.started` event recording during safety pauses and hard limits, so an already-dispatched command moves out of expiring lease state while noisy progress output can still be dropped.
 - Triggered a best-effort global pending-command dispatch after safety resume, so queued work does not wait for an unrelated connector event after an operator clears the pause.
 - Kept live telemetry daily high-water fallback until the UTC day boundary, so a persisted-sample failure cannot relax a same-day hard limit after the short bucket TTL expires.
+- Added the same local dev fallback to `loadSafetyPosture()` that bootstrap and usage summary already use, so Budget Board refresh remains usable when the Worker API is unavailable in Vite sample mode.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`
