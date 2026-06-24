@@ -45,6 +45,7 @@ superseded_by:
 - The WorkspaceDO internal turn-interaction validator now accepts the same object-shaped exec-policy amendment approval decision as the public route, with DO coverage for forwarding that response to the connector.
 - Browser-submitted interaction responses now must match the stored request payload: approval decisions are constrained by `available_decisions` when app-server supplied them, input answers must cover exactly the requested questions with non-empty answers, and Thread Centre renders the full network approval context so unknown safety-relevant fields are visible.
 - GitHub Codex follow-up fixes remove absolute workspace-shaped sample paths, use checked app-server auto-resolution deadline arithmetic, keep HITL response delivery acknowledgements pending until the app-server response is written, and handle HITL responses that arrive while the connector is still waiting for the request event acknowledgement.
+- The independent PR review found two fail-closed gaps. WorkspaceDO now rejects malformed required `approval.requested` and `input.requested` events with a negative ack before any DB write, and app-server `availableDecisions` now preserves an empty `available_decisions` list when supplied decisions are invalid so the browser and API do not fall back to unrestricted defaults.
 
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.

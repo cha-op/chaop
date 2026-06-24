@@ -880,6 +880,28 @@ test("prepareTurnInteractionResolutionInDb rejects unavailable approval decision
   assert.equal(db.claimInserts, 0);
 });
 
+test("prepareTurnInteractionResolutionInDb rejects approval decisions when availability is empty", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    approvalAvailableDecisions: []
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 400 &&
+      /decision is not available/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
 test("prepareTurnInteractionResolutionInDb accepts available approval decision objects", async () => {
   const amendmentDecision = {
     acceptWithExecpolicyAmendment: {

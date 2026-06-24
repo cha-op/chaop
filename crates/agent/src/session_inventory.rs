@@ -2382,16 +2382,15 @@ fn turn_interaction_question(value: &Value) -> Option<Value> {
 }
 
 fn available_approval_decisions_from_request(params: &Value) -> Option<Value> {
-    let mapped = params
-        .get("availableDecisions")
-        .and_then(Value::as_array)?
-        .iter()
-        .filter_map(normalized_approval_decision)
-        .collect::<Vec<_>>();
-    if mapped.is_empty() {
-        None
-    } else {
-        Some(Value::Array(mapped))
+    match params.get("availableDecisions") {
+        None => None,
+        Some(Value::Array(decisions)) => Some(Value::Array(
+            decisions
+                .iter()
+                .filter_map(normalized_approval_decision)
+                .collect::<Vec<_>>(),
+        )),
+        Some(_) => Some(Value::Array(Vec::new())),
     }
 }
 
@@ -7498,6 +7497,110 @@ mod tests {
                 .pointer("/result/decision/acceptWithExecpolicyAmendment/execpolicy_amendment/0")
                 .and_then(Value::as_str),
             Some("touch")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn app_server_command_preserves_empty_available_decisions_when_options_are_invalid() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": 82,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-approval-1",
+                "reason": "Needs write access",
+                "command": "touch requested.txt",
+                "cwd": "/tmp/project",
+                "availableDecisions": [
+                    "approveForever",
+                    {
+                        "acceptWithExecpolicyAmendment": {
+                            "execpolicy_amendment": []
+                        }
+                    }
+                ]
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                Some("/tmp/project"),
+                "command-1",
+                "Run approved command",
+                Arc::new(AtomicBool::new(false)),
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("approval event");
+        assert_eq!(event.kind, "approval.requested");
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("available_decisions"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        let interaction_id = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("interaction_id"))
+            .and_then(Value::as_str)
+            .expect("interaction id")
+            .to_owned();
+        send_turn_interaction_response(
+            &response_tx,
+            TurnInteractionResponseDispatch {
+                request_id: None,
+                command_id: "command-1".to_owned(),
+                interaction_id,
+                response: TurnInteractionResponse::Approval {
+                    decision: json!("cancel"),
+                },
+                auto_resolved: false,
+            },
+        );
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("app-server interaction response");
+        assert_eq!(
+            app_response
+                .pointer("/result/decision")
+                .and_then(Value::as_str),
+            Some("cancel")
         );
         let events = handle.join().expect("command thread");
         assert_eq!(

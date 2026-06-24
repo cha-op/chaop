@@ -16,6 +16,7 @@ import {
   type ThreadArchiveSyncResult,
   type ThreadEvent,
   type TurnInteractionApprovalDecision,
+  type TurnInteractionRequestPayload,
   type TurnInteractionResponseAck,
   type TurnInteractionResponseDelivery,
   type TurnInteractionResponseDispatch
@@ -364,6 +365,22 @@ export class WorkspaceDO implements DurableObject {
           snapshot: result.snapshot
         }));
       }
+      return;
+    }
+
+    const malformedRequiredTurnInteraction = malformedRequiredTurnInteractionEvent(message.payload);
+    if (message.kind === "agent.event" && malformedRequiredTurnInteraction) {
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            command_id: malformedRequiredTurnInteraction.command_id,
+            kind: malformedRequiredTurnInteraction.kind,
+            accepted: false,
+            dropped: true,
+            reason: "Turn interaction request payload is invalid"
+          })
+        )
+      );
       return;
     }
 
@@ -1515,20 +1532,61 @@ function jsonResponse(payload: unknown, status = 200): Response {
 function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
+  const validKind =
+    record.kind === "command.started" ||
+    record.kind === "command.output" ||
+    record.kind === "command.finished" ||
+    record.kind === "command.failed" ||
+    record.kind === "approval.requested" ||
+    record.kind === "approval.resolved" ||
+    record.kind === "input.requested" ||
+    record.kind === "input.received";
+  if (!validKind) return false;
+  if (isRequiredTurnInteractionRequestKind(record.kind)) {
+    if (!isTurnInteractionRequestPayloadForEvent(record.payload, record.kind)) return false;
+  } else if (record.payload !== undefined && !isRecord(record.payload)) {
+    return false;
+  }
   return (
     typeof record.command_id === "string" &&
-    (record.kind === "command.started" ||
-      record.kind === "command.output" ||
-      record.kind === "command.finished" ||
-      record.kind === "command.failed" ||
-      record.kind === "approval.requested" ||
-      record.kind === "approval.resolved" ||
-      record.kind === "input.requested" ||
-      record.kind === "input.received") &&
     (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
     (record.target_host_session_id === undefined || typeof record.target_host_session_id === "string") &&
-    (record.payload === undefined || isRecord(record.payload)) &&
     typeof record.summary === "string"
+  );
+}
+
+function isRequiredTurnInteractionRequestKind(kind: unknown): kind is "approval.requested" | "input.requested" {
+  return kind === "approval.requested" || kind === "input.requested";
+}
+
+function malformedRequiredTurnInteractionEvent(
+  value: unknown
+): { command_id: string; kind: "approval.requested" | "input.requested" } | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!isRequiredTurnInteractionRequestKind(value.kind)) return undefined;
+  if (isAgentCommandEvent(value)) return undefined;
+  return typeof value.command_id === "string" ? { command_id: value.command_id, kind: value.kind } : undefined;
+}
+
+function isTurnInteractionRequestPayloadForEvent(
+  value: unknown,
+  kind: "approval.requested" | "input.requested"
+): value is TurnInteractionRequestPayload {
+  if (!isRecord(value)) return false;
+  const requestKind = kind === "approval.requested" ? "approval" : "input";
+  return (
+    value.type === "turn_interaction" &&
+    typeof value.interaction_id === "string" &&
+    value.interaction_id.trim().length > 0 &&
+    value.status === "pending" &&
+    typeof value.method === "string" &&
+    value.request_kind === requestKind &&
+    typeof value.app_server_thread_id === "string" &&
+    value.app_server_thread_id.trim().length > 0 &&
+    typeof value.app_server_turn_id === "string" &&
+    value.app_server_turn_id.trim().length > 0 &&
+    typeof value.title === "string" &&
+    value.title.trim().length > 0
   );
 }
 

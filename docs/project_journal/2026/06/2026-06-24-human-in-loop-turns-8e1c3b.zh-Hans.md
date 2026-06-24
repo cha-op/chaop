@@ -45,6 +45,7 @@ superseded_by:
 - WorkspaceDO 内部 turn-interaction validator 现在也接受同 public route 一致的 object 形态 exec-policy amendment approval decision，并补了 DO 层测试覆盖它转发给 connector 的路径。
 - 浏览器提交的 interaction response 现在必须匹配已存储的 request payload：如果 app-server 给出了 `available_decisions`，approval decision 必须在其中；input answer 必须完整覆盖请求的问题并且非空；Thread Centre 也会展示完整 network approval context，让未知但可能影响安全判断的字段可见。
 - GitHub Codex 后续 review 修复移除了绝对 workspace 形态的 sample path，app-server auto-resolution deadline 改为 checked arithmetic，HITL response delivery ack 会等到 app-server response 写回成功后再确认，并且 connector 在等待 request event acknowledgement 时也会处理已经到达的 HITL response。
+- Independent PR review 又发现两个 fail-closed 缺口。WorkspaceDO 现在会在任何 DB 写入前用 negative ack 拒绝 malformed 的必要 `approval.requested` 和 `input.requested` events；app-server `availableDecisions` 里若全是无效 decision，也会保留空 `available_decisions` list，让浏览器和 API 不再回退到无限制默认 approval choices。
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。

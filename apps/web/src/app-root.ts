@@ -821,19 +821,21 @@ export class ChaopApp extends LitElement {
             `
           : nothing}
         <div class="interaction-actions">
-          ${approvalDecisions.map(
-            (decision) => html`
-              <button
-                type="button"
-                class=${approvalDecisionIsPrimary(decision) ? "primary-action" : ""}
-                title=${this.safetyButtonTitle("turn_interaction")}
-                ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
-                @click=${() => void this.resolveApprovalInteraction(interaction, decision)}
-              >
-                ${approvalDecisionLabel(decision)}
-              </button>
-            `
-          )}
+          ${approvalDecisions.length === 0
+            ? html`<small>No approval decisions available.</small>`
+            : approvalDecisions.map(
+                (decision) => html`
+                  <button
+                    type="button"
+                    class=${approvalDecisionIsPrimary(decision) ? "primary-action" : ""}
+                    title=${this.safetyButtonTitle("turn_interaction")}
+                    ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
+                    @click=${() => void this.resolveApprovalInteraction(interaction, decision)}
+                  >
+                    ${approvalDecisionLabel(decision)}
+                  </button>
+                `
+              )}
         </div>
       </section>
     `;
@@ -2078,7 +2080,7 @@ function formatMode(mode: string): string {
 function approvalDecisionsForPayload(
   payload: PendingTurnInteraction["payload"]
 ): TurnInteractionApprovalDecision[] {
-  return payload.available_decisions && payload.available_decisions.length > 0
+  return payload.available_decisions !== undefined
     ? payload.available_decisions
     : ["accept", "acceptForSession", "decline", "cancel"];
 }

@@ -4094,7 +4094,7 @@ function validateTurnInteractionResponseForRequest(
   }
   if (response.kind === "approval") {
     const available = request.available_decisions;
-    if (available && available.length > 0 && !available.some((decision) => jsonValueEquals(decision, response.decision))) {
+    if (available !== undefined && !available.some((decision) => jsonValueEquals(decision, response.decision))) {
       throw new CommandTargetError("Turn interaction approval decision is not available for this request", 400);
     }
     return;
