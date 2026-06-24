@@ -525,10 +525,11 @@ export class ChaopApp extends LitElement {
     const task = this.taskForThread(thread.id);
     const events = this.eventsForThread(thread.id);
     const turns = threadTurnsForDisplay(thread.id, this.data!.running_commands, events);
-    const command = this.lastCommandId
+    const command = (this.lastCommandId
       ? turns.find((turn) => turn.command_id === this.lastCommandId)?.command
-      : turns.find((turn) => turn.command)?.command
-        ?? this.data!.running_commands.find((item) => item.thread_id === thread.id);
+      : undefined)
+      ?? turns.find((turn) => turn.command)?.command
+      ?? this.data!.running_commands.find((item) => item.thread_id === thread.id);
 
     return html`
       <section class="page-grid thread-grid">
@@ -1354,6 +1355,9 @@ export class ChaopApp extends LitElement {
   }
 
   private openThread(threadId: string): void {
+    if (this.selectedThreadId !== threadId) {
+      this.lastCommandId = undefined;
+    }
     this.selectedThreadId = threadId;
     this.commandModeExplicit = false;
     this.ensureCommandMode();
@@ -1370,8 +1374,12 @@ export class ChaopApp extends LitElement {
 
   private ensureSelectedThread(): void {
     if (!this.data || this.view !== "thread-centre") return;
+    const previousThreadId = this.selectedThreadId;
     const selected = this.selectedThread();
     this.selectedThreadId = selected?.id;
+    if (previousThreadId !== this.selectedThreadId) {
+      this.lastCommandId = undefined;
+    }
     this.ensureCommandMode();
   }
 
