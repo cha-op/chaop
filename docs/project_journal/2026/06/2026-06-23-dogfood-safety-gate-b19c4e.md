@@ -46,7 +46,7 @@ superseded_by:
 - Narrowed safety copy from broad "dogfood writes" wording to "guarded dogfood actions" so cleanup paths that remain intentionally available are not misrepresented.
 - Split conservative Host Session refresh blocking from focused pending command dispatch so a conservative posture does not strand already accepted work.
 - Re-checked `command_create` safety before every pending command lease/dispatch, so terminal command cleanup cannot start another pending command while dogfood safety is paused, hard-limited, or throttled.
-- Failed already dispatched commands when safety blocks non-terminal connector progress events, so paused or hard-limited commands do not stay leased or running until disconnect.
+- Dropped non-terminal connector progress events during pause, throttle, or hard limit without D1 writes, while still acknowledging them so connectors can send the terminal cleanup event.
 - Treated malformed emergency-pause setting rows as fail-closed, matching unreadable pause state behaviour.
 - Removed machine-local validation paths from the tracked journal entries.
 - Kept the standalone safety-posture endpoint aligned with sample bootstrap data when local dev mode runs without a D1 binding.
@@ -63,6 +63,7 @@ superseded_by:
 - Dropped in-flight `agent.host_sessions` reports when `host_session_refresh` safety blocks broad inventory writes, while still releasing conservative pending command dispatch after clearing the refresh marker.
 - Added `app_server_instances_report` safety coverage so emergency pause, throttling, and hard limits also block connector status-report persistence.
 - Derived bootstrap safety from the same Budget Summary constraints and state used by the Budget Board, so live telemetry cannot make the initial budget and safety postures disagree.
+- Kept terminal command events as the cleanup path under safety blocks, and prevented that cleanup from dispatching new work while `command_create` is blocked.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

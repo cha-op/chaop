@@ -46,7 +46,7 @@ superseded_by:
 - 已把 safety 文案从宽泛的 “dogfood writes” 收窄为 “guarded dogfood actions”，避免把仍需保留的 cleanup paths 误描述为同一类受阻动作。
 - 已把 conservative Host Session refresh block 和 focused pending command dispatch 拆开，避免 conservative posture 卡住已经接受的工作。
 - 每次 pending command lease/dispatch 前都会重新检查 `command_create` safety，因此 terminal command cleanup 不会在 dogfood safety pause、hard limit 或 throttled 状态下启动下一条 pending command。
-- 当 safety 挡住非终态 connector progress events 时，已经 dispatch 的 command 现在会被标记为 failed，避免 paused 或 hard-limited command 一直停在 leased 或 running。
+- pause、throttle 或 hard limit 期间，非终态 connector progress events 现在会被丢弃且不写 D1，但仍会 ACK，让 connector 可以继续发送 terminal cleanup event。
 - malformed emergency-pause setting rows 现在会 fail closed，与 pause state 无法读取时的行为保持一致。
 - 已移除 tracked journal entries 中的本机验证路径。
 - 本地 dev mode 无 D1 binding 时，standalone safety-posture endpoint 现在会与 sample bootstrap data 保持一致。
@@ -63,6 +63,7 @@ superseded_by:
 - 当 `host_session_refresh` safety 阻挡宽泛清单写入时，进行中的 `agent.host_sessions` report 现在会被丢弃；清掉刷新标记后，保守状态下仍会继续释放已允许的待派发命令。
 - 已新增 `app_server_instances_report` safety 覆盖；紧急暂停、限流和硬限制现在也会阻挡连接器状态报告持久化。
 - 启动响应里的安全姿态现在会复用预算板同一份预算约束和状态推导，因此实时遥测不会让首屏预算姿态和安全姿态互相矛盾。
+- safety block 期间继续把 terminal command event 作为 cleanup path，同时确保 cleanup 不会在 `command_create` 被阻挡时继续派发新工作。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

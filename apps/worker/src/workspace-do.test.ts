@@ -2149,7 +2149,7 @@ test("agent event ack rejects stale command events", async () => {
   });
 });
 
-test("dogfood safety pause fails non-terminal agent events so dispatched commands do not stay active", async () => {
+test("dogfood safety pause drops non-terminal agent events without stranding the connector", async () => {
   const sent: string[] = [];
   const browserSent: string[] = [];
   const agentSocket = mutableSocketWithAttachment({
@@ -2183,27 +2183,21 @@ test("dogfood safety pause fails non-terminal agent events so dispatched command
   assert.equal(sent.length, 1);
   const ack = JSON.parse(sent[0] ?? "{}") as {
     kind?: string;
-    payload?: { command_id?: string; kind?: string; accepted?: boolean; reason?: string };
+    payload?: { command_id?: string; kind?: string; accepted?: boolean; dropped?: boolean; reason?: string };
   };
   assert.equal(ack.kind, "server.ack");
   assert.equal(ack.payload?.command_id, "command-1");
   assert.equal(ack.payload?.kind, "command.output");
-  assert.equal(ack.payload?.accepted, false);
+  assert.equal(ack.payload?.accepted, true);
+  assert.equal(ack.payload?.dropped, true);
   assert.match(ack.payload?.reason ?? "", /Dogfood emergency pause is active/);
   assert.deepEqual(
     (agentSocket.deserializeAttachment() as { activeCommandIds?: string[] }).activeCommandIds,
-    []
+    ["command-1"]
   );
-  assert.equal(browserSent.length, 1);
-  const browserEvent = JSON.parse(browserSent[0] ?? "{}") as {
-    kind?: string;
-    payload?: { event?: { kind?: string; summary?: string } };
-  };
-  assert.equal(browserEvent.kind, "thread.event");
-  assert.equal(browserEvent.payload?.event?.kind, "command.failed");
-  assert.match(browserEvent.payload?.event?.summary ?? "", /Dogfood safety blocked command progress/);
-  assert.equal(db.commandFailures, 1);
-  assert.equal(db.eventInserts, 1);
+  assert.equal(browserSent.length, 0);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.eventInserts, 0);
 });
 
 test("terminal agent events bypass dogfood safety block and clear socket activity", async () => {

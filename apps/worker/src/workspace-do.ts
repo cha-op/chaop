@@ -357,20 +357,13 @@ export class WorkspaceDO implements DurableObject {
           await assertDogfoodSafetyActionAllowed(this.env, "agent_event");
         } catch (error) {
           if (error instanceof DogfoodSafetyError) {
-            const failedEvents = await failActiveCommandsForConnector(this.env, connectorId, {
-              commandIds: [message.payload.command_id],
-              failureSummary: `Dogfood safety blocked command progress: ${error.message}`
-            });
-            this.clearSocketCommand(ws, connectorId, message.payload.command_id);
-            for (const event of failedEvents) {
-              this.broadcastToBrowsers(threadEventMessage(event));
-            }
             ws.send(
               JSON.stringify(
                 createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
                   command_id: message.payload.command_id,
                   kind: message.payload.kind,
-                  accepted: false,
+                  accepted: true,
+                  dropped: true,
                   reason: error.message
                 })
               )
