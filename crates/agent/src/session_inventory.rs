@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, RecvTimeoutError, Sender},
+    mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
 };
 use std::time::{Duration, Instant};
 use tungstenite::{
@@ -22,6 +22,7 @@ const APP_SERVER_THREAD_SOURCE_KINDS: [&str; 3] = ["cli", "vscode", "appServer"]
 const APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE: usize = 200;
 const APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE: usize = 2;
 const APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS: u64 = 12;
+const AUTO_RESOLUTION_RESPONSE_GRACE_MS: u64 = 250;
 
 type AppServerSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -2307,10 +2308,39 @@ fn receive_turn_interaction_response(
     cancel: &AtomicBool,
     auto_resolution_deadline: Option<Instant>,
 ) -> Result<TurnInteractionResponseDispatch, AppServerCommandError> {
+    let auto_resolution_grace_deadline = auto_resolution_deadline
+        .map(|deadline| deadline + Duration::from_millis(AUTO_RESOLUTION_RESPONSE_GRACE_MS));
     loop {
         ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
+        if let Some(dispatch) =
+            try_receive_turn_interaction_response(receiver, command_id, interaction_id)?
+        {
+            return Ok(dispatch);
+        }
         let now = Instant::now();
         if auto_resolution_deadline.is_some_and(|auto_deadline| now >= auto_deadline) {
+            if let Some(grace_deadline) = auto_resolution_grace_deadline {
+                if now < grace_deadline {
+                    let remaining = deadline.saturating_duration_since(now);
+                    let grace_wait = grace_deadline.saturating_duration_since(now);
+                    let wait = remaining.min(grace_wait).min(Duration::from_millis(100));
+                    match receiver.recv_timeout(wait) {
+                        Ok(dispatch)
+                            if dispatch.command_id == command_id
+                                && dispatch.interaction_id == interaction_id =>
+                        {
+                            return Ok(dispatch);
+                        }
+                        Ok(_) => continue,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err(AppServerCommandError::Other(
+                                "turn interaction response channel closed".to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
             return Ok(auto_resolved_input_response(command_id, interaction_id));
         }
         let remaining = deadline.saturating_duration_since(now);
@@ -2328,6 +2358,30 @@ fn receive_turn_interaction_response(
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
+                return Err(AppServerCommandError::Other(
+                    "turn interaction response channel closed".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+fn try_receive_turn_interaction_response(
+    receiver: &Receiver<TurnInteractionResponseDispatch>,
+    command_id: &str,
+    interaction_id: &str,
+) -> Result<Option<TurnInteractionResponseDispatch>, AppServerCommandError> {
+    loop {
+        match receiver.try_recv() {
+            Ok(dispatch)
+                if dispatch.command_id == command_id
+                    && dispatch.interaction_id == interaction_id =>
+            {
+                return Ok(Some(dispatch));
+            }
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
                 return Err(AppServerCommandError::Other(
                     "turn interaction response channel closed".to_owned(),
                 ));
@@ -7719,6 +7773,49 @@ mod tests {
             events.last().map(|event| event.kind.as_str()),
             Some("command.finished")
         );
+    }
+
+    #[test]
+    fn receive_turn_interaction_response_prefers_queued_response_at_auto_deadline() {
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut answers = HashMap::new();
+        answers.insert(
+            "q1".to_owned(),
+            TurnInteractionInputAnswer {
+                answers: vec!["Yes".to_owned()],
+            },
+        );
+        response_tx
+            .send(TurnInteractionResponseDispatch {
+                command_id: "command-1".to_owned(),
+                interaction_id: "interaction-1".to_owned(),
+                response: TurnInteractionResponse::Input { answers },
+                auto_resolved: false,
+            })
+            .expect("queue interaction response");
+        let cancel = AtomicBool::new(false);
+
+        let response = super::receive_turn_interaction_response(
+            &response_rx,
+            "command-1",
+            "interaction-1",
+            Instant::now() + Duration::from_secs(1),
+            1,
+            &cancel,
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .expect("receive queued response");
+
+        assert!(!response.auto_resolved);
+        match response.response {
+            TurnInteractionResponse::Input { answers } => {
+                assert_eq!(
+                    answers.get("q1").and_then(|answer| answer.answers.first()),
+                    Some(&"Yes".to_owned())
+                );
+            }
+            TurnInteractionResponse::Approval { .. } => panic!("expected input response"),
+        }
     }
 
     #[test]
