@@ -359,6 +359,7 @@ export class WorkspaceDO implements DurableObject {
       const finalCommandEvent =
         message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
       const progressEvent = !finalCommandEvent && message.payload.kind !== "command.started";
+      const turnInteractionEvent = isTurnInteractionEventKind(message.payload.kind);
       if (progressEvent) {
         try {
           await assertDogfoodSafetyActionAllowed(this.env, "agent_event");
@@ -369,7 +370,7 @@ export class WorkspaceDO implements DurableObject {
                 createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
                   command_id: message.payload.command_id,
                   kind: message.payload.kind,
-                  accepted: true,
+                  accepted: !turnInteractionEvent,
                   dropped: true,
                   reason: error.message
                 })
@@ -1461,6 +1462,15 @@ function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
     (record.target_host_session_id === undefined || typeof record.target_host_session_id === "string") &&
     (record.payload === undefined || isRecord(record.payload)) &&
     typeof record.summary === "string"
+  );
+}
+
+function isTurnInteractionEventKind(kind: AgentCommandEvent["kind"]): boolean {
+  return (
+    kind === "approval.requested" ||
+    kind === "approval.resolved" ||
+    kind === "input.requested" ||
+    kind === "input.received"
   );
 }
 

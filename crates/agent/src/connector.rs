@@ -1263,9 +1263,7 @@ fn wait_for_app_server_command_events(
                     deferred_messages,
                 )? {
                     cancel_codex_worker(&cancel, worker.take())?;
-                    return Err(
-                        "app-server interaction event was rejected by the control plane".into(),
-                    );
+                    return Ok(vec![app_server_interaction_rejected_event()]);
                 }
             }
             Err(TryRecvError::Disconnected) => {}
@@ -1331,6 +1329,17 @@ fn wait_for_app_server_command_events(
             cancel_codex_worker(&cancel, worker.take())?;
             return Err(error);
         }
+    }
+}
+
+fn app_server_interaction_rejected_event() -> ConnectorEvent {
+    ConnectorEvent {
+        kind: "command.failed".to_owned(),
+        priority: "P1".to_owned(),
+        summary:
+            "Codex app-server turn stopped because the control plane rejected the required interaction request."
+                .to_owned(),
+        payload: None,
     }
 }
 

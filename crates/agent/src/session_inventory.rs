@@ -35,6 +35,8 @@ pub struct TurnInteractionResponseDispatch {
     pub command_id: String,
     pub interaction_id: String,
     pub response: TurnInteractionResponse,
+    #[serde(default)]
+    pub auto_resolved: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1959,6 +1961,7 @@ fn handle_app_server_turn_request(
             )
         })?
         .to_owned();
+    let request_payload = event.payload.clone();
     channels.event_sender.send(event).map_err(|_| {
         AppServerCommandError::Other("turn interaction event channel closed".to_owned())
     })?;
@@ -1971,6 +1974,14 @@ fn handle_app_server_turn_request(
         cancel,
         auto_resolution_deadline(method, params),
     )?;
+    if response.auto_resolved {
+        let event = turn_interaction_resolution_event(&response, request_payload.as_ref())?;
+        channels.event_sender.send(event).map_err(|_| {
+            AppServerCommandError::Other(
+                "turn interaction resolution event channel closed".to_owned(),
+            )
+        })?;
+    }
     let result = app_server_turn_interaction_result(method, params, &response.response)?;
     socket
         .send(Message::Text(
@@ -2196,6 +2207,9 @@ fn turn_interaction_payload(
     if let Some(grant_root) = grant_root.filter(|value| !value.trim().is_empty()) {
         payload.insert("grant_root".to_owned(), json!(grant_root));
     }
+    if let Some(requested_permissions) = requested_permissions_from_request(params) {
+        payload.insert("requested_permissions".to_owned(), requested_permissions);
+    }
     if let Some(questions) = questions.filter(|value| !value.is_empty()) {
         payload.insert("questions".to_owned(), Value::Array(questions));
     }
@@ -2317,6 +2331,55 @@ fn auto_resolved_input_response(
         response: TurnInteractionResponse::Input {
             answers: HashMap::new(),
         },
+        auto_resolved: true,
+    }
+}
+
+fn turn_interaction_resolution_event(
+    dispatch: &TurnInteractionResponseDispatch,
+    request_payload: Option<&Value>,
+) -> Result<ConnectorEvent, AppServerCommandError> {
+    let request_payload = request_payload.ok_or_else(|| {
+        AppServerCommandError::Other(
+            "turn interaction resolution did not include request payload".to_owned(),
+        )
+    })?;
+    let title = request_payload
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("requested interaction");
+    match &dispatch.response {
+        TurnInteractionResponse::Input { answers } => Ok(ConnectorEvent {
+            kind: "input.received".to_owned(),
+            priority: "P1".to_owned(),
+            summary: format!("Input auto-resolved for {title}."),
+            payload: Some(json!({
+                "type": "turn_interaction_resolution",
+                "interaction_id": dispatch.interaction_id,
+                "status": "answered",
+                "answer_count": answers.len()
+            })),
+        }),
+        TurnInteractionResponse::Approval { decision } => {
+            let status = match decision.as_str() {
+                "accept" => "accepted",
+                "acceptForSession" => "accepted_for_session",
+                "decline" => "declined",
+                "cancel" => "cancelled",
+                _ => "cancelled",
+            };
+            Ok(ConnectorEvent {
+                kind: "approval.resolved".to_owned(),
+                priority: "P1".to_owned(),
+                summary: format!("Approval {} for {title}.", status.replace('_', " ")),
+                payload: Some(json!({
+                    "type": "turn_interaction_resolution",
+                    "interaction_id": dispatch.interaction_id,
+                    "status": status,
+                    "decision": decision
+                })),
+            })
+        }
     }
 }
 
@@ -2373,6 +2436,22 @@ fn granted_permissions_from_request(params: &Value) -> Value {
         granted.insert("fileSystem".to_owned(), file_system.clone());
     }
     Value::Object(granted)
+}
+
+fn requested_permissions_from_request(params: &Value) -> Option<Value> {
+    let requested = params.get("permissions")?;
+    let mut permissions = serde_json::Map::new();
+    if let Some(network) = requested.get("network").filter(|value| !value.is_null()) {
+        permissions.insert("network".to_owned(), network.clone());
+    }
+    if let Some(file_system) = requested.get("fileSystem").filter(|value| !value.is_null()) {
+        permissions.insert("fileSystem".to_owned(), file_system.clone());
+    }
+    if permissions.is_empty() {
+        None
+    } else {
+        Some(Value::Object(permissions))
+    }
 }
 
 fn notification_matches(params: &Value, thread_id: &str, turn_id: &str) -> bool {
@@ -7048,6 +7127,7 @@ mod tests {
                 response: TurnInteractionResponse::Approval {
                     decision: "accept".to_owned(),
                 },
+                auto_resolved: false,
             })
             .expect("send interaction response");
 
@@ -7059,6 +7139,130 @@ mod tests {
                 .pointer("/result/decision")
                 .and_then(Value::as_str),
             Some("accept")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn app_server_command_forwards_permissions_approval_details() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": 83,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-permissions-1",
+                "reason": "Needs access to inspect the workspace and fetch package metadata.",
+                "cwd": "/tmp/project",
+                "permissions": {
+                    "network": {
+                        "host": "registry.npmjs.org"
+                    },
+                    "fileSystem": {
+                        "read": ["/tmp/project"],
+                        "write": ["/tmp/project/package-lock.json"]
+                    }
+                }
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                Some("/tmp/project"),
+                "command-1",
+                "Inspect dependencies",
+                Arc::new(AtomicBool::new(false)),
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("permissions approval event");
+        assert_eq!(event.kind, "approval.requested");
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("subject"))
+                .and_then(Value::as_str),
+            Some("permissions")
+        );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.pointer("/requested_permissions/network/host"))
+                .and_then(Value::as_str),
+            Some("registry.npmjs.org")
+        );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| {
+                    payload.pointer("/requested_permissions/fileSystem/write/0")
+                })
+                .and_then(Value::as_str),
+            Some("/tmp/project/package-lock.json")
+        );
+        let interaction_id = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("interaction_id"))
+            .and_then(Value::as_str)
+            .expect("interaction id")
+            .to_owned();
+        response_tx
+            .send(TurnInteractionResponseDispatch {
+                command_id: "command-1".to_owned(),
+                interaction_id,
+                response: TurnInteractionResponse::Approval {
+                    decision: "acceptForSession".to_owned(),
+                },
+                auto_resolved: false,
+            })
+            .expect("send permissions response");
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("app-server permissions response");
+        assert_eq!(
+            app_response
+                .pointer("/result/scope")
+                .and_then(Value::as_str),
+            Some("session")
+        );
+        assert_eq!(
+            app_response
+                .pointer("/result/permissions/network/host")
+                .and_then(Value::as_str),
+            Some("registry.npmjs.org")
         );
         let events = handle.join().expect("command thread");
         assert_eq!(
@@ -7157,6 +7361,7 @@ mod tests {
                 command_id: "command-1".to_owned(),
                 interaction_id,
                 response: TurnInteractionResponse::Input { answers },
+                auto_resolved: false,
             })
             .expect("send input response");
 
@@ -7240,6 +7445,27 @@ mod tests {
                 .and_then(|payload| payload.get("auto_resolution_ms"))
                 .and_then(Value::as_u64),
             Some(10)
+        );
+
+        let resolution_event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("auto-resolution event");
+        assert_eq!(resolution_event.kind, "input.received");
+        assert_eq!(
+            resolution_event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str),
+            Some("turn_interaction_resolution")
+        );
+        assert_eq!(
+            resolution_event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("answer_count"))
+                .and_then(Value::as_u64),
+            Some(0)
         );
 
         let app_response = app_responses

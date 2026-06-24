@@ -32,6 +32,11 @@ superseded_by:
 - PR review 前跑完整本地 test/build gate。
 - 最终代码修改后刷新 API 和 Web 部署，然后运行 deployed E2E smoke，并检查 budget/safety posture。
 
+## Review follow-up
+- 最后一轮 review 发现 permission approval 需要先向 operator 展示 requested `network` 和 `fileSystem` 明细，才能安全批准 turn 或 session scope。
+- Review 也发现 dogfood safety pause 不能对隐藏的 approval/input request event 做 fake accept；现在 control plane 拒绝必要 interaction event 时，connector 会让对应 turn 可见地失败。
+- App-server input auto-resolution 现在会发出 `input.received` resolution event，这样 Browser clients 能清掉过期的 pending input controls，迟到提交也会被现有 resolution guard 拒绝。
+
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。
 - Resolution claim 按 command 和 interaction 共同限定，避免不同 turn 复用 app-server request ID 时让后续 response 被错误拦住。

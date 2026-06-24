@@ -776,6 +776,14 @@ export class ChaopApp extends LitElement {
               </dl>
             `
           : nothing}
+        ${payload.requested_permissions
+          ? html`
+              <div class="interaction-permissions">
+                <span>Requested permissions</span>
+                <pre><code>${formatJson(payload.requested_permissions)}</code></pre>
+              </div>
+            `
+          : nothing}
         <div class="interaction-actions">
           <button
             type="button"
@@ -2367,6 +2375,14 @@ function taskStateForEvent(kind: ThreadEvent["kind"]): TaskSummary["state"] | un
   if (kind === "command.finished") return "done";
   if (kind === "command.failed") return "failed";
   return undefined;
+}
+
+function formatJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? "";
+  } catch {
+    return "Unavailable";
+  }
 }
 
 function isTerminalCommandState(state: CommandSummary["state"]): boolean {

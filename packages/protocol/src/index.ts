@@ -491,6 +491,7 @@ export type TurnInteractionRequestPayload = {
   command?: string | undefined;
   cwd?: string | undefined;
   grant_root?: string | undefined;
+  requested_permissions?: Record<string, unknown> | undefined;
   questions?: TurnInteractionInputQuestion[] | undefined;
   auto_resolution_ms?: number | null | undefined;
 };

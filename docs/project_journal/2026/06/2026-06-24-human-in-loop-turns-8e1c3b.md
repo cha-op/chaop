@@ -32,6 +32,11 @@ superseded_by:
 - Run the full local test/build gate before PR review.
 - Refresh API and Web deployments after the final code changes, then run the deployed E2E smoke with budget/safety checks.
 
+## Review Follow-Up
+- The final review pass found that permission approvals needed to show the requested `network` and `fileSystem` details before an operator could approve turn or session scope.
+- The review also found that dogfood safety pauses must not fake-accept hidden approval/input request events; the connector now fails the affected turn visibly when the control plane rejects a required interaction event.
+- App-server input auto-resolution now emits an `input.received` resolution event so Browser clients clear stale pending input controls and late submissions are rejected by the existing resolution guard.
+
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.
 - Resolution claims are scoped by command plus interaction so repeated app-server request IDs across turns do not strand later responses.
