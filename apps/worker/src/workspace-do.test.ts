@@ -2188,8 +2188,12 @@ test("turn interaction response waits for connector delivery acknowledgement", a
       command_id: "command-1",
       interaction_id: "interaction-1",
       response: {
-        kind: "input",
-        answers: {}
+        kind: "approval",
+        decision: {
+          acceptWithExecpolicyAmendment: {
+            execpolicy_amendment: ["touch", "requested.txt"]
+          }
+        }
       }
     })
   }));
@@ -2201,6 +2205,7 @@ test("turn interaction response waits for connector delivery acknowledgement", a
       request_id?: string;
       command_id?: string;
       interaction_id?: string;
+      response?: unknown;
     };
     command_id?: string;
     target?: { type?: string };
@@ -2208,6 +2213,14 @@ test("turn interaction response waits for connector delivery acknowledgement", a
   assert.equal(delivery.kind, "turn.interaction_response");
   assert.equal(delivery.payload?.command_id, "command-1");
   assert.equal(delivery.payload?.interaction_id, "interaction-1");
+  assert.deepEqual(delivery.payload?.response, {
+    kind: "approval",
+    decision: {
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: ["touch", "requested.txt"]
+      }
+    }
+  });
   assert.match(delivery.payload?.request_id ?? "", /^turn-interaction-/);
   assert.equal(delivery.command_id, "command-1");
   assert.deepEqual(delivery.target, { type: "connector" });

@@ -15,6 +15,7 @@ import {
   type ThreadArchiveSyncDispatch,
   type ThreadArchiveSyncResult,
   type ThreadEvent,
+  type TurnInteractionApprovalDecision,
   type TurnInteractionResponseAck,
   type TurnInteractionResponseDelivery,
   type TurnInteractionResponseDispatch
@@ -1563,12 +1564,7 @@ function isTurnInteractionResponseDispatch(value: unknown): value is TurnInterac
   const response = value.response;
   if (!isRecord(response)) return false;
   if (response.kind === "approval") {
-    return (
-      response.decision === "accept" ||
-      response.decision === "acceptForSession" ||
-      response.decision === "decline" ||
-      response.decision === "cancel"
-    );
+    return isTurnInteractionApprovalDecision(response.decision);
   }
   if (response.kind === "input") {
     return isRecord(response.answers) &&
@@ -1579,6 +1575,23 @@ function isTurnInteractionResponseDispatch(value: unknown): value is TurnInterac
       );
   }
   return false;
+}
+
+function isTurnInteractionApprovalDecision(value: unknown): value is TurnInteractionApprovalDecision {
+  if (
+    value === "accept" ||
+    value === "acceptForSession" ||
+    value === "decline" ||
+    value === "cancel"
+  ) {
+    return true;
+  }
+  if (!isRecord(value)) return false;
+  const amendment = value.acceptWithExecpolicyAmendment;
+  return isRecord(amendment) &&
+    Array.isArray(amendment.execpolicy_amendment) &&
+    amendment.execpolicy_amendment.length > 0 &&
+    amendment.execpolicy_amendment.every((item) => typeof item === "string" && item.trim().length > 0);
 }
 
 function isTurnInteractionResponseAck(value: unknown): value is TurnInteractionResponseAck {

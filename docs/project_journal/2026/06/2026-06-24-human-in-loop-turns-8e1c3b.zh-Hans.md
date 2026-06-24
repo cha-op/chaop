@@ -42,6 +42,7 @@ superseded_by:
 - 最终 review 发现 response delivery acknowledgement 还需要证明 app-server worker 已消费同一个 interaction response。现在 connector 会跟踪每个 app-server turn 的 active interaction，并等待本地 worker delivery acknowledgement 后，Worker 才会记录 browser response。
 - 重复 interaction-resolution insert 在输给 unique constraint 时，会 best-effort 回滚本次分配的 sequence number，避免 sequence gap 和后续不必要的 accounting。
 - App-server v2 command approval 兼容性现在会保留 `availableDecisions`、object 形态的 `acceptWithExecpolicyAmendment` response、`proposedExecpolicyAmendment`、`commandActions` 和 `networkApprovalContext`，让 Thread Centre 能显示 network-specific approval，并把准确的 accepted decision 回写给 app-server。
+- WorkspaceDO 内部 turn-interaction validator 现在也接受同 public route 一致的 object 形态 exec-policy amendment approval decision，并补了 DO 层测试覆盖它转发给 connector 的路径。
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。
