@@ -67,6 +67,7 @@ superseded_by:
 - Merged current-day persisted maximum Cloudflare telemetry into Budget Summary calculations, keeping `/api/bootstrap` and `/api/usage-summary` aligned with guarded write decisions when a later live sample is lower.
 - Reused the short-cached live Cloudflare telemetry sample in guarded write checks, so an explicit live safety refresh can still block writes in the same Worker isolate even when telemetry sample persistence fails.
 - Guarded app-server stopped status writes during connector WebSocket close, preventing disconnect cleanup from bypassing the `app_server_instances_report` safety action.
+- Extended the live telemetry fallback cache across sample-bucket boundaries for the same UTC day and telemetry selector, preventing a failed telemetry upsert from dropping hard-limit protection when the next bucket starts.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

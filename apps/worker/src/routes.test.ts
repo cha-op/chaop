@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { handleRequest } from "./routes.js";
-import { loadBudgetSummaryFromDb, loadDogfoodSafetyPostureFromDb } from "./db.js";
+import {
+  DogfoodSafetyError,
+  assertDogfoodSafetyActionAllowed,
+  loadBudgetSummaryFromDb,
+  loadDogfoodSafetyPostureFromDb
+} from "./db.js";
 import type { Env } from "./types.js";
 
 const devEnv: Env = {
@@ -2873,6 +2878,69 @@ test("command creation safety guard uses cached live hard limit when telemetry p
     assert.equal(commandBody.guard.state, "blocked");
     assert.equal(commandBody.guard.budget_state, "hard_limited");
     assert.equal(commandBody.safety.state, "hard_limited");
+    assert.equal(fetchCount, 1);
+  } finally {
+    console.warn = originalWarn;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("command creation safety guard keeps cached live hard limit across telemetry sample buckets", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  let fetchCount = 0;
+  console.warn = () => undefined;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 20 } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten: 120_000 } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const env: Env = {
+    ...devEnv,
+    DB: commandTargetDb({ id: "connector-online" }, {
+      failTelemetrySampleWrites: true
+    }),
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "telemetry-cache-cross-bucket-account",
+    CF_TELEMETRY_API_WORKER: "chaop-api-cross-bucket",
+    CF_TELEMETRY_D1_DATABASE_ID: "telemetry-cache-cross-bucket-database",
+    CF_TELEMETRY_CACHE_SECONDS: "300",
+    CF_TELEMETRY_SAMPLE_SECONDS: "1"
+  };
+
+  try {
+    const safety = await loadDogfoodSafetyPostureFromDb(
+      env,
+      "2026-06-15T09:04:59.000Z",
+      {},
+      { refreshCloudflareTelemetry: true }
+    );
+    assert.equal(safety.state, "hard_limited");
+
+    await assert.rejects(
+      () => assertDogfoodSafetyActionAllowed(env, "command_create", "2026-06-15T09:05:01.000Z"),
+      (error) =>
+        error instanceof DogfoodSafetyError &&
+        error.guard.action === "command_create" &&
+        error.guard.state === "blocked" &&
+        error.guard.budget_state === "hard_limited"
+    );
     assert.equal(fetchCount, 1);
   } finally {
     console.warn = originalWarn;
