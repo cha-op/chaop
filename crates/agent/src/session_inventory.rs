@@ -1875,10 +1875,10 @@ fn handle_app_server_turn_message(
         return Ok(None);
     };
     let params = value.get("params").unwrap_or(&Value::Null);
-    if let Some(request_id) = value.get("id").and_then(Value::as_i64)
+    if let Some(request_id) = json_rpc_turn_request_id(value.get("id"))
         && handle_app_server_turn_request(
             socket,
-            request_id,
+            &request_id,
             method,
             params,
             thread_id,
@@ -1928,7 +1928,7 @@ fn handle_app_server_turn_message(
 
 fn handle_app_server_turn_request(
     socket: &mut AppServerSocket,
-    request_id: i64,
+    request_id: &Value,
     method: &str,
     params: &Value,
     thread_id: &str,
@@ -2009,7 +2009,7 @@ fn app_server_turn_request_method(method: &str) -> bool {
 
 fn turn_interaction_event(
     method: &str,
-    request_id: i64,
+    request_id: &Value,
     params: &Value,
 ) -> Result<ConnectorEvent, AppServerCommandError> {
     match method {
@@ -2151,7 +2151,7 @@ fn turn_interaction_event(
 #[allow(clippy::too_many_arguments)]
 fn turn_interaction_payload(
     method: &str,
-    request_id: i64,
+    request_id: &Value,
     params: &Value,
     request_kind: &str,
     subject: Option<&str>,
@@ -2219,13 +2219,30 @@ fn turn_interaction_payload(
     Ok(Value::Object(payload))
 }
 
-fn turn_interaction_id(method: &str, request_id: i64, params: &Value) -> String {
+fn turn_interaction_id(method: &str, request_id: &Value, params: &Value) -> String {
+    let request_id = json_rpc_id_fragment(request_id);
     params
         .get("approvalId")
         .and_then(Value::as_str)
         .or_else(|| params.get("itemId").and_then(Value::as_str))
         .map(|value| format!("{method}:{value}:{request_id}"))
         .unwrap_or_else(|| format!("{method}:{request_id}"))
+}
+
+fn json_rpc_turn_request_id(value: Option<&Value>) -> Option<Value> {
+    match value? {
+        Value::String(_) => value.cloned(),
+        Value::Number(number) if number.is_i64() || number.is_u64() => value.cloned(),
+        _ => None,
+    }
+}
+
+fn json_rpc_id_fragment(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        _ => value.to_string(),
+    }
 }
 
 fn turn_interaction_question(value: &Value) -> Option<Value> {
@@ -7368,6 +7385,106 @@ mod tests {
         let app_response = app_responses
             .recv_timeout(Duration::from_secs(1))
             .expect("app-server input response");
+        assert_eq!(
+            app_response
+                .pointer("/result/answers/q1/answers/0")
+                .and_then(Value::as_str),
+            Some("Yes")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn app_server_command_handles_string_json_rpc_interaction_id() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": "input-request-1",
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-input-1",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "header": "Confirm",
+                        "question": "Continue?",
+                        "isOther": false,
+                        "isSecret": false
+                    }
+                ],
+                "autoResolutionMs": null
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                None,
+                "command-1",
+                "Ask for input",
+                Arc::new(AtomicBool::new(false)),
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input event");
+        assert_eq!(event.kind, "input.requested");
+        let interaction_id = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("interaction_id"))
+            .and_then(Value::as_str)
+            .expect("interaction id")
+            .to_owned();
+        let mut answers = HashMap::new();
+        answers.insert(
+            "q1".to_owned(),
+            TurnInteractionInputAnswer {
+                answers: vec!["Yes".to_owned()],
+            },
+        );
+        response_tx
+            .send(TurnInteractionResponseDispatch {
+                command_id: "command-1".to_owned(),
+                interaction_id,
+                response: TurnInteractionResponse::Input { answers },
+                auto_resolved: false,
+            })
+            .expect("send input response");
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("app-server input response");
+        assert_eq!(
+            app_response.get("id").and_then(Value::as_str),
+            Some("input-request-1")
+        );
         assert_eq!(
             app_response
                 .pointer("/result/answers/q1/answers/0")

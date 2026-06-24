@@ -1402,7 +1402,7 @@ fn handle_turn_interaction_response_text(
     }
     let dispatch: TurnInteractionResponseDispatch = serde_json::from_value(envelope.payload)?;
     if dispatch.command_id == command_id {
-        sender.send(dispatch)?;
+        let _ = sender.send(dispatch);
     }
     Ok(true)
 }
@@ -1770,9 +1770,10 @@ mod tests {
         app_server_instances_message_with_report_id, apply_agent_ready_ack_text,
         apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
         bounded_app_server_instance_text, classify_ack_wait_text, command_events,
-        drain_pending_connector_events, handle_background_ack_message, host_sessions_ack_message,
-        host_sessions_message, host_sessions_retry_interval, is_read_timeout,
-        record_agent_ready_sent, requires_app_server_execution_mode, should_send_agent_ready,
+        drain_pending_connector_events, handle_background_ack_message,
+        handle_turn_interaction_response_text, host_sessions_ack_message, host_sessions_message,
+        host_sessions_retry_interval, is_read_timeout, record_agent_ready_sent,
+        requires_app_server_execution_mode, should_send_agent_ready,
         should_send_app_server_instances, should_send_host_sessions,
     };
     use crate::app_server_manager::AppServerManager;
@@ -1973,6 +1974,21 @@ mod tests {
 
         assert!(!accepted);
         assert_eq!(dispatched, vec!["input.requested"]);
+    }
+
+    #[test]
+    fn late_turn_interaction_response_is_consumed_after_receiver_closes() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+
+        let handled = handle_turn_interaction_response_text(
+            r#"{"kind":"turn.interaction_response","payload":{"command_id":"command-1","interaction_id":"interaction-1","response":{"kind":"input","answers":{}}}}"#,
+            "command-1",
+            &sender,
+        )
+        .expect("late response should not fail");
+
+        assert!(handled);
     }
 
     #[test]

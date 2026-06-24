@@ -393,8 +393,22 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
         throw error;
       }
-      const event = await recordTurnInteractionResolutionInDb(env, eventId, payload.value);
-      await broadcastThreadEvents(env, [event]);
+      let event: ThreadEvent;
+      try {
+        event = await recordTurnInteractionResolutionInDb(env, eventId, payload.value, {
+          allowExisting: true
+        });
+      } catch (error) {
+        await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+        throw error;
+      }
+      try {
+        await broadcastThreadEvents(env, [event]);
+      } catch (error) {
+        console.warn("Turn interaction resolution broadcast failed", {
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
       const response: ResolveTurnInteractionResponse = {
         accepted: true,
         event

@@ -1672,7 +1672,8 @@ export async function prepareTurnInteractionResolutionInDb(
 export async function recordTurnInteractionResolutionInDb(
   env: Env,
   eventId: string,
-  response: ResolveTurnInteractionRequest
+  response: ResolveTurnInteractionRequest,
+  options: { allowExisting?: boolean } = {}
 ): Promise<ThreadEvent> {
   if (!env.DB) {
     throw new Error("DB binding is required for turn interaction resolution");
@@ -1703,19 +1704,30 @@ export async function recordTurnInteractionResolutionInDb(
   if (!payload) {
     throw new CommandTargetError("Turn interaction payload is unavailable", 409);
   }
-  if (await hasTurnInteractionResolution(env, row.command_id, payload.interaction_id)) {
+  const existing = await findTurnInteractionResolution(env, row.command_id, payload.interaction_id);
+  if (existing) {
+    if (options.allowExisting) return existing;
     throw new CommandTargetError("Turn interaction has already been resolved", 409);
   }
   const resolution = turnInteractionResolutionEvent(response, payload);
-  const event = await appendEvent(env, {
-    workspace_id: row.workspace_id,
-    thread_id: row.thread_id,
-    command_id: row.command_id,
-    kind: response.kind === "approval" ? "approval.resolved" : "input.received",
-    priority: "P1",
-    summary: resolution.summary,
-    payload: resolution.payload
-  });
+  let event: ThreadEvent | undefined;
+  try {
+    event = await appendEvent(env, {
+      workspace_id: row.workspace_id,
+      thread_id: row.thread_id,
+      command_id: row.command_id,
+      kind: response.kind === "approval" ? "approval.resolved" : "input.received",
+      priority: "P1",
+      summary: resolution.summary,
+      payload: resolution.payload
+    });
+  } catch (error) {
+    const raced = options.allowExisting
+      ? await findTurnInteractionResolution(env, row.command_id, payload.interaction_id)
+      : undefined;
+    if (raced && isUniqueConstraintError(error)) return raced;
+    throw error;
+  }
   if (!event) {
     throw new NotFoundError("Thread not found");
   }
@@ -4022,17 +4034,26 @@ async function hasTurnInteractionResolution(
   commandId: string,
   interactionId: string
 ): Promise<boolean> {
+  return Boolean(await findTurnInteractionResolution(env, commandId, interactionId));
+}
+
+async function findTurnInteractionResolution(
+  env: Env,
+  commandId: string,
+  interactionId: string
+): Promise<ThreadEvent | undefined> {
   const row = await env.DB!.prepare(
-    `SELECT id
+    `SELECT id, thread_id, command_id, seq, kind, priority, summary, payload_json, created_at
      FROM events
      WHERE command_id = ?
        AND kind IN ('approval.resolved', 'input.received')
        AND json_extract(payload_json, '$.interaction_id') = ?
+     ORDER BY created_at DESC, seq DESC
      LIMIT 1`
   )
     .bind(commandId, interactionId)
-    .first<{ id: string }>();
-  return Boolean(row);
+    .first<ThreadEventRow>();
+  return row ? threadEventFromRow(row) : undefined;
 }
 
 function turnInteractionResolutionInteractionId(event: AgentCommandEvent): string | undefined {

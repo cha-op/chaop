@@ -818,6 +818,27 @@ test("recordTurnInteractionResolutionInDb rejects already resolved interactions 
   assert.equal(db.eventInserts, 0);
 });
 
+test("recordTurnInteractionResolutionInDb can return an existing resolution after dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: true });
+
+  const event = await recordTurnInteractionResolutionInDb(
+    { DB: db } as Env,
+    "event-request-1",
+    {
+      kind: "approval",
+      decision: "accept"
+    },
+    { allowExisting: true }
+  );
+
+  assert.equal(event.id, "event-resolution-1");
+  assert.equal(event.kind, "approval.resolved");
+  assert.equal(event.payload?.type, "turn_interaction_resolution");
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.taskUpdates, 0);
+});
+
 test("recordTurnInteractionResolutionInDb resumes waiting tasks after append", async () => {
   const db = turnInteractionResolutionDb({ resolved: false });
 
@@ -1768,7 +1789,24 @@ function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boo
             return {
               async first() {
                 counters.resolutionChecks += 1;
-                return options.resolved ? { id: "event-resolution-1" } : null;
+                return options.resolved
+                  ? {
+                    id: "event-resolution-1",
+                    thread_id: "thread-1",
+                    command_id: "command-1",
+                    seq: 3,
+                    kind: "approval.resolved",
+                    priority: "P1",
+                    summary: "Approval accepted for command execution.",
+                    payload_json: JSON.stringify({
+                      type: "turn_interaction_resolution",
+                      interaction_id: "interaction-1",
+                      status: "accepted",
+                      decision: "accept"
+                    }),
+                    created_at: "2026-06-24T10:00:00.000Z"
+                  }
+                  : null;
               }
             };
           }
