@@ -1969,6 +1969,7 @@ fn handle_app_server_turn_request(
         deadline,
         timeout_seconds,
         cancel,
+        auto_resolution_deadline(method, params),
     )?;
     let result = app_server_turn_interaction_result(method, params, &response.response)?;
     socket
@@ -2265,11 +2266,19 @@ fn receive_turn_interaction_response(
     deadline: Instant,
     timeout_seconds: u64,
     cancel: &AtomicBool,
+    auto_resolution_deadline: Option<Instant>,
 ) -> Result<TurnInteractionResponseDispatch, AppServerCommandError> {
     loop {
         ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let wait = remaining.min(Duration::from_millis(100));
+        let now = Instant::now();
+        if auto_resolution_deadline.is_some_and(|auto_deadline| now >= auto_deadline) {
+            return Ok(auto_resolved_input_response(command_id, interaction_id));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let mut wait = remaining.min(Duration::from_millis(100));
+        if let Some(auto_deadline) = auto_resolution_deadline {
+            wait = wait.min(auto_deadline.saturating_duration_since(now));
+        }
         match receiver.recv_timeout(wait) {
             Ok(dispatch)
                 if dispatch.command_id == command_id
@@ -2285,6 +2294,29 @@ fn receive_turn_interaction_response(
                 ));
             }
         }
+    }
+}
+
+fn auto_resolution_deadline(method: &str, params: &Value) -> Option<Instant> {
+    if method != "item/tool/requestUserInput" {
+        return None;
+    }
+    params
+        .get("autoResolutionMs")
+        .and_then(Value::as_u64)
+        .map(|ms| Instant::now() + Duration::from_millis(ms))
+}
+
+fn auto_resolved_input_response(
+    command_id: &str,
+    interaction_id: &str,
+) -> TurnInteractionResponseDispatch {
+    TurnInteractionResponseDispatch {
+        command_id: command_id.to_owned(),
+        interaction_id: interaction_id.to_owned(),
+        response: TurnInteractionResponse::Input {
+            answers: HashMap::new(),
+        },
     }
 }
 
@@ -7136,6 +7168,89 @@ mod tests {
                 .pointer("/result/answers/q1/answers/0")
                 .and_then(Value::as_str),
             Some("Yes")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn app_server_command_auto_resolves_user_input_interaction() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": 82,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-input-1",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "header": "Confirm",
+                        "question": "Continue?",
+                        "isOther": false,
+                        "isSecret": false
+                    }
+                ],
+                "autoResolutionMs": 10
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_response_tx, response_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                None,
+                "command-1",
+                "Ask for input",
+                Arc::new(AtomicBool::new(false)),
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input event");
+        assert_eq!(event.kind, "input.requested");
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("auto_resolution_ms"))
+                .and_then(Value::as_u64),
+            Some(10)
+        );
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("auto-resolved app-server input response");
+        assert_eq!(
+            app_response
+                .pointer("/result/answers")
+                .and_then(Value::as_object)
+                .map(serde_json::Map::len),
+            Some(0)
         );
         let events = handle.join().expect("command thread");
         assert_eq!(
