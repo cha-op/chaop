@@ -277,6 +277,52 @@ test("turn interaction response records recovery event when connector delivery i
   assert.equal(db.claimDeletes, 1);
 });
 
+test("turn interaction response records event when delivered marker fails", async () => {
+  const db = turnInteractionResolutionRouteDb({ failDeliveredMarker: true });
+  const internalPaths: string[] = [];
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/thread-events/event-request-1/interaction", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        kind: "approval",
+        decision: "accept"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL) => {
+            const path = new URL(String(input)).pathname;
+            internalPaths.push(path);
+            return new Response(JSON.stringify({ accepted: true }), {
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = await response.json() as { accepted?: boolean; event?: { kind?: string; payload?: { status?: string } } };
+
+  assert.equal(response.status, 202);
+  assert.equal(body.accepted, true);
+  assert.equal(body.event?.kind, "approval.resolved");
+  assert.equal(body.event?.payload?.status, "accepted");
+  assert.deepEqual(internalPaths, ["/internal/resolve-turn-interaction", "/internal/broadcast-thread-events"]);
+  assert.equal(db.claimInserts, 1);
+  assert.equal(db.dispatchStartUpdates, 1);
+  assert.equal(db.deliveredUpdateAttempts, 1);
+  assert.equal(db.deliveryUncertainUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.claimDeletes, 1);
+});
+
 test("turn interaction response releases claim when connector was not sent", async () => {
   const db = turnInteractionResolutionRouteDb();
   const response = await handleRequest(
@@ -5068,10 +5114,11 @@ function safetyPauseDb(options: DogfoodSafetyFakeOptions = {}): D1Database {
   } as unknown as D1Database;
 }
 
-function turnInteractionResolutionRouteDb(): D1Database & {
+function turnInteractionResolutionRouteDb(options: { failDeliveredMarker?: boolean } = {}): D1Database & {
   readonly claimDeletes: number;
   readonly claimInserts: number;
   readonly dispatchStartUpdates: number;
+  readonly deliveredUpdateAttempts: number;
   readonly deliveryUncertainUpdates: number;
   readonly eventInserts: number;
 } {
@@ -5094,6 +5141,7 @@ function turnInteractionResolutionRouteDb(): D1Database & {
     claimDeletes: 0,
     claimInserts: 0,
     dispatchStartUpdates: 0,
+    deliveredUpdateAttempts: 0,
     deliveryUncertainUpdates: 0,
     eventInserts: 0,
     taskUpdates: 0,
@@ -5249,6 +5297,25 @@ function turnInteractionResolutionRouteDb(): D1Database & {
         };
       }
 
+      if (/UPDATE turn_interaction_resolution_claims[\s\S]*delivered_at = COALESCE/.test(sql)) {
+        return {
+          bind(deliveredAt: string, commandId: string, interactionId: string) {
+            assert.match(deliveredAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async run() {
+                counters.deliveredUpdateAttempts += 1;
+                if (options.failDeliveredMarker) {
+                  throw new Error("delivered marker unavailable");
+                }
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       if (/UPDATE turn_interaction_resolution_claims[\s\S]*delivery_uncertain_at = COALESCE/.test(sql)) {
         return {
           bind(uncertainAt: string, commandId: string, interactionId: string) {
@@ -5342,6 +5409,9 @@ function turnInteractionResolutionRouteDb(): D1Database & {
     get dispatchStartUpdates() {
       return counters.dispatchStartUpdates;
     },
+    get deliveredUpdateAttempts() {
+      return counters.deliveredUpdateAttempts;
+    },
     get deliveryUncertainUpdates() {
       return counters.deliveryUncertainUpdates;
     },
@@ -5354,6 +5424,7 @@ function turnInteractionResolutionRouteDb(): D1Database & {
     readonly claimDeletes: number;
     readonly claimInserts: number;
     readonly dispatchStartUpdates: number;
+    readonly deliveredUpdateAttempts: number;
     readonly deliveryUncertainUpdates: number;
     readonly eventInserts: number;
   };

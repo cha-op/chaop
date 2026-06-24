@@ -421,7 +421,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           }
         }
         if (confirmedConnectorDelivery) {
-          await markTurnInteractionResolutionDeliveredInDb(env, dispatch.command_id, dispatch.interaction_id);
+          await markConfirmedTurnInteractionDeliveryBestEffort(env, dispatch);
         }
       }
       let event: ThreadEvent;
@@ -746,6 +746,27 @@ async function dispatchPendingCommandsBestEffort(env: Env): Promise<void> {
     await dispatchPendingCommand(env);
   } catch (error) {
     console.warn("Safety resume could not dispatch pending commands", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+async function markConfirmedTurnInteractionDeliveryBestEffort(
+  env: Env,
+  dispatch: TurnInteractionResponseDispatch
+): Promise<void> {
+  try {
+    await markTurnInteractionResolutionDeliveredInDb(env, dispatch.command_id, dispatch.interaction_id);
+    return;
+  } catch (error) {
+    console.warn("Turn interaction delivered marker failed", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
+  try {
+    await markTurnInteractionResolutionDeliveryUncertainInDb(env, dispatch.command_id, dispatch.interaction_id);
+  } catch (error) {
+    console.warn("Turn interaction uncertain delivery fallback failed", {
       message: error instanceof Error ? error.message : String(error)
     });
   }
