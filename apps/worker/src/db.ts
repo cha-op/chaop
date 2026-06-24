@@ -26,6 +26,9 @@ import type {
   CreateLocalThreadResponse,
   CreateCommandRequest,
   CreateCommandResponse,
+  DogfoodSafetyAction,
+  DogfoodSafetyActionGuard,
+  DogfoodSafetyPosture,
   AgentHostSession,
   DetachHostSessionResponse,
   HostSessionSummary,
@@ -96,6 +99,7 @@ const DEFAULT_BUDGET_TELEMETRY_SAMPLE_SECONDS = 300;
 const DEFAULT_BUDGET_TELEMETRY_HISTORY_CACHE_SECONDS = 60;
 const BUDGET_TELEMETRY_HISTORY_HOURS = 24;
 const BUDGET_TELEMETRY_HISTORY_LIMIT = 300;
+const DOGFOOD_SAFETY_PAUSE_KEY = "dogfood_safety.pause";
 const CLOUDFLARE_GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 const WS_INCOMING_MESSAGES_PER_DO_REQUEST = 20;
 const BUDGET_STATE_RANK: Record<BudgetState, number> = {
@@ -107,6 +111,7 @@ const BUDGET_STATE_RANK: Record<BudgetState, number> = {
 };
 
 let cloudflareTelemetryCache: CloudflareTelemetryCacheEntry | undefined;
+let cloudflareTelemetryDailyCache: CloudflareTelemetryCacheEntry | undefined;
 let budgetTelemetryHistoryCache: BudgetTelemetryHistoryCacheEntry | undefined;
 
 export class CommandTargetError extends Error {
@@ -122,9 +127,25 @@ export class LocalThreadTargetError extends Error {
   readonly status = 404;
 }
 
+export class DogfoodSafetyError extends Error {
+  readonly status = 429;
+
+  constructor(
+    message: string,
+    readonly posture: DogfoodSafetyPosture,
+    readonly guard: DogfoodSafetyActionGuard
+  ) {
+    super(message);
+  }
+}
+
 export class NotFoundError extends Error {
   readonly status = 404;
 }
+
+type DogfoodSafetyPostureOptions = {
+  refreshCloudflareTelemetry?: boolean | undefined;
+};
 
 export type RecordAgentEventResult = {
   accepted: boolean;
@@ -164,6 +185,13 @@ export async function loadBootstrapFromDb(
     listRecentEvents(env)
   ]);
   const budgetSummary = await loadBudgetSummaryFromDb(env, undefined, { connectors, tasks });
+  const safetyGeneratedAt = budgetSummary.generated_at ?? new Date().toISOString();
+  const safety = dogfoodSafetyPosture({
+    generatedAt: safetyGeneratedAt,
+    paused: await loadDogfoodSafetyPause(env, safetyGeneratedAt),
+    constraints: budgetSummary.constraints ?? [],
+    budgetStates: [budgetSummary.state]
+  });
 
   return {
     user,
@@ -178,6 +206,7 @@ export async function loadBootstrapFromDb(
     running_commands: runningCommands,
     events,
     budget: budgetSummary,
+    safety,
     server_time: new Date().toISOString()
   };
 }
@@ -191,7 +220,7 @@ export async function loadBudgetSummaryFromDb(
     return emptyBudgetSummary(generatedAt);
   }
 
-  const [daily, fourHour, burst, connectorStates, taskStates, telemetry] = await Promise.all([
+  const [daily, fourHour, burst, connectorStates, taskStates, liveTelemetry, persistedTelemetry] = await Promise.all([
     currentUsageWindow(env, "daily", generatedAt),
     currentUsageWindow(env, "four_hour", generatedAt),
     currentUsageWindow(env, "burst", generatedAt),
@@ -201,13 +230,15 @@ export async function loadBudgetSummaryFromDb(
     snapshots.tasks
       ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
       : listTaskBudgetStates(env),
-    loadCloudflareTelemetryBestEffort(env, generatedAt)
+    loadCloudflareTelemetryBestEffort(env, generatedAt),
+    loadMaxPersistedCloudflareTelemetrySample(env, generatedAt)
   ]);
+  const telemetry = mergeCloudflareTelemetrySamples(liveTelemetry, persistedTelemetry);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const primaryWindow = daily ?? fourHour ?? burst;
   const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
   const localBaselines = localBudgetWindowBaselines(env, generatedAt);
-  const telemetrySampleInserted = await persistBudgetTelemetrySampleBestEffort(env, telemetry, generatedAt);
+  const telemetrySampleInserted = await persistBudgetTelemetrySampleBestEffort(env, liveTelemetry, generatedAt);
   const telemetryHistory = await loadBudgetTelemetryHistoryBestEffort(env, generatedAt, {
     force: telemetrySampleInserted
   });
@@ -242,6 +273,137 @@ export async function loadBudgetSummaryFromDb(
     telemetry_history: telemetryHistory,
     d1_activity: d1Activity
   };
+}
+
+export async function loadDogfoodSafetyPostureFromDb(
+  env: Env,
+  generatedAt = new Date().toISOString(),
+  snapshots: { connectors?: ConnectorSummary[] | undefined; tasks?: TaskSummary[] | undefined } = {},
+  options: DogfoodSafetyPostureOptions = {}
+): Promise<DogfoodSafetyPosture> {
+  const effectiveGeneratedAt = generatedAt ?? new Date().toISOString();
+  if (!env.DB) {
+    return dogfoodSafetyPosture({
+      generatedAt: effectiveGeneratedAt,
+      paused: undefined,
+      constraints: budgetConstraints({}, [], undefined, localBudgetWindowBaselines({}, effectiveGeneratedAt))
+    });
+  }
+
+  const liveTelemetryPromise = options.refreshCloudflareTelemetry
+    ? loadCloudflareTelemetryBestEffort(env, effectiveGeneratedAt)
+    : loadCachedCloudflareTelemetryBestEffort(env, effectiveGeneratedAt);
+  const persistedTelemetryPromise = loadMaxPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt);
+  const [pause, daily, fourHour, burst, connectorStates, taskStates, liveTelemetry, persistedTelemetry] = await Promise.all([
+    loadDogfoodSafetyPause(env, effectiveGeneratedAt),
+    currentUsageWindow(env, "daily", effectiveGeneratedAt),
+    currentUsageWindow(env, "four_hour", effectiveGeneratedAt),
+    currentUsageWindow(env, "burst", effectiveGeneratedAt),
+    snapshots.connectors
+      ? Promise.resolve(connectorBudgetStateCounts(snapshots.connectors))
+      : listConnectorBudgetStates(env),
+    snapshots.tasks
+      ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
+      : listTaskBudgetStates(env),
+    liveTelemetryPromise,
+    persistedTelemetryPromise
+  ]);
+  const telemetry = mergeCloudflareTelemetrySamples(liveTelemetry, persistedTelemetry);
+  if (options.refreshCloudflareTelemetry) {
+    await persistBudgetTelemetrySampleBestEffort(env, liveTelemetry, effectiveGeneratedAt);
+  }
+  const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
+  const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
+  const constraints = budgetConstraints(
+    env,
+    windowSignals,
+    telemetry,
+    localBudgetWindowBaselines(env, effectiveGeneratedAt)
+  );
+  return dogfoodSafetyPosture({
+    generatedAt: effectiveGeneratedAt,
+    paused: pause,
+    constraints,
+    budgetStates: [
+      ...connectorStates.map((row) => budgetStateFromString(row.budget_state)),
+      ...taskStates.map((row) => budgetStateFromString(row.budget_state))
+    ]
+  });
+}
+
+export async function setDogfoodSafetyPauseInDb(
+  env: Env,
+  paused: boolean,
+  actor: BrowserIdentity,
+  reason?: string | undefined,
+  generatedAt = new Date().toISOString()
+): Promise<DogfoodSafetyPosture> {
+  if (!env.DB) {
+    return dogfoodSafetyPosture({
+      generatedAt,
+      paused: paused
+        ? {
+          paused: true,
+          reason: boundedSafetyReason(reason),
+          updated_by: actor.email,
+          updated_at: generatedAt
+        }
+        : undefined,
+      constraints: budgetConstraints({}, [], undefined, localBudgetWindowBaselines({}, generatedAt))
+    });
+  }
+
+  if (paused) {
+    await env.DB.prepare(
+      `INSERT INTO control_plane_settings (key, value_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+    )
+      .bind(
+        DOGFOOD_SAFETY_PAUSE_KEY,
+        JSON.stringify({
+          paused: true,
+          reason: boundedSafetyReason(reason),
+          updated_by: actor.email,
+          updated_at: generatedAt
+        }),
+        generatedAt
+      )
+      .run();
+  } else {
+    await env.DB.prepare("DELETE FROM control_plane_settings WHERE key = ?")
+      .bind(DOGFOOD_SAFETY_PAUSE_KEY)
+      .run();
+  }
+
+  return loadDogfoodSafetyPostureFromDb(env, generatedAt);
+}
+
+export async function assertDogfoodSafetyActionAllowed(
+  env: Env,
+  action: DogfoodSafetyAction,
+  generatedAt = new Date().toISOString()
+): Promise<DogfoodSafetyPosture> {
+  const posture = await loadDogfoodSafetyPostureFromDb(env, generatedAt);
+  const guard = posture.actions.find((item) => item.action === action);
+  if (guard?.state === "blocked") {
+    throw new DogfoodSafetyError(guard.reason, posture, guard);
+  }
+  return posture;
+}
+
+export async function dogfoodSafetyActionAllowed(
+  env: Env,
+  action: DogfoodSafetyAction,
+  generatedAt = new Date().toISOString()
+): Promise<boolean> {
+  try {
+    await assertDogfoodSafetyActionAllowed(env, action, generatedAt);
+    return true;
+  } catch (error) {
+    if (error instanceof DogfoodSafetyError) return false;
+    throw error;
+  }
 }
 
 export async function bootstrapBudgetWindowsInDb(
@@ -2877,7 +3039,12 @@ async function failRejectedExplicitAppServerStartLease(
 export async function failActiveCommandsForConnector(
   env: Env,
   connectorId: string,
-  options: { commandIds?: string[]; refreshConnectorActivity?: boolean; now?: string } = {}
+  options: {
+    commandIds?: string[];
+    failureSummary?: string;
+    refreshConnectorActivity?: boolean;
+    now?: string;
+  } = {}
 ): Promise<ThreadEvent[]> {
   if (!env.DB) return [];
 
@@ -2934,7 +3101,7 @@ export async function failActiveCommandsForConnector(
         command_id: command.id,
         kind: "command.failed",
         priority: "P1",
-        summary: "Connector disconnected before the command completed."
+        summary: options.failureSummary ?? "Connector disconnected before the command completed."
       });
       if (event) {
         events.push(event);
@@ -2969,7 +3136,9 @@ export async function markConnectorDisconnected(env: Env, connectorId: string): 
     now,
     refreshConnectorActivity: false
   });
-  await markAppServerInstancesStoppedForConnector(env, connectorId, now);
+  if (await dogfoodSafetyActionAllowed(env, "app_server_instances_report", now)) {
+    await markAppServerInstancesStoppedForConnector(env, connectorId, now);
+  }
   await markConnectorOffline(env, connectorId, now);
   return events;
 }
@@ -4391,22 +4560,33 @@ async function loadCloudflareTelemetryBestEffort(
     const now = Date.now();
     if (cloudflareTelemetryCache?.key === cacheKey && cloudflareTelemetryCache.expiresAt > now) {
       if (cloudflareTelemetryCache.pending) {
-        return await cloudflareTelemetryCache.pending;
+        const sample = await cloudflareTelemetryCache.pending;
+        return mergeCloudflareTelemetrySamples(sample, cachedCloudflareTelemetryDailySample(env, generatedAt));
       }
-      return cloudflareTelemetryCache.sample;
+      return mergeCloudflareTelemetrySamples(
+        cloudflareTelemetryCache.sample,
+        cachedCloudflareTelemetryDailySample(env, generatedAt)
+      );
     }
 
     const cacheSeconds = positiveIntegerEnv(env.CF_TELEMETRY_CACHE_SECONDS, DEFAULT_CF_TELEMETRY_CACHE_SECONDS);
     const cacheMs = cacheSeconds * 1000;
     const failureCacheMs = Math.min(cacheSeconds, DEFAULT_CF_TELEMETRY_FAILURE_CACHE_SECONDS) * 1000;
+    const dailyCacheKey = cloudflareTelemetryDailyCacheKey(env, generatedAt);
     const pending = loadCloudflareTelemetry(env, generatedAt).then(
       (sample) => {
+        const expiresAt = Date.now() + cacheMs;
+        const mergedSample = updateCloudflareTelemetryDailyCache(
+          dailyCacheKey,
+          sample,
+          cloudflareTelemetryDailyCacheExpiresAt(generatedAt, cacheMs)
+        );
         cloudflareTelemetryCache = {
           key: cacheKey,
-          sample,
-          expiresAt: Date.now() + cacheMs
+          sample: mergedSample,
+          expiresAt
         };
-        return sample;
+        return mergedSample;
       },
       (error) => {
         cloudflareTelemetryCache = {
@@ -4427,8 +4607,148 @@ async function loadCloudflareTelemetryBestEffort(
     console.warn("Cloudflare telemetry query failed", {
       message: error instanceof Error ? error.message : String(error)
     });
+    return cachedCloudflareTelemetryDailySample(env, generatedAt);
+  }
+}
+
+async function loadCachedCloudflareTelemetryBestEffort(
+  env: Env,
+  generatedAt: string
+): Promise<CloudflareTelemetrySample | undefined> {
+  if (
+    !env.CF_TELEMETRY_API_TOKEN ||
+    !env.CF_TELEMETRY_ACCOUNT_ID ||
+    !env.CF_TELEMETRY_API_WORKER ||
+    !env.CF_TELEMETRY_D1_DATABASE_ID
+  ) {
     return undefined;
   }
+
+  const cacheKey = cloudflareTelemetryCacheKey(env, generatedAt);
+  if (cloudflareTelemetryCache?.key === cacheKey && cloudflareTelemetryCache.expiresAt > Date.now()) {
+    let bucketSample: CloudflareTelemetrySample | undefined;
+    try {
+      bucketSample = cloudflareTelemetryCache.pending
+        ? await cloudflareTelemetryCache.pending
+        : cloudflareTelemetryCache.sample;
+    } catch {
+      bucketSample = undefined;
+    }
+    const dailySample = cachedCloudflareTelemetryDailySample(env, generatedAt);
+    const mergedSample = mergeCloudflareTelemetrySamples(bucketSample, dailySample);
+    if (mergedSample) return mergedSample;
+  }
+
+  return cachedCloudflareTelemetryDailySample(env, generatedAt);
+}
+
+function cachedCloudflareTelemetryDailySample(
+  env: Env,
+  generatedAt: string
+): CloudflareTelemetrySample | undefined {
+  const dailyCacheKey = cloudflareTelemetryDailyCacheKey(env, generatedAt);
+  if (cloudflareTelemetryDailyCache?.key !== dailyCacheKey || cloudflareTelemetryDailyCache.expiresAt <= Date.now()) {
+    return undefined;
+  }
+  return cloudflareTelemetryDailyCache.sample;
+}
+
+function updateCloudflareTelemetryDailyCache(
+  key: string,
+  sample: CloudflareTelemetrySample,
+  expiresAt: number
+): CloudflareTelemetrySample {
+  const existingSample =
+    cloudflareTelemetryDailyCache?.key === key && cloudflareTelemetryDailyCache.expiresAt > Date.now()
+      ? cloudflareTelemetryDailyCache.sample
+      : undefined;
+  const mergedSample = mergeCloudflareTelemetrySamples(sample, existingSample) ?? sample;
+  cloudflareTelemetryDailyCache = {
+    key,
+    sample: mergedSample,
+    expiresAt
+  };
+  return mergedSample;
+}
+
+function cloudflareTelemetryDailyCacheExpiresAt(generatedAt: string, fallbackMs: number): number {
+  const effectiveAt = safeDate(generatedAt);
+  const utcDayEnd = Date.UTC(
+    effectiveAt.getUTCFullYear(),
+    effectiveAt.getUTCMonth(),
+    effectiveAt.getUTCDate() + 1
+  );
+  return Math.max(Date.now() + fallbackMs, utcDayEnd);
+}
+
+async function loadMaxPersistedCloudflareTelemetrySample(
+  env: Env,
+  generatedAt: string
+): Promise<CloudflareTelemetrySample | undefined> {
+  if (!env.DB) return undefined;
+
+  try {
+    const effectiveAt = safeDate(generatedAt);
+    const windowStart = new Date(Date.UTC(
+      effectiveAt.getUTCFullYear(),
+      effectiveAt.getUTCMonth(),
+      effectiveAt.getUTCDate()
+    )).toISOString();
+    const row = await env.DB.prepare(
+      `SELECT MAX(sampled_at) AS sampled_at, window_start, MAX(window_end) AS window_end,
+              MAX(d1_rows_written_daily) AS d1_rows_written_daily,
+              MAX(d1_rows_read_daily) AS d1_rows_read_daily,
+              MAX(worker_requests_daily) AS worker_requests_daily,
+              MAX(durable_object_requests_daily) AS durable_object_requests_daily
+       FROM budget_telemetry_samples
+       WHERE sample_type = ? AND selector_hash = ? AND window_start = ?
+       GROUP BY window_start
+       LIMIT 1`
+    )
+      .bind("cloudflare_daily", cloudflareTelemetrySelectorHash(env), windowStart)
+      .first<BudgetTelemetryLatestSampleRow>();
+    if (!row) return undefined;
+    return {
+      windowStart: row.window_start,
+      windowEnd: row.window_end,
+      updatedAt: row.sampled_at,
+      workerRequestsDaily: optionalNonNegativeInteger(row.worker_requests_daily),
+      durableObjectRequestEquivalentsDaily: optionalNonNegativeInteger(row.durable_object_requests_daily),
+      d1RowsReadDaily: optionalNonNegativeInteger(row.d1_rows_read_daily),
+      d1RowsWrittenDaily: optionalNonNegativeInteger(row.d1_rows_written_daily)
+    };
+  } catch (error) {
+    console.warn("Persisted Cloudflare telemetry sample could not be loaded", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+}
+
+function mergeCloudflareTelemetrySamples(
+  live: CloudflareTelemetrySample | undefined,
+  persisted: CloudflareTelemetrySample | undefined
+): CloudflareTelemetrySample | undefined {
+  if (!live) return persisted;
+  if (!persisted) return live;
+  return {
+    windowStart: live.windowStart,
+    windowEnd: live.windowEnd,
+    updatedAt: newerIso(live.updatedAt, persisted.updatedAt),
+    workerRequestsDaily: maxOptionalMetric(live.workerRequestsDaily, persisted.workerRequestsDaily),
+    durableObjectRequestEquivalentsDaily: maxOptionalMetric(
+      live.durableObjectRequestEquivalentsDaily,
+      persisted.durableObjectRequestEquivalentsDaily
+    ),
+    d1RowsReadDaily: maxOptionalMetric(live.d1RowsReadDaily, persisted.d1RowsReadDaily),
+    d1RowsWrittenDaily: maxOptionalMetric(live.d1RowsWrittenDaily, persisted.d1RowsWrittenDaily)
+  };
+}
+
+function maxOptionalMetric(left: number | undefined, right: number | undefined): number | undefined {
+  if (left === undefined) return right;
+  if (right === undefined) return left;
+  return Math.max(left, right);
 }
 
 function cloudflareTelemetryCacheKey(env: Env, generatedAt: string): string {
@@ -4449,6 +4769,24 @@ function cloudflareTelemetryCacheKey(env: Env, generatedAt: string): string {
     env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? "",
     date,
     sampleBucket
+  ].join("\0");
+}
+
+function cloudflareTelemetryDailyCacheKey(env: Env, generatedAt: string): string {
+  const end = new Date(generatedAt);
+  const effectiveEnd = Number.isNaN(end.getTime()) ? new Date() : end;
+  const date = new Date(Date.UTC(
+    effectiveEnd.getUTCFullYear(),
+    effectiveEnd.getUTCMonth(),
+    effectiveEnd.getUTCDate()
+  )).toISOString().slice(0, 10);
+  return [
+    env.CF_TELEMETRY_ACCOUNT_ID,
+    env.CF_TELEMETRY_API_WORKER,
+    env.CF_TELEMETRY_WEB_WORKER ?? "",
+    env.CF_TELEMETRY_D1_DATABASE_ID,
+    env.CF_TELEMETRY_DO_NAMESPACE_NAME ?? "",
+    date
   ].join("\0");
 }
 
@@ -4539,11 +4877,71 @@ async function persistBudgetTelemetrySampleBestEffort(
     const sampledAt = telemetrySampleBucketStart(generatedAt, sampleSeconds).toISOString();
     const selectorHash = cloudflareTelemetrySelectorHash(env);
     const result = await env.DB.prepare(
-      `INSERT OR IGNORE INTO budget_telemetry_samples (
+      `INSERT INTO budget_telemetry_samples (
          id, sample_type, selector_hash, sampled_at, window_start, window_end,
          d1_rows_written_daily, d1_rows_read_daily, worker_requests_daily,
          durable_object_requests_daily, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         window_start = excluded.window_start,
+         window_end = excluded.window_end,
+         d1_rows_written_daily = CASE
+           WHEN excluded.d1_rows_written_daily IS NULL THEN budget_telemetry_samples.d1_rows_written_daily
+           WHEN budget_telemetry_samples.d1_rows_written_daily IS NULL THEN excluded.d1_rows_written_daily
+           WHEN excluded.d1_rows_written_daily > budget_telemetry_samples.d1_rows_written_daily THEN excluded.d1_rows_written_daily
+           ELSE budget_telemetry_samples.d1_rows_written_daily
+         END,
+         d1_rows_read_daily = CASE
+           WHEN excluded.d1_rows_read_daily IS NULL THEN budget_telemetry_samples.d1_rows_read_daily
+           WHEN budget_telemetry_samples.d1_rows_read_daily IS NULL THEN excluded.d1_rows_read_daily
+           WHEN excluded.d1_rows_read_daily > budget_telemetry_samples.d1_rows_read_daily THEN excluded.d1_rows_read_daily
+           ELSE budget_telemetry_samples.d1_rows_read_daily
+         END,
+         worker_requests_daily = CASE
+           WHEN excluded.worker_requests_daily IS NULL THEN budget_telemetry_samples.worker_requests_daily
+           WHEN budget_telemetry_samples.worker_requests_daily IS NULL THEN excluded.worker_requests_daily
+           WHEN excluded.worker_requests_daily > budget_telemetry_samples.worker_requests_daily THEN excluded.worker_requests_daily
+           ELSE budget_telemetry_samples.worker_requests_daily
+         END,
+         durable_object_requests_daily = CASE
+           WHEN excluded.durable_object_requests_daily IS NULL THEN budget_telemetry_samples.durable_object_requests_daily
+           WHEN budget_telemetry_samples.durable_object_requests_daily IS NULL THEN excluded.durable_object_requests_daily
+           WHEN excluded.durable_object_requests_daily > budget_telemetry_samples.durable_object_requests_daily THEN excluded.durable_object_requests_daily
+           ELSE budget_telemetry_samples.durable_object_requests_daily
+         END,
+         created_at = CASE
+           WHEN excluded.created_at > budget_telemetry_samples.created_at THEN excluded.created_at
+           ELSE budget_telemetry_samples.created_at
+         END
+       WHERE
+         (
+           excluded.d1_rows_written_daily IS NOT NULL
+           AND (
+             budget_telemetry_samples.d1_rows_written_daily IS NULL
+             OR excluded.d1_rows_written_daily > budget_telemetry_samples.d1_rows_written_daily
+           )
+         )
+         OR (
+           excluded.d1_rows_read_daily IS NOT NULL
+           AND (
+             budget_telemetry_samples.d1_rows_read_daily IS NULL
+             OR excluded.d1_rows_read_daily > budget_telemetry_samples.d1_rows_read_daily
+           )
+         )
+         OR (
+           excluded.worker_requests_daily IS NOT NULL
+           AND (
+             budget_telemetry_samples.worker_requests_daily IS NULL
+             OR excluded.worker_requests_daily > budget_telemetry_samples.worker_requests_daily
+           )
+         )
+         OR (
+           excluded.durable_object_requests_daily IS NOT NULL
+           AND (
+             budget_telemetry_samples.durable_object_requests_daily IS NULL
+             OR excluded.durable_object_requests_daily > budget_telemetry_samples.durable_object_requests_daily
+           )
+         )`
     )
       .bind(
         `budget-telemetry:cloudflare_daily:${selectorHash}:${sampledAt}`,
@@ -4843,6 +5241,193 @@ const CLOUDFLARE_TELEMETRY_QUERY = `query ChaopCloudflareTelemetry(
     }
   }
 }`;
+
+async function loadDogfoodSafetyPause(
+  env: Env,
+  generatedAt = new Date().toISOString()
+): Promise<DogfoodSafetyPauseSetting | undefined> {
+  if (!env.DB) return undefined;
+  try {
+    const row = await env.DB.prepare(
+      "SELECT value_json, updated_at FROM control_plane_settings WHERE key = ? LIMIT 1"
+    )
+      .bind(DOGFOOD_SAFETY_PAUSE_KEY)
+      .first<{ value_json: string; updated_at: string }>();
+    if (!row) return undefined;
+    const parsed = JSON.parse(row.value_json) as unknown;
+    if (!isRecord(parsed) || typeof parsed.paused !== "boolean") {
+      return {
+        paused: true,
+        reason: "Dogfood safety pause state is malformed; guarded dogfood actions are blocked until the control-plane setting is corrected.",
+        updated_at: row.updated_at
+      };
+    }
+    if (!parsed.paused) return undefined;
+    return {
+      paused: true,
+      reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
+      updated_by: typeof parsed.updated_by === "string" ? parsed.updated_by : undefined,
+      updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : row.updated_at
+    };
+  } catch (error) {
+    console.warn("Dogfood safety pause state could not be loaded", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return {
+      paused: true,
+      reason: "Dogfood safety pause state could not be loaded; guarded dogfood actions are blocked until the control-plane setting is readable.",
+      updated_at: generatedAt
+    };
+  }
+}
+
+function dogfoodSafetyPosture({
+  generatedAt,
+  paused,
+  constraints,
+  budgetStates = []
+}: {
+  generatedAt: string;
+  paused: DogfoodSafetyPauseSetting | undefined;
+  constraints: BudgetConstraint[];
+  budgetStates?: BudgetState[] | undefined;
+}): DogfoodSafetyPosture {
+  const bottleneck = budgetBottleneckConstraint(constraints);
+  const sampledStates = constraints
+    .filter((constraint) => constraint.sampled && constraint.hard && constraint.state !== "missing")
+    .map((constraint) => constraint.state as BudgetState);
+  const state = paused ? "hard_limited" : worstBudgetState([...sampledStates, ...budgetStates]);
+  const visibleBottleneck = dogfoodSafetyBottleneckForState(state, bottleneck);
+  const actions = DOGFOOD_SAFETY_ACTIONS.map((action) =>
+    dogfoodSafetyGuard(action, state, paused, visibleBottleneck)
+  );
+  return {
+    state,
+    paused: paused !== undefined,
+    paused_reason: paused?.reason,
+    paused_by: paused?.updated_by,
+    paused_at: paused?.updated_at,
+    generated_at: generatedAt,
+    summary: dogfoodSafetySummary(state, paused, visibleBottleneck),
+    bottleneck_constraint: visibleBottleneck,
+    actions
+  };
+}
+
+function dogfoodSafetyBottleneckForState(
+  state: BudgetState,
+  bottleneck: BudgetConstraint | undefined
+): BudgetConstraint | undefined {
+  if (!bottleneck) return undefined;
+  if (bottleneck.state === "missing") return undefined;
+  if (state === "normal" || state === "recovery") return bottleneck;
+  return BUDGET_STATE_RANK[bottleneck.state] >= BUDGET_STATE_RANK[state] ? bottleneck : undefined;
+}
+
+function dogfoodSafetyGuard(
+  action: DogfoodSafetyAction,
+  state: BudgetState,
+  paused: DogfoodSafetyPauseSetting | undefined,
+  bottleneck: BudgetConstraint | undefined
+): DogfoodSafetyActionGuard {
+  const blocked = dogfoodSafetyActionBlocked(action, state, paused);
+  return {
+    action,
+    state: blocked ? "blocked" : "allowed",
+    reason: blocked
+      ? dogfoodSafetyBlockedReason(action, state, paused, bottleneck)
+      : dogfoodSafetyAllowedReason(action, state, bottleneck),
+    budget_state: state,
+    constraint_id: bottleneck?.id,
+    constraint_label: bottleneck?.label,
+    remaining_event_capacity: bottleneck?.remaining_event_capacity
+  };
+}
+
+function dogfoodSafetyActionBlocked(
+  action: DogfoodSafetyAction,
+  state: BudgetState,
+  paused: DogfoodSafetyPauseSetting | undefined
+): boolean {
+  if (paused) return true;
+  if (state === "hard_limited" || state === "throttled") return true;
+  return action === "host_session_refresh" && state === "conservative";
+}
+
+function dogfoodSafetyBlockedReason(
+  action: DogfoodSafetyAction,
+  state: BudgetState,
+  paused: DogfoodSafetyPauseSetting | undefined,
+  bottleneck: BudgetConstraint | undefined
+): string {
+  if (paused) {
+    return paused.reason
+      ? `Dogfood emergency pause is active: ${paused.reason}`
+      : "Dogfood emergency pause is active.";
+  }
+  if (action === "host_session_refresh" && state === "conservative") {
+    return "Host Session refresh is paused while cost posture is conservative; use existing attached threads or resume when the bottleneck clears.";
+  }
+  const bottleneckLabel = bottleneck ? ` Current bottleneck: ${bottleneck.label}.` : "";
+  return `Cost posture is ${state.replace("_", " ")}; this write or refresh action is blocked.${bottleneckLabel}`;
+}
+
+function dogfoodSafetyAllowedReason(
+  action: DogfoodSafetyAction,
+  state: BudgetState,
+  bottleneck: BudgetConstraint | undefined
+): string {
+  if (state === "conservative" && action !== "host_session_refresh") {
+    return "Allowed, but broad refresh remains blocked until cost posture returns to normal.";
+  }
+  if (bottleneck) {
+    return `Allowed. Current bottleneck is ${bottleneck.label}.`;
+  }
+  return "Allowed. No sampled hard budget bottleneck is currently available.";
+}
+
+function dogfoodSafetySummary(
+  state: BudgetState,
+  paused: DogfoodSafetyPauseSetting | undefined,
+  bottleneck: BudgetConstraint | undefined
+): string {
+  if (paused) {
+    return paused.reason
+      ? `Emergency pause active: ${paused.reason}`
+      : "Emergency pause active.";
+  }
+  if (state === "hard_limited" || state === "throttled") {
+    return bottleneck
+      ? `Cost posture is ${state.replace("_", " ")}; ${bottleneck.label} is blocking guarded dogfood actions.`
+      : `Cost posture is ${state.replace("_", " ")}; guarded dogfood actions are blocked.`;
+  }
+  if (state === "conservative") {
+    return bottleneck
+      ? `Cost posture is conservative; ${bottleneck.label} is the current bottleneck.`
+      : "Cost posture is conservative; broad refresh is blocked.";
+  }
+  return bottleneck
+    ? `Guarded dogfood actions are allowed. Current bottleneck: ${bottleneck.label}.`
+    : "Guarded dogfood actions are allowed.";
+}
+
+function boundedSafetyReason(reason: string | undefined): string | undefined {
+  const trimmed = reason?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, 240);
+}
+
+const DOGFOOD_SAFETY_ACTIONS: DogfoodSafetyAction[] = [
+  "command_create",
+  "local_thread_create",
+  "host_session_refresh",
+  "host_session_attach",
+  "host_session_detach",
+  "task_archive",
+  "budget_bootstrap",
+  "agent_event",
+  "app_server_instances_report"
+];
 
 function emptyBudgetSummary(generatedAt: string): BudgetSummary {
   const constraints = budgetConstraints({}, []);
@@ -5294,6 +5879,14 @@ function nonNegativeInteger(value: number | undefined): number {
   return Math.max(0, Math.floor(value));
 }
 
+function optionalNonNegativeInteger(value: number | null | undefined): number | undefined {
+  return value === null || value === undefined ? undefined : nonNegativeInteger(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function nullableNonNegativeInteger(value: number | null | undefined): number | null {
   return value === null || value === undefined ? null : nonNegativeInteger(value);
 }
@@ -5346,10 +5939,10 @@ type CloudflareTelemetrySample = {
   windowStart: string;
   windowEnd: string;
   updatedAt: string;
-  workerRequestsDaily: number;
-  durableObjectRequestEquivalentsDaily: number;
-  d1RowsReadDaily: number;
-  d1RowsWrittenDaily: number;
+  workerRequestsDaily?: number | undefined;
+  durableObjectRequestEquivalentsDaily?: number | undefined;
+  d1RowsReadDaily?: number | undefined;
+  d1RowsWrittenDaily?: number | undefined;
 };
 
 type BudgetTelemetrySampleRow = {
@@ -5358,6 +5951,18 @@ type BudgetTelemetrySampleRow = {
   d1_rows_read_daily: number | null;
   worker_requests_daily: number | null;
   durable_object_requests_daily: number | null;
+};
+
+type BudgetTelemetryLatestSampleRow = BudgetTelemetrySampleRow & {
+  window_start: string;
+  window_end: string;
+};
+
+type DogfoodSafetyPauseSetting = {
+  paused: true;
+  reason?: string | undefined;
+  updated_by?: string | undefined;
+  updated_at: string;
 };
 
 type CloudflareGraphqlMetricRow = {

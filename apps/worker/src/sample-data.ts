@@ -3,6 +3,7 @@ import type {
   BootstrapPayload,
   BudgetSummary,
   ConnectorSummary,
+  DogfoodSafetyPosture,
   HostSessionSummary,
   HostSessionSyncSummary,
   TaskCategory,
@@ -528,6 +529,97 @@ export const events: ThreadEvent[] = [
   }
 ];
 
+export const safety: DogfoodSafetyPosture = {
+  state: budget.state,
+  paused: false,
+  generated_at: budget.generated_at ?? "2026-06-09T21:58:05.000Z",
+  summary: "Cost posture is conservative; D1 rows written / day is the current bottleneck.",
+  bottleneck_constraint: budget.bottleneck_constraint,
+  actions: [
+    {
+      action: "command_create",
+      state: "allowed",
+      reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    },
+    {
+      action: "local_thread_create",
+      state: "allowed",
+      reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    },
+    {
+      action: "host_session_refresh",
+      state: "blocked",
+      reason: "Host Session refresh is paused while cost posture is conservative; use existing attached threads or resume when the bottleneck clears.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    },
+    {
+      action: "host_session_attach",
+      state: "allowed",
+      reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    },
+    {
+      action: "host_session_detach",
+      state: "allowed",
+      reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    },
+    {
+      action: "task_archive",
+      state: "allowed",
+      reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    },
+    {
+      action: "budget_bootstrap",
+      state: "allowed",
+      reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    },
+    {
+      action: "agent_event",
+      state: "allowed",
+      reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    },
+    {
+      action: "app_server_instances_report",
+      state: "allowed",
+      reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    }
+  ]
+};
+
 export function sampleBootstrap(email = "operator@example.com"): BootstrapPayload {
   return {
     user: {
@@ -546,6 +638,7 @@ export function sampleBootstrap(email = "operator@example.com"): BootstrapPayloa
     running_commands: [],
     events,
     budget,
+    safety,
     server_time: new Date().toISOString()
   };
 }

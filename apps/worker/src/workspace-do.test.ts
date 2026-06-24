@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { BudgetState } from "@chaop/protocol";
 import {
   agentSocketsForConnector,
   appServerInstancesMessage,
@@ -185,6 +186,129 @@ test("full host session reports are not browser snapshots when app-server invent
   assert.equal(update.payload?.snapshot, false);
 });
 
+test("host session reports are dropped while dogfood safety blocks refresh writes", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    pendingHostSessionsDispatch: true,
+    pendingHostSessionsDispatchDeadline: Date.now() + 60_000
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({ pendingCommand: true, safetyPaused: true });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.host_sessions",
+    payload: {
+      sessions: [
+        {
+          session_id: "session-1",
+          title: "Inventory title",
+          title_source: "metadata",
+          cwd: "/tmp/project",
+          updated_at: "2026-06-13T10:01:00.000Z"
+        }
+      ],
+      inventory_scope: "full",
+      app_server_inventory_ok: true
+    }
+  }));
+
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
+  assert.equal(agentSent.length, 1);
+  assert.equal(browserSent.length, 0);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; accepted?: boolean; reason?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.host_sessions");
+  assert.equal(ack.payload?.accepted, false);
+  assert.match(ack.payload?.reason ?? "", /Dogfood safety blocked/);
+  const attachment = agentSocket.deserializeAttachment() as {
+    pendingHostSessionsDispatch?: boolean;
+  };
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
+test("blocked host session reports still release conservative pending dispatch", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    pendingHostSessionsDispatch: true,
+    pendingHostSessionsDispatchDeadline: Date.now() + 60_000
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({ pendingCommand: true, safetyBudgetState: "conservative" });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.host_sessions",
+    payload: {
+      sessions: [
+        {
+          session_id: "session-1",
+          title: "Inventory title",
+          title_source: "metadata",
+          cwd: "/tmp/project",
+          updated_at: "2026-06-13T10:01:00.000Z"
+        }
+      ],
+      inventory_scope: "full",
+      app_server_inventory_ok: true
+    }
+  }));
+
+  assert.equal(db.pendingDispatchQueries, 1);
+  assert.equal(db.commandLeases, 1);
+  assert.equal(agentSent.length, 2);
+  assert.equal(browserSent.length, 0);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; accepted?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.host_sessions");
+  assert.equal(ack.payload?.accepted, false);
+  const dispatch = JSON.parse(agentSent[1] ?? "{}") as {
+    kind?: string;
+    payload?: { command?: { id?: string } };
+  };
+  assert.equal(dispatch.kind, "command.dispatch");
+  assert.equal(dispatch.payload?.command?.id, "command-1");
+  const attachment = agentSocket.deserializeAttachment() as {
+    pendingHostSessionsDispatch?: boolean;
+  };
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
 test("connectorsMessage wraps connector capability updates for browser consumers", () => {
   const message = connectorsMessage({
     connectors: [
@@ -282,6 +406,44 @@ test("agent app-server instance report is acked and broadcast", async () => {
   const update = JSON.parse(browserSent[0] ?? "{}") as { kind?: string; payload?: { app_server_instances?: Array<{ state?: string }> } };
   assert.equal(update.kind, "app_server_instances.updated");
   assert.equal(update.payload?.app_server_instances?.[0]?.state, "healthy");
+});
+
+test("agent app-server instance reports are dropped while dogfood safety blocks status writes", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      return [];
+    }
+  } as unknown as DurableObjectState;
+  const db = appServerInstanceDoDb({ safetyPaused: true });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      report_id: "report-paused",
+      instances: [appServerInstancePayload("healthy")]
+    }
+  }));
+
+  assert.equal(db.writes, 0);
+  assert.equal(agentSent.length, 1);
+  assert.equal(browserSent.length, 0);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as {
+    payload?: { kind?: string; accepted?: boolean; reason?: string; report_id?: string };
+  };
+  assert.equal(ack.payload?.kind, "agent.app_server_instances");
+  assert.equal(ack.payload?.accepted, false);
+  assert.equal(ack.payload?.report_id, "report-paused");
+  assert.match(ack.payload?.reason ?? "", /Dogfood emergency pause/);
 });
 
 test("agent app-server instance report accepts workspace and thread placement targets", async () => {
@@ -703,6 +865,57 @@ test("closing ready socket with handshaking peer fails active commands without m
   assert.match(connectorUpdate.payload?.connectors?.[0]?.updated_at ?? "", /^\d{4}-\d{2}-\d{2}T/);
 });
 
+test("closing ready socket skips app-server stopped writes while dogfood safety blocks status writes", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const closingSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const handshakingPeer = socketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online"
+  });
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [closingSocket, handshakingPeer];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const safety = { paused: false };
+  const db = socketGoneDb({ safety });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(closingSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      instances: [appServerInstancePayload("healthy")]
+    }
+  }));
+  assert.equal(db.appServerInstanceWrites, 1);
+  agentSent.length = 0;
+  browserSent.length = 0;
+  safety.paused = true;
+
+  await workspace.webSocketClose(closingSocket);
+
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.activityUpdates, 1);
+  assert.equal(db.connectorDegradedUpdates, 1);
+  assert.equal(db.connectorOfflineUpdates, 0);
+  assert.equal(db.appServerInstanceWrites, 1);
+  assert.equal(browserSent.length, 2);
+  const kinds = browserSent.map((message) => (JSON.parse(message) as { kind?: string }).kind);
+  assert.deepEqual(kinds, ["thread.event", "connectors.updated"]);
+});
+
 test("closing idle ready socket with ready peer does not fail active connector commands", async () => {
   const browserSent: string[] = [];
   const closingSocket = socketWithAttachment({
@@ -1016,6 +1229,192 @@ test("agent.ready refreshes host sessions before pending command dispatch", asyn
   assert.deepEqual(replacementUpdate.payload?.connectors?.[0]?.capabilities, ["placeholder_commands"]);
 });
 
+test("agent.ready skips automatic host session refresh while dogfood safety blocks refresh", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({ pendingCommand: true, safetyPaused: true });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.ready",
+    payload: { capabilities: ["placeholder_commands"] }
+  }));
+
+  assert.equal(db.capabilityUpdates, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
+  assert.equal(sent.length, 1);
+  assert.equal(browserSent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; capabilities?: string[] };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.ready");
+  assert.deepEqual(ack.payload?.capabilities, ["placeholder_commands"]);
+  const attachment = agentSocket.deserializeAttachment() as {
+    socketType?: string;
+    connectorId?: string;
+    connectedAt?: number;
+    agentReady?: boolean;
+    pendingHostSessionsDispatch?: boolean;
+  };
+  assert.equal(attachment.socketType, "agent");
+  assert.equal(attachment.connectorId, "connector-online");
+  assert.equal(attachment.connectedAt, 300);
+  assert.equal(attachment.agentReady, true);
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
+test("agent.ready skips automatic host session refresh without D1 sample safety", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, {} as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.ready",
+    payload: { capabilities: ["placeholder_commands"] }
+  }));
+
+  assert.equal(sent.length, 1);
+  assert.equal(browserSent.length, 0);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; capabilities?: string[] };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.ready");
+  assert.deepEqual(ack.payload?.capabilities, ["placeholder_commands"]);
+  const attachment = agentSocket.deserializeAttachment() as {
+    pendingHostSessionsDispatch?: boolean;
+  };
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
+test("agent.ready dispatches pending commands while conservative posture blocks host session refresh", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({ pendingCommand: true, safetyBudgetState: "conservative" });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.ready",
+    payload: { capabilities: ["placeholder_commands"] }
+  }));
+
+  assert.equal(db.capabilityUpdates, 1);
+  assert.equal(db.pendingDispatchQueries, 1);
+  assert.equal(db.commandLeases, 1);
+  assert.equal(sent.length, 2);
+  assert.equal(browserSent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; capabilities?: string[] };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.ready");
+  assert.deepEqual(ack.payload?.capabilities, ["placeholder_commands"]);
+  const dispatch = JSON.parse(sent[1] ?? "{}") as {
+    kind?: string;
+    payload?: { command?: { id?: string } };
+  };
+  assert.equal(dispatch.kind, "command.dispatch");
+  assert.equal(dispatch.payload?.command?.id, "command-1");
+  const attachment = agentSocket.deserializeAttachment() as {
+    pendingHostSessionsDispatch?: boolean;
+  };
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
+test("agent.ready stops pending dispatch after stale cleanup moves safety to hard limit", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({
+    pendingCommand: true,
+    safetyBudgetState: "conservative",
+    safetyBudgetStateAfterStaleCleanup: "hard_limited"
+  });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.ready",
+    payload: { capabilities: ["placeholder_commands"] }
+  }));
+
+  assert.equal(db.capabilityUpdates, 1);
+  assert.equal(db.staleExplicitCleanupQueries, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
+  assert.equal(sent.length, 1);
+  assert.equal(browserSent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; capabilities?: string[] };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.ready");
+});
+
 test("agent.ready does not dispatch while a peer socket has host-session refresh pending", async () => {
   const staleSent: string[] = [];
   const refreshingSent: string[] = [];
@@ -1131,6 +1530,39 @@ test("dispatch-pending cleans stale app-server targets before ready sockets", as
   assert.equal((await response.json() as { dispatched_to?: number }).dispatched_to, 0);
   assert.equal(db.staleExplicitCleanupQueries, 1);
   assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(sent.length, 0);
+});
+
+test("dispatch-pending stops after stale cleanup moves safety to hard limit", async () => {
+  const sent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true
+  }, sent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({
+    pendingCommand: true,
+    safetyBudgetStateAfterStaleCleanup: "hard_limited"
+  });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  const response = await workspace.fetch(new Request("https://workspace-do/internal/dispatch-pending", {
+    method: "POST",
+    body: JSON.stringify({ connector_id: "connector-online" })
+  }));
+
+  assert.equal((await response.json() as { dispatched_to?: number }).dispatched_to, 0);
+  assert.equal(db.staleExplicitCleanupQueries, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
   assert.equal(sent.length, 0);
 });
 
@@ -1343,6 +1775,45 @@ test("global dispatch-pending cleans stale app-server targets before ready socke
   assert.equal((await response.json() as { dispatched_to?: number }).dispatched_to, 0);
   assert.equal(db.staleExplicitCleanupQueries, 1);
   assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(sent.length, 0);
+});
+
+test("global dispatch-pending stops after stale cleanup moves safety to hard limit", async () => {
+  const sent: string[] = [];
+  const firstSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true
+  }, sent);
+  const secondSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 350,
+    agentReady: true
+  }, sent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent" || tag === "agent:connector-online") return [firstSocket, secondSocket];
+      if (tag === "browser") return [];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({
+    pendingCommand: true,
+    safetyBudgetStateAfterStaleCleanup: "hard_limited"
+  });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  const response = await workspace.fetch(new Request("https://workspace-do/internal/dispatch-pending", {
+    method: "POST",
+    body: JSON.stringify({})
+  }));
+
+  assert.equal((await response.json() as { dispatched_to?: number }).dispatched_to, 0);
+  assert.equal(db.staleExplicitCleanupQueries, 1);
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
   assert.equal(sent.length, 0);
 });
 
@@ -1729,6 +2200,171 @@ test("agent event ack rejects stale command events", async () => {
   });
 });
 
+test("dogfood safety pause drops non-terminal agent events without stranding the connector", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    activeCommandIds: ["command-1"]
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = dogfoodSafetyBlockedAgentEventDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "command.output",
+      priority: "P2",
+      summary: "Should not be persisted"
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean; dropped?: boolean; reason?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.command_id, "command-1");
+  assert.equal(ack.payload?.kind, "command.output");
+  assert.equal(ack.payload?.accepted, true);
+  assert.equal(ack.payload?.dropped, true);
+  assert.match(ack.payload?.reason ?? "", /Dogfood emergency pause is active/);
+  assert.deepEqual(
+    (agentSocket.deserializeAttachment() as { activeCommandIds?: string[] }).activeCommandIds,
+    ["command-1"]
+  );
+  assert.equal(browserSent.length, 0);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
+test("dogfood safety pause still records command started events", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    activeCommandIds: ["command-1"]
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = dogfoodSafetyBlockedAgentEventDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "command.started",
+      priority: "P1",
+      summary: "Started while paused"
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean; dropped?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, {
+    command_id: "command-1",
+    kind: "command.started",
+    accepted: true
+  });
+  assert.equal(browserSent.length, 1);
+  const browserEvent = JSON.parse(browserSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { event?: { kind?: string; summary?: string } };
+  };
+  assert.equal(browserEvent.kind, "thread.event");
+  assert.equal(browserEvent.payload?.event?.kind, "command.started");
+  assert.equal(browserEvent.payload?.event?.summary, "Started while paused");
+  assert.equal(db.commandStateUpdates, 1);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.eventInserts, 1);
+});
+
+test("terminal agent events bypass dogfood safety block and clear socket activity", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    activeCommandIds: ["command-1"]
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = dogfoodSafetyBlockedTerminalAgentEventDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "command.finished",
+      priority: "P1",
+      summary: "Finished while paused"
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, {
+    command_id: "command-1",
+    kind: "command.finished",
+    accepted: true
+  });
+  assert.deepEqual(
+    (agentSocket.deserializeAttachment() as { activeCommandIds?: string[] }).activeCommandIds,
+    []
+  );
+  assert.equal(browserSent.length, 1);
+  const browserEvent = JSON.parse(browserSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { event?: { kind?: string; summary?: string } };
+  };
+  assert.equal(browserEvent.kind, "thread.event");
+  assert.equal(browserEvent.payload?.event?.kind, "command.finished");
+  assert.equal(browserEvent.payload?.event?.summary, "Finished while paused");
+  assert.ok(db.safetyQueries > 0);
+  assert.equal(db.commandUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+});
+
 test("rejected stale final command events still poll pending work for the connector", async () => {
   const sent: string[] = [];
   const agentSocket = {
@@ -1936,6 +2572,9 @@ test("rejected targeted app-server starts trigger pending dispatch to available 
 function staleCommandEventDb(): D1Database {
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
@@ -1968,6 +2607,9 @@ function staleFinalCommandEventDb(): D1Database & { readonly pendingDispatchQuer
   const counters = { pendingDispatchQueries: 0 };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
@@ -2047,6 +2689,415 @@ function staleFinalCommandEventDb(): D1Database & { readonly pendingDispatchQuer
   } as D1Database & { readonly pendingDispatchQueries: number };
 }
 
+function dogfoodSafetyBlockedAgentEventDb(): D1Database & {
+  readonly commandFailures: number;
+  readonly commandStateUpdates: number;
+  readonly eventInserts: number;
+} {
+  const counters = {
+    commandFailures: 0,
+    commandStateUpdates: 0,
+    eventInserts: 0
+  };
+  return {
+    prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql, { paused: true });
+      if (safetyStatement) return safetyStatement;
+
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id/.test(sql) && /FROM commands/.test(sql)) {
+        return {
+          bind(commandId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                return {
+                  id: "command-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  task_id: null,
+                  type: "codex",
+                  target_connector_id: "connector-online",
+                  target_connector_id_source: "attached",
+                  lease_owner_connector_id: "connector-online",
+                  lease_target_host_session_id: null,
+                  state: "leased"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = \?/.test(sql) && /state IN \('leased', 'running'\)/.test(sql)) {
+        return {
+          bind(
+            nextState: string,
+            nextConnectorId: string | null,
+            updatedAt: string,
+            commandId: string,
+            connectorId: string
+          ) {
+            assert.equal(nextState, "running");
+            assert.equal(nextConnectorId, "connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                counters.commandStateUpdates += 1;
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = 'failed'/.test(sql) && /state IN \('leased', 'running'\)/.test(sql)) {
+        return {
+          bind(updatedAt: string, commandId: string, connectorId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                counters.commandFailures += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 1 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            workspaceId: string,
+            threadId: string,
+            commandId: string,
+            seq: number,
+            kind: string,
+            priority: string,
+            summary: string,
+            createdAt: string
+          ) {
+            assert.match(id, /^event-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-1");
+            assert.equal(commandId, "command-1");
+            assert.equal(seq, 1);
+            assert.ok(kind === "command.failed" || kind === "command.started");
+            assert.equal(priority, "P1");
+            if (kind === "command.failed") {
+              assert.match(summary, /Dogfood safety blocked command progress/);
+            } else {
+              assert.equal(summary, "Started while paused");
+            }
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
+      if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { active_count: 0 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE connectors/.test(sql)) {
+        return {
+          bind(first: number | string, second: string, connectorId: string) {
+            if (typeof first === "number") {
+              assert.equal(first, 0);
+              assert.match(second, /^\d{4}-\d{2}-\d{2}T/);
+            } else {
+              assert.match(first, /^\d{4}-\d{2}-\d{2}T/);
+              assert.match(second, /^\d{4}-\d{2}-\d{2}T/);
+            }
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get commandFailures() {
+      return counters.commandFailures;
+    },
+    get commandStateUpdates() {
+      return counters.commandStateUpdates;
+    },
+    get eventInserts() {
+      return counters.eventInserts;
+    }
+  } as unknown as D1Database & {
+    readonly commandFailures: number;
+    readonly commandStateUpdates: number;
+    readonly eventInserts: number;
+  };
+}
+
+function dogfoodSafetyBlockedTerminalAgentEventDb(): D1Database & {
+  readonly safetyQueries: number;
+  readonly commandUpdates: number;
+  readonly eventInserts: number;
+} {
+  const counters = {
+    safetyQueries: 0,
+    commandUpdates: 0,
+    eventInserts: 0
+  };
+  return {
+    prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql, { paused: true });
+      if (safetyStatement) {
+        counters.safetyQueries += 1;
+        return safetyStatement;
+      }
+
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
+        return {
+          bind(commandId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                return {
+                  id: "command-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  task_id: null,
+                  type: "codex",
+                  target_connector_id: null,
+                  target_connector_id_source: "auto",
+                  lease_owner_connector_id: "connector-online",
+                  state: "running",
+                  lease_target_host_session_id: null
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /lease_owner_connector_id = \?/.test(sql) && /state IN \('leased', 'running'\)/.test(sql)) {
+        return {
+          bind(
+            nextState: string,
+            connectorId: string,
+            updatedAt: string,
+            commandId: string,
+            ownerConnectorId: string
+          ) {
+            assert.equal(nextState, "succeeded");
+            assert.equal(connectorId, "connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(ownerConnectorId, "connector-online");
+            return {
+              async run() {
+                counters.commandUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads/.test(sql) && /RETURNING last_seq/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 1 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind(
+            id: string,
+            workspaceId: string,
+            threadId: string,
+            commandId: string,
+            seq: number,
+            kind: string,
+            priority: string,
+            summary: string,
+            createdAt: string
+          ) {
+            assert.match(id, /^event-/);
+            assert.equal(workspaceId, "workspace-api");
+            assert.equal(threadId, "thread-1");
+            assert.equal(commandId, "command-1");
+            assert.equal(seq, 1);
+            assert.equal(kind, "command.finished");
+            assert.equal(priority, "P1");
+            assert.equal(summary, "Finished while paused");
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO usage_windows/.test(sql)) {
+        return usageWindowUpsertFake();
+      }
+
+      if (/UPDATE connectors/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT COUNT\(\*\) AS active_count/.test(sql)) {
+        return {
+          bind(connectorId: string) {
+            assert.equal(connectorId, "connector-online");
+            return {
+              async first() {
+                return { active_count: 0 };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get safetyQueries() {
+      return counters.safetyQueries;
+    },
+    get commandUpdates() {
+      return counters.commandUpdates;
+    },
+    get eventInserts() {
+      return counters.eventInserts;
+    }
+  } as unknown as D1Database & {
+    readonly safetyQueries: number;
+    readonly commandUpdates: number;
+    readonly eventInserts: number;
+  };
+}
+
+function safetyQueryStatement(sql: string, options: { paused?: boolean; budgetState?: BudgetState } = {}) {
+  if (/SELECT value_json, updated_at FROM control_plane_settings/.test(sql)) {
+    return {
+      bind(key: string) {
+        assert.equal(key, "dogfood_safety.pause");
+        return {
+          async first() {
+            return options.paused
+              ? {
+                value_json: JSON.stringify({
+                  paused: true,
+                  reason: "operator stop",
+                  updated_at: "2026-06-12T10:00:00.000Z"
+                }),
+                updated_at: "2026-06-12T10:00:00.000Z"
+              }
+              : undefined;
+          }
+        };
+      }
+    };
+  }
+
+  if (/FROM usage_windows/.test(sql)) {
+    return {
+      bind() {
+        return {
+          async first() {
+            return undefined;
+          }
+        };
+      }
+    };
+  }
+
+  if (/FROM budget_telemetry_samples/.test(sql)) {
+    return {
+      bind() {
+        return {
+          async first() {
+            return undefined;
+          }
+        };
+      }
+    };
+  }
+
+  if (/FROM connectors/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+    return {
+      async all() {
+        return { results: options.budgetState ? [{ budget_state: options.budgetState, count: 1 }] : [] };
+      }
+    };
+  }
+
+  if (/FROM tasks/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+    return {
+      async all() {
+        return { results: [] };
+      }
+    };
+  }
+
+  return undefined;
+}
+
 function rejectedStartedEventWithFailedResultDb(): D1Database & {
   readonly explicitFailures: number;
   readonly pendingDispatchQueries: number;
@@ -2057,6 +3108,9 @@ function rejectedStartedEventWithFailedResultDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
@@ -2250,6 +3304,9 @@ function rejectedTargetedStartDispatchDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id, target_connector_id_source,\s+lease_owner_connector_id, state/.test(sql)) {
         return {
           bind(commandId: string) {
@@ -2501,7 +3558,7 @@ function socketWithAttachment(attachment: unknown): WebSocket {
   } as unknown as WebSocket;
 }
 
-function socketGoneDb(): D1Database & {
+function socketGoneDb(options: { safety?: { paused?: boolean; budgetState?: BudgetState } } = {}): D1Database & {
   readonly commandFailures: number;
   readonly taskUpdates: number;
   readonly eventInserts: number;
@@ -2522,6 +3579,9 @@ function socketGoneDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql, options.safety);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id\s+FROM connectors/.test(sql)) {
         return {
           bind(connectorId: string) {
@@ -2971,11 +4031,20 @@ type AppServerInstanceDoRow = {
   updated_at: string;
 };
 
-function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
+function appServerInstanceDoDb(options: {
+  safetyPaused?: boolean;
+  safetyBudgetState?: BudgetState;
+} = {}): D1Database & { readonly writes: number } {
   const rows = new Map<string, AppServerInstanceDoRow>();
   const counters = { writes: 0 };
   return {
     prepare(sql: string) {
+      const safetyOptions: { paused?: boolean; budgetState?: BudgetState } = {};
+      if (options.safetyPaused !== undefined) safetyOptions.paused = options.safetyPaused;
+      if (options.safetyBudgetState !== undefined) safetyOptions.budgetState = options.safetyBudgetState;
+      const safetyStatement = safetyQueryStatement(sql, safetyOptions);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id\s+FROM connectors/.test(sql)) {
         return {
           bind(connectorId: string) {
@@ -3097,6 +4166,9 @@ function staleReleaseDispatchDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/FROM commands cmd/.test(sql) && /cmd\.lease_target_host_session_id IS NOT NULL/.test(sql)) {
         return {
           bind(
@@ -3313,6 +4385,9 @@ function readyGatedDispatchDb(options: {
   initialStatus?: "online" | "offline" | "degraded";
   initialUpdatedAt?: string;
   pendingCommand?: boolean;
+  safetyPaused?: boolean;
+  safetyBudgetState?: BudgetState;
+  safetyBudgetStateAfterStaleCleanup?: BudgetState;
 } = {}): D1Database & {
   readonly capabilityUpdates: number;
   readonly connectorOnlineUpdates: number;
@@ -3358,6 +4433,16 @@ function readyGatedDispatchDb(options: {
   };
   return {
     prepare(sql: string) {
+      const safetyOptions: { paused?: boolean; budgetState?: BudgetState } = {};
+      if (options.safetyPaused !== undefined) safetyOptions.paused = options.safetyPaused;
+      const effectiveBudgetState = options.safetyBudgetStateAfterStaleCleanup !== undefined
+        && counters.staleExplicitCleanupQueries > 0
+        ? options.safetyBudgetStateAfterStaleCleanup
+        : options.safetyBudgetState;
+      if (effectiveBudgetState !== undefined) safetyOptions.budgetState = effectiveBudgetState;
+      const safetyStatement = safetyQueryStatement(sql, safetyOptions);
+      if (safetyStatement) return safetyStatement;
+
       if (/UPDATE connectors/.test(sql) && /capabilities_json = \?/.test(sql)) {
         return {
           bind(

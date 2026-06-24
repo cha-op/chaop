@@ -737,6 +737,20 @@ test("markConnectorDisconnected fails active commands and marks connector offlin
   assert.equal(db.connectorOfflineUpdates, 1);
 });
 
+test("markConnectorDisconnected skips app-server stopped writes while dogfood safety blocks status writes", async () => {
+  const db = connectorDisconnectedDb({ safetyPaused: true });
+
+  const events = await markConnectorDisconnected({ DB: db } as Env, "connector-online");
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.kind, "command.failed");
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.appServerInstanceStops, 0);
+  assert.equal(db.connectorOfflineUpdates, 1);
+});
+
 test("updateConnectorCapabilities stores refreshed agent.ready capabilities", async () => {
   const db = connectorCapabilitiesRefreshDb();
 
@@ -2084,7 +2098,7 @@ function appServerStartAfterDetachDb(currentTarget?: {
   return db as D1Database & typeof counters;
 }
 
-function connectorDisconnectedDb() {
+function connectorDisconnectedDb(options: { safetyPaused?: boolean | undefined } = {}) {
   const counters = {
     commandFailures: 0,
     taskUpdates: 0,
@@ -2120,6 +2134,68 @@ function connectorDisconnectedDb() {
   ]);
   const db = {
     prepare(sql: string) {
+      if (/SELECT[\s\S]+FROM control_plane_settings/.test(sql)) {
+        return {
+          bind(key: string) {
+            assert.equal(key, "dogfood_safety.pause");
+            return {
+              async first() {
+                return options.safetyPaused
+                  ? {
+                    value_json: JSON.stringify({
+                      paused: true,
+                      reason: "test pause",
+                      updated_at: "2026-06-12T10:00:00.000Z"
+                    }),
+                    updated_at: "2026-06-12T10:00:00.000Z"
+                  }
+                  : undefined;
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM usage_windows/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async first() {
+                return undefined;
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM budget_telemetry_samples/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async first() {
+                return undefined;
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM connectors/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        return {
+          async all() {
+            return { results: [] };
+          }
+        };
+      }
+
+      if (/FROM tasks/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        return {
+          async all() {
+            return { results: [] };
+          }
+        };
+      }
+
       if (/FROM commands/.test(sql) && /lease_owner_connector_id = \?/.test(sql) && /state IN \('leased', 'running'\)/.test(sql)) {
         return {
           bind(connectorId: string) {
@@ -2405,6 +2481,59 @@ function duplicateConnectorRetirementDb(options: { sourceAppServerPresent?: numb
   ]);
   const db = {
     prepare(sql: string) {
+      if (/SELECT[\s\S]+FROM control_plane_settings/.test(sql)) {
+        return {
+          bind(key: string) {
+            assert.equal(key, "dogfood_safety.pause");
+            return {
+              async first() {
+                return undefined;
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM usage_windows/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async first() {
+                return undefined;
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM budget_telemetry_samples/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async first() {
+                return undefined;
+              }
+            };
+          }
+        };
+      }
+
+      if (/FROM connectors/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        return {
+          async all() {
+            return { results: [] };
+          }
+        };
+      }
+
+      if (/FROM tasks/.test(sql) && /GROUP BY budget_state/.test(sql)) {
+        return {
+          async all() {
+            return { results: [] };
+          }
+        };
+      }
+
       if (/SELECT id\s+FROM connectors\s+WHERE id <> \? AND name = \? AND hostname = \?/.test(sql)) {
         return {
           bind(connectorId: string, name: string, hostname: string) {

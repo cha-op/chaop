@@ -1,4 +1,4 @@
-import type { BootstrapPayload } from "@chaop/protocol";
+import type { BootstrapPayload, DogfoodSafetyPosture } from "@chaop/protocol";
 
 export function fallbackBootstrap(): BootstrapPayload {
   return {
@@ -620,6 +620,100 @@ export function fallbackBootstrap(): BootstrapPayload {
         ]
       }
     },
+    safety: fallbackSafety(),
     server_time: new Date().toISOString()
+  };
+}
+
+function fallbackSafety(): DogfoodSafetyPosture {
+  const bottleneck = {
+    id: "d1_rows_written_daily",
+    label: "D1 rows written / day",
+    detail: "Cloudflare Free D1 rows-written limit, converted to Chaop event capacity with the current schema-derived write model.",
+    window_type: "daily",
+    unit: "d1_row",
+    hard: true,
+    sampled: true,
+    state: "conservative",
+    source: "sample",
+    limit_units: 100000,
+    used_units: 75000,
+    used_pct: 75,
+    remaining_units: 25000,
+    remaining_ratio: 0.25,
+    per_event_units: 26,
+    remaining_event_capacity: 961,
+    window_start: "2026-06-09T00:00:00.000Z",
+    window_end: "2026-06-10T00:00:00.000Z",
+    updated_at: "2026-06-09T21:58:05.000Z"
+  } satisfies NonNullable<BootstrapPayload["budget"]["bottleneck_constraint"]>;
+  const guarded = {
+    budget_state: "conservative",
+    constraint_id: bottleneck.id,
+    constraint_label: bottleneck.label,
+    remaining_event_capacity: bottleneck.remaining_event_capacity
+  } as const;
+  return {
+    state: "conservative",
+    paused: false,
+    generated_at: "2026-06-09T21:58:05.000Z",
+    summary: "Cost posture is conservative; D1 rows written / day is the current bottleneck.",
+    bottleneck_constraint: bottleneck,
+    actions: [
+      {
+        action: "command_create",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
+      },
+      {
+        action: "local_thread_create",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
+      },
+      {
+        action: "host_session_refresh",
+        state: "blocked",
+        reason: "Host Session refresh is paused while cost posture is conservative; use existing attached threads or resume when the bottleneck clears.",
+        ...guarded
+      },
+      {
+        action: "host_session_attach",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
+      },
+      {
+        action: "host_session_detach",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
+      },
+      {
+        action: "task_archive",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
+      },
+      {
+        action: "budget_bootstrap",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
+      },
+      {
+        action: "agent_event",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
+      },
+      {
+        action: "app_server_instances_report",
+        state: "allowed",
+        reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+        ...guarded
+      }
+    ]
   };
 }

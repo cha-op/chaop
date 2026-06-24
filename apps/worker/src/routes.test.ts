@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { handleRequest } from "./routes.js";
-import { loadBudgetSummaryFromDb } from "./db.js";
+import {
+  DogfoodSafetyError,
+  assertDogfoodSafetyActionAllowed,
+  loadBudgetSummaryFromDb,
+  loadDogfoodSafetyPostureFromDb
+} from "./db.js";
 import type { Env } from "./types.js";
 
 const devEnv: Env = {
@@ -10,6 +16,50 @@ const devEnv: Env = {
   CHAOP_GUI_DOMAIN: "app.example.com",
   AGENT_BOOTSTRAP_SECRET: "test-bootstrap"
 };
+
+async function accessJwtTestContext(teamDomain: string): Promise<{
+  env: Env;
+  jwt: string;
+  restore: () => void;
+}> {
+  const audience = "test-access-aud";
+  const kid = "test-access-key";
+  const { publicKey, privateKey } = await generateKeyPair("RS256");
+  const jwk = await exportJWK(publicKey);
+  jwk.kid = kid;
+  jwk.alg = "RS256";
+  jwk.use = "sig";
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const requestUrl = input instanceof Request ? input.url : String(input);
+    assert.equal(requestUrl, `${teamDomain}/cdn-cgi/access/certs`);
+    return new Response(JSON.stringify({ keys: [jwk] }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const jwt = await new SignJWT({ email: "operator@example.com" })
+    .setProtectedHeader({ alg: "RS256", kid })
+    .setIssuer(teamDomain)
+    .setAudience(audience)
+    .setSubject("operator")
+    .setIssuedAt()
+    .setExpirationTime("1h")
+    .sign(privateKey);
+
+  return {
+    env: {
+      CHAOP_API_DOMAIN: "api.example.com",
+      CHAOP_GUI_DOMAIN: "app.example.com",
+      ACCESS_AUD: audience,
+      ACCESS_TEAM_DOMAIN: teamDomain
+    },
+    jwt,
+    restore: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
 
 test("health route returns service metadata", async () => {
   const response = await handleRequest(new Request("https://api.example.com/api/health"), devEnv);
@@ -109,6 +159,7 @@ test("host session refresh dispatches to the workspace durable object", async ()
     }),
     {
       ...devEnv,
+      DB: safetyPauseDb(),
       WORKSPACE_DO: {
         idFromName: () => ({}) as DurableObjectId,
         get: () => ({
@@ -139,6 +190,69 @@ test("host session refresh dispatches to the workspace durable object", async ()
   assert.equal(body.debounced_connector_count, 1);
   assert.equal(body.cooldown_ms, 60_000);
   assert.equal(internalPath, "/internal/refresh-host-sessions");
+});
+
+test("host session refresh requires D1 binding outside sample mode", async () => {
+  const { env, jwt, restore } = await accessJwtTestContext("https://access-refresh.example.com");
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/host-sessions/refresh", {
+        method: "POST",
+        headers: {
+          origin: "https://app.example.com",
+          "cf-access-jwt-assertion": jwt
+        }
+      }),
+      {
+        ...env,
+        WORKSPACE_DO: {
+          idFromName: () => ({}) as DurableObjectId,
+          get: () => ({
+            fetch: async () => {
+              throw new Error("DO should not be called without a D1 binding");
+            }
+          }) as unknown as DurableObjectStub
+        } as unknown as DurableObjectNamespace
+      }
+    );
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: "DB binding is required" });
+  } finally {
+    restore();
+  }
+});
+
+test("sample safety blocks host session refresh before Durable Object dispatch", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/refresh", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not be called while sample safety blocks refresh");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string; budget_state: string };
+  };
+
+  assert.equal(response.status, 429);
+  assert.equal(body.guard.action, "host_session_refresh");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.guard.budget_state, "conservative");
+  assert.match(body.error, /Host Session refresh is paused/);
 });
 
 test("local thread creation rejects invalid payloads before DB work", async () => {
@@ -1308,6 +1422,53 @@ test("host session detach clears the attached task and thread when D1 is bound",
   assert.match(broadcastedEventId, /^event-/);
 });
 
+test("host session detach safety guard blocks before detach side effects", async () => {
+  const db = hostSessionDetachDb({
+    safety: {
+      paused: true,
+      pauseReason: "test stop"
+    }
+  });
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/session-1/detach", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        connector_id: "connector-online"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not receive broadcasts while safety blocks detach");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string };
+    safety: { paused: boolean };
+  };
+
+  assert.equal(response.status, 429);
+  assert.match(body.error, /test stop/);
+  assert.equal(body.guard.action, "host_session_detach");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.safety.paused, true);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.connectorActivityUpdates, 0);
+});
+
 test("host session detach refreshes connector activity after failing a leased command", async () => {
   const db = hostSessionDetachDb({ detachedCommandState: "leased" });
   const response = await handleRequest(
@@ -1556,6 +1717,129 @@ test("browser bootstrap does not write the user row when D1 is bound", async () 
   assert.equal(body.connectors.length, 0);
   assert.equal(body.tasks.length, 0);
   assert.equal(body.task_categories.length, 5);
+});
+
+test("browser bootstrap derives safety from the same live telemetry as budget", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 10 } }],
+            webWorkerInvocations: [],
+            durableObjectsInvocationsAdaptiveGroups: [],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 10, rowsWritten: 120_000 } }]
+          }
+        ]
+      }
+    }
+  }))) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/bootstrap"),
+      {
+        ...devEnv,
+        DB: readOnlyBootstrapTelemetryPersistFailDb(),
+        CF_TELEMETRY_API_TOKEN: "bootstrap-safety-token",
+        CF_TELEMETRY_ACCOUNT_ID: "bootstrap-safety-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-bootstrap-safety",
+        CF_TELEMETRY_D1_DATABASE_ID: "bootstrap-safety-database",
+        CF_TELEMETRY_CACHE_SECONDS: "1",
+        CF_TELEMETRY_SAMPLE_SECONDS: "300"
+      }
+    );
+    const body = (await response.json()) as {
+      budget: { state: string };
+      safety: { state: string; actions: Array<{ action: string; state: string }> };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.budget.state, "hard_limited");
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(
+      body.safety.actions.find((guard) => guard.action === "command_create")?.state,
+      "blocked"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("browser bootstrap keeps persisted max telemetry when live refresh is lower", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  console.warn = () => undefined;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 10 } }],
+            webWorkerInvocations: [],
+            durableObjectsInvocationsAdaptiveGroups: [],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 10, rowsWritten: 50_000 } }]
+          }
+        ]
+      }
+    }
+  }))) as typeof fetch;
+
+  const now = new Date();
+  const dayStart = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate()
+  )).toISOString();
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/bootstrap"),
+      {
+        ...devEnv,
+        DB: readOnlyBootstrapTelemetryPersistFailDb([
+          {
+            id: "bootstrap-persisted-high",
+            sample_type: "cloudflare_daily",
+            sampled_at: now.toISOString(),
+            window_start: dayStart,
+            window_end: now.toISOString(),
+            d1_rows_written_daily: 120_000,
+            d1_rows_read_daily: 2_500,
+            worker_requests_daily: 75,
+            durable_object_requests_daily: 80,
+            created_at: now.toISOString()
+          }
+        ]),
+        CF_TELEMETRY_API_TOKEN: "bootstrap-safety-token",
+        CF_TELEMETRY_ACCOUNT_ID: "bootstrap-persisted-max-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-bootstrap-persisted-max",
+        CF_TELEMETRY_D1_DATABASE_ID: "bootstrap-persisted-max-database",
+        CF_TELEMETRY_CACHE_SECONDS: "1",
+        CF_TELEMETRY_SAMPLE_SECONDS: "300"
+      }
+    );
+    const body = (await response.json()) as {
+      budget: { state: string; bottleneck_constraint?: { id: string; used_units: number } };
+      safety: { state: string; actions: Array<{ action: string; state: string }> };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.budget.state, "hard_limited");
+    assert.deepEqual(
+      [body.budget.bottleneck_constraint?.id, body.budget.bottleneck_constraint?.used_units],
+      ["d1_rows_written_daily", 120_000]
+    );
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(
+      body.safety.actions.find((guard) => guard.action === "command_create")?.state,
+      "blocked"
+    );
+  } finally {
+    console.warn = originalWarn;
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("usage summary returns bounded D1 budget windows", async () => {
@@ -1877,6 +2161,986 @@ test("budget bootstrap opens zero-count current usage windows", async () => {
   );
 });
 
+test("safety posture returns sample safety when dev mode has no D1 binding", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    devEnv
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      actions: Array<{ action: string; state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "conservative");
+  assert.deepEqual(
+    body.safety.actions.map((guard) => [guard.action, guard.state]),
+    [
+      ["command_create", "allowed"],
+      ["local_thread_create", "allowed"],
+      ["host_session_refresh", "blocked"],
+      ["host_session_attach", "allowed"],
+      ["host_session_detach", "allowed"],
+      ["task_archive", "allowed"],
+      ["budget_bootstrap", "allowed"],
+      ["agent_event", "allowed"],
+      ["app_server_instances_report", "allowed"]
+    ]
+  );
+});
+
+test("safety posture reports conservative inventory guard without blocking focused writes", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        usageWindows: {
+          daily: safetyUsageWindow("daily", 3000)
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      paused: boolean;
+      actions: Array<{ action: string; state: string; reason: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "conservative");
+  assert.equal(body.safety.paused, false);
+  assert.deepEqual(
+    body.safety.actions.map((guard) => [guard.action, guard.state]),
+    [
+      ["command_create", "allowed"],
+      ["local_thread_create", "allowed"],
+      ["host_session_refresh", "blocked"],
+      ["host_session_attach", "allowed"],
+      ["host_session_detach", "allowed"],
+      ["task_archive", "allowed"],
+      ["budget_bootstrap", "allowed"],
+      ["agent_event", "allowed"],
+      ["app_server_instances_report", "allowed"]
+    ]
+  );
+  assert.match(
+    body.safety.actions.find((guard) => guard.action === "host_session_refresh")!.reason,
+    /broad refresh|Host Session refresh/
+  );
+});
+
+test("safety posture treats missing live telemetry as allowed", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb()
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      bottleneck_constraint?: unknown;
+      actions: Array<{ action: string; state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "normal");
+  assert.equal(body.safety.bottleneck_constraint, undefined);
+  assert.equal(body.safety.actions.every((guard) => guard.state === "allowed"), true);
+});
+
+test("safety posture uses live Cloudflare telemetry for hard limits", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedBody: { variables?: Record<string, unknown> } | undefined;
+  const telemetrySamples: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (input, init) => {
+    assert.equal(String(input), "https://api.cloudflare.com/client/v4/graphql");
+    requestedBody = JSON.parse(String(init?.body ?? "{}")) as { variables?: Record<string, unknown> };
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 20 } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten: 120_000 } }],
+              durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 40 } }],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/safety-posture", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: safetyPauseDb({ telemetrySamples }),
+        CF_TELEMETRY_API_TOKEN: "safety-telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "safety-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-safety",
+        CF_TELEMETRY_D1_DATABASE_ID: "safety-database"
+      }
+    );
+    const body = (await response.json()) as {
+      safety: {
+        state: string;
+        bottleneck_constraint?: { id?: string; state?: string; source?: string };
+        actions: Array<{ action: string; state: string }>;
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(requestedBody?.variables?.accountTag, "safety-account");
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.id, "d1_rows_written_daily");
+    assert.equal(body.safety.bottleneck_constraint?.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.source, "cloudflare_analytics");
+    assert.equal(body.safety.actions.every((guard) => guard.state === "blocked"), true);
+    assert.equal(telemetrySamples.length, 1);
+    assert.equal(telemetrySamples[0]?.d1_rows_written_daily, 120_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("safety posture keeps persisted max telemetry when live refresh is lower", async () => {
+  const originalFetch = globalThis.fetch;
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const tomorrowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const highSampleAt = new Date(todayStart.getTime() + 9 * 60 * 60 * 1000).toISOString();
+  const telemetrySamples: Record<string, unknown>[] = [
+    {
+      id: "sample-high",
+      sample_type: "cloudflare_daily",
+      sampled_at: highSampleAt,
+      window_start: todayStart.toISOString(),
+      window_end: tomorrowStart.toISOString(),
+      d1_rows_written_daily: 120_000,
+      d1_rows_read_daily: 100,
+      worker_requests_daily: 20,
+      durable_object_requests_daily: 40,
+      created_at: highSampleAt
+    }
+  ];
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 30 } }],
+            webWorkerInvocations: [],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 120, rowsWritten: 40_000 } }],
+            durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 50 } }],
+            durableObjectsPeriodicGroups: []
+          }
+        ]
+      }
+    }
+  }), {
+    headers: { "content-type": "application/json; charset=utf-8" }
+  })) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/safety-posture", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: safetyPauseDb({ telemetrySamples }),
+        CF_TELEMETRY_API_TOKEN: "safety-telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "safety-merge-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-safety-merge",
+        CF_TELEMETRY_D1_DATABASE_ID: "safety-merge-database"
+      }
+    );
+    const body = (await response.json()) as {
+      safety: {
+        state: string;
+        bottleneck_constraint?: { id?: string; state?: string; used_units?: number | null };
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.id, "d1_rows_written_daily");
+    assert.equal(body.safety.bottleneck_constraint?.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.used_units, 120_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("safety posture falls back to persisted max telemetry when live refresh fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const tomorrowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const highSampleAt = new Date(todayStart.getTime() + 9 * 60 * 60 * 1000).toISOString();
+  const telemetrySamples: Record<string, unknown>[] = [
+    {
+      id: "sample-high",
+      sample_type: "cloudflare_daily",
+      sampled_at: highSampleAt,
+      window_start: todayStart.toISOString(),
+      window_end: tomorrowStart.toISOString(),
+      d1_rows_written_daily: 120_000,
+      d1_rows_read_daily: 100,
+      worker_requests_daily: 20,
+      durable_object_requests_daily: 40,
+      created_at: highSampleAt
+    }
+  ];
+  globalThis.fetch = (async () => {
+    throw new Error("temporary telemetry failure");
+  }) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/safety-posture", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: safetyPauseDb({ telemetrySamples }),
+        CF_TELEMETRY_API_TOKEN: "safety-telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "safety-fallback-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-safety-fallback",
+        CF_TELEMETRY_D1_DATABASE_ID: "safety-fallback-database"
+      }
+    );
+    const body = (await response.json()) as {
+      safety: {
+        state: string;
+        bottleneck_constraint?: { id?: string; state?: string; used_units?: number | null };
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.id, "d1_rows_written_daily");
+    assert.equal(body.safety.bottleneck_constraint?.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.used_units, 120_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("safety posture includes connector and task budget states", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        connectorBudgetStates: ["normal", "throttled"],
+        taskBudgetStates: ["hard_limited"]
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      bottleneck_constraint?: unknown;
+      actions: Array<{ action: string; state: string; reason: string; budget_state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "hard_limited");
+  assert.equal(body.safety.bottleneck_constraint, undefined);
+  assert.equal(body.safety.actions.every((guard) => guard.state === "blocked"), true);
+  assert.equal(
+    body.safety.actions.find((guard) => guard.action === "command_create")?.budget_state,
+    "hard_limited"
+  );
+  assert.match(
+    body.safety.actions.find((guard) => guard.action === "command_create")!.reason,
+    /Cost posture is hard limited/
+  );
+});
+
+test("safety posture fails closed when pause state cannot be read", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        pauseReadError: "control setting unavailable"
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      paused: boolean;
+      paused_reason?: string | undefined;
+      actions: Array<{ state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "hard_limited");
+  assert.equal(body.safety.paused, true);
+  assert.match(body.safety.paused_reason ?? "", /could not be loaded/);
+  assert.equal(body.safety.actions.every((guard) => guard.state === "blocked"), true);
+});
+
+test("safety posture fails closed when pause state row is malformed", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety-posture", {
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        malformedPauseRow: true
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    safety: {
+      state: string;
+      paused: boolean;
+      paused_reason?: string | undefined;
+      actions: Array<{ state: string }>;
+    };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(body.safety.state, "hard_limited");
+  assert.equal(body.safety.paused, true);
+  assert.match(body.safety.paused_reason ?? "", /malformed/);
+  assert.equal(body.safety.actions.every((guard) => guard.state === "blocked"), true);
+});
+
+test("safety pause and resume update the operator guard state", async () => {
+  const db = safetyPauseDb();
+  const dispatchRequests: Array<{ url: string; method: string; body: string }> = [];
+  const pause = await handleRequest(
+    new Request("https://api.example.com/api/safety/pause", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        reason: "test stop"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db
+    }
+  );
+  const paused = (await pause.json()) as {
+    safety: {
+      paused: boolean;
+      paused_reason?: string;
+      actions: Array<{ state: string }>;
+    };
+  };
+  const resume = await handleRequest(
+    new Request("https://api.example.com/api/safety/resume", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: (name: string) => {
+          assert.equal(name, "global");
+          return {} as DurableObjectId;
+        },
+        get: () => ({
+          async fetch(input: RequestInfo, init?: RequestInit) {
+            const request = new Request(input, init);
+            dispatchRequests.push({
+              url: request.url,
+              method: request.method,
+              body: await request.text()
+            });
+            return new Response(JSON.stringify({ dispatched_to: 1 }), {
+              headers: { "content-type": "application/json" }
+            });
+          }
+        })
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const resumed = (await resume.json()) as {
+    safety: {
+      paused: boolean;
+      actions: Array<{ state: string }>;
+    };
+  };
+
+  assert.equal(pause.status, 200);
+  assert.equal(paused.safety.paused, true);
+  assert.equal(paused.safety.paused_reason, "test stop");
+  assert.equal(paused.safety.actions.every((guard) => guard.state === "blocked"), true);
+  assert.equal(resume.status, 200);
+  assert.equal(resumed.safety.paused, false);
+  assert.equal(resumed.safety.actions.every((guard) => guard.state === "allowed"), true);
+  assert.deepEqual(dispatchRequests, [{
+    url: "https://workspace-do/internal/dispatch-pending",
+    method: "POST",
+    body: ""
+  }]);
+});
+
+test("safety pause requires a D1 binding even in sample mode", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/safety/pause", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        reason: "test stop"
+      })
+    }),
+    devEnv
+  );
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: "DB binding is required" });
+});
+
+test("safety pause blocks command creation before command writes", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, {
+        safety: {
+          paused: true,
+          pauseReason: "test stop"
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string };
+    safety: { paused: boolean };
+  };
+
+  assert.equal(response.status, 429);
+  assert.match(body.error, /test stop/);
+  assert.equal(body.guard.action, "command_create");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.safety.paused, true);
+});
+
+test("connector budget state blocks command creation before command writes", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, {
+        safety: {
+          connectorBudgetStates: ["throttled"]
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string; budget_state: string };
+    safety: { state: string };
+  };
+
+  assert.equal(response.status, 429);
+  assert.equal(body.guard.action, "command_create");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.guard.budget_state, "throttled");
+  assert.equal(body.safety.state, "throttled");
+  assert.match(body.error, /Cost posture is throttled/);
+});
+
+test("command creation safety guard does not fetch live Cloudflare telemetry", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response("{}", { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/commands", {
+        method: "POST",
+        headers: {
+          origin: "https://app.example.com"
+        },
+        body: JSON.stringify({
+          workspace_id: "workspace-api",
+          thread_id: "thread-orders-500",
+          prompt: "Summarise current errors"
+        })
+      }),
+      {
+        ...devEnv,
+        DB: commandTargetDb({ id: "connector-online" }),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "telemetry-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_D1_DATABASE_ID: "telemetry-database"
+      }
+    );
+    const body = (await response.json()) as { accepted?: boolean };
+
+    assert.equal(response.status, 202);
+    assert.equal(body.accepted, true);
+    assert.equal(fetchCount, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("command creation safety guard uses persisted Cloudflare telemetry samples", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response("{}", { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/commands", {
+        method: "POST",
+        headers: {
+          origin: "https://app.example.com"
+        },
+        body: JSON.stringify({
+          workspace_id: "workspace-api",
+          thread_id: "thread-orders-500",
+          prompt: "Summarise current errors"
+        })
+      }),
+      {
+        ...devEnv,
+        DB: commandTargetDb({ id: "connector-online" }, {
+          safety: {
+            telemetrySample: {
+              sampled_at: "2026-06-15T09:00:00.000Z",
+              window_start: "2026-06-15T00:00:00.000Z",
+              window_end: "2026-06-16T00:00:00.000Z",
+              d1_rows_written_daily: 120_000,
+              d1_rows_read_daily: 100,
+              worker_requests_daily: 20,
+              durable_object_requests_daily: 40
+            }
+          }
+        }),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "telemetry-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_D1_DATABASE_ID: "telemetry-database"
+      }
+    );
+    const body = (await response.json()) as {
+      guard: { action: string; state: string; budget_state: string };
+      safety: { state: string };
+    };
+
+    assert.equal(response.status, 429);
+    assert.equal(body.guard.action, "command_create");
+    assert.equal(body.guard.state, "blocked");
+    assert.equal(body.guard.budget_state, "hard_limited");
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(fetchCount, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("command creation safety guard uses cached live hard limit when telemetry persistence fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  let fetchCount = 0;
+  console.warn = () => undefined;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 20 } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten: 120_000 } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const env: Env = {
+    ...devEnv,
+    DB: commandTargetDb({ id: "connector-online" }, {
+      failTelemetrySampleWrites: true
+    }),
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "telemetry-cache-hard-limit-account",
+    CF_TELEMETRY_API_WORKER: "chaop-api-cache-hard-limit",
+    CF_TELEMETRY_D1_DATABASE_ID: "telemetry-cache-hard-limit-database",
+    CF_TELEMETRY_CACHE_SECONDS: "300",
+    CF_TELEMETRY_SAMPLE_SECONDS: "300"
+  };
+
+  try {
+    const safetyResponse = await handleRequest(
+      new Request("https://api.example.com/api/safety-posture", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      env
+    );
+    const safetyBody = (await safetyResponse.json()) as {
+      safety: { state: string; actions: Array<{ action: string; state: string }> };
+    };
+    assert.equal(safetyResponse.status, 200);
+    assert.equal(safetyBody.safety.state, "hard_limited");
+    assert.equal(
+      safetyBody.safety.actions.find((guard) => guard.action === "command_create")?.state,
+      "blocked"
+    );
+
+    const commandResponse = await handleRequest(
+      new Request("https://api.example.com/api/commands", {
+        method: "POST",
+        headers: {
+          origin: "https://app.example.com"
+        },
+        body: JSON.stringify({
+          workspace_id: "workspace-api",
+          thread_id: "thread-orders-500",
+          prompt: "Summarise current errors"
+        })
+      }),
+      env
+    );
+    const commandBody = (await commandResponse.json()) as {
+      guard: { action: string; state: string; budget_state: string };
+      safety: { state: string };
+    };
+    assert.equal(commandResponse.status, 429);
+    assert.equal(commandBody.guard.action, "command_create");
+    assert.equal(commandBody.guard.state, "blocked");
+    assert.equal(commandBody.guard.budget_state, "hard_limited");
+    assert.equal(commandBody.safety.state, "hard_limited");
+    assert.equal(fetchCount, 1);
+  } finally {
+    console.warn = originalWarn;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("command creation safety guard keeps cached live hard limit across telemetry sample buckets", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const originalDateNow = Date.now;
+  let fetchCount = 0;
+  let nowMs = Date.parse("2026-06-15T09:04:59.000Z");
+  console.warn = () => undefined;
+  Date.now = () => nowMs;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    if (fetchCount === 3) {
+      throw new Error("temporary telemetry failure");
+    }
+    const rowsWritten = fetchCount === 1 ? 120_000 : 5_000;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 20 } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const env: Env = {
+    ...devEnv,
+    DB: commandTargetDb({ id: "connector-online" }, {
+      failTelemetrySampleWrites: true
+    }),
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "telemetry-cache-cross-bucket-account",
+    CF_TELEMETRY_API_WORKER: "chaop-api-cross-bucket",
+    CF_TELEMETRY_D1_DATABASE_ID: "telemetry-cache-cross-bucket-database",
+    CF_TELEMETRY_CACHE_SECONDS: "300",
+    CF_TELEMETRY_SAMPLE_SECONDS: "1"
+  };
+
+  try {
+    const safety = await loadDogfoodSafetyPostureFromDb(
+      env,
+      "2026-06-15T09:04:59.000Z",
+      {},
+      { refreshCloudflareTelemetry: true }
+    );
+    assert.equal(safety.state, "hard_limited");
+
+    const lowerLiveRefresh = await loadDogfoodSafetyPostureFromDb(
+      env,
+      "2026-06-15T09:05:01.000Z",
+      {},
+      { refreshCloudflareTelemetry: true }
+    );
+    assert.equal(lowerLiveRefresh.state, "hard_limited");
+
+    const failedLiveRefresh = await loadDogfoodSafetyPostureFromDb(
+      env,
+      "2026-06-15T09:05:03.000Z",
+      {},
+      { refreshCloudflareTelemetry: true }
+    );
+    assert.equal(failedLiveRefresh.state, "hard_limited");
+
+    nowMs = Date.parse("2026-06-15T09:11:00.000Z");
+    await assert.rejects(
+      () => assertDogfoodSafetyActionAllowed(env, "command_create", "2026-06-15T09:11:00.000Z"),
+      (error) =>
+        error instanceof DogfoodSafetyError &&
+        error.guard.action === "command_create" &&
+        error.guard.state === "blocked" &&
+        error.guard.budget_state === "hard_limited"
+    );
+    assert.equal(fetchCount, 3);
+  } finally {
+    console.warn = originalWarn;
+    Date.now = originalDateNow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("command creation safety guard uses daily max persisted telemetry samples", async () => {
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const tomorrowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const highSampleAt = new Date(todayStart.getTime() + 9 * 60 * 60 * 1000).toISOString();
+  const lowerSampleAt = new Date(todayStart.getTime() + 9 * 60 * 60 * 1000 + 5 * 60 * 1000).toISOString();
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, {
+        safety: {
+          telemetrySamples: [
+            {
+              id: "sample-high",
+              sample_type: "cloudflare_daily",
+              sampled_at: highSampleAt,
+              window_start: todayStart.toISOString(),
+              window_end: tomorrowStart.toISOString(),
+              d1_rows_written_daily: 120_000,
+              d1_rows_read_daily: 100,
+              worker_requests_daily: 20,
+              durable_object_requests_daily: 40,
+              created_at: highSampleAt
+            },
+            {
+              id: "sample-lower-later",
+              sample_type: "cloudflare_daily",
+              sampled_at: lowerSampleAt,
+              window_start: todayStart.toISOString(),
+              window_end: tomorrowStart.toISOString(),
+              d1_rows_written_daily: 40_000,
+              d1_rows_read_daily: 120,
+              worker_requests_daily: 30,
+              durable_object_requests_daily: 50,
+              created_at: lowerSampleAt
+            }
+          ]
+        }
+      }),
+      CF_TELEMETRY_API_TOKEN: "telemetry-token",
+      CF_TELEMETRY_ACCOUNT_ID: "telemetry-account",
+      CF_TELEMETRY_API_WORKER: "chaop-api",
+      CF_TELEMETRY_D1_DATABASE_ID: "telemetry-database"
+    }
+  );
+  const body = (await response.json()) as {
+    guard: { action: string; state: string; budget_state: string; used_units?: number };
+    safety: { state: string; bottleneck_constraint?: { used_units?: number | null } };
+  };
+
+  assert.equal(response.status, 429);
+  assert.equal(body.guard.action, "command_create");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.guard.budget_state, "hard_limited");
+  assert.equal(body.safety.state, "hard_limited");
+  assert.equal(body.safety.bottleneck_constraint?.used_units, 120_000);
+});
+
+test("pause state read failures block command creation before command writes", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/commands", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        prompt: "Summarise current errors"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: commandTargetDb({ id: "connector-online" }, {
+        safety: {
+          pauseReadError: "control setting unavailable"
+        }
+      })
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string; budget_state: string };
+    safety: { paused: boolean; state: string };
+  };
+
+  assert.equal(response.status, 429);
+  assert.match(body.error, /could not be loaded/);
+  assert.equal(body.guard.action, "command_create");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.guard.budget_state, "hard_limited");
+  assert.equal(body.safety.paused, true);
+  assert.equal(body.safety.state, "hard_limited");
+});
+
+test("conservative safety posture blocks host session inventory refresh before Durable Object dispatch", async () => {
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/host-sessions/refresh", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      }
+    }),
+    {
+      ...devEnv,
+      DB: safetyPauseDb({
+        usageWindows: {
+          daily: safetyUsageWindow("daily", 3000)
+        }
+      }),
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO should not be called while safety blocks refresh");
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = (await response.json()) as {
+    error: string;
+    guard: { action: string; state: string; budget_state: string };
+  };
+
+  assert.equal(response.status, 429);
+  assert.equal(body.guard.action, "host_session_refresh");
+  assert.equal(body.guard.state, "blocked");
+  assert.equal(body.guard.budget_state, "conservative");
+  assert.match(body.error, /Host Session refresh is paused/);
+});
+
 test("usage summary samples Cloudflare telemetry constraints when configured", async () => {
   const originalFetch = globalThis.fetch;
   let requestedBody: { variables?: Record<string, unknown> } | undefined;
@@ -1995,6 +3259,104 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
         ["estimated_event_persistence_daily", false, null],
         ["estimated_non_event_residual_daily", false, null]
       ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("usage summary keeps persisted max telemetry when live refresh is lower", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 20 } }],
+            webWorkerInvocations: [{ sum: { requests: 5 } }],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 1234, rowsWritten: 50_000 } }],
+            durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 40 } }],
+            durableObjectsPeriodicGroups: [{ sum: { inboundWebsocketMsgCount: 41 } }]
+          }
+        ]
+      }
+    }
+  }), {
+    headers: { "content-type": "application/json; charset=utf-8" }
+  })) as typeof fetch;
+
+  const now = new Date();
+  const dayStart = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate()
+  )).toISOString();
+  const telemetrySamples: Record<string, unknown>[] = [
+    {
+      id: "persisted-high-current-day",
+      sample_type: "cloudflare_daily",
+      sampled_at: now.toISOString(),
+      window_start: dayStart,
+      window_end: now.toISOString(),
+      d1_rows_written_daily: 120_000,
+      d1_rows_read_daily: 2_500,
+      worker_requests_daily: 75,
+      durable_object_requests_daily: 80,
+      created_at: now.toISOString()
+    }
+  ];
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: budgetSummaryDb([], {
+          expiredWindowTypes: ["daily", "four_hour", "burst"],
+          telemetrySamples
+        }),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "account-1",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_WEB_WORKER: "chaop-web",
+        CF_TELEMETRY_D1_DATABASE_ID: "database-1",
+        CF_TELEMETRY_DO_NAMESPACE_NAME: "WorkspaceDO"
+      }
+    );
+    const body = (await response.json()) as {
+      state: string;
+      bottleneck_constraint: { id: string; state: string; used_units: number };
+      constraints: Array<{ id: string; state: string; sampled: boolean; source: string; used_units: number | null }>;
+      d1_activity: {
+        signals: Array<{ id: string; sampled: boolean; rows_written_daily: number | null }>;
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.state, "hard_limited");
+    assert.deepEqual(
+      [body.bottleneck_constraint.id, body.bottleneck_constraint.state, body.bottleneck_constraint.used_units],
+      ["d1_rows_written_daily", "hard_limited", 120_000]
+    );
+    const writtenConstraint = body.constraints.find((constraint) => constraint.id === "d1_rows_written_daily");
+    assert.deepEqual(
+      [
+        writtenConstraint?.id,
+        writtenConstraint?.state,
+        writtenConstraint?.sampled,
+        writtenConstraint?.source,
+        writtenConstraint?.used_units
+      ],
+      ["d1_rows_written_daily", "hard_limited", true, "cloudflare_analytics", 120_000]
+    );
+    const d1Activity = body.d1_activity.signals.find((signal) => signal.id === "cloudflare_d1_rows_written_daily");
+    assert.deepEqual(
+      [d1Activity?.id, d1Activity?.sampled, d1Activity?.rows_written_daily],
+      ["cloudflare_d1_rows_written_daily", true, 120_000]
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -2234,6 +3596,62 @@ test("budget telemetry cache expires on sample bucket boundaries", async () => {
 
     assert.equal(fetchCount, 2);
     assert.equal(second.telemetry_history?.points.at(-1)?.d1_rows_written_daily, 20);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("budget telemetry refresh updates an existing sample bucket for later safety guards", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    const rowsWritten = fetchCount === 1 ? 1_000 : 120_000;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: fetchCount } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: fetchCount * 100, rowsWritten } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const db = budgetSummaryDb([], { expiredWindowTypes: ["daily", "four_hour", "burst"] });
+  const env: Env = {
+    ...devEnv,
+    DB: db,
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "account-same-bucket-upsert",
+    CF_TELEMETRY_API_WORKER: "chaop-api-upsert",
+    CF_TELEMETRY_D1_DATABASE_ID: "database-same-bucket-upsert",
+    CF_TELEMETRY_CACHE_SECONDS: "1",
+    CF_TELEMETRY_SAMPLE_SECONDS: "300"
+  };
+
+  try {
+    const first = await loadBudgetSummaryFromDb(env, "2026-06-15T09:04:00.000Z");
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const second = await loadBudgetSummaryFromDb(env, "2026-06-15T09:04:30.000Z");
+    const safety = await loadDogfoodSafetyPostureFromDb(env, "2026-06-15T09:04:45.000Z");
+
+    assert.equal(fetchCount, 2);
+    assert.equal(first.telemetry_history?.points.length, 1);
+    assert.equal(first.telemetry_history?.points.at(-1)?.d1_rows_written_daily, 1_000);
+    assert.equal(second.telemetry_history?.points.length, 1);
+    assert.equal(second.telemetry_history?.points.at(-1)?.d1_rows_written_daily, 120_000);
+    assert.equal(safety.state, "hard_limited");
+    assert.equal(safety.bottleneck_constraint?.id, "d1_rows_written_daily");
+    assert.equal(safety.bottleneck_constraint?.used_units, 120_000);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -3176,6 +4594,410 @@ function readOnlyBootstrapDb(): D1Database {
   } as unknown as D1Database;
 }
 
+function readOnlyBootstrapTelemetryPersistFailDb(telemetrySamples?: Record<string, unknown>[]): D1Database {
+  return {
+    prepare(sql: string) {
+      assert.doesNotMatch(sql, /INSERT INTO users/);
+      assert.doesNotMatch(sql, /GROUP BY budget_state/);
+      if (/INSERT INTO budget_telemetry_samples/.test(sql)) {
+        throw new Error("telemetry sample persistence unavailable");
+      }
+      const safetyQuery = dogfoodSafetyQueryFake(sql, {
+        includeUsageWindows: false,
+        includeBudgetStateCounts: false,
+        telemetrySamples
+      });
+      if (safetyQuery) return safetyQuery;
+      if (/FROM host_sessions hs/.test(sql)) {
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
+        assert.match(sql, /c\.status <> 'offline'/);
+      }
+      if (/FROM app_server_instances/.test(sql)) {
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = asi\.connector_id/);
+        assert.match(sql, /c\.status <> 'offline'/);
+      }
+      return {
+        bind() {
+          return this;
+        },
+        async first() {
+          return undefined;
+        },
+        async all() {
+          return { results: [] };
+        }
+      };
+    }
+  } as unknown as D1Database;
+}
+
+type DogfoodSafetyFakeOptions = {
+  includeUsageWindows?: boolean | undefined;
+  includeBudgetStateCounts?: boolean | undefined;
+  paused?: boolean | undefined;
+  pauseReadError?: string | undefined;
+  pauseReason?: string | undefined;
+  malformedPauseRow?: boolean | undefined;
+  usageWindows?: Record<string, Record<string, unknown> | undefined> | undefined;
+  telemetrySample?: Record<string, unknown> | undefined;
+  telemetrySamples?: Record<string, unknown>[] | undefined;
+  connectorBudgetStates?: string[] | undefined;
+  taskBudgetStates?: string[] | undefined;
+};
+
+function dogfoodSafetyQueryFake(
+  sql: string,
+  options: DogfoodSafetyFakeOptions = {}
+) {
+  if (/SELECT[\s\S]+FROM control_plane_settings/.test(sql)) {
+    return {
+      bind(key: string) {
+        assert.equal(key, "dogfood_safety.pause");
+        return {
+          async first() {
+            if (options.pauseReadError) throw new Error(options.pauseReadError);
+            if (options.malformedPauseRow) {
+              return {
+                value_json: JSON.stringify({ paused: "true" }),
+                updated_at: "2026-06-15T09:00:00.000Z"
+              };
+            }
+            if (!options.paused) return undefined;
+            const updatedAt = "2026-06-15T09:00:00.000Z";
+            return {
+              value_json: JSON.stringify({
+                paused: true,
+                reason: options.pauseReason,
+                updated_by: "operator@example.com",
+                updated_at: updatedAt
+              }),
+              updated_at: updatedAt
+            };
+          }
+        };
+      }
+    };
+  }
+
+  if (options.includeUsageWindows !== false && /FROM usage_windows/.test(sql)) {
+    return {
+      bind(windowType: string, windowStartAt: string, windowEndAt: string) {
+        assert.match(windowStartAt, /^\d{4}-\d{2}-\d{2}T/);
+        assert.equal(windowEndAt, windowStartAt);
+        return {
+          async first() {
+            return options.usageWindows?.[windowType];
+          }
+        };
+      }
+    };
+  }
+
+  if (
+    /FROM budget_telemetry_samples/.test(sql)
+    && /window_start = \?/.test(sql)
+    && /LIMIT 1/.test(sql)
+  ) {
+    return {
+      bind(sampleType: string, selectorHash: string, windowStart: string) {
+        assert.equal(sampleType, "cloudflare_daily");
+        assert.equal(typeof selectorHash, "string");
+        assert.match(windowStart, /^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/);
+        return {
+          async first() {
+            if (options.telemetrySample) return options.telemetrySample;
+            const samples = (options.telemetrySamples ?? [])
+              .filter((sample) =>
+                sample.sample_type === sampleType &&
+                String(sample.selector_hash ?? selectorHash) === selectorHash &&
+                sample.window_start === windowStart
+              );
+            if (/MAX\(d1_rows_written_daily\)/.test(sql)) {
+              return aggregateTelemetrySamples(samples);
+            }
+            return samples.sort((left, right) =>
+                String(right.sampled_at).localeCompare(String(left.sampled_at))
+              )[0];
+          }
+        };
+      }
+    };
+  }
+
+  if (/INSERT INTO budget_telemetry_samples/.test(sql) && options.telemetrySamples) {
+    return {
+      bind(
+        id: string,
+        sampleType: string,
+        selectorHash: string,
+        sampledAt: string,
+        windowStart: string,
+        windowEnd: string,
+        d1RowsWrittenDaily: number | null,
+        d1RowsReadDaily: number | null,
+        workerRequestsDaily: number | null,
+        durableObjectRequestsDaily: number | null,
+        createdAt: string
+      ) {
+        return {
+          async run() {
+            const samples = options.telemetrySamples;
+            if (!samples) return { meta: { changes: 0 } };
+            return upsertTelemetrySample(samples, {
+              id,
+              sample_type: sampleType,
+              selector_hash: selectorHash,
+              sampled_at: sampledAt,
+              window_start: windowStart,
+              window_end: windowEnd,
+              d1_rows_written_daily: d1RowsWrittenDaily,
+              d1_rows_read_daily: d1RowsReadDaily,
+              worker_requests_daily: workerRequestsDaily,
+              durable_object_requests_daily: durableObjectRequestsDaily,
+              created_at: createdAt
+            });
+          }
+        };
+      }
+    };
+  }
+
+  if (
+    options.includeBudgetStateCounts !== false
+    && /FROM connectors/.test(sql)
+    && /GROUP BY budget_state/.test(sql)
+  ) {
+    return {
+      async all() {
+        return { results: budgetStateCountRows(options.connectorBudgetStates ?? []) };
+      }
+    };
+  }
+
+  if (
+    options.includeBudgetStateCounts !== false
+    && /FROM tasks/.test(sql)
+    && /GROUP BY budget_state/.test(sql)
+  ) {
+    return {
+      async all() {
+        return { results: budgetStateCountRows(options.taskBudgetStates ?? []) };
+      }
+    };
+  }
+
+  return undefined;
+}
+
+function budgetStateCountRows(states: string[]): Array<{ budget_state: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const state of states) {
+    counts.set(state, (counts.get(state) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([budget_state, count]) => ({ budget_state, count }));
+}
+
+function aggregateTelemetrySamples(samples: Record<string, unknown>[]): Record<string, unknown> | undefined {
+  if (samples.length === 0) return undefined;
+  const latest = samples.reduce((current, sample) =>
+    String(sample.sampled_at).localeCompare(String(current.sampled_at)) > 0 ? sample : current
+  );
+  return {
+    sampled_at: latest.sampled_at,
+    window_start: latest.window_start,
+    window_end: samples.reduce((current, sample) =>
+      String(sample.window_end).localeCompare(String(current)) > 0 ? sample.window_end : current,
+    latest.window_end),
+    d1_rows_written_daily: samples.reduce(
+      (current, sample) => maxTelemetryCounter(current, sample.d1_rows_written_daily),
+      null as unknown
+    ),
+    d1_rows_read_daily: samples.reduce(
+      (current, sample) => maxTelemetryCounter(current, sample.d1_rows_read_daily),
+      null as unknown
+    ),
+    worker_requests_daily: samples.reduce(
+      (current, sample) => maxTelemetryCounter(current, sample.worker_requests_daily),
+      null as unknown
+    ),
+    durable_object_requests_daily: samples.reduce(
+      (current, sample) => maxTelemetryCounter(current, sample.durable_object_requests_daily),
+      null as unknown
+    )
+  };
+}
+
+function upsertTelemetrySample(
+  samples: Record<string, unknown>[],
+  incoming: Record<string, unknown>
+): { meta: { changes: number } } {
+  const existing = samples.find((sample) => sample.id === incoming.id);
+  if (!existing) {
+    samples.push(incoming);
+    return { meta: { changes: 1 } };
+  }
+
+  const next = {
+    ...existing,
+    window_start: incoming.window_start,
+    window_end: incoming.window_end,
+    d1_rows_written_daily: maxTelemetryCounter(existing.d1_rows_written_daily, incoming.d1_rows_written_daily),
+    d1_rows_read_daily: maxTelemetryCounter(existing.d1_rows_read_daily, incoming.d1_rows_read_daily),
+    worker_requests_daily: maxTelemetryCounter(existing.worker_requests_daily, incoming.worker_requests_daily),
+    durable_object_requests_daily: maxTelemetryCounter(
+      existing.durable_object_requests_daily,
+      incoming.durable_object_requests_daily
+    )
+  };
+  const changed = (
+    next.window_start !== existing.window_start ||
+    next.window_end !== existing.window_end ||
+    next.d1_rows_written_daily !== existing.d1_rows_written_daily ||
+    next.d1_rows_read_daily !== existing.d1_rows_read_daily ||
+    next.worker_requests_daily !== existing.worker_requests_daily ||
+    next.durable_object_requests_daily !== existing.durable_object_requests_daily
+  );
+  if (!changed) {
+    return { meta: { changes: 0 } };
+  }
+
+  Object.assign(existing, {
+    ...next,
+    created_at: newerIso(String(existing.created_at ?? ""), String(incoming.created_at ?? ""))
+  });
+  return { meta: { changes: 1 } };
+}
+
+function maxTelemetryCounter(current: unknown, incoming: unknown): number | null {
+  const currentNumber = nullableCounter(current);
+  const incomingNumber = nullableCounter(incoming);
+  if (incomingNumber === null) return currentNumber;
+  return currentNumber === null ? incomingNumber : Math.max(currentNumber, incomingNumber);
+}
+
+function nullableCounter(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : null;
+}
+
+function newerIso(current: string, incoming: string): string {
+  if (!current) return incoming;
+  if (!incoming) return current;
+  return current > incoming ? current : incoming;
+}
+
+function safetyPauseDb(options: DogfoodSafetyFakeOptions = {}): D1Database {
+  let paused = options.paused ?? false;
+  let pauseReason = options.pauseReason;
+  let pauseUpdatedBy = "operator@example.com";
+  let pauseUpdatedAt = "2026-06-15T09:00:00.000Z";
+
+  return {
+    prepare(sql: string) {
+      if (/SELECT[\s\S]+FROM control_plane_settings/.test(sql)) {
+        return {
+          bind(key: string) {
+            assert.equal(key, "dogfood_safety.pause");
+            return {
+              async first() {
+                if (options.pauseReadError) throw new Error(options.pauseReadError);
+                if (options.malformedPauseRow) {
+                  return {
+                    value_json: JSON.stringify({ paused: "true" }),
+                    updated_at: pauseUpdatedAt
+                  };
+                }
+                if (!paused) return undefined;
+                return {
+                  value_json: JSON.stringify({
+                    paused: true,
+                    reason: pauseReason,
+                    updated_by: pauseUpdatedBy,
+                    updated_at: pauseUpdatedAt
+                  }),
+                  updated_at: pauseUpdatedAt
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO control_plane_settings/.test(sql)) {
+        return {
+          bind(key: string, valueJson: string, updatedAt: string) {
+            assert.equal(key, "dogfood_safety.pause");
+            return {
+              async run() {
+                const value = JSON.parse(valueJson) as {
+                  reason?: string | undefined;
+                  updated_by?: string | undefined;
+                  updated_at?: string | undefined;
+                };
+                paused = true;
+                pauseReason = value.reason;
+                pauseUpdatedBy = value.updated_by ?? "operator@example.com";
+                pauseUpdatedAt = value.updated_at ?? updatedAt;
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/DELETE FROM control_plane_settings/.test(sql)) {
+        return {
+          bind(key: string) {
+            assert.equal(key, "dogfood_safety.pause");
+            return {
+              async run() {
+                paused = false;
+                pauseReason = undefined;
+                return { success: true, meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      const safetyQuery = dogfoodSafetyQueryFake(sql, {
+        ...options,
+        paused,
+        pauseReason,
+        includeUsageWindows: options.includeUsageWindows
+      });
+      if (safetyQuery) return safetyQuery;
+
+      throw new Error(`Unexpected SQL in safety pause fake: ${sql}`);
+    }
+  } as unknown as D1Database;
+}
+
+function safetyUsageWindow(windowType: "daily" | "four_hour" | "burst", eventsReceived: number) {
+  const windowStart = windowType === "daily"
+    ? "2026-06-15T00:00:00.000Z"
+    : windowType === "four_hour"
+      ? "2026-06-15T08:00:00.000Z"
+      : "2026-06-15T09:00:00.000Z";
+  const windowEnd = windowType === "daily"
+    ? "2026-06-16T00:00:00.000Z"
+    : windowType === "four_hour"
+      ? "2026-06-15T12:00:00.000Z"
+      : "2026-06-15T09:01:00.000Z";
+  return {
+    id: `usage-${windowType}`,
+    window_type: windowType,
+    window_start: windowStart,
+    window_end: windowEnd,
+    budget_state: "normal",
+    used_pct: 0,
+    events_received: eventsReceived,
+    events_compacted: 0,
+    events_delayed: 0,
+    local_spool_bytes: 0,
+    updated_at: "2026-06-15T09:00:00.000Z"
+  };
+}
+
 function budgetSummaryDb(
   omitWindowTypes: string[] = [],
   options: {
@@ -3235,6 +5057,13 @@ function budgetSummaryDb(
 
   return {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql, {
+        includeUsageWindows: false,
+        includeBudgetStateCounts: false,
+        telemetrySamples
+      });
+      if (safetyQuery) return safetyQuery;
+
       if (/FROM usage_windows/.test(sql)) {
         assert.match(sql, /WHERE window_type = \?/);
         assert.match(sql, /window_start <= \?/);
@@ -3275,7 +5104,7 @@ function budgetSummaryDb(
         };
       }
 
-      if (/INSERT OR IGNORE INTO budget_telemetry_samples/.test(sql)) {
+      if (/INSERT INTO budget_telemetry_samples/.test(sql)) {
         return {
           bind(
             id: string,
@@ -3292,10 +5121,7 @@ function budgetSummaryDb(
           ) {
             return {
               async run() {
-                if (telemetrySamples.some((sample) => sample.id === id)) {
-                  return { meta: { changes: 0 } };
-                }
-                telemetrySamples.push({
+                return upsertTelemetrySample(telemetrySamples, {
                   id,
                   sample_type: sampleType,
                   selector_hash: selectorHash,
@@ -3308,7 +5134,6 @@ function budgetSummaryDb(
                   durable_object_requests_daily: durableObjectRequestsDaily,
                   created_at: createdAt
                 });
-                return { meta: { changes: 1 } };
               }
             };
           }
@@ -3349,6 +5174,9 @@ function budgetBootstrapDb(): D1Database & { readonly usageWindowUpserts: number
 
   return {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql, { includeUsageWindows: false });
+      if (safetyQuery) return safetyQuery;
+
       if (/INSERT INTO usage_windows/.test(sql)) {
         return {
           bind(...args: unknown[]) {
@@ -3445,6 +5273,8 @@ function commandTargetDb(
     expectedTargetConnectorIdSource?: "explicit" | "attached" | "auto";
     expectedAutoConnectorId?: string;
     expectedExecutionMode?: "app_server" | "codex_cli_fallback";
+    failTelemetrySampleWrites?: boolean;
+    safety?: DogfoodSafetyFakeOptions | undefined;
   } = {}
 ): D1Database {
   const supportsCodex = options.supportsCodex ?? true;
@@ -3458,6 +5288,13 @@ function commandTargetDb(
   const attachedThreadAppServerPresent = options.attachedThreadAppServerPresent ?? false;
   return {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql, options.safety);
+      if (safetyQuery) return safetyQuery;
+
+      if (options.failTelemetrySampleWrites && /INSERT INTO budget_telemetry_samples/.test(sql)) {
+        throw new Error("telemetry sample persistence unavailable");
+      }
+
       if (/INSERT INTO users/.test(sql)) {
         return {
           bind() {
@@ -3762,6 +5599,9 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
 
   const db = {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql);
+      if (safetyQuery) return safetyQuery;
+
       if (/INSERT INTO users/.test(sql)) {
         return {
           bind(userId: string, email: string, name: string) {
@@ -4160,6 +6000,9 @@ function taskArchiveSyncDb(
 
   const db = {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql);
+      if (safetyQuery) return safetyQuery;
+
       if (/FROM host_sessions hs/.test(sql) && /hs\.attached_task_id = \?/.test(sql)) {
         return {
           bind(taskId: string) {
@@ -4382,6 +6225,9 @@ function hostSessionAttachBackfillDb(
 
   const db = {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql);
+      if (safetyQuery) return safetyQuery;
+
       if (/SELECT hs\.id, hs\.connector_id/.test(sql) && /FROM host_sessions hs/.test(sql)) {
         return {
           bind(sessionId: string, connectorId?: string) {
@@ -4731,6 +6577,7 @@ function hostSessionDetachDb(options: {
   releaseDetachedCommands?: boolean;
   detachedLeaseOwnedByReplacement?: boolean;
   detachedCommandExecutionMode?: "app_server" | "codex_cli_fallback";
+  safety?: DogfoodSafetyFakeOptions | undefined;
 } = {}): D1Database & {
   readonly commandReleases: number;
   readonly commandFailures: number;
@@ -4763,6 +6610,9 @@ function hostSessionDetachDb(options: {
 
   return {
     prepare(sql: string) {
+      const safetyQuery = dogfoodSafetyQueryFake(sql, options.safety);
+      if (safetyQuery) return safetyQuery;
+
       if (/FROM host_sessions hs/.test(sql) && /WHERE hs\.session_id = \? AND hs\.connector_id = \?/.test(sql)) {
         assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
         assert.match(sql, /c\.status <> 'offline'/);

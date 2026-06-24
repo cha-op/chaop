@@ -9,7 +9,10 @@ import type {
   CreateLocalThreadResponse,
   DetachHostSessionRequest,
   DetachHostSessionResponse,
+  DogfoodSafetyPostureResponse,
   RefreshHostSessionsResponse,
+  SetDogfoodSafetyPauseRequest,
+  SetDogfoodSafetyPauseResponse,
   TaskArchiveResponse,
   ThreadEventsResponse
 } from "@chaop/protocol";
@@ -18,7 +21,8 @@ import { fallbackBootstrap } from "./sample-data.js";
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
-    message: string
+    message: string,
+    public readonly payload?: unknown
   ) {
     super(message);
     this.name = "ApiError";
@@ -36,7 +40,7 @@ export async function loadBootstrap(): Promise<BootstrapPayload> {
     }
     return (await response.json()) as BootstrapPayload;
   } catch (error) {
-    if (import.meta.env.DEV) {
+    if (devFallbackEnabled()) {
       return fallbackBootstrap();
     }
     throw error;
@@ -54,7 +58,7 @@ export async function loadUsageSummary(): Promise<BudgetSummary> {
     }
     return (await response.json()) as BudgetSummary;
   } catch (error) {
-    if (import.meta.env.DEV) {
+    if (devFallbackEnabled()) {
       return fallbackBootstrap().budget;
     }
     throw error;
@@ -63,6 +67,34 @@ export async function loadUsageSummary(): Promise<BudgetSummary> {
 
 export async function bootstrapBudgetSamples(): Promise<BudgetSummary> {
   return postJson("/api/budget/bootstrap", {});
+}
+
+export async function loadSafetyPosture(): Promise<DogfoodSafetyPostureResponse> {
+  try {
+    const response = await fetch(apiUrl("/api/safety-posture"), {
+      credentials: "include",
+      headers: devHeaders()
+    });
+    if (!response.ok) {
+      throw await responseError(response, "Safety posture failed");
+    }
+    return (await response.json()) as DogfoodSafetyPostureResponse;
+  } catch (error) {
+    if (devFallbackEnabled()) {
+      return { safety: fallbackBootstrap().safety };
+    }
+    throw error;
+  }
+}
+
+export async function pauseDogfoodSafety(
+  request: SetDogfoodSafetyPauseRequest
+): Promise<SetDogfoodSafetyPauseResponse> {
+  return postJson("/api/safety/pause", request);
+}
+
+export async function resumeDogfoodSafety(): Promise<SetDogfoodSafetyPauseResponse> {
+  return postJson("/api/safety/resume", {});
 }
 
 export async function createCommand(request: CreateCommandRequest): Promise<CreateCommandResponse> {
@@ -126,7 +158,7 @@ export async function loadThreadEvents(threadId: string): Promise<ThreadEventsRe
 
     return (await response.json()) as ThreadEventsResponse;
   } catch (error) {
-    if (import.meta.env.DEV) {
+    if (devFallbackEnabled()) {
       return { events: [] };
     }
     throw error;
@@ -169,27 +201,32 @@ async function postJson<T>(path: string, request: unknown): Promise<T> {
 }
 
 async function responseError(response: Response, fallback: string): Promise<ApiError> {
-  const message = await responseErrorMessage(response);
-  return new ApiError(response.status, `${fallback}: ${message ?? `HTTP ${response.status}`}`);
+  const error = await responseErrorPayload(response);
+  return new ApiError(response.status, `${fallback}: ${error.message ?? `HTTP ${response.status}`}`, error.payload);
 }
 
-async function responseErrorMessage(response: Response): Promise<string | undefined> {
+async function responseErrorPayload(response: Response): Promise<{ message?: string | undefined; payload?: unknown }> {
   const contentType = response.headers.get("content-type") ?? "";
   try {
     if (contentType.includes("application/json")) {
       const body = (await response.json()) as unknown;
       if (typeof body === "object" && body !== null && typeof (body as { error?: unknown }).error === "string") {
-        return (body as { error: string }).error;
+        return { message: (body as { error: string }).error, payload: body };
       }
+      return { payload: body };
     }
 
     const text = await response.text();
-    return text.trim() || undefined;
+    return { message: text.trim() || undefined };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
 function devHeaders(): HeadersInit {
-  return import.meta.env.DEV ? { "x-chaop-dev-user": "operator@example.com" } : {};
+  return devFallbackEnabled() ? { "x-chaop-dev-user": "operator@example.com" } : {};
+}
+
+function devFallbackEnabled(): boolean {
+  return import.meta.env?.DEV === true;
 }

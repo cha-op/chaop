@@ -17,7 +17,10 @@ import {
   type ThreadEvent
 } from "@chaop/protocol";
 import {
+  DogfoodSafetyError,
+  assertDogfoodSafetyActionAllowed,
   cleanupStaleExplicitAppServerCommandTargets,
+  dogfoodSafetyActionAllowed,
   failActiveCommandsForConnector,
   getConnectorSummary,
   markAppServerInstancesStoppedForConnector,
@@ -220,20 +223,46 @@ export class WorkspaceDO implements DurableObject {
         )
       );
       if (readyPayload && (!wasReady || capabilitiesChanged)) {
-        this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
+        const refreshDecision = await this.hostSessionRefreshDecision();
+        if (refreshDecision.refreshAllowed) {
+          this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
+        }
         await this.broadcastConnectorUpdate(connectorId);
-        await this.sendPendingCommandsAndReleased(ws, connectorId);
+        if (refreshDecision.pendingDispatchAllowed) {
+          await this.sendPendingCommandsAndReleased(ws, connectorId);
+        }
       }
       if (!readyPayload && !wasReady) {
         await markConnectorOnline(this.env, connectorId);
-        this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
+        const refreshDecision = await this.hostSessionRefreshDecision();
+        if (refreshDecision.refreshAllowed) {
+          this.dispatchHostSessionsRefreshToSocket(ws, connectorId);
+        }
         await this.broadcastConnectorUpdate(connectorId);
-        await this.sendPendingCommandsAndReleased(ws, connectorId);
+        if (refreshDecision.pendingDispatchAllowed) {
+          await this.sendPendingCommandsAndReleased(ws, connectorId);
+        }
       }
       return;
     }
 
     if (message.kind === "agent.host_sessions" && isAgentHostSessionsReport(message.payload)) {
+      const refreshDecision = await this.hostSessionRefreshDecision();
+      if (!refreshDecision.refreshAllowed) {
+        ws.send(
+          JSON.stringify(
+            createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+              kind: "agent.host_sessions",
+              accepted: false,
+              reason: "Dogfood safety blocked Host Session refresh results."
+            })
+          )
+        );
+        if (this.consumePendingHostSessionsDispatch(ws, connectorId) && refreshDecision.pendingDispatchAllowed) {
+          await this.sendPendingCommandsAndReleased(ws, connectorId);
+        }
+        return;
+      }
       const result = await recordHostSessions(this.env, connectorId, message.payload);
       ws.send(
         JSON.stringify(
@@ -273,6 +302,24 @@ export class WorkspaceDO implements DurableObject {
         );
         return;
       }
+      try {
+        await assertDogfoodSafetyActionAllowed(this.env, "app_server_instances_report");
+      } catch (error) {
+        if (error instanceof DogfoodSafetyError) {
+          ws.send(
+            JSON.stringify(
+              createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+                kind: "agent.app_server_instances",
+                accepted: false,
+                reason: error.message,
+                report_id: message.payload.report_id
+              })
+            )
+          );
+          return;
+        }
+        throw error;
+      }
       const reportFingerprint = cacheableAppServerReportFingerprint(message.payload);
       const deduped = this.shouldSkipDuplicateAppServerReport(connectorId, reportFingerprint);
       const result = deduped
@@ -304,6 +351,30 @@ export class WorkspaceDO implements DurableObject {
     }
 
     if (message.kind === "agent.event" && isAgentCommandEvent(message.payload)) {
+      const finalCommandEvent =
+        message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
+      const progressEvent = !finalCommandEvent && message.payload.kind !== "command.started";
+      if (progressEvent) {
+        try {
+          await assertDogfoodSafetyActionAllowed(this.env, "agent_event");
+        } catch (error) {
+          if (error instanceof DogfoodSafetyError) {
+            ws.send(
+              JSON.stringify(
+                createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+                  command_id: message.payload.command_id,
+                  kind: message.payload.kind,
+                  accepted: true,
+                  dropped: true,
+                  reason: error.message
+                })
+              )
+            );
+            return;
+          }
+          throw error;
+        }
+      }
       const result = await recordAgentEvent(this.env, connectorId, message.payload);
       ws.send(
         JSON.stringify(
@@ -317,8 +388,6 @@ export class WorkspaceDO implements DurableObject {
       if (result.event) {
         this.broadcastToBrowsers(threadEventMessage(result.event));
       }
-      const finalCommandEvent =
-        message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
       const resultFinalCommandEvent =
         result.event?.kind === "command.finished" || result.event?.kind === "command.failed";
       if (result.accepted && (finalCommandEvent || resultFinalCommandEvent)) {
@@ -469,13 +538,15 @@ export class WorkspaceDO implements DurableObject {
       if (!hasReadyPeer) {
         const stoppedAt = new Date().toISOString();
         this.appServerReportCache.delete(attachment.connectorId);
-        const stoppedInstances = await markAppServerInstancesStoppedForConnector(this.env, attachment.connectorId, stoppedAt);
-        if (stoppedInstances.length > 0) {
-          this.broadcastToBrowsers(appServerInstancesMessage({
-            app_server_instances: stoppedInstances,
-            connector_id: attachment.connectorId,
-            synced_at: stoppedAt
-          }));
+        if (await dogfoodSafetyActionAllowed(this.env, "app_server_instances_report", stoppedAt)) {
+          const stoppedInstances = await markAppServerInstancesStoppedForConnector(this.env, attachment.connectorId, stoppedAt);
+          if (stoppedInstances.length > 0) {
+            this.broadcastToBrowsers(appServerInstancesMessage({
+              app_server_instances: stoppedInstances,
+              connector_id: attachment.connectorId,
+              synced_at: stoppedAt
+            }));
+          }
         }
       }
       if (!hasReadyPeer && hasAuthenticatedPeer) {
@@ -554,6 +625,28 @@ export class WorkspaceDO implements DurableObject {
     this.hostSessionsRefreshSentAt.set(connectorId, now);
     this.markHostSessionsRefreshPending(socket, connectorId);
     return true;
+  }
+
+  private async hostSessionRefreshDecision(): Promise<{
+    refreshAllowed: boolean;
+    pendingDispatchAllowed: boolean;
+  }> {
+    if (!this.env.DB) {
+      return { refreshAllowed: false, pendingDispatchAllowed: true };
+    }
+    try {
+      await assertDogfoodSafetyActionAllowed(this.env, "host_session_refresh");
+      return { refreshAllowed: true, pendingDispatchAllowed: true };
+    } catch (error) {
+      if (error instanceof DogfoodSafetyError) {
+        const conservativeRefreshOnlyBlock = error.guard.budget_state === "conservative";
+        return {
+          refreshAllowed: false,
+          pendingDispatchAllowed: conservativeRefreshOnlyBlock
+        };
+      }
+      throw error;
+    }
   }
 
   private async createLocalThread(request: Request): Promise<Response> {
@@ -836,9 +929,15 @@ export class WorkspaceDO implements DurableObject {
     ) {
       return [];
     }
+    if (!(await this.canDispatchPendingCommands())) {
+      return [];
+    }
     let releasedConnectorIds: string[] = [];
     if (!options.skipStaleExplicitCleanup) {
       releasedConnectorIds = await this.cleanupStaleExplicitAppServerCommandTargets(connectorId);
+      if (!(await this.canDispatchPendingCommands())) {
+        return releasedConnectorIds;
+      }
     }
     const dispatches = await pendingCommandsForConnector(this.env, connectorId);
     for (const payload of dispatches) {
@@ -900,12 +999,18 @@ export class WorkspaceDO implements DurableObject {
   }
 
   private async sendPendingCommandsToAgents(connectorId?: string): Promise<WebSocket[]> {
+    if (!(await this.canDispatchPendingCommands())) {
+      return [];
+    }
     if (connectorId) {
       const sockets = this.ctx.getWebSockets(`agent:${connectorId}`);
       if (sockets.some((socket) => hasPendingHostSessionsDispatch(socket, connectorId))) {
         return [];
       }
       const releasedConnectorIds = await this.cleanupStaleExplicitAppServerCommandTargets(connectorId);
+      if (!(await this.canDispatchPendingCommands())) {
+        return [];
+      }
       const targetConnectorIds = new Set([connectorId, ...releasedConnectorIds]);
       const readySockets = [...targetConnectorIds].flatMap((targetConnectorId) => {
         const targetSockets = this.ctx.getWebSockets(`agent:${targetConnectorId}`);
@@ -920,7 +1025,9 @@ export class WorkspaceDO implements DurableObject {
         readySockets.map((socket) => {
           const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
           return attachment?.connectorId
-            ? this.sendPendingCommands(socket, attachment.connectorId, { skipStaleExplicitCleanup: true })
+            ? this.sendPendingCommands(socket, attachment.connectorId, {
+              skipStaleExplicitCleanup: true
+            })
             : undefined;
         })
       );
@@ -948,6 +1055,9 @@ export class WorkspaceDO implements DurableObject {
         connectorIds.add(releasedConnectorId);
       }
     }
+    if (!(await this.canDispatchPendingCommands())) {
+      return [];
+    }
     const readySockets = [...connectorIds].flatMap((connectorId) =>
       pendingRefreshConnectorIds.has(connectorId)
         ? []
@@ -959,10 +1069,24 @@ export class WorkspaceDO implements DurableObject {
     await Promise.all(readySockets.map((socket) => {
       const attachment = socket.deserializeAttachment() as { connectorId?: string } | undefined;
       return attachment?.connectorId
-        ? this.sendPendingCommands(socket, attachment.connectorId, { skipStaleExplicitCleanup: true })
+        ? this.sendPendingCommands(socket, attachment.connectorId, {
+          skipStaleExplicitCleanup: true
+        })
         : undefined;
     }));
     return readySockets;
+  }
+
+  private async canDispatchPendingCommands(): Promise<boolean> {
+    try {
+      await assertDogfoodSafetyActionAllowed(this.env, "command_create");
+      return true;
+    } catch (error) {
+      if (error instanceof DogfoodSafetyError) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   private markAgentReady(ws: WebSocket, connectorId: string, pendingHostSessionsDispatch = false): void {

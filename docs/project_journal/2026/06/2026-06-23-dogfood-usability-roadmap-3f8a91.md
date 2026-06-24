@@ -4,7 +4,7 @@ title: Dogfood Usability Roadmap
 status: active
 created: 2026-06-23
 updated: 2026-06-23
-branch: wip/app-server-attach-resume
+branch: wip/dogfood-safety-gate
 pr:
 supersedes:
 superseded_by:
@@ -41,5 +41,5 @@ superseded_by:
 - Run three review lanes before merge, then resolve or explicitly close every GitHub conversation.
 
 ## Current Next Step
-- Finish the current app-server attach/resume PR and merge it once checks, reviews, and conversations are clean.
-- Start PR A from updated `master` immediately after that merge.
+- PR A is now active on `wip/dogfood-safety-gate`.
+- Implement the dogfood safety gate first: visible cost posture, server-side guards for costly write/refresh actions, and an emergency pause or stop path.

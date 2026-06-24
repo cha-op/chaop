@@ -5,6 +5,9 @@ import type {
   CommandSummary,
   CreateCommandRequest,
   ConnectorSummary,
+  DogfoodSafetyAction,
+  DogfoodSafetyActionGuard,
+  DogfoodSafetyPosture,
   HostSessionBackfillSummary,
   HostSessionSummary,
   HostSessionSyncSummary,
@@ -23,6 +26,28 @@ const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], 
   draining: 3,
   healthy: 4
 };
+
+export function safetyGuardForAction(
+  data: BootstrapPayload | undefined,
+  action: DogfoodSafetyAction
+): DogfoodSafetyActionGuard | undefined {
+  return data?.safety?.actions.find((guard) => guard.action === action);
+}
+
+export function safetyActionBlocked(
+  data: BootstrapPayload | undefined,
+  action: DogfoodSafetyAction
+): boolean {
+  return safetyGuardForAction(data, action)?.state === "blocked";
+}
+
+export function safetyActionReason(
+  data: BootstrapPayload | undefined,
+  action: DogfoodSafetyAction
+): string | undefined {
+  const guard = safetyGuardForAction(data, action);
+  return guard?.state === "blocked" ? guard.reason : undefined;
+}
 
 export function budgetSourceLabel(budget: BudgetSummary): string {
   const windowSampleCount = budget.window_sample_count ?? (budget.windows ?? []).length;
@@ -129,12 +154,14 @@ export function mergeBootstrapPayload(
   if (!current) {
     return {
       ...incoming,
-      app_server_instances: appServerInstancesOrEmpty(incoming)
+      app_server_instances: appServerInstancesOrEmpty(incoming),
+      safety: safetyOrFallback(incoming)
     };
   }
 
   const hostSessionSyncs = mergeHostSessionSyncs(incoming.host_session_syncs, current.host_session_syncs);
   const incomingAppServerInstances = maybeAppServerInstances(incoming);
+  const incomingSafety = maybeSafety(incoming);
   return {
     ...incoming,
     connectors: mergeBootstrapConnectors(current.connectors, incoming.connectors),
@@ -146,13 +173,60 @@ export function mergeBootstrapPayload(
     host_session_syncs: hostSessionSyncs,
     app_server_instances: incomingAppServerInstances
       ? mergeBootstrapAppServerInstances(appServerInstancesOrEmpty(current), incomingAppServerInstances)
-      : appServerInstancesOrEmpty(current)
+      : appServerInstancesOrEmpty(current),
+    safety: incomingSafety ?? safetyOrFallback(current, incoming.server_time)
   };
 }
 
 function maybeAppServerInstances(payload: BootstrapPayload): AppServerInstanceSummary[] | undefined {
   const value = (payload as { app_server_instances?: unknown }).app_server_instances;
   return Array.isArray(value) ? value as AppServerInstanceSummary[] : undefined;
+}
+
+function maybeSafety(payload: BootstrapPayload): DogfoodSafetyPosture | undefined {
+  const value = (payload as { safety?: unknown }).safety;
+  return isSafetyPosture(value) ? value : undefined;
+}
+
+function safetyOrFallback(payload: BootstrapPayload, generatedAt = payload.server_time): DogfoodSafetyPosture {
+  return maybeSafety(payload) ?? defaultSafetyPosture(generatedAt);
+}
+
+function isSafetyPosture(value: unknown): value is DogfoodSafetyPosture {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<DogfoodSafetyPosture>;
+  return typeof candidate.state === "string"
+    && typeof candidate.paused === "boolean"
+    && typeof candidate.generated_at === "string"
+    && typeof candidate.summary === "string"
+    && Array.isArray(candidate.actions);
+}
+
+const DEFAULT_SAFETY_ACTIONS: DogfoodSafetyAction[] = [
+  "command_create",
+  "local_thread_create",
+  "host_session_refresh",
+  "host_session_attach",
+  "host_session_detach",
+  "task_archive",
+  "budget_bootstrap",
+  "agent_event",
+  "app_server_instances_report"
+];
+
+function defaultSafetyPosture(generatedAt = new Date(0).toISOString()): DogfoodSafetyPosture {
+  return {
+    state: "normal",
+    paused: false,
+    generated_at: generatedAt,
+    summary: "Dogfood writes are allowed.",
+    actions: DEFAULT_SAFETY_ACTIONS.map((action) => ({
+      action,
+      state: "allowed",
+      reason: "Allowed by the legacy control plane response.",
+      budget_state: "normal"
+    }))
+  };
 }
 
 function appServerInstancesOrEmpty(payload: BootstrapPayload): AppServerInstanceSummary[] {

@@ -32,7 +32,9 @@ import {
   mergeConnectorSummaries,
   mergeHostSessions,
   normaliseCommandMode,
-  primaryAppServerInstanceForConnector
+  primaryAppServerInstanceForConnector,
+  safetyActionBlocked,
+  safetyActionReason
 } from "./state.ts";
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
@@ -167,6 +169,39 @@ test("mergeBootstrapPayload keeps current app-server instances when legacy boots
   assert.deepEqual(merged.app_server_instances, [currentInstance]);
 });
 
+test("mergeBootstrapPayload normalises legacy bootstrap without safety", () => {
+  const incoming = payload();
+  delete (incoming as Partial<BootstrapPayload>).safety;
+
+  const merged = mergeBootstrapPayload(undefined, incoming);
+
+  assert.equal(merged.safety.state, "normal");
+  assert.equal(merged.safety.paused, false);
+  assert.equal(merged.safety.generated_at, incoming.server_time);
+  assert.equal(merged.safety.actions.every((guard) => guard.state === "allowed"), true);
+  assert.equal(safetyActionBlocked(merged, "command_create"), false);
+});
+
+test("mergeBootstrapPayload keeps current safety when legacy bootstrap omits the field", () => {
+  const current = payload({
+    safety: {
+      ...safety(),
+      state: "hard_limited",
+      paused: true,
+      paused_reason: "operator stop",
+      summary: "Emergency pause active."
+    }
+  });
+  const incoming = payload();
+  delete (incoming as Partial<BootstrapPayload>).safety;
+
+  const merged = mergeBootstrapPayload(current, incoming);
+
+  assert.equal(merged.safety.state, "hard_limited");
+  assert.equal(merged.safety.paused, true);
+  assert.equal(merged.safety.paused_reason, "operator stop");
+});
+
 test("budgetSourceLabel reports unknown source for legacy budget payloads", () => {
   const budget = { ...payload().budget };
   delete (budget as Partial<typeof budget>).source;
@@ -275,6 +310,30 @@ test("budgetPctLabel distinguishes missing samples from zero usage", () => {
   assert.equal(budgetPctLabel(undefined), "missing");
   assert.equal(budgetPctLabel(0), "0%");
   assert.equal(budgetPctLabel(125.4), "125.4%");
+});
+
+test("safety helpers expose blocked action reasons only for guarded actions", () => {
+  const baseSafety = safety();
+  const data = payload({
+    safety: {
+      ...baseSafety,
+      actions: baseSafety.actions.map((guard) =>
+        guard.action === "host_session_refresh"
+          ? {
+            ...guard,
+            state: "blocked",
+            reason: "Refresh is paused while cost posture is conservative.",
+            budget_state: "conservative"
+          }
+          : guard
+      )
+    }
+  });
+
+  assert.equal(safetyActionBlocked(data, "host_session_refresh"), true);
+  assert.equal(safetyActionReason(data, "host_session_refresh"), "Refresh is paused while cost posture is conservative.");
+  assert.equal(safetyActionBlocked(data, "command_create"), false);
+  assert.equal(safetyActionReason(data, "command_create"), undefined);
 });
 
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {
@@ -901,8 +960,34 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
       window_sample_count: 0,
       windows: []
     },
+    safety: safety(),
     server_time: "2026-06-12T10:00:00.000Z",
     ...overrides
+  };
+}
+
+function safety(): BootstrapPayload["safety"] {
+  return {
+    state: "normal",
+    paused: false,
+    generated_at: "2026-06-12T10:00:00.000Z",
+    summary: "Guarded dogfood actions are allowed.",
+    actions: [
+      "command_create",
+      "local_thread_create",
+      "host_session_refresh",
+      "host_session_attach",
+      "host_session_detach",
+      "task_archive",
+      "budget_bootstrap",
+      "agent_event",
+      "app_server_instances_report"
+    ].map((action) => ({
+      action: action as BootstrapPayload["safety"]["actions"][number]["action"],
+      state: "allowed" as const,
+      reason: "Allowed.",
+      budget_state: "normal" as const
+    }))
   };
 }
 
