@@ -68,6 +68,7 @@ superseded_by:
 - 受保护写入检查现在会复用短缓存的 live Cloudflare telemetry sample；因此即使 telemetry sample 持久化失败，显式 live safety refresh 也能在同一个 Worker isolate 内继续阻挡写入。
 - connector WebSocket close 期间的 app-server stopped status 写入现在也会经过 `app_server_instances_report` safety action，避免断连清理绕过状态报告保护。
 - live telemetry fallback cache 现在会在同一个 UTC 日和 telemetry selector 内跨 sample bucket 保留，并按每个 metric 的高水位合并，因此后续更低的 live sample 不会丢失 hard-limit protection。
+- duplicate connector retirement 期间的 app-server stopped 写入现在也会走同一个 `app_server_instances_report` safety action，同时保留 command/offline cleanup。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

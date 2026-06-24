@@ -68,6 +68,7 @@ superseded_by:
 - Reused the short-cached live Cloudflare telemetry sample in guarded write checks, so an explicit live safety refresh can still block writes in the same Worker isolate even when telemetry sample persistence fails.
 - Guarded app-server stopped status writes during connector WebSocket close, preventing disconnect cleanup from bypassing the `app_server_instances_report` safety action.
 - Extended the live telemetry fallback cache across sample-bucket boundaries for the same UTC day and telemetry selector, and merged it by per-metric high-water marks so a later lower live sample cannot drop hard-limit protection.
+- Guarded duplicate-connector retirement app-server stopped writes with the same `app_server_instances_report` safety action, while leaving command/offline cleanup available.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

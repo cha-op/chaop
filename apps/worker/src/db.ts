@@ -3136,7 +3136,9 @@ export async function markConnectorDisconnected(env: Env, connectorId: string): 
     now,
     refreshConnectorActivity: false
   });
-  await markAppServerInstancesStoppedForConnector(env, connectorId, now);
+  if (await dogfoodSafetyActionAllowed(env, "app_server_instances_report", now)) {
+    await markAppServerInstancesStoppedForConnector(env, connectorId, now);
+  }
   await markConnectorOffline(env, connectorId, now);
   return events;
 }
