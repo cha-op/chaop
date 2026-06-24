@@ -1664,6 +1664,7 @@ export async function prepareTurnInteractionResolutionInDb(
   if (turnInteractionAutoResolutionExpired(payload, row.created_at)) {
     throw new CommandTargetError("Turn interaction auto-resolution deadline has expired", 409);
   }
+  validateTurnInteractionResponseForRequest(response, payload);
   if (await hasTurnInteractionResolution(env, row.command_id, payload.interaction_id)) {
     throw new CommandTargetError("Turn interaction has already been resolved", 409);
   }
@@ -1710,6 +1711,7 @@ export async function recordTurnInteractionResolutionInDb(
   if (!payload) {
     throw new CommandTargetError("Turn interaction payload is unavailable", 409);
   }
+  validateTurnInteractionResponseForRequest(response, payload);
   const existing = await findTurnInteractionResolution(env, row.command_id, payload.interaction_id);
   if (existing) {
     if (options.allowExisting) {
@@ -4081,6 +4083,56 @@ function turnInteractionAutoResolutionExpired(
   const createdMs = Date.parse(createdAt);
   if (!Number.isFinite(createdMs)) return false;
   return nowMs >= createdMs + autoResolutionMs + graceMs;
+}
+
+function validateTurnInteractionResponseForRequest(
+  response: ResolveTurnInteractionRequest,
+  request: TurnInteractionRequestPayload
+): void {
+  if (response.kind !== request.request_kind) {
+    throw new CommandTargetError("Turn interaction response does not match the request kind", 400);
+  }
+  if (response.kind === "approval") {
+    const available = request.available_decisions;
+    if (available && available.length > 0 && !available.some((decision) => jsonValueEquals(decision, response.decision))) {
+      throw new CommandTargetError("Turn interaction approval decision is not available for this request", 400);
+    }
+    return;
+  }
+
+  const questions = request.questions ?? [];
+  const expectedIds = new Set(questions.map((question) => question.id).filter((id) => id.trim().length > 0));
+  const answerIds = Object.keys(response.answers);
+  for (const answerId of answerIds) {
+    if (!expectedIds.has(answerId)) {
+      throw new CommandTargetError("Turn interaction input response includes an unknown question", 400);
+    }
+  }
+  for (const questionId of expectedIds) {
+    const answer = response.answers[questionId];
+    if (!answer || !Array.isArray(answer.answers) || answer.answers.length === 0) {
+      throw new CommandTargetError("Turn interaction input response is missing a required answer", 400);
+    }
+    if (answer.answers.some((item) => item.trim().length === 0)) {
+      throw new CommandTargetError("Turn interaction input response includes an empty answer", 400);
+    }
+  }
+}
+
+function jsonValueEquals(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((item, index) => jsonValueEquals(item, right[index]));
+  }
+  if (isRecord(left) || isRecord(right)) {
+    if (!isRecord(left) || !isRecord(right)) return false;
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    if (leftKeys.length !== rightKeys.length) return false;
+    return leftKeys.every((key, index) => key === rightKeys[index] && jsonValueEquals(left[key], right[key]));
+  }
+  return false;
 }
 
 async function hasTurnInteractionResolution(

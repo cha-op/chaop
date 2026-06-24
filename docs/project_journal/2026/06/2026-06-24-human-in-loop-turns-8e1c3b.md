@@ -43,6 +43,7 @@ superseded_by:
 - Duplicate interaction-resolution insert races now best-effort roll back the sequence number they allocated when the insert loses to the unique constraint, avoiding sequence gaps and unnecessary follow-on accounting.
 - App-server v2 command approval compatibility now preserves `availableDecisions`, object-shaped `acceptWithExecpolicyAmendment` responses, `proposedExecpolicyAmendment`, `commandActions`, and `networkApprovalContext` so Thread Centre can render network-specific approvals and send the exact accepted decision back to app-server.
 - The WorkspaceDO internal turn-interaction validator now accepts the same object-shaped exec-policy amendment approval decision as the public route, with DO coverage for forwarding that response to the connector.
+- Browser-submitted interaction responses now must match the stored request payload: approval decisions are constrained by `available_decisions` when app-server supplied them, input answers must cover exactly the requested questions with non-empty answers, and Thread Centre renders the full network approval context so unknown safety-relevant fields are visible.
 
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.

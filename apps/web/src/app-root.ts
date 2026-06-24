@@ -782,6 +782,10 @@ export class ChaopApp extends LitElement {
                   ? html`<div><dt>Port</dt><dd>${payload.network_approval_context.port}</dd></div>`
                   : nothing}
               </dl>
+              <div class="interaction-permissions">
+                <span>Network context</span>
+                <pre><code>${formatJson(payload.network_approval_context)}</code></pre>
+              </div>
             `
           : nothing}
         ${payload.cwd || payload.grant_root

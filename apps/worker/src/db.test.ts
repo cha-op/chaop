@@ -850,6 +850,79 @@ test("prepareTurnInteractionResolutionInDb reclaims stale claims before dispatch
   assert.equal(db.claimInserts, 1);
 });
 
+test("prepareTurnInteractionResolutionInDb rejects unavailable approval decisions", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    approvalAvailableDecisions: [
+      "decline",
+      {
+        acceptWithExecpolicyAmendment: {
+          execpolicy_amendment: ["touch", "requested.txt"]
+        }
+      },
+      "cancel"
+    ]
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 400 &&
+      /decision is not available/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb accepts available approval decision objects", async () => {
+  const amendmentDecision = {
+    acceptWithExecpolicyAmendment: {
+      execpolicy_amendment: ["touch", "requested.txt"]
+    }
+  };
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    approvalAvailableDecisions: ["decline", amendmentDecision, "cancel"]
+  });
+
+  const dispatch = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: amendmentDecision
+  });
+
+  assert.deepEqual(dispatch.response, {
+    kind: "approval",
+    decision: amendmentDecision
+  });
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects incomplete input answers", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false, requestKind: "input" });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "input",
+        answers: {}
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 400 &&
+      /missing a required answer/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
 test("prepareTurnInteractionResolutionInDb rejects expired auto-resolving input before dispatch", async () => {
   const db = turnInteractionResolutionDb({
     resolved: false,
@@ -911,7 +984,11 @@ test("prepareTurnInteractionResolutionInDb accepts input during explicit respons
 
   const dispatch = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
     kind: "input",
-    answers: {}
+    answers: {
+      "question-1": {
+        answers: ["Yes"]
+      }
+    }
   });
 
   assert.equal(dispatch.command_id, "command-1");
@@ -1870,6 +1947,7 @@ function turnInteractionResolutionDb(options: {
   autoResolutionMs?: number | null;
   autoResolutionExpiresAt?: string;
   autoResolutionResponseGraceMs?: number | null;
+  approvalAvailableDecisions?: unknown[];
 }) {
   const requestKind = options.requestKind ?? "approval";
   const payload = JSON.stringify({
@@ -1885,12 +1963,16 @@ function turnInteractionResolutionDb(options: {
     ...(requestKind === "approval"
       ? {
         command: "cat config.json",
-        cwd: "/workspace"
+        cwd: "/workspace",
+        ...(options.approvalAvailableDecisions
+          ? { available_decisions: options.approvalAvailableDecisions }
+          : {})
       }
       : {
         questions: [
           {
             id: "question-1",
+            header: "Confirm",
             question: "Continue?",
             is_other: false,
             is_secret: false
