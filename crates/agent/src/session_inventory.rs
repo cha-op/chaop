@@ -12,7 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::{
     Message, WebSocket, client::client, connect, handshake::HandshakeError, http::Uri,
     stream::MaybeTlsStream,
@@ -880,6 +880,16 @@ fn resolve_session(
 }
 
 fn unix_seconds_to_iso(seconds: i64) -> Option<String> {
+    unix_timestamp_to_iso(seconds, 0)
+}
+
+fn system_time_to_iso_millis(value: SystemTime) -> Option<String> {
+    let duration = value.duration_since(UNIX_EPOCH).ok()?;
+    let seconds = i64::try_from(duration.as_secs()).ok()?;
+    unix_timestamp_to_iso(seconds, duration.subsec_millis())
+}
+
+fn unix_timestamp_to_iso(seconds: i64, millis: u32) -> Option<String> {
     if seconds < 0 {
         return None;
     }
@@ -890,7 +900,7 @@ fn unix_seconds_to_iso(seconds: i64) -> Option<String> {
     let minute = (seconds_of_day % 3_600) / 60;
     let second = seconds_of_day % 60;
     Some(format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z"
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
     ))
 }
 
@@ -2233,8 +2243,17 @@ fn turn_interaction_payload(
     }
     if let Some(auto_resolution_ms) = auto_resolution_ms {
         payload.insert("auto_resolution_ms".to_owned(), json!(auto_resolution_ms));
+        if let Some(expires_at) = auto_resolution_expires_at(auto_resolution_ms) {
+            payload.insert("auto_resolution_expires_at".to_owned(), json!(expires_at));
+        }
     }
     Ok(Value::Object(payload))
+}
+
+fn auto_resolution_expires_at(auto_resolution_ms: u64) -> Option<String> {
+    SystemTime::now()
+        .checked_add(Duration::from_millis(auto_resolution_ms))
+        .and_then(system_time_to_iso_millis)
 }
 
 fn turn_interaction_id(method: &str, request_id: &Value, params: &Value) -> String {
@@ -7735,6 +7754,14 @@ mod tests {
                 .and_then(|payload| payload.get("auto_resolution_ms"))
                 .and_then(Value::as_u64),
             Some(10)
+        );
+        assert!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("auto_resolution_expires_at"))
+                .and_then(Value::as_str)
+                .is_some()
         );
 
         let resolution_event = event_rx

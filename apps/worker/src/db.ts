@@ -4064,6 +4064,12 @@ function turnInteractionAutoResolutionExpired(
   if (typeof autoResolutionMs !== "number" || !Number.isFinite(autoResolutionMs) || autoResolutionMs < 0) {
     return false;
   }
+  if (typeof payload.auto_resolution_expires_at === "string") {
+    const expiresAtMs = Date.parse(payload.auto_resolution_expires_at);
+    if (Number.isFinite(expiresAtMs)) {
+      return nowMs >= expiresAtMs;
+    }
+  }
   const createdMs = Date.parse(createdAt);
   if (!Number.isFinite(createdMs)) return false;
   return nowMs >= createdMs + autoResolutionMs;
@@ -4140,7 +4146,8 @@ function isTurnInteractionRequestPayload(value: unknown): value is TurnInteracti
     (value.request_kind === "approval" || value.request_kind === "input") &&
     typeof value.app_server_thread_id === "string" &&
     typeof value.app_server_turn_id === "string" &&
-    typeof value.title === "string"
+    typeof value.title === "string" &&
+    (value.auto_resolution_expires_at === undefined || typeof value.auto_resolution_expires_at === "string")
   );
 }
 

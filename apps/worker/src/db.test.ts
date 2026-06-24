@@ -826,6 +826,31 @@ test("prepareTurnInteractionResolutionInDb rejects expired auto-resolving input 
   assert.equal(db.claimInserts, 0);
 });
 
+test("prepareTurnInteractionResolutionInDb uses explicit auto-resolution expiry before dispatch", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    autoResolutionMs: 60_000,
+    autoResolutionExpiresAt: "2000-01-01T00:00:00.000Z",
+    createdAt: "2999-01-01T00:00:00.000Z"
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "input",
+        answers: {}
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /auto-resolution deadline has expired/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
 test("recordTurnInteractionResolutionInDb rejects already resolved interactions before append", async () => {
   const db = turnInteractionResolutionDb({ resolved: true });
 
@@ -1747,6 +1772,7 @@ function turnInteractionResolutionDb(options: {
   createdAt?: string;
   requestKind?: "approval" | "input";
   autoResolutionMs?: number | null;
+  autoResolutionExpiresAt?: string;
 }) {
   const requestKind = options.requestKind ?? "approval";
   const payload = JSON.stringify({
@@ -1773,7 +1799,10 @@ function turnInteractionResolutionDb(options: {
             is_secret: false
           }
         ],
-        auto_resolution_ms: options.autoResolutionMs
+        auto_resolution_ms: options.autoResolutionMs,
+        ...(options.autoResolutionExpiresAt
+          ? { auto_resolution_expires_at: options.autoResolutionExpiresAt }
+          : {})
       })
   });
   const createdAt = options.createdAt ?? "2026-06-24T10:00:00.000Z";

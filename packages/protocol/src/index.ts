@@ -494,6 +494,7 @@ export type TurnInteractionRequestPayload = {
   requested_permissions?: Record<string, unknown> | undefined;
   questions?: TurnInteractionInputQuestion[] | undefined;
   auto_resolution_ms?: number | null | undefined;
+  auto_resolution_expires_at?: string | undefined;
 };
 
 export type TurnInteractionResolutionPayload = {
