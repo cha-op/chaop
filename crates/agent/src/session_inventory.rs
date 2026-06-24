@@ -33,6 +33,8 @@ pub struct AppServerCommandChannels {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct TurnInteractionResponseDispatch {
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub command_id: String,
     pub interaction_id: String,
     pub response: TurnInteractionResponse,
@@ -2243,6 +2245,10 @@ fn turn_interaction_payload(
     }
     if let Some(auto_resolution_ms) = auto_resolution_ms {
         payload.insert("auto_resolution_ms".to_owned(), json!(auto_resolution_ms));
+        payload.insert(
+            "auto_resolution_response_grace_ms".to_owned(),
+            json!(AUTO_RESOLUTION_RESPONSE_GRACE_MS),
+        );
         if let Some(expires_at) = auto_resolution_expires_at(auto_resolution_ms) {
             payload.insert("auto_resolution_expires_at".to_owned(), json!(expires_at));
         }
@@ -2424,6 +2430,7 @@ fn auto_resolved_input_response(
     interaction_id: &str,
 ) -> TurnInteractionResponseDispatch {
     TurnInteractionResponseDispatch {
+        request_id: None,
         command_id: command_id.to_owned(),
         interaction_id: interaction_id.to_owned(),
         response: TurnInteractionResponse::Input {
@@ -3685,14 +3692,14 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AppServerCommandChannels, AppServerTurnOutput,
-        HistorySession, InventoryScope, SessionDraft, TitleSource, TurnInteractionInputAnswer,
-        TurnInteractionResponse, TurnInteractionResponseDispatch,
-        app_server_command_result_events_with_cancel, app_server_sessions_from_response,
-        app_server_thread_from_response, app_server_titles_from_response,
-        build_host_session_backfill, build_host_sessions_report, create_app_server_thread_at,
-        ensure_app_server_host_session_at, load_app_server_sessions, read_recent_lines,
-        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
+        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AUTO_RESOLUTION_RESPONSE_GRACE_MS,
+        AppServerCommandChannels, AppServerTurnOutput, HistorySession, InventoryScope,
+        SessionDraft, TitleSource, TurnInteractionInputAnswer, TurnInteractionResponse,
+        TurnInteractionResponseDispatch, app_server_command_result_events_with_cancel,
+        app_server_sessions_from_response, app_server_thread_from_response,
+        app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
+        create_app_server_thread_at, ensure_app_server_host_session_at, load_app_server_sessions,
+        read_recent_lines, remaining_app_server_archive_timeout, resolve_session, rollout_paths,
         set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
         unix_seconds_to_iso,
     };
@@ -7220,6 +7227,7 @@ mod tests {
             .to_owned();
         response_tx
             .send(TurnInteractionResponseDispatch {
+                request_id: None,
                 command_id: "command-1".to_owned(),
                 interaction_id,
                 response: TurnInteractionResponse::Approval {
@@ -7338,6 +7346,7 @@ mod tests {
             .to_owned();
         response_tx
             .send(TurnInteractionResponseDispatch {
+                request_id: None,
                 command_id: "command-1".to_owned(),
                 interaction_id,
                 response: TurnInteractionResponse::Approval {
@@ -7456,6 +7465,7 @@ mod tests {
         );
         response_tx
             .send(TurnInteractionResponseDispatch {
+                request_id: None,
                 command_id: "command-1".to_owned(),
                 interaction_id,
                 response: TurnInteractionResponse::Input { answers },
@@ -7663,6 +7673,7 @@ mod tests {
         );
         response_tx
             .send(TurnInteractionResponseDispatch {
+                request_id: None,
                 command_id: "command-1".to_owned(),
                 interaction_id,
                 response: TurnInteractionResponse::Input { answers },
@@ -7763,6 +7774,14 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some()
         );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("auto_resolution_response_grace_ms"))
+                .and_then(Value::as_u64),
+            Some(AUTO_RESOLUTION_RESPONSE_GRACE_MS)
+        );
 
         let resolution_event = event_rx
             .recv_timeout(Duration::from_secs(1))
@@ -7814,6 +7833,7 @@ mod tests {
         );
         response_tx
             .send(TurnInteractionResponseDispatch {
+                request_id: None,
                 command_id: "command-1".to_owned(),
                 interaction_id: "interaction-1".to_owned(),
                 response: TurnInteractionResponse::Input { answers },

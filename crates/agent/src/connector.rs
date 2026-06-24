@@ -10,7 +10,7 @@ use crate::session_inventory::{
     create_app_server_thread, ensure_app_server_host_session, set_app_server_thread_archived,
 };
 use crate::shutdown::{install_signal_handlers, shutdown_requested};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs;
@@ -43,6 +43,14 @@ pub enum RunMode {
 struct Envelope {
     kind: String,
     payload: serde_json::Value,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct TurnInteractionResponseAck {
+    request_id: String,
+    accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1298,6 +1306,7 @@ fn wait_for_app_server_command_events(
         let socket_result: Result<(), Box<dyn std::error::Error>> = match socket.read() {
             Ok(Message::Text(text)) => {
                 if handle_turn_interaction_response_text(
+                    socket,
                     text.as_ref(),
                     &command_id,
                     &interaction_sender,
@@ -1392,19 +1401,61 @@ fn app_server_interaction_rejected_event() -> ConnectorEvent {
 }
 
 fn handle_turn_interaction_response_text(
+    socket: &mut AgentSocket,
     text: &str,
     command_id: &str,
     sender: &mpsc::Sender<TurnInteractionResponseDispatch>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(ack) = turn_interaction_response_ack_for_text(text, command_id, sender)? else {
+        return Ok(false);
+    };
+    send_turn_interaction_response_ack(socket, ack)?;
+    Ok(true)
+}
+
+fn turn_interaction_response_ack_for_text(
+    text: &str,
+    command_id: &str,
+    sender: &mpsc::Sender<TurnInteractionResponseDispatch>,
+) -> Result<Option<TurnInteractionResponseAck>, Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
     if envelope.kind != "turn.interaction_response" {
-        return Ok(false);
+        return Ok(None);
     }
     let dispatch: TurnInteractionResponseDispatch = serde_json::from_value(envelope.payload)?;
+    let request_id = dispatch
+        .request_id
+        .clone()
+        .ok_or("turn interaction response did not include request_id")?;
     if dispatch.command_id == command_id {
-        let _ = sender.send(dispatch);
+        let accepted = sender.send(dispatch).is_ok();
+        return Ok(Some(TurnInteractionResponseAck {
+            request_id,
+            accepted,
+            error: (!accepted)
+                .then_some("App-server turn is no longer waiting for this interaction".to_owned()),
+        }));
     }
-    Ok(true)
+    Ok(Some(TurnInteractionResponseAck {
+        request_id,
+        accepted: false,
+        error: Some("Turn interaction response targeted a different command".to_owned()),
+    }))
+}
+
+fn send_turn_interaction_response_ack(
+    socket: &mut AgentSocket,
+    ack: TurnInteractionResponseAck,
+) -> Result<(), Box<dyn std::error::Error>> {
+    socket.send(Message::Text(
+        json!({
+            "kind": "turn.interaction_response_ack",
+            "payload": ack
+        })
+        .to_string()
+        .into(),
+    ))?;
+    Ok(())
 }
 
 fn cancel_codex_worker(
@@ -1763,18 +1814,18 @@ mod tests {
     use super::{
         AckWaitAction, AgentReadyState, AppServerInstancesSendState, CommandDispatch,
         CommandPayload, CommandTargetHostSession, CommandType, Envelope, HostSessionsSendState,
-        acknowledge_agent_ready, acknowledge_app_server_instances, acknowledge_host_sessions,
-        agent_event_message, agent_ready_ack_message, agent_ready_message,
-        agent_ready_retry_interval, app_server_instance_summary_interval,
+        TurnInteractionResponseAck, acknowledge_agent_ready, acknowledge_app_server_instances,
+        acknowledge_host_sessions, agent_event_message, agent_ready_ack_message,
+        agent_ready_message, agent_ready_retry_interval, app_server_instance_summary_interval,
         app_server_instances_message, app_server_instances_message_key,
         app_server_instances_message_with_report_id, apply_agent_ready_ack_text,
         apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
         bounded_app_server_instance_text, classify_ack_wait_text, command_events,
-        drain_pending_connector_events, handle_background_ack_message,
-        handle_turn_interaction_response_text, host_sessions_ack_message, host_sessions_message,
-        host_sessions_retry_interval, is_read_timeout, record_agent_ready_sent,
-        requires_app_server_execution_mode, should_send_agent_ready,
+        drain_pending_connector_events, handle_background_ack_message, host_sessions_ack_message,
+        host_sessions_message, host_sessions_retry_interval, is_read_timeout,
+        record_agent_ready_sent, requires_app_server_execution_mode, should_send_agent_ready,
         should_send_app_server_instances, should_send_host_sessions,
+        turn_interaction_response_ack_for_text,
     };
     use crate::app_server_manager::AppServerManager;
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
@@ -1977,18 +2028,26 @@ mod tests {
     }
 
     #[test]
-    fn late_turn_interaction_response_is_consumed_after_receiver_closes() {
+    fn late_turn_interaction_response_is_rejected_after_receiver_closes() {
         let (sender, receiver) = std::sync::mpsc::channel();
         drop(receiver);
 
-        let handled = handle_turn_interaction_response_text(
-            r#"{"kind":"turn.interaction_response","payload":{"command_id":"command-1","interaction_id":"interaction-1","response":{"kind":"input","answers":{}}}}"#,
+        let ack = turn_interaction_response_ack_for_text(
+            r#"{"kind":"turn.interaction_response","payload":{"request_id":"response-1","command_id":"command-1","interaction_id":"interaction-1","response":{"kind":"input","answers":{}}}}"#,
             "command-1",
             &sender,
         )
-        .expect("late response should not fail");
+        .expect("late response should not fail")
+        .expect("turn response ack");
 
-        assert!(handled);
+        assert_eq!(
+            ack,
+            TurnInteractionResponseAck {
+                request_id: "response-1".to_owned(),
+                accepted: false,
+                error: Some("App-server turn is no longer waiting for this interaction".to_owned()),
+            }
+        );
     }
 
     #[test]

@@ -2165,6 +2165,76 @@ test("sync thread archive dispatches to the selected agent socket and resolves t
   assert.deepEqual(ack.payload, { kind: "thread.archive_sync_result", request_id: "archive-1" });
 });
 
+test("turn interaction response waits for connector delivery acknowledgement", async () => {
+  const sent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    activeCommandIds: ["command-1"]
+  }, sent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "agent");
+      return [agentSocket];
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, {} as Env);
+
+  const responsePromise = workspace.fetch(new Request("https://workspace-do/internal/resolve-turn-interaction", {
+    method: "POST",
+    body: JSON.stringify({
+      command_id: "command-1",
+      interaction_id: "interaction-1",
+      response: {
+        kind: "input",
+        answers: {}
+      }
+    })
+  }));
+
+  await waitFor(() => sent.length === 1);
+  const delivery = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: {
+      request_id?: string;
+      command_id?: string;
+      interaction_id?: string;
+    };
+    command_id?: string;
+    target?: { type?: string };
+  };
+  assert.equal(delivery.kind, "turn.interaction_response");
+  assert.equal(delivery.payload?.command_id, "command-1");
+  assert.equal(delivery.payload?.interaction_id, "interaction-1");
+  assert.match(delivery.payload?.request_id ?? "", /^turn-interaction-/);
+  assert.equal(delivery.command_id, "command-1");
+  assert.deepEqual(delivery.target, { type: "connector" });
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "turn.interaction_response_ack",
+    payload: {
+      request_id: delivery.payload?.request_id,
+      accepted: true
+    }
+  }));
+
+  const response = await responsePromise;
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { accepted: true });
+
+  const ack = JSON.parse(sent[1] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; request_id?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, {
+    kind: "turn.interaction_response_ack",
+    request_id: delivery.payload?.request_id
+  });
+});
+
 test("agent event ack rejects stale command events", async () => {
   const sent: string[] = [];
   const agentSocket = {

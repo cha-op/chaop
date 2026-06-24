@@ -802,6 +802,21 @@ test("prepareTurnInteractionResolutionInDb rejects claimed interactions before d
   assert.equal(db.claimInserts, 1);
 });
 
+test("prepareTurnInteractionResolutionInDb reclaims stale claims before dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false, claimed: true, staleClaim: true });
+
+  const dispatch = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+
+  assert.equal(dispatch.command_id, "command-1");
+  assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.staleClaimDeletes, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
 test("prepareTurnInteractionResolutionInDb rejects expired auto-resolving input before dispatch", async () => {
   const db = turnInteractionResolutionDb({
     resolved: false,
@@ -849,6 +864,27 @@ test("prepareTurnInteractionResolutionInDb uses explicit auto-resolution expiry 
 
   assert.equal(db.resolutionChecks, 0);
   assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb accepts input during explicit response grace", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    autoResolutionMs: 60_000,
+    autoResolutionExpiresAt: new Date(Date.now() - 100).toISOString(),
+    autoResolutionResponseGraceMs: 10_000,
+    createdAt: "2999-01-01T00:00:00.000Z"
+  });
+
+  const dispatch = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {}
+  });
+
+  assert.equal(dispatch.command_id, "command-1");
+  assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
 });
 
 test("recordTurnInteractionResolutionInDb rejects already resolved interactions before append", async () => {
@@ -1769,10 +1805,12 @@ test("chooseConnectorForLocalThread rejects connectors without app-server suppor
 function turnInteractionResolutionDb(options: {
   resolved: boolean;
   claimed?: boolean;
+  staleClaim?: boolean;
   createdAt?: string;
   requestKind?: "approval" | "input";
   autoResolutionMs?: number | null;
   autoResolutionExpiresAt?: string;
+  autoResolutionResponseGraceMs?: number | null;
 }) {
   const requestKind = options.requestKind ?? "approval";
   const payload = JSON.stringify({
@@ -1802,6 +1840,9 @@ function turnInteractionResolutionDb(options: {
         auto_resolution_ms: options.autoResolutionMs,
         ...(options.autoResolutionExpiresAt
           ? { auto_resolution_expires_at: options.autoResolutionExpiresAt }
+          : {}),
+        ...(options.autoResolutionResponseGraceMs !== undefined
+          ? { auto_resolution_response_grace_ms: options.autoResolutionResponseGraceMs }
           : {})
       })
   });
@@ -1811,6 +1852,7 @@ function turnInteractionResolutionDb(options: {
     resolutionChecks: 0,
     claimInserts: 0,
     claimDeletes: 0,
+    staleClaimDeletes: 0,
     taskUpdates: 0
   };
   const db = {
@@ -1859,7 +1901,10 @@ function turnInteractionResolutionDb(options: {
         };
       }
 
-      if (/json_extract\(payload_json, '\$\.interaction_id'\)/.test(sql)) {
+      if (
+        /SELECT id, thread_id, command_id, seq, kind, priority, summary, payload_json, created_at/.test(sql) &&
+        /json_extract\(payload_json, '\$\.interaction_id'\)/.test(sql)
+      ) {
         return {
           bind(commandId: string, interactionId: string) {
             assert.equal(commandId, "command-1");
@@ -1891,6 +1936,30 @@ function turnInteractionResolutionDb(options: {
         };
       }
 
+      if (/DELETE FROM turn_interaction_resolution_claims[\s\S]*created_at </.test(sql)) {
+        return {
+          bind(
+            commandId: string,
+            interactionId: string,
+            staleBefore: string,
+            resolutionCommandId: string,
+            resolutionInteractionId: string
+          ) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            assert.match(staleBefore, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(resolutionCommandId, "command-1");
+            assert.equal(resolutionInteractionId, "interaction-1");
+            return {
+              async run() {
+                counters.staleClaimDeletes += 1;
+                return { meta: { changes: options.staleClaim ? 1 : 0 } };
+              }
+            };
+          }
+        };
+      }
+
       if (/INSERT INTO turn_interaction_resolution_claims/.test(sql)) {
         return {
           bind(
@@ -1908,7 +1977,7 @@ function turnInteractionResolutionDb(options: {
             return {
               async run() {
                 counters.claimInserts += 1;
-                return { meta: { changes: options.claimed ? 0 : 1 } };
+                return { meta: { changes: options.claimed && !options.staleClaim ? 0 : 1 } };
               }
             };
           }
@@ -1987,6 +2056,9 @@ function turnInteractionResolutionDb(options: {
     },
     get claimDeletes() {
       return counters.claimDeletes;
+    },
+    get staleClaimDeletes() {
+      return counters.staleClaimDeletes;
     },
     get taskUpdates() {
       return counters.taskUpdates;

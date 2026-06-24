@@ -495,6 +495,7 @@ export type TurnInteractionRequestPayload = {
   questions?: TurnInteractionInputQuestion[] | undefined;
   auto_resolution_ms?: number | null | undefined;
   auto_resolution_expires_at?: string | undefined;
+  auto_resolution_response_grace_ms?: number | null | undefined;
 };
 
 export type TurnInteractionResolutionPayload = {
@@ -686,6 +687,16 @@ export type TurnInteractionResponseDispatch = {
   command_id: string;
   interaction_id: string;
   response: ResolveTurnInteractionRequest;
+};
+
+export type TurnInteractionResponseDelivery = TurnInteractionResponseDispatch & {
+  request_id: string;
+};
+
+export type TurnInteractionResponseAck = {
+  request_id: string;
+  accepted: boolean;
+  error?: string | undefined;
 };
 
 export type AgentHostSession = {

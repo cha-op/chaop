@@ -15,6 +15,8 @@ import {
   type ThreadArchiveSyncDispatch,
   type ThreadArchiveSyncResult,
   type ThreadEvent,
+  type TurnInteractionResponseAck,
+  type TurnInteractionResponseDelivery,
   type TurnInteractionResponseDispatch
 } from "@chaop/protocol";
 import {
@@ -41,6 +43,7 @@ const THREAD_CREATE_TIMEOUT_MS = 15_000;
 const HOST_SESSION_APP_SERVER_ENSURE_TIMEOUT_MS = 15_000;
 const HOST_SESSION_BACKFILL_TIMEOUT_MS = 15_000;
 const THREAD_ARCHIVE_SYNC_TIMEOUT_MS = 20_000;
+const TURN_INTERACTION_RESPONSE_TIMEOUT_MS = 10_000;
 const APP_SERVER_REPORT_CACHE_MS = 60_000;
 const HOST_SESSIONS_REFRESH_COOLDOWN_MS = 60_000;
 const HOST_SESSIONS_REFRESH_DISPATCH_WAIT_MS = 30_000;
@@ -85,6 +88,14 @@ export class WorkspaceDO implements DurableObject {
     {
       timer: ReturnType<typeof setTimeout>;
       resolve: (result: ThreadArchiveSyncResult) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private readonly pendingTurnInteractionResponses = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      resolve: (result: TurnInteractionResponseAck) => void;
       reject: (error: Error) => void;
     }
   >();
@@ -461,6 +472,19 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    if (message.kind === "turn.interaction_response_ack" && isTurnInteractionResponseAck(message.payload)) {
+      this.resolveTurnInteractionResponse(message.payload);
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            kind: "turn.interaction_response_ack",
+            request_id: message.payload.request_id
+          })
+        )
+      );
+      return;
+    }
+
     ws.send(JSON.stringify(createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, { received: text.length })));
   }
 
@@ -529,17 +553,29 @@ export class WorkspaceDO implements DurableObject {
     if (!socket) {
       return jsonResponse({ error: "No active connector socket is handling this turn" }, 409);
     }
+    const requestId = `turn-interaction-${cryptoRandomId().slice(0, 16)}`;
+    const delivery: TurnInteractionResponseDelivery = {
+      ...dispatch,
+      request_id: requestId
+    };
     try {
-      socket.send(
-        JSON.stringify(
-          createEnvelope("turn.interaction_response", { type: "worker", id: "workspace-do-global" }, dispatch, {
-            command_id: dispatch.command_id,
-            target: { type: "connector" }
-          })
-        )
-      );
-    } catch {
-      return jsonResponse({ error: "Connector socket could not receive the turn interaction response" }, 409);
+      const ack = await this.waitForTurnInteractionResponse(requestId, () => {
+        socket.send(
+          JSON.stringify(
+            createEnvelope("turn.interaction_response", { type: "worker", id: "workspace-do-global" }, delivery, {
+              command_id: dispatch.command_id,
+              target: { type: "connector" }
+            })
+          )
+        );
+      });
+      if (!ack.accepted) {
+        return jsonResponse({ error: ack.error ?? "Connector did not accept the turn interaction response" }, 409);
+      }
+    } catch (error) {
+      return jsonResponse({
+        error: error instanceof Error ? error.message : "Connector could not receive the turn interaction response"
+      }, 409);
     }
     return jsonResponse({ accepted: true });
   }
@@ -945,6 +981,36 @@ export class WorkspaceDO implements DurableObject {
     }
     clearTimeout(pending.timer);
     this.pendingThreadArchiveSyncs.delete(result.request_id);
+    pending.resolve(result);
+  }
+
+  private async waitForTurnInteractionResponse(
+    requestId: string,
+    send: () => void
+  ): Promise<TurnInteractionResponseAck> {
+    return await new Promise<TurnInteractionResponseAck>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingTurnInteractionResponses.delete(requestId);
+        reject(new Error("Connector timed out while receiving the turn interaction response"));
+      }, TURN_INTERACTION_RESPONSE_TIMEOUT_MS);
+      this.pendingTurnInteractionResponses.set(requestId, { timer, resolve, reject });
+      try {
+        send();
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingTurnInteractionResponses.delete(requestId);
+        reject(error instanceof Error ? error : new Error("Connector send failed"));
+      }
+    });
+  }
+
+  private resolveTurnInteractionResponse(result: TurnInteractionResponseAck): void {
+    const pending = this.pendingTurnInteractionResponses.get(result.request_id);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingTurnInteractionResponses.delete(result.request_id);
     pending.resolve(result);
   }
 
@@ -1515,6 +1581,16 @@ function isTurnInteractionResponseDispatch(value: unknown): value is TurnInterac
   return false;
 }
 
+function isTurnInteractionResponseAck(value: unknown): value is TurnInteractionResponseAck {
+  return (
+    isRecord(value) &&
+    typeof value.request_id === "string" &&
+    value.request_id.trim().length > 0 &&
+    typeof value.accepted === "boolean" &&
+    (value.error === undefined || typeof value.error === "string")
+  );
+}
+
 function isLocalThreadCreateDispatch(value: unknown): value is LocalThreadCreateDispatch {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
@@ -1670,4 +1746,10 @@ function isAgentHostSession(value: unknown): boolean {
     (record.cwd === undefined || typeof record.cwd === "string") &&
     typeof record.updated_at === "string"
   );
+}
+
+function cryptoRandomId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

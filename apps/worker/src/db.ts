@@ -50,6 +50,8 @@ const DEFAULT_WORKSPACE_ID = "workspace-api";
 const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
+const DEFAULT_TURN_INTERACTION_AUTO_RESOLUTION_RESPONSE_GRACE_MS = 250;
+const TURN_INTERACTION_RESOLUTION_CLAIM_TTL_MS = 60_000;
 const CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY = 100_000;
 const CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY = 100_000;
 const CLOUDFLARE_FREE_D1_ROWS_READ_PER_DAY = 5_000_000;
@@ -4064,15 +4066,21 @@ function turnInteractionAutoResolutionExpired(
   if (typeof autoResolutionMs !== "number" || !Number.isFinite(autoResolutionMs) || autoResolutionMs < 0) {
     return false;
   }
+  const graceMs =
+    typeof payload.auto_resolution_response_grace_ms === "number" &&
+    Number.isFinite(payload.auto_resolution_response_grace_ms) &&
+    payload.auto_resolution_response_grace_ms >= 0
+      ? payload.auto_resolution_response_grace_ms
+      : DEFAULT_TURN_INTERACTION_AUTO_RESOLUTION_RESPONSE_GRACE_MS;
   if (typeof payload.auto_resolution_expires_at === "string") {
     const expiresAtMs = Date.parse(payload.auto_resolution_expires_at);
     if (Number.isFinite(expiresAtMs)) {
-      return nowMs >= expiresAtMs;
+      return nowMs >= expiresAtMs + graceMs;
     }
   }
   const createdMs = Date.parse(createdAt);
   if (!Number.isFinite(createdMs)) return false;
-  return nowMs >= createdMs + autoResolutionMs;
+  return nowMs >= createdMs + autoResolutionMs + graceMs;
 }
 
 async function hasTurnInteractionResolution(
@@ -4122,6 +4130,7 @@ async function claimTurnInteractionResolution(
   interactionId: string,
   responseKind: ResolveTurnInteractionRequest["kind"]
 ): Promise<void> {
+  await deleteStaleTurnInteractionResolutionClaim(env, commandId, interactionId);
   const result = await env.DB!.prepare(
     `INSERT INTO turn_interaction_resolution_claims (
        interaction_id, request_event_id, command_id, response_kind, created_at
@@ -4133,6 +4142,29 @@ async function claimTurnInteractionResolution(
   if (result.meta?.changes === 0) {
     throw new CommandTargetError("Turn interaction has already been resolved", 409);
   }
+}
+
+async function deleteStaleTurnInteractionResolutionClaim(
+  env: Env,
+  commandId: string,
+  interactionId: string
+): Promise<void> {
+  const staleBefore = new Date(Date.now() - TURN_INTERACTION_RESOLUTION_CLAIM_TTL_MS).toISOString();
+  await env.DB!.prepare(
+    `DELETE FROM turn_interaction_resolution_claims
+     WHERE command_id = ?
+       AND interaction_id = ?
+       AND created_at < ?
+       AND NOT EXISTS (
+         SELECT 1
+         FROM events
+         WHERE command_id = ?
+           AND kind IN ('approval.resolved', 'input.received')
+           AND json_extract(payload_json, '$.interaction_id') = ?
+       )`
+  )
+    .bind(commandId, interactionId, staleBefore, commandId, interactionId)
+    .run();
 }
 
 function isTurnInteractionRequestPayload(value: unknown): value is TurnInteractionRequestPayload {
@@ -4147,7 +4179,12 @@ function isTurnInteractionRequestPayload(value: unknown): value is TurnInteracti
     typeof value.app_server_thread_id === "string" &&
     typeof value.app_server_turn_id === "string" &&
     typeof value.title === "string" &&
-    (value.auto_resolution_expires_at === undefined || typeof value.auto_resolution_expires_at === "string")
+    (value.auto_resolution_expires_at === undefined || typeof value.auto_resolution_expires_at === "string") &&
+    (
+      value.auto_resolution_response_grace_ms === undefined ||
+      value.auto_resolution_response_grace_ms === null ||
+      typeof value.auto_resolution_response_grace_ms === "number"
+    )
   );
 }
 
