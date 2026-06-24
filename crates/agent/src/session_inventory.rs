@@ -2237,13 +2237,12 @@ fn turn_interaction_payload(
 }
 
 fn turn_interaction_id(method: &str, request_id: &Value, params: &Value) -> String {
-    let request_id = json_rpc_id_fragment(request_id);
-    params
+    let target_id = params
         .get("approvalId")
         .and_then(Value::as_str)
-        .or_else(|| params.get("itemId").and_then(Value::as_str))
-        .map(|value| format!("{method}:{value}:{request_id}"))
-        .unwrap_or_else(|| format!("{method}:{request_id}"))
+        .or_else(|| params.get("itemId").and_then(Value::as_str));
+    serde_json::to_string(&json!([method, target_id, request_id]))
+        .unwrap_or_else(|_| format!("{method}:{}:{}", target_id.unwrap_or_default(), request_id))
 }
 
 fn json_rpc_turn_request_id(value: Option<&Value>) -> Option<Value> {
@@ -2251,14 +2250,6 @@ fn json_rpc_turn_request_id(value: Option<&Value>) -> Option<Value> {
         Value::String(_) => value.cloned(),
         Value::Number(number) if number.is_i64() || number.is_u64() => value.cloned(),
         _ => None,
-    }
-}
-
-fn json_rpc_id_fragment(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Number(number) => number.to_string(),
-        _ => value.to_string(),
     }
 }
 
@@ -7500,6 +7491,30 @@ mod tests {
             events.last().map(|event| event.kind.as_str()),
             Some("command.failed")
         );
+    }
+
+    #[test]
+    fn turn_interaction_id_distinguishes_json_rpc_id_type_and_boundaries() {
+        let params = json!({
+            "threadId": "thread-live-1",
+            "turnId": "turn-1",
+            "itemId": "item:1"
+        });
+        let numeric = super::turn_interaction_id("item/tool/requestUserInput", &json!(1), &params);
+        let string = super::turn_interaction_id("item/tool/requestUserInput", &json!("1"), &params);
+        assert_ne!(numeric, string);
+
+        let alternate_params = json!({
+            "threadId": "thread-live-1",
+            "turnId": "turn-1",
+            "itemId": "item"
+        });
+        let alternate = super::turn_interaction_id(
+            "item/tool/requestUserInput",
+            &json!("1:1"),
+            &alternate_params,
+        );
+        assert_ne!(string, alternate);
     }
 
     #[test]
