@@ -1622,7 +1622,7 @@ export async function prepareTurnInteractionResolutionInDb(
     throw new Error("DB binding is required for turn interaction resolution");
   }
   const row = await env.DB.prepare(
-    `SELECT e.id, e.thread_id, e.command_id, e.kind, e.payload_json,
+    `SELECT e.id, e.thread_id, e.command_id, e.kind, e.payload_json, e.created_at,
             cmd.lease_owner_connector_id, cmd.state
      FROM events e
      LEFT JOIN commands cmd ON cmd.id = e.command_id
@@ -1636,6 +1636,7 @@ export async function prepareTurnInteractionResolutionInDb(
       command_id: string | null;
       kind: ThreadEvent["kind"];
       payload_json: string | null;
+      created_at: string;
       lease_owner_connector_id: string | null;
       state: CommandSummary["state"] | null;
     }>();
@@ -1657,6 +1658,9 @@ export async function prepareTurnInteractionResolutionInDb(
   }
   if (response.kind === "input" && row.kind !== "input.requested") {
     throw new CommandTargetError("Turn interaction is not an input request", 400);
+  }
+  if (turnInteractionAutoResolutionExpired(payload, row.created_at)) {
+    throw new CommandTargetError("Turn interaction auto-resolution deadline has expired", 409);
   }
   if (await hasTurnInteractionResolution(env, row.command_id, payload.interaction_id)) {
     throw new CommandTargetError("Turn interaction has already been resolved", 409);
@@ -1706,7 +1710,10 @@ export async function recordTurnInteractionResolutionInDb(
   }
   const existing = await findTurnInteractionResolution(env, row.command_id, payload.interaction_id);
   if (existing) {
-    if (options.allowExisting) return existing;
+    if (options.allowExisting) {
+      await releaseTurnInteractionResolutionClaimBestEffort(env, row.command_id, payload.interaction_id);
+      return existing;
+    }
     throw new CommandTargetError("Turn interaction has already been resolved", 409);
   }
   const resolution = turnInteractionResolutionEvent(response, payload);
@@ -1725,7 +1732,10 @@ export async function recordTurnInteractionResolutionInDb(
     const raced = options.allowExisting
       ? await findTurnInteractionResolution(env, row.command_id, payload.interaction_id)
       : undefined;
-    if (raced && isUniqueConstraintError(error)) return raced;
+    if (raced && isUniqueConstraintError(error)) {
+      await releaseTurnInteractionResolutionClaimBestEffort(env, row.command_id, payload.interaction_id);
+      return raced;
+    }
     throw error;
   }
   if (!event) {
@@ -1744,6 +1754,7 @@ export async function recordTurnInteractionResolutionInDb(
       .bind(row.lease_owner_connector_id, row.lease_owner_connector_id, event.created_at, row.task_id)
       .run();
   }
+  await releaseTurnInteractionResolutionClaimBestEffort(env, row.command_id, payload.interaction_id);
   return event;
 }
 
@@ -1758,6 +1769,20 @@ export async function releaseTurnInteractionResolutionClaimInDb(
   )
     .bind(commandId, interactionId)
     .run();
+}
+
+async function releaseTurnInteractionResolutionClaimBestEffort(
+  env: Env,
+  commandId: string,
+  interactionId: string
+): Promise<void> {
+  try {
+    await releaseTurnInteractionResolutionClaimInDb(env, commandId, interactionId);
+  } catch (error) {
+    console.warn("Turn interaction resolution claim cleanup failed", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 export async function chooseConnectorForLocalThread(
@@ -4027,6 +4052,21 @@ function parseTurnInteractionRequestPayload(payloadJson: string | null): TurnInt
   } catch {
     return undefined;
   }
+}
+
+function turnInteractionAutoResolutionExpired(
+  payload: TurnInteractionRequestPayload,
+  createdAt: string,
+  nowMs = Date.now()
+): boolean {
+  if (payload.request_kind !== "input") return false;
+  const autoResolutionMs = payload.auto_resolution_ms;
+  if (typeof autoResolutionMs !== "number" || !Number.isFinite(autoResolutionMs) || autoResolutionMs < 0) {
+    return false;
+  }
+  const createdMs = Date.parse(createdAt);
+  if (!Number.isFinite(createdMs)) return false;
+  return nowMs >= createdMs + autoResolutionMs;
 }
 
 async function hasTurnInteractionResolution(

@@ -802,6 +802,30 @@ test("prepareTurnInteractionResolutionInDb rejects claimed interactions before d
   assert.equal(db.claimInserts, 1);
 });
 
+test("prepareTurnInteractionResolutionInDb rejects expired auto-resolving input before dispatch", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    autoResolutionMs: 1,
+    createdAt: "2000-01-01T00:00:00.000Z"
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "input",
+        answers: {}
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /auto-resolution deadline has expired/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
 test("recordTurnInteractionResolutionInDb rejects already resolved interactions before append", async () => {
   const db = turnInteractionResolutionDb({ resolved: true });
 
@@ -837,6 +861,7 @@ test("recordTurnInteractionResolutionInDb can return an existing resolution afte
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.eventInserts, 0);
   assert.equal(db.taskUpdates, 0);
+  assert.equal(db.claimDeletes, 1);
 });
 
 test("recordTurnInteractionResolutionInDb resumes waiting tasks after append", async () => {
@@ -850,6 +875,7 @@ test("recordTurnInteractionResolutionInDb resumes waiting tasks after append", a
   assert.equal(event.kind, "approval.resolved");
   assert.equal(db.eventInserts, 1);
   assert.equal(db.taskUpdates, 1);
+  assert.equal(db.claimDeletes, 1);
 });
 
 test("releaseTurnInteractionResolutionClaimInDb deletes pending claims", async () => {
@@ -1715,20 +1741,42 @@ test("chooseConnectorForLocalThread rejects connectors without app-server suppor
   );
 });
 
-function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boolean }) {
+function turnInteractionResolutionDb(options: {
+  resolved: boolean;
+  claimed?: boolean;
+  createdAt?: string;
+  requestKind?: "approval" | "input";
+  autoResolutionMs?: number | null;
+}) {
+  const requestKind = options.requestKind ?? "approval";
   const payload = JSON.stringify({
     type: "turn_interaction",
     interaction_id: "interaction-1",
     status: "pending",
-    method: "item/commandExecution/requestApproval",
-    request_kind: "approval",
-    subject: "command_execution",
+    method: requestKind === "approval" ? "item/commandExecution/requestApproval" : "item/tool/requestUserInput",
+    request_kind: requestKind,
+    ...(requestKind === "approval" ? { subject: "command_execution" } : {}),
     app_server_thread_id: "thread-local-1",
     app_server_turn_id: "turn-1",
-    title: "Approve command execution",
-    command: "cat config.json",
-    cwd: "/workspace"
+    title: requestKind === "approval" ? "Approve command execution" : "Provide input",
+    ...(requestKind === "approval"
+      ? {
+        command: "cat config.json",
+        cwd: "/workspace"
+      }
+      : {
+        questions: [
+          {
+            id: "question-1",
+            question: "Continue?",
+            is_other: false,
+            is_secret: false
+          }
+        ],
+        auto_resolution_ms: options.autoResolutionMs
+      })
   });
+  const createdAt = options.createdAt ?? "2026-06-24T10:00:00.000Z";
   const counters = {
     eventInserts: 0,
     resolutionChecks: 0,
@@ -1748,8 +1796,9 @@ function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boo
                   id: "event-request-1",
                   thread_id: "thread-1",
                   command_id: "command-1",
-                  kind: "approval.requested",
+                  kind: requestKind === "approval" ? "approval.requested" : "input.requested",
                   payload_json: payload,
+                  created_at: createdAt,
                   lease_owner_connector_id: "connector-online",
                   state: "running"
                 };
@@ -1770,7 +1819,7 @@ function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boo
                   workspace_id: "workspace-api",
                   thread_id: "thread-1",
                   command_id: "command-1",
-                  kind: "approval.requested",
+                  kind: requestKind === "approval" ? "approval.requested" : "input.requested",
                   payload_json: payload,
                   task_id: "task-1",
                   lease_owner_connector_id: "connector-online"
@@ -1825,7 +1874,7 @@ function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boo
             assert.equal(interactionId, "interaction-1");
             assert.equal(eventId, "event-request-1");
             assert.equal(commandId, "command-1");
-            assert.equal(responseKind, "approval");
+            assert.equal(responseKind, requestKind);
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             return {
               async run() {
