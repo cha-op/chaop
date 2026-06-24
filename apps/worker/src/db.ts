@@ -291,7 +291,7 @@ export async function loadDogfoodSafetyPostureFromDb(
 
   const liveTelemetryPromise = options.refreshCloudflareTelemetry
     ? loadCloudflareTelemetryBestEffort(env, effectiveGeneratedAt)
-    : Promise.resolve(undefined);
+    : loadCachedCloudflareTelemetryBestEffort(env, effectiveGeneratedAt);
   const persistedTelemetryPromise = loadMaxPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt);
   const [pause, daily, fourHour, burst, connectorStates, taskStates, liveTelemetry, persistedTelemetry] = await Promise.all([
     loadDogfoodSafetyPause(env, effectiveGeneratedAt),
@@ -307,9 +307,7 @@ export async function loadDogfoodSafetyPostureFromDb(
     liveTelemetryPromise,
     persistedTelemetryPromise
   ]);
-  const telemetry = options.refreshCloudflareTelemetry
-    ? mergeCloudflareTelemetrySamples(liveTelemetry, persistedTelemetry)
-    : persistedTelemetry;
+  const telemetry = mergeCloudflareTelemetrySamples(liveTelemetry, persistedTelemetry);
   if (options.refreshCloudflareTelemetry) {
     await persistBudgetTelemetrySampleBestEffort(env, liveTelemetry, effectiveGeneratedAt);
   }
@@ -391,6 +389,20 @@ export async function assertDogfoodSafetyActionAllowed(
     throw new DogfoodSafetyError(guard.reason, posture, guard);
   }
   return posture;
+}
+
+export async function dogfoodSafetyActionAllowed(
+  env: Env,
+  action: DogfoodSafetyAction,
+  generatedAt = new Date().toISOString()
+): Promise<boolean> {
+  try {
+    await assertDogfoodSafetyActionAllowed(env, action, generatedAt);
+    return true;
+  } catch (error) {
+    if (error instanceof DogfoodSafetyError) return false;
+    throw error;
+  }
 }
 
 export async function bootstrapBudgetWindowsInDb(
@@ -4581,6 +4593,32 @@ async function loadCloudflareTelemetryBestEffort(
     console.warn("Cloudflare telemetry query failed", {
       message: error instanceof Error ? error.message : String(error)
     });
+    return undefined;
+  }
+}
+
+async function loadCachedCloudflareTelemetryBestEffort(
+  env: Env,
+  generatedAt: string
+): Promise<CloudflareTelemetrySample | undefined> {
+  if (
+    !env.CF_TELEMETRY_API_TOKEN ||
+    !env.CF_TELEMETRY_ACCOUNT_ID ||
+    !env.CF_TELEMETRY_API_WORKER ||
+    !env.CF_TELEMETRY_D1_DATABASE_ID
+  ) {
+    return undefined;
+  }
+
+  const cacheKey = cloudflareTelemetryCacheKey(env, generatedAt);
+  if (cloudflareTelemetryCache?.key !== cacheKey || cloudflareTelemetryCache.expiresAt <= Date.now()) {
+    return undefined;
+  }
+  try {
+    return cloudflareTelemetryCache.pending
+      ? await cloudflareTelemetryCache.pending
+      : cloudflareTelemetryCache.sample;
+  } catch {
     return undefined;
   }
 }

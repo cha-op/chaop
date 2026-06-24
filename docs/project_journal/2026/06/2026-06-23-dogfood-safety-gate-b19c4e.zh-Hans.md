@@ -65,6 +65,8 @@ superseded_by:
 - 启动响应里的安全姿态现在会复用预算板同一份预算约束和状态推导，因此实时遥测不会让首屏预算姿态和安全姿态互相矛盾。
 - safety block 期间继续把 terminal command event 作为 cleanup path，同时确保 cleanup 不会在 `command_create` 被阻挡时继续派发新工作。
 - Budget Summary 计算现在会合并当前 UTC 日已持久化的 Cloudflare telemetry 最大值，因此后续 live sample 较低时，`/api/bootstrap` 和 `/api/usage-summary` 仍会与受保护写入决策保持一致。
+- 受保护写入检查现在会复用短缓存的 live Cloudflare telemetry sample；因此即使 telemetry sample 持久化失败，显式 live safety refresh 也能在同一个 Worker isolate 内继续阻挡写入。
+- connector WebSocket close 期间的 app-server stopped status 写入现在也会经过 `app_server_instances_report` safety action，避免断连清理绕过状态报告保护。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

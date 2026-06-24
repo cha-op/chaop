@@ -65,6 +65,8 @@ superseded_by:
 - Derived bootstrap safety from the same Budget Summary constraints and state used by the Budget Board, so live telemetry cannot make the initial budget and safety postures disagree.
 - Kept terminal command events as the cleanup path under safety blocks, and prevented that cleanup from dispatching new work while `command_create` is blocked.
 - Merged current-day persisted maximum Cloudflare telemetry into Budget Summary calculations, keeping `/api/bootstrap` and `/api/usage-summary` aligned with guarded write decisions when a later live sample is lower.
+- Reused the short-cached live Cloudflare telemetry sample in guarded write checks, so an explicit live safety refresh can still block writes in the same Worker isolate even when telemetry sample persistence fails.
+- Guarded app-server stopped status writes during connector WebSocket close, preventing disconnect cleanup from bypassing the `app_server_instances_report` safety action.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

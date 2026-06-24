@@ -2792,6 +2792,94 @@ test("command creation safety guard uses persisted Cloudflare telemetry samples"
   }
 });
 
+test("command creation safety guard uses cached live hard limit when telemetry persistence fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  let fetchCount = 0;
+  console.warn = () => undefined;
+  globalThis.fetch = (async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [
+            {
+              apiWorkerInvocations: [{ sum: { requests: 20 } }],
+              webWorkerInvocations: [],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten: 120_000 } }],
+              durableObjectsInvocationsAdaptiveGroups: [],
+              durableObjectsPeriodicGroups: []
+            }
+          ]
+        }
+      }
+    }), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }) as typeof fetch;
+
+  const env: Env = {
+    ...devEnv,
+    DB: commandTargetDb({ id: "connector-online" }, {
+      failTelemetrySampleWrites: true
+    }),
+    CF_TELEMETRY_API_TOKEN: "telemetry-token",
+    CF_TELEMETRY_ACCOUNT_ID: "telemetry-cache-hard-limit-account",
+    CF_TELEMETRY_API_WORKER: "chaop-api-cache-hard-limit",
+    CF_TELEMETRY_D1_DATABASE_ID: "telemetry-cache-hard-limit-database",
+    CF_TELEMETRY_CACHE_SECONDS: "300",
+    CF_TELEMETRY_SAMPLE_SECONDS: "300"
+  };
+
+  try {
+    const safetyResponse = await handleRequest(
+      new Request("https://api.example.com/api/safety-posture", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      env
+    );
+    const safetyBody = (await safetyResponse.json()) as {
+      safety: { state: string; actions: Array<{ action: string; state: string }> };
+    };
+    assert.equal(safetyResponse.status, 200);
+    assert.equal(safetyBody.safety.state, "hard_limited");
+    assert.equal(
+      safetyBody.safety.actions.find((guard) => guard.action === "command_create")?.state,
+      "blocked"
+    );
+
+    const commandResponse = await handleRequest(
+      new Request("https://api.example.com/api/commands", {
+        method: "POST",
+        headers: {
+          origin: "https://app.example.com"
+        },
+        body: JSON.stringify({
+          workspace_id: "workspace-api",
+          thread_id: "thread-orders-500",
+          prompt: "Summarise current errors"
+        })
+      }),
+      env
+    );
+    const commandBody = (await commandResponse.json()) as {
+      guard: { action: string; state: string; budget_state: string };
+      safety: { state: string };
+    };
+    assert.equal(commandResponse.status, 429);
+    assert.equal(commandBody.guard.action, "command_create");
+    assert.equal(commandBody.guard.state, "blocked");
+    assert.equal(commandBody.guard.budget_state, "hard_limited");
+    assert.equal(commandBody.safety.state, "hard_limited");
+    assert.equal(fetchCount, 1);
+  } finally {
+    console.warn = originalWarn;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("command creation safety guard uses daily max persisted telemetry samples", async () => {
   const now = new Date();
   const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
@@ -5067,6 +5155,7 @@ function commandTargetDb(
     expectedTargetConnectorIdSource?: "explicit" | "attached" | "auto";
     expectedAutoConnectorId?: string;
     expectedExecutionMode?: "app_server" | "codex_cli_fallback";
+    failTelemetrySampleWrites?: boolean;
     safety?: DogfoodSafetyFakeOptions | undefined;
   } = {}
 ): D1Database {
@@ -5083,6 +5172,10 @@ function commandTargetDb(
     prepare(sql: string) {
       const safetyQuery = dogfoodSafetyQueryFake(sql, options.safety);
       if (safetyQuery) return safetyQuery;
+
+      if (options.failTelemetrySampleWrites && /INSERT INTO budget_telemetry_samples/.test(sql)) {
+        throw new Error("telemetry sample persistence unavailable");
+      }
 
       if (/INSERT INTO users/.test(sql)) {
         return {

@@ -20,6 +20,7 @@ import {
   DogfoodSafetyError,
   assertDogfoodSafetyActionAllowed,
   cleanupStaleExplicitAppServerCommandTargets,
+  dogfoodSafetyActionAllowed,
   failActiveCommandsForConnector,
   getConnectorSummary,
   markAppServerInstancesStoppedForConnector,
@@ -536,13 +537,15 @@ export class WorkspaceDO implements DurableObject {
       if (!hasReadyPeer) {
         const stoppedAt = new Date().toISOString();
         this.appServerReportCache.delete(attachment.connectorId);
-        const stoppedInstances = await markAppServerInstancesStoppedForConnector(this.env, attachment.connectorId, stoppedAt);
-        if (stoppedInstances.length > 0) {
-          this.broadcastToBrowsers(appServerInstancesMessage({
-            app_server_instances: stoppedInstances,
-            connector_id: attachment.connectorId,
-            synced_at: stoppedAt
-          }));
+        if (await dogfoodSafetyActionAllowed(this.env, "app_server_instances_report", stoppedAt)) {
+          const stoppedInstances = await markAppServerInstancesStoppedForConnector(this.env, attachment.connectorId, stoppedAt);
+          if (stoppedInstances.length > 0) {
+            this.broadcastToBrowsers(appServerInstancesMessage({
+              app_server_instances: stoppedInstances,
+              connector_id: attachment.connectorId,
+              synced_at: stoppedAt
+            }));
+          }
         }
       }
       if (!hasReadyPeer && hasAuthenticatedPeer) {

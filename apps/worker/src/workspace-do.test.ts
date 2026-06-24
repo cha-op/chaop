@@ -865,6 +865,57 @@ test("closing ready socket with handshaking peer fails active commands without m
   assert.match(connectorUpdate.payload?.connectors?.[0]?.updated_at ?? "", /^\d{4}-\d{2}-\d{2}T/);
 });
 
+test("closing ready socket skips app-server stopped writes while dogfood safety blocks status writes", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const closingSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const handshakingPeer = socketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online"
+  });
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [closingSocket, handshakingPeer];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const safety = { paused: false };
+  const db = socketGoneDb({ safety });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(closingSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      instances: [appServerInstancePayload("healthy")]
+    }
+  }));
+  assert.equal(db.appServerInstanceWrites, 1);
+  agentSent.length = 0;
+  browserSent.length = 0;
+  safety.paused = true;
+
+  await workspace.webSocketClose(closingSocket);
+
+  assert.equal(db.commandFailures, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.activityUpdates, 1);
+  assert.equal(db.connectorDegradedUpdates, 1);
+  assert.equal(db.connectorOfflineUpdates, 0);
+  assert.equal(db.appServerInstanceWrites, 1);
+  assert.equal(browserSent.length, 2);
+  const kinds = browserSent.map((message) => (JSON.parse(message) as { kind?: string }).kind);
+  assert.deepEqual(kinds, ["thread.event", "connectors.updated"]);
+});
+
 test("closing idle ready socket with ready peer does not fail active connector commands", async () => {
   const browserSent: string[] = [];
   const closingSocket = socketWithAttachment({
@@ -3414,7 +3465,7 @@ function socketWithAttachment(attachment: unknown): WebSocket {
   } as unknown as WebSocket;
 }
 
-function socketGoneDb(): D1Database & {
+function socketGoneDb(options: { safety?: { paused?: boolean; budgetState?: BudgetState } } = {}): D1Database & {
   readonly commandFailures: number;
   readonly taskUpdates: number;
   readonly eventInserts: number;
@@ -3435,7 +3486,7 @@ function socketGoneDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
-      const safetyStatement = safetyQueryStatement(sql);
+      const safetyStatement = safetyQueryStatement(sql, options.safety);
       if (safetyStatement) return safetyStatement;
 
       if (/SELECT id\s+FROM connectors/.test(sql)) {
