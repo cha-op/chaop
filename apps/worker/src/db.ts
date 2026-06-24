@@ -4558,9 +4558,13 @@ async function loadCloudflareTelemetryBestEffort(
     const now = Date.now();
     if (cloudflareTelemetryCache?.key === cacheKey && cloudflareTelemetryCache.expiresAt > now) {
       if (cloudflareTelemetryCache.pending) {
-        return await cloudflareTelemetryCache.pending;
+        const sample = await cloudflareTelemetryCache.pending;
+        return mergeCloudflareTelemetrySamples(sample, cachedCloudflareTelemetryDailySample(env, generatedAt));
       }
-      return cloudflareTelemetryCache.sample;
+      return mergeCloudflareTelemetrySamples(
+        cloudflareTelemetryCache.sample,
+        cachedCloudflareTelemetryDailySample(env, generatedAt)
+      );
     }
 
     const cacheSeconds = positiveIntegerEnv(env.CF_TELEMETRY_CACHE_SECONDS, DEFAULT_CF_TELEMETRY_CACHE_SECONDS);
@@ -4570,17 +4574,13 @@ async function loadCloudflareTelemetryBestEffort(
     const pending = loadCloudflareTelemetry(env, generatedAt).then(
       (sample) => {
         const expiresAt = Date.now() + cacheMs;
+        const mergedSample = updateCloudflareTelemetryDailyCache(dailyCacheKey, sample, expiresAt);
         cloudflareTelemetryCache = {
           key: cacheKey,
-          sample,
+          sample: mergedSample,
           expiresAt
         };
-        cloudflareTelemetryDailyCache = {
-          key: dailyCacheKey,
-          sample,
-          expiresAt
-        };
-        return sample;
+        return mergedSample;
       },
       (error) => {
         cloudflareTelemetryCache = {
@@ -4601,7 +4601,7 @@ async function loadCloudflareTelemetryBestEffort(
     console.warn("Cloudflare telemetry query failed", {
       message: error instanceof Error ? error.message : String(error)
     });
-    return undefined;
+    return cachedCloudflareTelemetryDailySample(env, generatedAt);
   }
 }
 
@@ -4620,21 +4620,49 @@ async function loadCachedCloudflareTelemetryBestEffort(
 
   const cacheKey = cloudflareTelemetryCacheKey(env, generatedAt);
   if (cloudflareTelemetryCache?.key === cacheKey && cloudflareTelemetryCache.expiresAt > Date.now()) {
+    let bucketSample: CloudflareTelemetrySample | undefined;
     try {
-      const bucketSample = cloudflareTelemetryCache.pending
+      bucketSample = cloudflareTelemetryCache.pending
         ? await cloudflareTelemetryCache.pending
         : cloudflareTelemetryCache.sample;
-      if (bucketSample) return bucketSample;
     } catch {
-      return undefined;
+      bucketSample = undefined;
     }
+    const dailySample = cachedCloudflareTelemetryDailySample(env, generatedAt);
+    const mergedSample = mergeCloudflareTelemetrySamples(bucketSample, dailySample);
+    if (mergedSample) return mergedSample;
   }
 
+  return cachedCloudflareTelemetryDailySample(env, generatedAt);
+}
+
+function cachedCloudflareTelemetryDailySample(
+  env: Env,
+  generatedAt: string
+): CloudflareTelemetrySample | undefined {
   const dailyCacheKey = cloudflareTelemetryDailyCacheKey(env, generatedAt);
-  if (cloudflareTelemetryDailyCache?.key === dailyCacheKey && cloudflareTelemetryDailyCache.expiresAt > Date.now()) {
-    return cloudflareTelemetryDailyCache.sample;
+  if (cloudflareTelemetryDailyCache?.key !== dailyCacheKey || cloudflareTelemetryDailyCache.expiresAt <= Date.now()) {
+    return undefined;
   }
-  return undefined;
+  return cloudflareTelemetryDailyCache.sample;
+}
+
+function updateCloudflareTelemetryDailyCache(
+  key: string,
+  sample: CloudflareTelemetrySample,
+  expiresAt: number
+): CloudflareTelemetrySample {
+  const existingSample =
+    cloudflareTelemetryDailyCache?.key === key && cloudflareTelemetryDailyCache.expiresAt > Date.now()
+      ? cloudflareTelemetryDailyCache.sample
+      : undefined;
+  const mergedSample = mergeCloudflareTelemetrySamples(sample, existingSample) ?? sample;
+  cloudflareTelemetryDailyCache = {
+    key,
+    sample: mergedSample,
+    expiresAt
+  };
+  return mergedSample;
 }
 
 async function loadMaxPersistedCloudflareTelemetrySample(

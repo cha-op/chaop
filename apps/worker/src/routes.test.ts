@@ -2892,6 +2892,10 @@ test("command creation safety guard keeps cached live hard limit across telemetr
   console.warn = () => undefined;
   globalThis.fetch = (async () => {
     fetchCount += 1;
+    if (fetchCount === 3) {
+      throw new Error("temporary telemetry failure");
+    }
+    const rowsWritten = fetchCount === 1 ? 120_000 : 5_000;
     return new Response(JSON.stringify({
       data: {
         viewer: {
@@ -2899,7 +2903,7 @@ test("command creation safety guard keeps cached live hard limit across telemetr
             {
               apiWorkerInvocations: [{ sum: { requests: 20 } }],
               webWorkerInvocations: [],
-              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten: 120_000 } }],
+              d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 100, rowsWritten } }],
               durableObjectsInvocationsAdaptiveGroups: [],
               durableObjectsPeriodicGroups: []
             }
@@ -2933,15 +2937,31 @@ test("command creation safety guard keeps cached live hard limit across telemetr
     );
     assert.equal(safety.state, "hard_limited");
 
+    const lowerLiveRefresh = await loadDogfoodSafetyPostureFromDb(
+      env,
+      "2026-06-15T09:05:01.000Z",
+      {},
+      { refreshCloudflareTelemetry: true }
+    );
+    assert.equal(lowerLiveRefresh.state, "hard_limited");
+
+    const failedLiveRefresh = await loadDogfoodSafetyPostureFromDb(
+      env,
+      "2026-06-15T09:05:03.000Z",
+      {},
+      { refreshCloudflareTelemetry: true }
+    );
+    assert.equal(failedLiveRefresh.state, "hard_limited");
+
     await assert.rejects(
-      () => assertDogfoodSafetyActionAllowed(env, "command_create", "2026-06-15T09:05:01.000Z"),
+      () => assertDogfoodSafetyActionAllowed(env, "command_create", "2026-06-15T09:05:04.000Z"),
       (error) =>
         error instanceof DogfoodSafetyError &&
         error.guard.action === "command_create" &&
         error.guard.state === "blocked" &&
         error.guard.budget_state === "hard_limited"
     );
-    assert.equal(fetchCount, 1);
+    assert.equal(fetchCount, 3);
   } finally {
     console.warn = originalWarn;
     globalThis.fetch = originalFetch;
