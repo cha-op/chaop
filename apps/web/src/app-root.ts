@@ -265,8 +265,10 @@ export class ChaopApp extends LitElement {
     }
     this.view = nextView;
     const nextThreadId = threadIdFromHash();
-    if (nextThreadId !== this.selectedThreadId) {
+    const threadChanged = nextThreadId !== this.selectedThreadId;
+    if (threadChanged) {
       this.commandModeExplicit = false;
+      this.resetThreadCommandState();
     }
     this.selectedThreadId = nextThreadId;
     this.ensureSelectedThread();
@@ -1038,14 +1040,18 @@ export class ChaopApp extends LitElement {
         execution_mode: commandExecutionModeForRequest(this.commandMode),
         prompt: this.commandPrompt
       });
-      this.lastCommandId = response.command.id;
       this.upsertCommand(response.command);
-      this.commandState = "accepted";
+      if (this.selectedThread()?.id === thread.id) {
+        this.lastCommandId = response.command.id;
+        this.commandState = "accepted";
+      }
       await this.load();
     } catch (error) {
-      this.commandState = "failed";
       this.mergeSafetyPostureFromError(error);
-      this.actionError = actionErrorMessage("Command failed", error);
+      if (this.selectedThread()?.id === thread.id) {
+        this.commandState = "failed";
+        this.actionError = actionErrorMessage("Command failed", error);
+      }
     }
   };
 
@@ -1356,7 +1362,7 @@ export class ChaopApp extends LitElement {
 
   private openThread(threadId: string): void {
     if (this.selectedThreadId !== threadId) {
-      this.lastCommandId = undefined;
+      this.resetThreadCommandState();
     }
     this.selectedThreadId = threadId;
     this.commandModeExplicit = false;
@@ -1378,9 +1384,14 @@ export class ChaopApp extends LitElement {
     const selected = this.selectedThread();
     this.selectedThreadId = selected?.id;
     if (previousThreadId !== this.selectedThreadId) {
-      this.lastCommandId = undefined;
+      this.resetThreadCommandState();
     }
     this.ensureCommandMode();
+  }
+
+  private resetThreadCommandState(): void {
+    this.lastCommandId = undefined;
+    this.commandState = "idle";
   }
 
   private activeThreads(): ThreadSummary[] {
