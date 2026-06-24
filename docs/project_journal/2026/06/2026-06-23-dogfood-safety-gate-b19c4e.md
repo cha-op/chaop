@@ -71,11 +71,13 @@ superseded_by:
 - Guarded duplicate-connector retirement app-server stopped writes with the same `app_server_instances_report` safety action, while leaving command/offline cleanup available.
 - Preserved `command.started` event recording during safety pauses and hard limits, so an already-dispatched command moves out of expiring lease state while noisy progress output can still be dropped.
 - Triggered a best-effort global pending-command dispatch after safety resume, so queued work does not wait for an unrelated connector event after an operator clears the pause.
+- Kept live telemetry daily high-water fallback until the UTC day boundary, so a persisted-sample failure cannot relax a same-day hard limit after the short bucket TTL expires.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`
 - `pnpm --filter @chaop/worker test`
 - `pnpm --filter @chaop/worker test -- --test-name-pattern "dogfood safety pause|command started|safety pause and resume"`
+- `pnpm --filter @chaop/worker test -- --test-name-pattern "cached live hard limit"`
 - `pnpm test`
 - `pnpm build`
 - `cargo fmt --check`

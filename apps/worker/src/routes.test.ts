@@ -2913,8 +2913,11 @@ test("command creation safety guard uses cached live hard limit when telemetry p
 test("command creation safety guard keeps cached live hard limit across telemetry sample buckets", async () => {
   const originalFetch = globalThis.fetch;
   const originalWarn = console.warn;
+  const originalDateNow = Date.now;
   let fetchCount = 0;
+  let nowMs = Date.parse("2026-06-15T09:04:59.000Z");
   console.warn = () => undefined;
+  Date.now = () => nowMs;
   globalThis.fetch = (async () => {
     fetchCount += 1;
     if (fetchCount === 3) {
@@ -2978,8 +2981,9 @@ test("command creation safety guard keeps cached live hard limit across telemetr
     );
     assert.equal(failedLiveRefresh.state, "hard_limited");
 
+    nowMs = Date.parse("2026-06-15T09:11:00.000Z");
     await assert.rejects(
-      () => assertDogfoodSafetyActionAllowed(env, "command_create", "2026-06-15T09:05:04.000Z"),
+      () => assertDogfoodSafetyActionAllowed(env, "command_create", "2026-06-15T09:11:00.000Z"),
       (error) =>
         error instanceof DogfoodSafetyError &&
         error.guard.action === "command_create" &&
@@ -2989,6 +2993,7 @@ test("command creation safety guard keeps cached live hard limit across telemetr
     assert.equal(fetchCount, 3);
   } finally {
     console.warn = originalWarn;
+    Date.now = originalDateNow;
     globalThis.fetch = originalFetch;
   }
 });

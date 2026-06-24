@@ -4576,7 +4576,11 @@ async function loadCloudflareTelemetryBestEffort(
     const pending = loadCloudflareTelemetry(env, generatedAt).then(
       (sample) => {
         const expiresAt = Date.now() + cacheMs;
-        const mergedSample = updateCloudflareTelemetryDailyCache(dailyCacheKey, sample, expiresAt);
+        const mergedSample = updateCloudflareTelemetryDailyCache(
+          dailyCacheKey,
+          sample,
+          cloudflareTelemetryDailyCacheExpiresAt(generatedAt, cacheMs)
+        );
         cloudflareTelemetryCache = {
           key: cacheKey,
           sample: mergedSample,
@@ -4665,6 +4669,16 @@ function updateCloudflareTelemetryDailyCache(
     expiresAt
   };
   return mergedSample;
+}
+
+function cloudflareTelemetryDailyCacheExpiresAt(generatedAt: string, fallbackMs: number): number {
+  const effectiveAt = safeDate(generatedAt);
+  const utcDayEnd = Date.UTC(
+    effectiveAt.getUTCFullYear(),
+    effectiveAt.getUTCMonth(),
+    effectiveAt.getUTCDate() + 1
+  );
+  return Math.max(Date.now() + fallbackMs, utcDayEnd);
 }
 
 async function loadMaxPersistedCloudflareTelemetrySample(
