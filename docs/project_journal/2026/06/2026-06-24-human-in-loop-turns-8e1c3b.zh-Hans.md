@@ -44,6 +44,7 @@ superseded_by:
 - App-server v2 command approval 兼容性现在会保留 `availableDecisions`、object 形态的 `acceptWithExecpolicyAmendment` response、`proposedExecpolicyAmendment`、`commandActions` 和 `networkApprovalContext`，让 Thread Centre 能显示 network-specific approval，并把准确的 accepted decision 回写给 app-server。
 - WorkspaceDO 内部 turn-interaction validator 现在也接受同 public route 一致的 object 形态 exec-policy amendment approval decision，并补了 DO 层测试覆盖它转发给 connector 的路径。
 - 浏览器提交的 interaction response 现在必须匹配已存储的 request payload：如果 app-server 给出了 `available_decisions`，approval decision 必须在其中；input answer 必须完整覆盖请求的问题并且非空；Thread Centre 也会展示完整 network approval context，让未知但可能影响安全判断的字段可见。
+- GitHub Codex 后续 review 修复移除了绝对 workspace 形态的 sample path，app-server auto-resolution deadline 改为 checked arithmetic，HITL response delivery ack 会等到 app-server response 写回成功后再确认，并且 connector 在等待 request event acknowledgement 时也会处理已经到达的 HITL response。
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。

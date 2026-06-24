@@ -55,6 +55,12 @@ struct TurnInteractionResponseAck {
     error: Option<String>,
 }
 
+struct TurnInteractionAckWaitContext<'a> {
+    command_id: &'a str,
+    sender: &'a mpsc::Sender<TurnInteractionResponseDelivery>,
+    active_interaction: &'a Arc<Mutex<Option<String>>>,
+}
+
 #[derive(Debug, Default)]
 struct AgentReadyState {
     last_sent: Option<String>,
@@ -794,6 +800,7 @@ fn handle_text_message(
             app_server_instances_state,
             host_sessions_state,
             deferred_messages,
+            None,
         )? {
             return Ok(true);
         }
@@ -1260,6 +1267,11 @@ fn wait_for_app_server_command_events(
             app_server_instances_state,
             host_sessions_state,
             deferred_messages,
+            Some(&TurnInteractionAckWaitContext {
+                command_id: &command_id,
+                sender: &interaction_sender,
+                active_interaction: &active_interaction,
+            }),
         )? {
             cancel_codex_worker(&cancel, worker.take())?;
             return Ok(vec![app_server_interaction_rejected_event()]);
@@ -1276,6 +1288,11 @@ fn wait_for_app_server_command_events(
                     app_server_instances_state,
                     host_sessions_state,
                     deferred_messages,
+                    Some(&TurnInteractionAckWaitContext {
+                        command_id: &command_id,
+                        sender: &interaction_sender,
+                        active_interaction: &active_interaction,
+                    }),
                 )? {
                     set_socket_read_timeout(socket, Some(connector_read_tick()))?;
                     return Ok(vec![app_server_interaction_rejected_event()]);
@@ -1362,9 +1379,10 @@ fn dispatch_pending_app_server_command_events(
     app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
+    turn_interaction_context: Option<&TurnInteractionAckWaitContext<'_>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     drain_pending_connector_events(event_receiver, |event| {
-        dispatch_events(
+        dispatch_events_with_turn_interaction_context(
             socket,
             command,
             vec![event],
@@ -1372,6 +1390,7 @@ fn dispatch_pending_app_server_command_events(
             app_server_instances_state,
             host_sessions_state,
             deferred_messages,
+            turn_interaction_context,
         )
     })
 }
@@ -1644,6 +1663,28 @@ fn dispatch_events(
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    dispatch_events_with_turn_interaction_context(
+        socket,
+        command,
+        events,
+        config,
+        app_server_instances_state,
+        host_sessions_state,
+        deferred_messages,
+        None,
+    )
+}
+
+fn dispatch_events_with_turn_interaction_context(
+    socket: &mut AgentSocket,
+    command: &CommandPayload,
+    events: Vec<ConnectorEvent>,
+    config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
+    host_sessions_state: &mut HostSessionsSendState,
+    deferred_messages: &mut VecDeque<String>,
+    turn_interaction_context: Option<&TurnInteractionAckWaitContext<'_>>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     dispatch_events_for_target_host_session(
         socket,
         command,
@@ -1653,6 +1694,7 @@ fn dispatch_events(
         app_server_instances_state,
         host_sessions_state,
         deferred_messages,
+        turn_interaction_context,
     )
 }
 
@@ -1665,6 +1707,7 @@ fn dispatch_events_for_target_host_session(
     app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
+    turn_interaction_context: Option<&TurnInteractionAckWaitContext<'_>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     for event in events {
         if event.kind == "command.accepted" {
@@ -1683,6 +1726,7 @@ fn dispatch_events_for_target_host_session(
             app_server_instances_state,
             host_sessions_state,
             deferred_messages,
+            turn_interaction_context,
         )? {
             return Ok(false);
         }
@@ -1769,6 +1813,7 @@ fn wait_for_ack(
     app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
+    turn_interaction_context: Option<&TurnInteractionAckWaitContext<'_>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     set_socket_read_timeout(socket, Some(Duration::from_secs(10)))?;
     loop {
@@ -1786,14 +1831,27 @@ fn wait_for_ack(
                     AckWaitAction::HostSessionsRefresh => {
                         send_host_sessions(socket, config, host_sessions_state, true)?;
                     }
-                    AckWaitAction::Defer => handle_background_text_message(
-                        socket,
-                        text.as_ref(),
-                        config,
-                        app_server_instances_state,
-                        host_sessions_state,
-                        deferred_messages,
-                    )?,
+                    AckWaitAction::Defer => {
+                        if let Some(context) = turn_interaction_context {
+                            if handle_turn_interaction_response_text(
+                                socket,
+                                text.as_ref(),
+                                context.command_id,
+                                context.sender,
+                                context.active_interaction,
+                            )? {
+                                continue;
+                            }
+                        }
+                        handle_background_text_message(
+                            socket,
+                            text.as_ref(),
+                            config,
+                            app_server_instances_state,
+                            host_sessions_state,
+                            deferred_messages,
+                        )?;
+                    }
                 }
             }
             Message::Ping(payload) => socket.send(Message::Pong(payload))?,

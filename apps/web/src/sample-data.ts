@@ -399,10 +399,10 @@ export function fallbackBootstrap(): BootstrapPayload {
           title: "Approve command execution",
           detail: "Needs read access to inspect local configuration.",
           command: "cat ./config/local.json",
-          cwd: "/workspace/sample",
+          cwd: "sample-workspace",
           requested_permissions: {
             fileSystem: {
-              read: ["/workspace/sample/config/local.json"]
+              read: ["config/local.json"]
             }
           }
         },

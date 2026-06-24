@@ -37,6 +37,11 @@ pub struct TurnInteractionResponseDelivery {
     pub delivery_ack: Sender<bool>,
 }
 
+struct ReceivedTurnInteractionResponse {
+    dispatch: TurnInteractionResponseDispatch,
+    delivery_ack: Option<Sender<bool>>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct TurnInteractionResponseDispatch {
     #[serde(default)]
@@ -2014,26 +2019,36 @@ fn handle_app_server_turn_request(
         }
         Err(error) => return Err(error),
     };
-    if response.auto_resolved {
-        let event = turn_interaction_resolution_event(&response, request_payload.as_ref())?;
+    if response.dispatch.auto_resolved {
+        let event =
+            turn_interaction_resolution_event(&response.dispatch, request_payload.as_ref())?;
         channels.event_sender.send(event).map_err(|_| {
             AppServerCommandError::Other(
                 "turn interaction resolution event channel closed".to_owned(),
             )
         })?;
     }
-    let result = app_server_turn_interaction_result(method, params, &response.response)?;
-    socket
-        .send(Message::Text(
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": result
-            })
-            .to_string()
-            .into(),
-        ))
-        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+    let result =
+        match app_server_turn_interaction_result(method, params, &response.dispatch.response) {
+            Ok(result) => result,
+            Err(error) => {
+                acknowledge_turn_interaction_delivery(response.delivery_ack, false);
+                return Err(error);
+            }
+        };
+    if let Err(error) = socket.send(Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result
+        })
+        .to_string()
+        .into(),
+    )) {
+        acknowledge_turn_interaction_delivery(response.delivery_ack, false);
+        return Err(AppServerCommandError::Other(error.to_string()));
+    }
+    acknowledge_turn_interaction_delivery(response.delivery_ack, true);
     Ok(true)
 }
 
@@ -2445,9 +2460,10 @@ fn receive_turn_interaction_response(
     timeout_seconds: u64,
     cancel: &AtomicBool,
     auto_resolution_deadline: Option<Instant>,
-) -> Result<TurnInteractionResponseDispatch, AppServerCommandError> {
-    let auto_resolution_grace_deadline = auto_resolution_deadline
-        .map(|deadline| deadline + Duration::from_millis(AUTO_RESOLUTION_RESPONSE_GRACE_MS));
+) -> Result<ReceivedTurnInteractionResponse, AppServerCommandError> {
+    let auto_resolution_grace_deadline = auto_resolution_deadline.and_then(|deadline| {
+        deadline.checked_add(Duration::from_millis(AUTO_RESOLUTION_RESPONSE_GRACE_MS))
+    });
     loop {
         ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
         if let Some(dispatch) =
@@ -2467,8 +2483,10 @@ fn receive_turn_interaction_response(
                             if delivery.dispatch.command_id == command_id
                                 && delivery.dispatch.interaction_id == interaction_id
                             {
-                                let _ = delivery.delivery_ack.send(true);
-                                return Ok(delivery.dispatch);
+                                return Ok(ReceivedTurnInteractionResponse {
+                                    dispatch: delivery.dispatch,
+                                    delivery_ack: Some(delivery.delivery_ack),
+                                });
                             }
                             let _ = delivery.delivery_ack.send(false);
                             continue;
@@ -2482,7 +2500,10 @@ fn receive_turn_interaction_response(
                     }
                 }
             }
-            return Ok(auto_resolved_input_response(command_id, interaction_id));
+            return Ok(ReceivedTurnInteractionResponse {
+                dispatch: auto_resolved_input_response(command_id, interaction_id),
+                delivery_ack: None,
+            });
         }
         let remaining = deadline.saturating_duration_since(now);
         let mut wait = remaining.min(Duration::from_millis(100));
@@ -2494,8 +2515,10 @@ fn receive_turn_interaction_response(
                 if delivery.dispatch.command_id == command_id
                     && delivery.dispatch.interaction_id == interaction_id
                 {
-                    let _ = delivery.delivery_ack.send(true);
-                    return Ok(delivery.dispatch);
+                    return Ok(ReceivedTurnInteractionResponse {
+                        dispatch: delivery.dispatch,
+                        delivery_ack: Some(delivery.delivery_ack),
+                    });
                 }
                 let _ = delivery.delivery_ack.send(false);
             }
@@ -2513,15 +2536,17 @@ fn try_receive_turn_interaction_response(
     receiver: &Receiver<TurnInteractionResponseDelivery>,
     command_id: &str,
     interaction_id: &str,
-) -> Result<Option<TurnInteractionResponseDispatch>, AppServerCommandError> {
+) -> Result<Option<ReceivedTurnInteractionResponse>, AppServerCommandError> {
     loop {
         match receiver.try_recv() {
             Ok(delivery) => {
                 if delivery.dispatch.command_id == command_id
                     && delivery.dispatch.interaction_id == interaction_id
                 {
-                    let _ = delivery.delivery_ack.send(true);
-                    return Ok(Some(delivery.dispatch));
+                    return Ok(Some(ReceivedTurnInteractionResponse {
+                        dispatch: delivery.dispatch,
+                        delivery_ack: Some(delivery.delivery_ack),
+                    }));
                 }
                 let _ = delivery.delivery_ack.send(false);
             }
@@ -2542,7 +2567,13 @@ fn auto_resolution_deadline(method: &str, params: &Value) -> Option<Instant> {
     params
         .get("autoResolutionMs")
         .and_then(Value::as_u64)
-        .map(|ms| Instant::now() + Duration::from_millis(ms))
+        .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)))
+}
+
+fn acknowledge_turn_interaction_delivery(delivery_ack: Option<Sender<bool>>, accepted: bool) {
+    if let Some(delivery_ack) = delivery_ack {
+        let _ = delivery_ack.send(accepted);
+    }
 }
 
 fn auto_resolved_input_response(
@@ -3835,11 +3866,11 @@ mod tests {
         AppServerCommandChannels, AppServerTurnOutput, HistorySession, InventoryScope,
         SessionDraft, TitleSource, TurnInteractionInputAnswer, TurnInteractionResponse,
         TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
-        app_server_command_result_events_with_cancel, app_server_sessions_from_response,
-        app_server_thread_from_response, app_server_titles_from_response,
-        build_host_session_backfill, build_host_sessions_report, create_app_server_thread_at,
-        ensure_app_server_host_session_at, load_app_server_sessions, read_recent_lines,
-        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
+        acknowledge_turn_interaction_delivery, app_server_command_result_events_with_cancel,
+        app_server_sessions_from_response, app_server_thread_from_response,
+        app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
+        create_app_server_thread_at, ensure_app_server_host_session_at, load_app_server_sessions,
+        read_recent_lines, remaining_app_server_archive_timeout, resolve_session, rollout_paths,
         set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
         unix_seconds_to_iso,
     };
@@ -8084,14 +8115,15 @@ mod tests {
         )
         .expect("receive queued response");
 
-        assert!(!response.auto_resolved);
+        assert!(!response.dispatch.auto_resolved);
+        acknowledge_turn_interaction_delivery(response.delivery_ack, true);
         assert_eq!(
             delivery_ack
                 .recv_timeout(Duration::from_secs(1))
                 .expect("delivery ack"),
             true
         );
-        match response.response {
+        match response.dispatch.response {
             TurnInteractionResponse::Input { answers } => {
                 assert_eq!(
                     answers.get("q1").and_then(|answer| answer.answers.first()),
@@ -8100,6 +8132,20 @@ mod tests {
             }
             TurnInteractionResponse::Approval { .. } => panic!("expected input response"),
         }
+    }
+
+    #[test]
+    fn auto_resolution_deadline_handles_large_deadlines_without_panicking() {
+        let deadline = std::panic::catch_unwind(|| {
+            super::auto_resolution_deadline(
+                "item/tool/requestUserInput",
+                &json!({
+                    "autoResolutionMs": u64::MAX
+                }),
+            )
+        });
+
+        assert!(deadline.is_ok());
     }
 
     #[test]
