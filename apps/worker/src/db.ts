@@ -184,7 +184,13 @@ export async function loadBootstrapFromDb(
     listRecentEvents(env)
   ]);
   const budgetSummary = await loadBudgetSummaryFromDb(env, undefined, { connectors, tasks });
-  const safety = await loadDogfoodSafetyPostureFromDb(env, budgetSummary.generated_at, { connectors, tasks });
+  const safetyGeneratedAt = budgetSummary.generated_at ?? new Date().toISOString();
+  const safety = dogfoodSafetyPosture({
+    generatedAt: safetyGeneratedAt,
+    paused: await loadDogfoodSafetyPause(env, safetyGeneratedAt),
+    constraints: budgetSummary.constraints ?? [],
+    budgetStates: [budgetSummary.state]
+  });
 
   return {
     user,
@@ -5303,7 +5309,8 @@ const DOGFOOD_SAFETY_ACTIONS: DogfoodSafetyAction[] = [
   "host_session_detach",
   "task_archive",
   "budget_bootstrap",
-  "agent_event"
+  "agent_event",
+  "app_server_instances_report"
 ];
 
 function emptyBudgetSummary(generatedAt: string): BudgetSummary {

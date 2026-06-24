@@ -980,7 +980,8 @@ function safety(): BootstrapPayload["safety"] {
       "host_session_detach",
       "task_archive",
       "budget_bootstrap",
-      "agent_event"
+      "agent_event",
+      "app_server_instances_report"
     ].map((action) => ({
       action: action as BootstrapPayload["safety"]["actions"][number]["action"],
       state: "allowed" as const,

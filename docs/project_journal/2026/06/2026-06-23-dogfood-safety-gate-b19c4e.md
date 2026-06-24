@@ -3,7 +3,7 @@ id: 20260623-b19c4e
 title: Dogfood Safety Gate
 status: active
 created: 2026-06-23
-updated: 2026-06-23
+updated: 2026-06-24
 branch: wip/dogfood-safety-gate
 pr: 19
 supersedes:
@@ -60,6 +60,9 @@ superseded_by:
 - Tightened guarded write telemetry reads to use the current UTC day's persisted maximum cumulative counters per metric, so a later lower Cloudflare sample cannot relax an earlier hard limit.
 - Made production Host Session refresh fail closed when the D1 binding is unavailable, while keeping sample-mode refresh governed by sample safety.
 - Merged live safety refresh telemetry with the persisted current-day maximum before returning `/api/safety-posture`, keeping Browser controls aligned with guarded write decisions.
+- Dropped in-flight `agent.host_sessions` reports when `host_session_refresh` safety blocks broad inventory writes, while still releasing conservative pending command dispatch after clearing the refresh marker.
+- Added `app_server_instances_report` safety coverage so emergency pause, throttling, and hard limits also block connector status-report persistence.
+- Derived bootstrap safety from the same Budget Summary constraints and state used by the Budget Board, so live telemetry cannot make the initial budget and safety postures disagree.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`

@@ -210,7 +210,8 @@ const DEFAULT_SAFETY_ACTIONS: DogfoodSafetyAction[] = [
   "host_session_detach",
   "task_archive",
   "budget_bootstrap",
-  "agent_event"
+  "agent_event",
+  "app_server_instances_report"
 ];
 
 function defaultSafetyPosture(generatedAt = new Date(0).toISOString()): DogfoodSafetyPosture {

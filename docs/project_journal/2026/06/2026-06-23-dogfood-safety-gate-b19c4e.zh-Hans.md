@@ -3,7 +3,7 @@ id: 20260623-b19c4e-zh-Hans
 title: 试用安全闸门
 status: active
 created: 2026-06-23
-updated: 2026-06-23
+updated: 2026-06-24
 branch: wip/dogfood-safety-gate
 pr: 19
 supersedes:
@@ -60,6 +60,9 @@ superseded_by:
 - 受保护写路径读取 telemetry 时现在会按当前 UTC 日分别取每个 metric 的已持久化最大累计 counter，因此后续更低的 Cloudflare sample 不会放松更早触发的 hard limit。
 - production Host Session refresh 现在会在 D1 binding 不可用时 fail closed，同时 sample mode refresh 继续由 sample safety 控制。
 - `/api/safety-posture` 返回前现在会把 live safety refresh telemetry 和当前日已持久化最大值合并，保持 Browser controls 与受保护写入决策一致。
+- 当 `host_session_refresh` safety 阻挡宽泛清单写入时，进行中的 `agent.host_sessions` report 现在会被丢弃；清掉刷新标记后，保守状态下仍会继续释放已允许的待派发命令。
+- 已新增 `app_server_instances_report` safety 覆盖；紧急暂停、限流和硬限制现在也会阻挡连接器状态报告持久化。
+- 启动响应里的安全姿态现在会复用预算板同一份预算约束和状态推导，因此实时遥测不会让首屏预算姿态和安全姿态互相矛盾。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

@@ -1714,6 +1714,54 @@ test("browser bootstrap does not write the user row when D1 is bound", async () 
   assert.equal(body.task_categories.length, 5);
 });
 
+test("browser bootstrap derives safety from the same live telemetry as budget", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 10 } }],
+            webWorkerInvocations: [],
+            durableObjectsInvocationsAdaptiveGroups: [],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 10, rowsWritten: 120_000 } }]
+          }
+        ]
+      }
+    }
+  }))) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/bootstrap"),
+      {
+        ...devEnv,
+        DB: readOnlyBootstrapTelemetryPersistFailDb(),
+        CF_TELEMETRY_API_TOKEN: "bootstrap-safety-token",
+        CF_TELEMETRY_ACCOUNT_ID: "bootstrap-safety-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-bootstrap-safety",
+        CF_TELEMETRY_D1_DATABASE_ID: "bootstrap-safety-database",
+        CF_TELEMETRY_CACHE_SECONDS: "1",
+        CF_TELEMETRY_SAMPLE_SECONDS: "300"
+      }
+    );
+    const body = (await response.json()) as {
+      budget: { state: string };
+      safety: { state: string; actions: Array<{ action: string; state: string }> };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.budget.state, "hard_limited");
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(
+      body.safety.actions.find((guard) => guard.action === "command_create")?.state,
+      "blocked"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("usage summary returns bounded D1 budget windows", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/usage-summary", {
@@ -2061,7 +2109,8 @@ test("safety posture returns sample safety when dev mode has no D1 binding", asy
       ["host_session_detach", "allowed"],
       ["task_archive", "allowed"],
       ["budget_bootstrap", "allowed"],
-      ["agent_event", "allowed"]
+      ["agent_event", "allowed"],
+      ["app_server_instances_report", "allowed"]
     ]
   );
 });
@@ -2103,7 +2152,8 @@ test("safety posture reports conservative inventory guard without blocking focus
       ["host_session_detach", "allowed"],
       ["task_archive", "allowed"],
       ["budget_bootstrap", "allowed"],
-      ["agent_event", "allowed"]
+      ["agent_event", "allowed"],
+      ["app_server_instances_report", "allowed"]
     ]
   );
   assert.match(
@@ -4149,6 +4199,37 @@ function readOnlyBootstrapDb(): D1Database {
         assert.match(sql, /INNER JOIN connectors c ON c\.id = asi\.connector_id/);
         assert.match(sql, /c\.status <> 'offline'/);
         assert.match(sql, /c\.capabilities_json LIKE '%"app_server_instance_state"%'/);
+      }
+      return {
+        bind() {
+          return this;
+        },
+        async first() {
+          return undefined;
+        },
+        async all() {
+          return { results: [] };
+        }
+      };
+    }
+  } as unknown as D1Database;
+}
+
+function readOnlyBootstrapTelemetryPersistFailDb(): D1Database {
+  return {
+    prepare(sql: string) {
+      assert.doesNotMatch(sql, /INSERT INTO users/);
+      assert.doesNotMatch(sql, /GROUP BY budget_state/);
+      if (/INSERT INTO budget_telemetry_samples/.test(sql)) {
+        throw new Error("telemetry sample persistence unavailable");
+      }
+      if (/FROM host_sessions hs/.test(sql)) {
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
+        assert.match(sql, /c\.status <> 'offline'/);
+      }
+      if (/FROM app_server_instances/.test(sql)) {
+        assert.match(sql, /INNER JOIN connectors c ON c\.id = asi\.connector_id/);
+        assert.match(sql, /c\.status <> 'offline'/);
       }
       return {
         bind() {

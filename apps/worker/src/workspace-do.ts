@@ -246,6 +246,22 @@ export class WorkspaceDO implements DurableObject {
     }
 
     if (message.kind === "agent.host_sessions" && isAgentHostSessionsReport(message.payload)) {
+      const refreshDecision = await this.hostSessionRefreshDecision();
+      if (!refreshDecision.refreshAllowed) {
+        ws.send(
+          JSON.stringify(
+            createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+              kind: "agent.host_sessions",
+              accepted: false,
+              reason: "Dogfood safety blocked Host Session refresh results."
+            })
+          )
+        );
+        if (this.consumePendingHostSessionsDispatch(ws, connectorId) && refreshDecision.pendingDispatchAllowed) {
+          await this.sendPendingCommandsAndReleased(ws, connectorId);
+        }
+        return;
+      }
       const result = await recordHostSessions(this.env, connectorId, message.payload);
       ws.send(
         JSON.stringify(
@@ -284,6 +300,24 @@ export class WorkspaceDO implements DurableObject {
           )
         );
         return;
+      }
+      try {
+        await assertDogfoodSafetyActionAllowed(this.env, "app_server_instances_report");
+      } catch (error) {
+        if (error instanceof DogfoodSafetyError) {
+          ws.send(
+            JSON.stringify(
+              createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+                kind: "agent.app_server_instances",
+                accepted: false,
+                reason: error.message,
+                report_id: message.payload.report_id
+              })
+            )
+          );
+          return;
+        }
+        throw error;
       }
       const reportFingerprint = cacheableAppServerReportFingerprint(message.payload);
       const deduped = this.shouldSkipDuplicateAppServerReport(connectorId, reportFingerprint);
@@ -600,6 +634,9 @@ export class WorkspaceDO implements DurableObject {
     refreshAllowed: boolean;
     pendingDispatchAllowed: boolean;
   }> {
+    if (!this.env.DB) {
+      return { refreshAllowed: false, pendingDispatchAllowed: true };
+    }
     try {
       await assertDogfoodSafetyActionAllowed(this.env, "host_session_refresh");
       return { refreshAllowed: true, pendingDispatchAllowed: true };

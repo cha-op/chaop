@@ -186,6 +186,129 @@ test("full host session reports are not browser snapshots when app-server invent
   assert.equal(update.payload?.snapshot, false);
 });
 
+test("host session reports are dropped while dogfood safety blocks refresh writes", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    pendingHostSessionsDispatch: true,
+    pendingHostSessionsDispatchDeadline: Date.now() + 60_000
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({ pendingCommand: true, safetyPaused: true });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.host_sessions",
+    payload: {
+      sessions: [
+        {
+          session_id: "session-1",
+          title: "Inventory title",
+          title_source: "metadata",
+          cwd: "/tmp/project",
+          updated_at: "2026-06-13T10:01:00.000Z"
+        }
+      ],
+      inventory_scope: "full",
+      app_server_inventory_ok: true
+    }
+  }));
+
+  assert.equal(db.pendingDispatchQueries, 0);
+  assert.equal(db.commandLeases, 0);
+  assert.equal(agentSent.length, 1);
+  assert.equal(browserSent.length, 0);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; accepted?: boolean; reason?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.host_sessions");
+  assert.equal(ack.payload?.accepted, false);
+  assert.match(ack.payload?.reason ?? "", /Dogfood safety blocked/);
+  const attachment = agentSocket.deserializeAttachment() as {
+    pendingHostSessionsDispatch?: boolean;
+  };
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
+test("blocked host session reports still release conservative pending dispatch", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    pendingHostSessionsDispatch: true,
+    pendingHostSessionsDispatchDeadline: Date.now() + 60_000
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = readyGatedDispatchDb({ pendingCommand: true, safetyBudgetState: "conservative" });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.host_sessions",
+    payload: {
+      sessions: [
+        {
+          session_id: "session-1",
+          title: "Inventory title",
+          title_source: "metadata",
+          cwd: "/tmp/project",
+          updated_at: "2026-06-13T10:01:00.000Z"
+        }
+      ],
+      inventory_scope: "full",
+      app_server_inventory_ok: true
+    }
+  }));
+
+  assert.equal(db.pendingDispatchQueries, 1);
+  assert.equal(db.commandLeases, 1);
+  assert.equal(agentSent.length, 2);
+  assert.equal(browserSent.length, 0);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; accepted?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.host_sessions");
+  assert.equal(ack.payload?.accepted, false);
+  const dispatch = JSON.parse(agentSent[1] ?? "{}") as {
+    kind?: string;
+    payload?: { command?: { id?: string } };
+  };
+  assert.equal(dispatch.kind, "command.dispatch");
+  assert.equal(dispatch.payload?.command?.id, "command-1");
+  const attachment = agentSocket.deserializeAttachment() as {
+    pendingHostSessionsDispatch?: boolean;
+  };
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
 test("connectorsMessage wraps connector capability updates for browser consumers", () => {
   const message = connectorsMessage({
     connectors: [
@@ -283,6 +406,44 @@ test("agent app-server instance report is acked and broadcast", async () => {
   const update = JSON.parse(browserSent[0] ?? "{}") as { kind?: string; payload?: { app_server_instances?: Array<{ state?: string }> } };
   assert.equal(update.kind, "app_server_instances.updated");
   assert.equal(update.payload?.app_server_instances?.[0]?.state, "healthy");
+});
+
+test("agent app-server instance reports are dropped while dogfood safety blocks status writes", async () => {
+  const agentSent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    agentReady: true
+  }, agentSent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      return [];
+    }
+  } as unknown as DurableObjectState;
+  const db = appServerInstanceDoDb({ safetyPaused: true });
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.app_server_instances",
+    payload: {
+      report_id: "report-paused",
+      instances: [appServerInstancePayload("healthy")]
+    }
+  }));
+
+  assert.equal(db.writes, 0);
+  assert.equal(agentSent.length, 1);
+  assert.equal(browserSent.length, 0);
+  const ack = JSON.parse(agentSent[0] ?? "{}") as {
+    payload?: { kind?: string; accepted?: boolean; reason?: string; report_id?: string };
+  };
+  assert.equal(ack.payload?.kind, "agent.app_server_instances");
+  assert.equal(ack.payload?.accepted, false);
+  assert.equal(ack.payload?.report_id, "report-paused");
+  assert.match(ack.payload?.reason ?? "", /Dogfood emergency pause/);
 });
 
 test("agent app-server instance report accepts workspace and thread placement targets", async () => {
@@ -1066,6 +1227,46 @@ test("agent.ready skips automatic host session refresh while dogfood safety bloc
   assert.equal(attachment.connectorId, "connector-online");
   assert.equal(attachment.connectedAt, 300);
   assert.equal(attachment.agentReady, true);
+  assert.equal(attachment.pendingHostSessionsDispatch, false);
+});
+
+test("agent.ready skips automatic host session refresh without D1 sample safety", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({
+    socketType: "browser"
+  }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "agent:connector-online") return [agentSocket];
+      if (tag === "browser") return [browserSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, {} as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.ready",
+    payload: { capabilities: ["placeholder_commands"] }
+  }));
+
+  assert.equal(sent.length, 1);
+  assert.equal(browserSent.length, 0);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { kind?: string; capabilities?: string[] };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.kind, "agent.ready");
+  assert.deepEqual(ack.payload?.capabilities, ["placeholder_commands"]);
+  const attachment = agentSocket.deserializeAttachment() as {
+    pendingHostSessionsDispatch?: boolean;
+  };
   assert.equal(attachment.pendingHostSessionsDispatch, false);
 });
 
@@ -3240,6 +3441,9 @@ function socketGoneDb(): D1Database & {
   };
   return {
     prepare(sql: string) {
+      const safetyStatement = safetyQueryStatement(sql);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id\s+FROM connectors/.test(sql)) {
         return {
           bind(connectorId: string) {
@@ -3689,11 +3893,20 @@ type AppServerInstanceDoRow = {
   updated_at: string;
 };
 
-function appServerInstanceDoDb(): D1Database & { readonly writes: number } {
+function appServerInstanceDoDb(options: {
+  safetyPaused?: boolean;
+  safetyBudgetState?: BudgetState;
+} = {}): D1Database & { readonly writes: number } {
   const rows = new Map<string, AppServerInstanceDoRow>();
   const counters = { writes: 0 };
   return {
     prepare(sql: string) {
+      const safetyOptions: { paused?: boolean; budgetState?: BudgetState } = {};
+      if (options.safetyPaused !== undefined) safetyOptions.paused = options.safetyPaused;
+      if (options.safetyBudgetState !== undefined) safetyOptions.budgetState = options.safetyBudgetState;
+      const safetyStatement = safetyQueryStatement(sql, safetyOptions);
+      if (safetyStatement) return safetyStatement;
+
       if (/SELECT id\s+FROM connectors/.test(sql)) {
         return {
           bind(connectorId: string) {
