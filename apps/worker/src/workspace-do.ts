@@ -353,7 +353,8 @@ export class WorkspaceDO implements DurableObject {
     if (message.kind === "agent.event" && isAgentCommandEvent(message.payload)) {
       const finalCommandEvent =
         message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
-      if (!finalCommandEvent) {
+      const progressEvent = !finalCommandEvent && message.payload.kind !== "command.started";
+      if (progressEvent) {
         try {
           await assertDogfoodSafetyActionAllowed(this.env, "agent_event");
         } catch (error) {

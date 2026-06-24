@@ -69,10 +69,13 @@ superseded_by:
 - Guarded app-server stopped status writes during connector WebSocket close, preventing disconnect cleanup from bypassing the `app_server_instances_report` safety action.
 - Extended the live telemetry fallback cache across sample-bucket boundaries for the same UTC day and telemetry selector, and merged it by per-metric high-water marks so a later lower live sample cannot drop hard-limit protection.
 - Guarded duplicate-connector retirement app-server stopped writes with the same `app_server_instances_report` safety action, while leaving command/offline cleanup available.
+- Preserved `command.started` event recording during safety pauses and hard limits, so an already-dispatched command moves out of expiring lease state while noisy progress output can still be dropped.
+- Triggered a best-effort global pending-command dispatch after safety resume, so queued work does not wait for an unrelated connector event after an operator clears the pause.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`
 - `pnpm --filter @chaop/worker test`
+- `pnpm --filter @chaop/worker test -- --test-name-pattern "dogfood safety pause|command started|safety pause and resume"`
 - `pnpm test`
 - `pnpm build`
 - `cargo fmt --check`

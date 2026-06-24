@@ -125,14 +125,13 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!isSetDogfoodSafetyPauseRequest(payload.value)) {
       return json(request, env, { error: "Invalid safety pause payload" }, 400);
     }
+    const paused = url.pathname.endsWith("/pause");
     const response: SetDogfoodSafetyPauseResponse = {
-      safety: await setDogfoodSafetyPauseInDb(
-        env,
-        url.pathname.endsWith("/pause"),
-        auth.user,
-        payload.value.reason
-      )
+      safety: await setDogfoodSafetyPauseInDb(env, paused, auth.user, payload.value.reason)
     };
+    if (!paused) {
+      await dispatchPendingCommandsBestEffort(env);
+    }
     return json(request, env, response, 200);
   }
 
@@ -627,15 +626,26 @@ function isLocalHost(host: string): boolean {
   return /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
 }
 
-async function dispatchPendingCommand(env: Env, connectorId: string): Promise<void> {
+async function dispatchPendingCommand(env: Env, connectorId?: string): Promise<void> {
   if (!env.WORKSPACE_DO) return;
 
   const id = env.WORKSPACE_DO.idFromName("global");
   const stub = env.WORKSPACE_DO.get(id);
-  await stub.fetch("https://workspace-do/internal/dispatch-pending", {
-    method: "POST",
-    body: JSON.stringify({ connector_id: connectorId })
-  });
+  const init: RequestInit = { method: "POST" };
+  if (connectorId) {
+    init.body = JSON.stringify({ connector_id: connectorId });
+  }
+  await stub.fetch("https://workspace-do/internal/dispatch-pending", init);
+}
+
+async function dispatchPendingCommandsBestEffort(env: Env): Promise<void> {
+  try {
+    await dispatchPendingCommand(env);
+  } catch (error) {
+    console.warn("Safety resume could not dispatch pending commands", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 async function broadcastThreadEvents(env: Env, events: ThreadEvent[]): Promise<void> {

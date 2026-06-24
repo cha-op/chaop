@@ -2559,6 +2559,7 @@ test("safety posture fails closed when pause state row is malformed", async () =
 
 test("safety pause and resume update the operator guard state", async () => {
   const db = safetyPauseDb();
+  const dispatchRequests: Array<{ url: string; method: string; body: string }> = [];
   const pause = await handleRequest(
     new Request("https://api.example.com/api/safety/pause", {
       method: "POST",
@@ -2590,7 +2591,26 @@ test("safety pause and resume update the operator guard state", async () => {
     }),
     {
       ...devEnv,
-      DB: db
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: (name: string) => {
+          assert.equal(name, "global");
+          return {} as DurableObjectId;
+        },
+        get: () => ({
+          async fetch(input: RequestInfo, init?: RequestInit) {
+            const request = new Request(input, init);
+            dispatchRequests.push({
+              url: request.url,
+              method: request.method,
+              body: await request.text()
+            });
+            return new Response(JSON.stringify({ dispatched_to: 1 }), {
+              headers: { "content-type": "application/json" }
+            });
+          }
+        })
+      } as unknown as DurableObjectNamespace
     }
   );
   const resumed = (await resume.json()) as {
@@ -2607,6 +2627,11 @@ test("safety pause and resume update the operator guard state", async () => {
   assert.equal(resume.status, 200);
   assert.equal(resumed.safety.paused, false);
   assert.equal(resumed.safety.actions.every((guard) => guard.state === "allowed"), true);
+  assert.deepEqual(dispatchRequests, [{
+    url: "https://workspace-do/internal/dispatch-pending",
+    method: "POST",
+    body: ""
+  }]);
 });
 
 test("safety pause requires a D1 binding even in sample mode", async () => {

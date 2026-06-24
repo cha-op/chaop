@@ -2251,6 +2251,61 @@ test("dogfood safety pause drops non-terminal agent events without stranding the
   assert.equal(db.eventInserts, 0);
 });
 
+test("dogfood safety pause still records command started events", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    activeCommandIds: ["command-1"]
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const db = dogfoodSafetyBlockedAgentEventDb();
+  const workspace = new WorkspaceDO(ctx, { DB: db } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "command.started",
+      priority: "P1",
+      summary: "Started while paused"
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean; dropped?: boolean };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.deepEqual(ack.payload, {
+    command_id: "command-1",
+    kind: "command.started",
+    accepted: true
+  });
+  assert.equal(browserSent.length, 1);
+  const browserEvent = JSON.parse(browserSent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { event?: { kind?: string; summary?: string } };
+  };
+  assert.equal(browserEvent.kind, "thread.event");
+  assert.equal(browserEvent.payload?.event?.kind, "command.started");
+  assert.equal(browserEvent.payload?.event?.summary, "Started while paused");
+  assert.equal(db.commandStateUpdates, 1);
+  assert.equal(db.commandFailures, 0);
+  assert.equal(db.eventInserts, 1);
+});
+
 test("terminal agent events bypass dogfood safety block and clear socket activity", async () => {
   const sent: string[] = [];
   const browserSent: string[] = [];
@@ -2636,10 +2691,12 @@ function staleFinalCommandEventDb(): D1Database & { readonly pendingDispatchQuer
 
 function dogfoodSafetyBlockedAgentEventDb(): D1Database & {
   readonly commandFailures: number;
+  readonly commandStateUpdates: number;
   readonly eventInserts: number;
 } {
   const counters = {
     commandFailures: 0,
+    commandStateUpdates: 0,
     eventInserts: 0
   };
   return {
@@ -2647,11 +2704,10 @@ function dogfoodSafetyBlockedAgentEventDb(): D1Database & {
       const safetyStatement = safetyQueryStatement(sql, { paused: true });
       if (safetyStatement) return safetyStatement;
 
-      if (/SELECT id, workspace_id, thread_id, task_id, type, prompt, state, target_connector_id, created_at, updated_at/.test(sql)) {
+      if (/SELECT id, workspace_id, thread_id, task_id, type, target_connector_id/.test(sql) && /FROM commands/.test(sql)) {
         return {
-          bind(commandId: string, connectorId: string) {
+          bind(commandId: string) {
             assert.equal(commandId, "command-1");
-            assert.equal(connectorId, "connector-online");
             return {
               async first() {
                 return {
@@ -2660,12 +2716,36 @@ function dogfoodSafetyBlockedAgentEventDb(): D1Database & {
                   thread_id: "thread-1",
                   task_id: null,
                   type: "codex",
-                  prompt: "run",
-                  state: "running",
                   target_connector_id: "connector-online",
-                  created_at: "2026-06-13T10:00:00.000Z",
-                  updated_at: "2026-06-13T10:00:00.000Z"
+                  target_connector_id_source: "attached",
+                  lease_owner_connector_id: "connector-online",
+                  lease_target_host_session_id: null,
+                  state: "leased"
                 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE commands/.test(sql) && /SET state = \?/.test(sql) && /state IN \('leased', 'running'\)/.test(sql)) {
+        return {
+          bind(
+            nextState: string,
+            nextConnectorId: string | null,
+            updatedAt: string,
+            commandId: string,
+            connectorId: string
+          ) {
+            assert.equal(nextState, "running");
+            assert.equal(nextConnectorId, "connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(connectorId, "connector-online");
+            return {
+              async run() {
+                counters.commandStateUpdates += 1;
+                return { success: true, meta: { changes: 1 } };
               }
             };
           }
@@ -2720,9 +2800,13 @@ function dogfoodSafetyBlockedAgentEventDb(): D1Database & {
             assert.equal(threadId, "thread-1");
             assert.equal(commandId, "command-1");
             assert.equal(seq, 1);
-            assert.equal(kind, "command.failed");
+            assert.ok(kind === "command.failed" || kind === "command.started");
             assert.equal(priority, "P1");
-            assert.match(summary, /Dogfood safety blocked command progress/);
+            if (kind === "command.failed") {
+              assert.match(summary, /Dogfood safety blocked command progress/);
+            } else {
+              assert.equal(summary, "Started while paused");
+            }
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             return {
               async run() {
@@ -2753,9 +2837,14 @@ function dogfoodSafetyBlockedAgentEventDb(): D1Database & {
 
       if (/UPDATE connectors/.test(sql)) {
         return {
-          bind(activeCount: number, updatedAt: string, connectorId: string) {
-            assert.equal(activeCount, 0);
-            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+          bind(first: number | string, second: string, connectorId: string) {
+            if (typeof first === "number") {
+              assert.equal(first, 0);
+              assert.match(second, /^\d{4}-\d{2}-\d{2}T/);
+            } else {
+              assert.match(first, /^\d{4}-\d{2}-\d{2}T/);
+              assert.match(second, /^\d{4}-\d{2}-\d{2}T/);
+            }
             assert.equal(connectorId, "connector-online");
             return {
               async run() {
@@ -2771,11 +2860,15 @@ function dogfoodSafetyBlockedAgentEventDb(): D1Database & {
     get commandFailures() {
       return counters.commandFailures;
     },
+    get commandStateUpdates() {
+      return counters.commandStateUpdates;
+    },
     get eventInserts() {
       return counters.eventInserts;
     }
   } as unknown as D1Database & {
     readonly commandFailures: number;
+    readonly commandStateUpdates: number;
     readonly eventInserts: number;
   };
 }

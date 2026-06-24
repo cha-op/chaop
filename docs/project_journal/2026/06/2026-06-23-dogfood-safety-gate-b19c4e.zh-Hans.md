@@ -69,10 +69,13 @@ superseded_by:
 - connector WebSocket close 期间的 app-server stopped status 写入现在也会经过 `app_server_instances_report` safety action，避免断连清理绕过状态报告保护。
 - live telemetry fallback cache 现在会在同一个 UTC 日和 telemetry selector 内跨 sample bucket 保留，并按每个 metric 的高水位合并，因此后续更低的 live sample 不会丢失 hard-limit protection。
 - duplicate connector retirement 期间的 app-server stopped 写入现在也会走同一个 `app_server_instances_report` safety action，同时保留 command/offline cleanup。
+- safety pause 或 hard limit 期间现在仍会记录 `command.started` event，让已经派发的 command 离开会过期的 lease state；高频 progress output 仍可被丢弃以减少写入。
+- safety resume 后现在会 best-effort 触发一次全局 pending-command dispatch，避免 operator 解除 pause 后，已排队工作还要等其他 connector event 才继续。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`
 - `pnpm --filter @chaop/worker test`
+- `pnpm --filter @chaop/worker test -- --test-name-pattern "dogfood safety pause|command started|safety pause and resume"`
 - `pnpm test`
 - `pnpm build`
 - `cargo fmt --check`
