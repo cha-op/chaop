@@ -33,9 +33,12 @@ import type {
   DetachHostSessionResponse,
   HostSessionSummary,
   HostSessionSyncSummary,
+  ResolveTurnInteractionRequest,
   TaskCategory,
   TaskSummary,
   ThreadEvent,
+  TurnInteractionRequestPayload,
+  TurnInteractionResponseDispatch,
   ThreadSummary,
   WorkspaceSummary
 } from "@chaop/protocol";
@@ -1599,7 +1602,7 @@ export async function listThreadEventsInDb(
   const boundedLimit = Math.max(1, Math.min(limit, 200));
   const rows = await allRows<ThreadEventRow>(
     env.DB.prepare(
-      `SELECT id, thread_id, command_id, seq, kind, priority, summary, created_at
+      `SELECT id, thread_id, command_id, seq, kind, priority, summary, payload_json, created_at
        FROM events
        WHERE thread_id = ?
        ORDER BY seq DESC
@@ -1607,10 +1610,105 @@ export async function listThreadEventsInDb(
     )
       .bind(thread.id, boundedLimit)
   );
-  return rows.reverse().map((row) => ({
-    ...row,
-    command_id: row.command_id ?? undefined
-  }));
+  return rows.reverse().map(threadEventFromRow);
+}
+
+export async function prepareTurnInteractionResolutionInDb(
+  env: Env,
+  eventId: string,
+  response: ResolveTurnInteractionRequest
+): Promise<TurnInteractionResponseDispatch> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for turn interaction resolution");
+  }
+  const row = await env.DB.prepare(
+    `SELECT e.id, e.thread_id, e.command_id, e.kind, e.payload_json,
+            cmd.lease_owner_connector_id, cmd.state
+     FROM events e
+     LEFT JOIN commands cmd ON cmd.id = e.command_id
+     WHERE e.id = ?
+     LIMIT 1`
+  )
+    .bind(eventId)
+    .first<{
+      id: string;
+      thread_id: string;
+      command_id: string | null;
+      kind: ThreadEvent["kind"];
+      payload_json: string | null;
+      lease_owner_connector_id: string | null;
+      state: CommandSummary["state"] | null;
+    }>();
+  if (!row) {
+    throw new NotFoundError("Turn interaction event not found");
+  }
+  if (!row.command_id || !row.lease_owner_connector_id || !row.state || !isActiveCommandState(row.state)) {
+    throw new CommandTargetError("Turn interaction is no longer active", 409);
+  }
+  const payload = parseTurnInteractionRequestPayload(row.payload_json);
+  if (!payload) {
+    throw new CommandTargetError("Turn interaction payload is unavailable", 409);
+  }
+  if (payload.status !== "pending") {
+    throw new CommandTargetError("Turn interaction has already been resolved", 409);
+  }
+  if (response.kind === "approval" && row.kind !== "approval.requested") {
+    throw new CommandTargetError("Turn interaction is not an approval request", 400);
+  }
+  if (response.kind === "input" && row.kind !== "input.requested") {
+    throw new CommandTargetError("Turn interaction is not an input request", 400);
+  }
+  return {
+    command_id: row.command_id,
+    interaction_id: payload.interaction_id,
+    response
+  };
+}
+
+export async function recordTurnInteractionResolutionInDb(
+  env: Env,
+  eventId: string,
+  response: ResolveTurnInteractionRequest
+): Promise<ThreadEvent> {
+  if (!env.DB) {
+    throw new Error("DB binding is required for turn interaction resolution");
+  }
+  const row = await env.DB.prepare(
+    `SELECT e.id, e.workspace_id, e.thread_id, e.command_id, e.kind, e.payload_json
+     FROM events e
+     WHERE e.id = ?
+     LIMIT 1`
+  )
+    .bind(eventId)
+    .first<{
+      id: string;
+      workspace_id: string;
+      thread_id: string;
+      command_id: string | null;
+      kind: ThreadEvent["kind"];
+      payload_json: string | null;
+    }>();
+  if (!row || !row.command_id) {
+    throw new NotFoundError("Turn interaction event not found");
+  }
+  const payload = parseTurnInteractionRequestPayload(row.payload_json);
+  if (!payload) {
+    throw new CommandTargetError("Turn interaction payload is unavailable", 409);
+  }
+  const resolution = turnInteractionResolutionEvent(response, payload);
+  const event = await appendEvent(env, {
+    workspace_id: row.workspace_id,
+    thread_id: row.thread_id,
+    command_id: row.command_id,
+    kind: response.kind === "approval" ? "approval.resolved" : "input.received",
+    priority: "P1",
+    summary: resolution.summary,
+    payload: resolution.payload
+  });
+  if (!event) {
+    throw new NotFoundError("Thread not found");
+  }
+  return event;
 }
 
 export async function chooseConnectorForLocalThread(
@@ -2812,7 +2910,7 @@ export async function recordAgentEvent(
   }
 
   if (command.task_id) {
-    const taskState = event.kind === "command.started" ? "running" : finalTaskStateForEvent(event.kind);
+    const taskState = taskStateForEvent(event.kind);
     if (taskState) {
       await env.DB.prepare(
         `UPDATE tasks
@@ -2831,7 +2929,8 @@ export async function recordAgentEvent(
       command_id: command.id,
       kind: event.kind,
       priority: event.priority,
-      summary: event.summary
+      summary: event.summary,
+      payload: event.payload
     })
     : undefined;
 
@@ -3824,16 +3923,94 @@ async function listRecentCommands(env: Env): Promise<CommandSummary[]> {
 async function listRecentEvents(env: Env): Promise<ThreadEvent[]> {
   const rows = await allRows<ThreadEventRow>(
     env.DB!.prepare(
-      `SELECT id, thread_id, command_id, seq, kind, priority, summary, created_at
+      `SELECT id, thread_id, command_id, seq, kind, priority, summary, payload_json, created_at
        FROM events
        ORDER BY created_at DESC, seq DESC
        LIMIT 30`
     )
   );
-  return rows.reverse().map((row) => ({
-    ...row,
-    command_id: row.command_id ?? undefined
-  }));
+  return rows.reverse().map(threadEventFromRow);
+}
+
+function threadEventFromRow(row: ThreadEventRow): ThreadEvent {
+  const event: ThreadEvent = {
+    id: row.id,
+    thread_id: row.thread_id,
+    command_id: row.command_id ?? undefined,
+    seq: row.seq,
+    kind: row.kind,
+    priority: row.priority,
+    summary: row.summary,
+    created_at: row.created_at
+  };
+  if (row.payload_json) {
+    try {
+      event.payload = JSON.parse(row.payload_json) as ThreadEvent["payload"];
+    } catch {
+      // Ignore malformed optional payloads; the event summary remains usable.
+    }
+  }
+  return event;
+}
+
+function parseTurnInteractionRequestPayload(payloadJson: string | null): TurnInteractionRequestPayload | undefined {
+  if (!payloadJson) return undefined;
+  try {
+    const payload = JSON.parse(payloadJson) as unknown;
+    if (!isTurnInteractionRequestPayload(payload)) return undefined;
+    return payload;
+  } catch {
+    return undefined;
+  }
+}
+
+function isTurnInteractionRequestPayload(value: unknown): value is TurnInteractionRequestPayload {
+  if (!isRecord(value)) return false;
+  return (
+    value.type === "turn_interaction" &&
+    typeof value.interaction_id === "string" &&
+    value.interaction_id.trim().length > 0 &&
+    value.status === "pending" &&
+    typeof value.method === "string" &&
+    (value.request_kind === "approval" || value.request_kind === "input") &&
+    typeof value.app_server_thread_id === "string" &&
+    typeof value.app_server_turn_id === "string" &&
+    typeof value.title === "string"
+  );
+}
+
+function turnInteractionResolutionEvent(
+  response: ResolveTurnInteractionRequest,
+  request: TurnInteractionRequestPayload
+): { summary: string; payload: NonNullable<ThreadEvent["payload"]> } {
+  if (response.kind === "input") {
+    const answerCount = Object.keys(response.answers).length;
+    return {
+      summary: `Input provided for ${request.title}.`,
+      payload: {
+        type: "turn_interaction_resolution",
+        interaction_id: request.interaction_id,
+        status: "answered",
+        answer_count: answerCount
+      }
+    };
+  }
+  const status = response.decision === "accept"
+    ? "accepted"
+    : response.decision === "acceptForSession"
+      ? "accepted_for_session"
+      : response.decision === "decline"
+        ? "declined"
+        : "cancelled";
+  return {
+    summary: `Approval ${status.replaceAll("_", " ")} for ${request.title}.`,
+    payload: {
+      type: "turn_interaction_resolution",
+      interaction_id: request.interaction_id,
+      status,
+      decision: response.decision
+    }
+  };
 }
 
 async function chooseConnectorForWorkspace(
@@ -4059,11 +4236,13 @@ async function appendEvent(
     kind: input.kind,
     priority: input.priority,
     summary: input.summary,
+    payload: input.payload,
     created_at: now
   };
+  const payloadJson = input.payload ? JSON.stringify(input.payload) : null;
   await env.DB!.prepare(
-    `INSERT INTO events (id, workspace_id, thread_id, command_id, seq, kind, priority, summary, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO events (id, workspace_id, thread_id, command_id, seq, kind, priority, summary, payload_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       event.id,
@@ -4074,6 +4253,7 @@ async function appendEvent(
       event.kind,
       event.priority,
       event.summary,
+      payloadJson,
       event.created_at
     )
     .run();
@@ -4482,7 +4662,10 @@ function isActiveCommandState(state: CommandSummary["state"]): boolean {
   return state === "leased" || state === "running";
 }
 
-function finalTaskStateForEvent(kind: AgentCommandEvent["kind"]): TaskSummary["state"] | undefined {
+function taskStateForEvent(kind: AgentCommandEvent["kind"]): TaskSummary["state"] | undefined {
+  if (kind === "command.started" || kind === "approval.resolved" || kind === "input.received") return "running";
+  if (kind === "approval.requested") return "waiting_for_approval";
+  if (kind === "input.requested") return "waiting_for_input";
   if (kind === "command.finished") return "done";
   if (kind === "command.failed") return "failed";
   return undefined;
@@ -5424,6 +5607,7 @@ const DOGFOOD_SAFETY_ACTIONS: DogfoodSafetyAction[] = [
   "host_session_attach",
   "host_session_detach",
   "task_archive",
+  "turn_interaction",
   "budget_bootstrap",
   "agent_event",
   "app_server_instances_report"
@@ -6069,8 +6253,9 @@ type PendingCommandRow = CommandRow & {
   target_host_session_cwd: string | null;
 };
 
-type ThreadEventRow = Omit<ThreadEvent, "command_id"> & {
+type ThreadEventRow = Omit<ThreadEvent, "command_id" | "payload"> & {
   command_id: string | null;
+  payload_json: string | null;
 };
 
 type EventInput = Omit<ThreadEvent, "id" | "seq" | "created_at"> & {

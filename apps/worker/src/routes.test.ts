@@ -2188,6 +2188,7 @@ test("safety posture returns sample safety when dev mode has no D1 binding", asy
       ["host_session_attach", "allowed"],
       ["host_session_detach", "allowed"],
       ["task_archive", "allowed"],
+      ["turn_interaction", "allowed"],
       ["budget_bootstrap", "allowed"],
       ["agent_event", "allowed"],
       ["app_server_instances_report", "allowed"]
@@ -2231,6 +2232,7 @@ test("safety posture reports conservative inventory guard without blocking focus
       ["host_session_attach", "allowed"],
       ["host_session_detach", "allowed"],
       ["task_archive", "allowed"],
+      ["turn_interaction", "allowed"],
       ["budget_bootstrap", "allowed"],
       ["agent_event", "allowed"],
       ["app_server_instances_report", "allowed"]

@@ -218,12 +218,12 @@ export function fallbackBootstrap(): BootstrapPayload {
         thread_id: "thread-orders-500",
         title: "Investigate 500 errors on /api/orders",
         category_id: "incident",
-        state: "running",
+        state: "waiting_for_approval",
         connector_id: "connector-mac-studio",
         assigned_agent: "codex-placeholder",
         realtime_mode: "realtime",
         budget_state: "normal",
-        updated_at: "2026-06-09T21:58:00.000Z"
+        updated_at: "2026-06-09T21:59:03.000Z"
       },
       {
         id: "task-pr-readiness",
@@ -302,6 +302,19 @@ export function fallbackBootstrap(): BootstrapPayload {
         target_connector_id: "connector-mac-studio",
         created_at: "2026-06-09T21:58:00.000Z",
         updated_at: "2026-06-09T21:58:04.000Z"
+      },
+      {
+        id: "command-approval",
+        workspace_id: "workspace-api",
+        thread_id: "thread-orders-500",
+        task_id: "task-orders-500",
+        type: "codex",
+        execution_mode: "app_server",
+        prompt: "Inspect the local config file and patch the failing setting.",
+        state: "running",
+        target_connector_id: "connector-mac-studio",
+        created_at: "2026-06-09T21:59:00.000Z",
+        updated_at: "2026-06-09T21:59:03.000Z"
       }
     ],
     events: [
@@ -344,6 +357,51 @@ export function fallbackBootstrap(): BootstrapPayload {
         priority: "P1",
         summary: "Codex app-server turn completed successfully.",
         created_at: "2026-06-09T21:58:04.000Z"
+      },
+      {
+        id: "event-approval-accepted",
+        thread_id: "thread-orders-500",
+        command_id: "command-approval",
+        seq: 5,
+        kind: "command.accepted",
+        priority: "P1",
+        summary: "Control plane accepted the codex command.",
+        created_at: "2026-06-09T21:59:01.000Z"
+      },
+      {
+        id: "event-approval-started",
+        thread_id: "thread-orders-500",
+        command_id: "command-approval",
+        seq: 6,
+        kind: "command.started",
+        priority: "P1",
+        summary: "Connector started Codex app-server turn for local thread sample-thread-orders-500.",
+        created_at: "2026-06-09T21:59:02.000Z"
+      },
+      {
+        id: "event-approval-requested",
+        thread_id: "thread-orders-500",
+        command_id: "command-approval",
+        seq: 7,
+        kind: "approval.requested",
+        priority: "P0",
+        summary: "Approval requested for command: cat ./config/local.json",
+        payload: {
+          type: "turn_interaction",
+          interaction_id: "sample-approval-1",
+          status: "pending",
+          method: "item/commandExecution/requestApproval",
+          request_kind: "approval",
+          subject: "command_execution",
+          app_server_thread_id: "sample-thread-orders-500",
+          app_server_turn_id: "sample-turn-approval",
+          app_server_item_id: "sample-item-approval",
+          title: "Approve command execution",
+          detail: "Needs read access to inspect local configuration.",
+          command: "cat ./config/local.json",
+          cwd: "/Users/joey/Program/Codex-workspace/sample"
+        },
+        created_at: "2026-06-09T21:59:03.000Z"
       }
     ],
     budget: {

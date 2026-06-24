@@ -14,7 +14,8 @@ import {
   type LocalThreadCreateResult,
   type ThreadArchiveSyncDispatch,
   type ThreadArchiveSyncResult,
-  type ThreadEvent
+  type ThreadEvent,
+  type TurnInteractionResponseDispatch
 } from "@chaop/protocol";
 import {
   DogfoodSafetyError,
@@ -129,6 +130,10 @@ export class WorkspaceDO implements DurableObject {
 
     if (url.pathname === "/internal/broadcast-thread-events") {
       return this.broadcastThreadEvents(request);
+    }
+
+    if (url.pathname === "/internal/resolve-turn-interaction") {
+      return this.resolveTurnInteraction(request);
     }
 
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -512,6 +517,30 @@ export class WorkspaceDO implements DurableObject {
     return new Response(JSON.stringify({ broadcasted: events.length }), {
       headers: { "content-type": "application/json; charset=utf-8" }
     });
+  }
+
+  private async resolveTurnInteraction(request: Request): Promise<Response> {
+    const dispatch = await request.json().catch(() => undefined) as unknown;
+    if (!isTurnInteractionResponseDispatch(dispatch)) {
+      return jsonResponse({ error: "Invalid turn interaction dispatch" }, 400);
+    }
+    const socket = this.agentSocketForActiveCommand(dispatch.command_id);
+    if (!socket) {
+      return jsonResponse({ error: "No active connector socket is handling this turn" }, 409);
+    }
+    try {
+      socket.send(
+        JSON.stringify(
+          createEnvelope("turn.interaction_response", { type: "worker", id: "workspace-do-global" }, dispatch, {
+            command_id: dispatch.command_id,
+            target: { type: "connector" }
+          })
+        )
+      );
+    } catch {
+      return jsonResponse({ error: "Connector socket could not receive the turn interaction response" }, 409);
+    }
+    return jsonResponse({ accepted: true });
   }
 
   private async handleSocketGone(ws: WebSocket): Promise<void> {
@@ -1174,6 +1203,19 @@ export class WorkspaceDO implements DurableObject {
     });
   }
 
+  private agentSocketForActiveCommand(commandId: string): WebSocket | undefined {
+    return this.ctx.getWebSockets("agent")
+      .find((socket) => {
+        const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+        return (
+          attachment?.socketType === "agent" &&
+          typeof attachment.connectorId === "string" &&
+          isReadyAgentSocket(socket, attachment.connectorId) &&
+          socketActiveCommandIds(socket, attachment.connectorId).includes(commandId)
+        );
+      });
+  }
+
   private markSocketDispatchUnavailable(ws: WebSocket, connectorId: string): boolean {
     const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
     if (
@@ -1410,9 +1452,14 @@ function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
     (record.kind === "command.started" ||
       record.kind === "command.output" ||
       record.kind === "command.finished" ||
-      record.kind === "command.failed") &&
+      record.kind === "command.failed" ||
+      record.kind === "approval.requested" ||
+      record.kind === "approval.resolved" ||
+      record.kind === "input.requested" ||
+      record.kind === "input.received") &&
     (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
     (record.target_host_session_id === undefined || typeof record.target_host_session_id === "string") &&
+    (record.payload === undefined || isRecord(record.payload)) &&
     typeof record.summary === "string"
   );
 }
@@ -1431,6 +1478,31 @@ function isThreadEvent(value: unknown): value is ThreadEvent {
     typeof record.summary === "string" &&
     typeof record.created_at === "string"
   );
+}
+
+function isTurnInteractionResponseDispatch(value: unknown): value is TurnInteractionResponseDispatch {
+  if (!isRecord(value)) return false;
+  if (typeof value.command_id !== "string" || value.command_id.trim().length === 0) return false;
+  if (typeof value.interaction_id !== "string" || value.interaction_id.trim().length === 0) return false;
+  const response = value.response;
+  if (!isRecord(response)) return false;
+  if (response.kind === "approval") {
+    return (
+      response.decision === "accept" ||
+      response.decision === "acceptForSession" ||
+      response.decision === "decline" ||
+      response.decision === "cancel"
+    );
+  }
+  if (response.kind === "input") {
+    return isRecord(response.answers) &&
+      Object.values(response.answers).every((answer) =>
+        isRecord(answer) &&
+        Array.isArray(answer.answers) &&
+        answer.answers.every((item) => typeof item === "string")
+      );
+  }
+  return false;
 }
 
 function isLocalThreadCreateDispatch(value: unknown): value is LocalThreadCreateDispatch {
@@ -1550,8 +1622,15 @@ function isThreadEventKind(value: unknown): boolean {
     value === "command.finished" ||
     value === "command.failed" ||
     value === "approval.requested" ||
+    value === "approval.resolved" ||
+    value === "input.requested" ||
+    value === "input.received" ||
     value === "notice.throttled"
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isAgentHostSessionsReport(value: unknown): value is AgentHostSessionsReport {

@@ -437,11 +437,75 @@ export type ThreadEvent = {
     | "command.finished"
     | "command.failed"
     | "approval.requested"
+    | "approval.resolved"
+    | "input.requested"
+    | "input.received"
     | "notice.throttled";
   priority: "P0" | "P1" | "P2" | "P3";
   summary: string;
+  payload?: ThreadEventPayload | undefined;
   created_at: string;
 };
+
+export type TurnInteractionApprovalSubject =
+  | "command_execution"
+  | "file_change"
+  | "permissions"
+  | "legacy_exec"
+  | "legacy_apply_patch";
+
+export type TurnInteractionApprovalDecision =
+  | "accept"
+  | "acceptForSession"
+  | "decline"
+  | "cancel";
+
+export type TurnInteractionInputAnswer = {
+  answers: string[];
+};
+
+export type TurnInteractionInputQuestion = {
+  id: string;
+  header: string;
+  question: string;
+  is_other: boolean;
+  is_secret: boolean;
+  options?: Array<{
+    label: string;
+    description: string;
+  }> | undefined;
+};
+
+export type TurnInteractionRequestPayload = {
+  type: "turn_interaction";
+  interaction_id: string;
+  status: "pending";
+  method: string;
+  request_kind: "approval" | "input";
+  subject?: TurnInteractionApprovalSubject | undefined;
+  app_server_thread_id: string;
+  app_server_turn_id: string;
+  app_server_item_id?: string | undefined;
+  title: string;
+  detail?: string | undefined;
+  command?: string | undefined;
+  cwd?: string | undefined;
+  grant_root?: string | undefined;
+  questions?: TurnInteractionInputQuestion[] | undefined;
+  auto_resolution_ms?: number | null | undefined;
+};
+
+export type TurnInteractionResolutionPayload = {
+  type: "turn_interaction_resolution";
+  interaction_id: string;
+  status: "accepted" | "accepted_for_session" | "declined" | "cancelled" | "answered";
+  decision?: TurnInteractionApprovalDecision | undefined;
+  answer_count?: number | undefined;
+};
+
+export type ThreadEventPayload =
+  | TurnInteractionRequestPayload
+  | TurnInteractionResolutionPayload;
 
 export type BudgetSummary = {
   state: BudgetState;
@@ -470,6 +534,7 @@ export type DogfoodSafetyAction =
   | "host_session_attach"
   | "host_session_detach"
   | "task_archive"
+  | "turn_interaction"
   | "budget_bootstrap"
   | "agent_event"
   | "app_server_instances_report";
@@ -558,6 +623,21 @@ export type CreateCommandResponse = {
   accepted: boolean;
 };
 
+export type ResolveTurnInteractionRequest =
+  | {
+      kind: "approval";
+      decision: TurnInteractionApprovalDecision;
+    }
+  | {
+      kind: "input";
+      answers: Record<string, TurnInteractionInputAnswer>;
+    };
+
+export type ResolveTurnInteractionResponse = {
+  accepted: true;
+  event: ThreadEvent;
+};
+
 export type AttachHostSessionRequest = {
   connector_id?: string | undefined;
 };
@@ -590,9 +670,20 @@ export type AgentCommandEvent = {
     | "command.started"
     | "command.output"
     | "command.finished"
-    | "command.failed";
+    | "command.failed"
+    | "approval.requested"
+    | "approval.resolved"
+    | "input.requested"
+    | "input.received";
   priority: ThreadEvent["priority"];
   summary: string;
+  payload?: ThreadEventPayload | undefined;
+};
+
+export type TurnInteractionResponseDispatch = {
+  command_id: string;
+  interaction_id: string;
+  response: ResolveTurnInteractionRequest;
 };
 
 export type AgentHostSession = {

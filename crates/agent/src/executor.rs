@@ -19,6 +19,7 @@ pub fn codex_exec_started_event(workspace_root: &Path) -> ConnectorEvent {
             "Connector started Codex CLI fallback in {}.",
             workspace_root.to_string_lossy()
         ),
+        payload: None,
     }
 }
 
@@ -48,6 +49,7 @@ pub(crate) fn codex_exec_result_events_with_cancel(
             priority: "P1".to_owned(),
             summary: "Codex CLI fallback was cancelled because the connector connection closed."
                 .to_owned(),
+            payload: None,
         }],
         Ok(output) if output.timed_out => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
@@ -56,6 +58,7 @@ pub(crate) fn codex_exec_result_events_with_cancel(
                 "Codex CLI fallback timed out after {} seconds.",
                 config.codex_timeout_seconds.max(1)
             ),
+            payload: None,
         }],
         Ok(output) => codex_result_events(
             output.success,
@@ -71,11 +74,13 @@ pub(crate) fn codex_exec_result_events_with_cancel(
                 "Codex executable not found: {}. Set execution.codex_command to an absolute path visible to the connector process.",
                 config.codex_command
             ),
+            payload: None,
         }],
         Err(error) => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
             summary: format!("Codex CLI fallback could not start: {error}."),
+            payload: None,
         }],
     }
 }
@@ -215,6 +220,7 @@ fn codex_result_events(
                     .unwrap_or_default(),
                 truncate_summary(first_non_empty(stderr, stdout), 600)
             ),
+            payload: None,
         }];
     }
 
@@ -225,12 +231,14 @@ fn codex_result_events(
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
             summary: format!("Codex: {}", truncate_summary(&message, 700)),
+            payload: None,
         });
     } else {
         events.push(ConnectorEvent {
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
             summary: "Codex CLI fallback completed without an assistant message.".to_owned(),
+            payload: None,
         });
     }
 
@@ -239,6 +247,7 @@ fn codex_result_events(
             kind: "command.output".to_owned(),
             priority: "P3".to_owned(),
             summary: usage.summary(),
+            payload: None,
         });
     }
 
@@ -249,6 +258,7 @@ fn codex_result_events(
             summary:
                 "Codex CLI fallback output exceeded the connector cap; summaries may be incomplete."
                     .to_owned(),
+            payload: None,
         });
     }
 
@@ -256,6 +266,7 @@ fn codex_result_events(
         kind: "command.finished".to_owned(),
         priority: "P1".to_owned(),
         summary: "Codex CLI fallback completed successfully.".to_owned(),
+        payload: None,
     });
     events
 }

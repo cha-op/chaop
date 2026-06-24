@@ -19,6 +19,7 @@ import {
   type TaskState,
   type TaskSummary,
   type ThreadEvent,
+  type TurnInteractionApprovalDecision,
   type ThreadSummary
 } from "@chaop/protocol";
 import {
@@ -36,6 +37,7 @@ import {
   loadThreadEvents,
   pauseDogfoodSafety,
   refreshHostSessions,
+  resolveTurnInteraction,
   resumeDogfoodSafety,
   unarchiveTask
 } from "./api.js";
@@ -68,6 +70,7 @@ import {
   safetyActionReason,
   threadTurnsForDisplay,
   type CommandExecutionMode,
+  type PendingTurnInteraction,
   type ThreadTurnSummary
 } from "./state.js";
 
@@ -149,6 +152,12 @@ export class ChaopApp extends LitElement {
 
   @state()
   private newThreadState: "idle" | "creating" | "failed" = "idle";
+
+  @state()
+  private interactionDrafts: Record<string, Record<string, string>> = {};
+
+  @state()
+  private interactionSubmitting: Record<string, boolean> = {};
 
   @state()
   private hostSessionsRealtimeSyncedAt: string | undefined;
@@ -659,6 +668,7 @@ export class ChaopApp extends LitElement {
           </div>
           <span class=${`chip ${turn.status}`}>${turnStatusLabel(turn.status)}</span>
         </header>
+        ${this.renderPendingInteractions(turn)}
         ${this.renderTurnBody(turn)}
         ${latestProgress.length > 0
           ? html`
@@ -699,6 +709,135 @@ export class ChaopApp extends LitElement {
       `;
     }
     return this.renderPendingTurnBody(turn);
+  }
+
+  private renderPendingInteractions(turn: ThreadTurnSummary) {
+    if (turn.pending_interactions.length === 0) return nothing;
+    return html`
+      <div class="turn-interactions">
+        ${turn.pending_interactions.map((interaction) => this.renderPendingInteraction(interaction))}
+      </div>
+    `;
+  }
+
+  private renderPendingInteraction(interaction: PendingTurnInteraction) {
+    const payload = interaction.payload;
+    const submitting = Boolean(this.interactionSubmitting[interaction.event_id]);
+    if (payload.request_kind === "input") {
+      const questions = payload.questions ?? [];
+      const complete = questions.every((question) => this.interactionAnswer(interaction.event_id, question.id).trim().length > 0);
+      return html`
+        <section class="interaction-card input">
+          <header>
+            <div>
+              <span>Input requested</span>
+              <strong>${payload.title}</strong>
+            </div>
+            <span>${questions.length} ${questions.length === 1 ? "question" : "questions"}</span>
+          </header>
+          ${payload.detail ? html`<p>${payload.detail}</p>` : nothing}
+          <div class="interaction-questions">
+            ${questions.map(
+              (question) => html`
+                <label>
+                  <span>${question.header}</span>
+                  <small>${question.question}</small>
+                  ${question.options && question.options.length > 0
+                    ? html`
+                        <select
+                          .value=${this.interactionAnswer(interaction.event_id, question.id)}
+                          @change=${(event: Event) =>
+                            this.setInteractionAnswer(
+                              interaction.event_id,
+                              question.id,
+                              (event.target as HTMLSelectElement).value
+                            )}
+                        >
+                          <option value="">Choose an answer</option>
+                          ${question.options.map(
+                            (option) => html`<option value=${option.label}>${option.label}</option>`
+                          )}
+                        </select>
+                      `
+                    : html`
+                        <input
+                          type=${question.is_secret ? "password" : "text"}
+                          .value=${this.interactionAnswer(interaction.event_id, question.id)}
+                          @input=${(event: InputEvent) =>
+                            this.setInteractionAnswer(
+                              interaction.event_id,
+                              question.id,
+                              (event.target as HTMLInputElement).value
+                            )}
+                        />
+                      `}
+                </label>
+              `
+            )}
+          </div>
+          <div class="interaction-actions">
+            <button
+              type="button"
+              class="primary-action"
+              title=${this.safetyButtonTitle("turn_interaction")}
+              ?disabled=${submitting || !complete || this.safetyBlocked("turn_interaction")}
+              @click=${() => void this.submitInputInteraction(interaction)}
+            >
+              ${submitting ? "Sending..." : "Send input"}
+            </button>
+          </div>
+        </section>
+      `;
+    }
+
+    return html`
+      <section class="interaction-card approval">
+        <header>
+          <div>
+            <span>Approval requested</span>
+            <strong>${payload.title}</strong>
+          </div>
+          <span>${payload.subject ? formatMode(payload.subject) : "approval"}</span>
+        </header>
+        ${payload.detail ? html`<p>${payload.detail}</p>` : nothing}
+        ${payload.command ? html`<pre><code>${payload.command}</code></pre>` : nothing}
+        ${payload.cwd || payload.grant_root
+          ? html`
+              <dl>
+                ${payload.cwd ? html`<div><dt>Cwd</dt><dd>${payload.cwd}</dd></div>` : nothing}
+                ${payload.grant_root ? html`<div><dt>Grant root</dt><dd>${payload.grant_root}</dd></div>` : nothing}
+              </dl>
+            `
+          : nothing}
+        <div class="interaction-actions">
+          <button
+            type="button"
+            class="primary-action"
+            title=${this.safetyButtonTitle("turn_interaction")}
+            ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
+            @click=${() => void this.resolveApprovalInteraction(interaction, "accept")}
+          >
+            Approve
+          </button>
+          <button
+            type="button"
+            title=${this.safetyButtonTitle("turn_interaction")}
+            ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
+            @click=${() => void this.resolveApprovalInteraction(interaction, "acceptForSession")}
+          >
+            Approve for session
+          </button>
+          <button
+            type="button"
+            title=${this.safetyButtonTitle("turn_interaction")}
+            ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
+            @click=${() => void this.resolveApprovalInteraction(interaction, "decline")}
+          >
+            Decline
+          </button>
+        </div>
+      </section>
+    `;
   }
 
   private renderPendingTurnBody(turn: ThreadTurnSummary) {
@@ -1174,6 +1313,82 @@ export class ChaopApp extends LitElement {
       this.actionError = actionErrorMessage("Thread refresh failed", error);
     }
   };
+
+  private interactionAnswer(eventId: string, questionId: string): string {
+    return this.interactionDrafts[eventId]?.[questionId] ?? "";
+  }
+
+  private setInteractionAnswer(eventId: string, questionId: string, value: string): void {
+    this.interactionDrafts = {
+      ...this.interactionDrafts,
+      [eventId]: {
+        ...(this.interactionDrafts[eventId] ?? {}),
+        [questionId]: value
+      }
+    };
+  }
+
+  private setInteractionSubmitting(eventId: string, submitting: boolean): void {
+    this.interactionSubmitting = {
+      ...this.interactionSubmitting,
+      [eventId]: submitting
+    };
+  }
+
+  private async resolveApprovalInteraction(
+    interaction: PendingTurnInteraction,
+    decision: TurnInteractionApprovalDecision
+  ): Promise<void> {
+    this.actionError = undefined;
+    this.actionNotice = undefined;
+    if (!this.guardSafetyAction("turn_interaction")) return;
+    this.setInteractionSubmitting(interaction.event_id, true);
+    try {
+      const response = await resolveTurnInteraction(interaction.event_id, {
+        kind: "approval",
+        decision
+      });
+      this.applyThreadEvent(response.event);
+      this.actionNotice = "Approval response sent.";
+      await this.loadSelectedThreadEvents();
+    } catch (error) {
+      this.mergeSafetyPostureFromError(error);
+      this.actionError = actionErrorMessage("Approval response failed", error);
+    } finally {
+      this.setInteractionSubmitting(interaction.event_id, false);
+    }
+  }
+
+  private async submitInputInteraction(interaction: PendingTurnInteraction): Promise<void> {
+    this.actionError = undefined;
+    this.actionNotice = undefined;
+    if (!this.guardSafetyAction("turn_interaction")) return;
+    const answers: Record<string, { answers: string[] }> = {};
+    for (const question of interaction.payload.questions ?? []) {
+      const answer = this.interactionAnswer(interaction.event_id, question.id).trim();
+      if (answer.length > 0) {
+        answers[question.id] = { answers: [answer] };
+      }
+    }
+    this.setInteractionSubmitting(interaction.event_id, true);
+    try {
+      const response = await resolveTurnInteraction(interaction.event_id, {
+        kind: "input",
+        answers
+      });
+      this.applyThreadEvent(response.event);
+      this.interactionDrafts = Object.fromEntries(
+        Object.entries(this.interactionDrafts).filter(([eventId]) => eventId !== interaction.event_id)
+      );
+      this.actionNotice = "Input response sent.";
+      await this.loadSelectedThreadEvents();
+    } catch (error) {
+      this.mergeSafetyPostureFromError(error);
+      this.actionError = actionErrorMessage("Input response failed", error);
+    } finally {
+      this.setInteractionSubmitting(interaction.event_id, false);
+    }
+  }
 
   private async toggleTaskArchive(task: TaskSummary): Promise<void> {
     const action = task.archived_at ? "Unarchive" : "Archive";
@@ -2081,6 +2296,7 @@ function cleanApiErrorMessage(message: string): string {
 
 function commandStateForEvent(kind: ThreadEvent["kind"]): CommandSummary["state"] | undefined {
   if (kind === "command.started") return "running";
+  if (kind === "approval.resolved" || kind === "input.received") return "running";
   if (kind === "command.finished") return "succeeded";
   if (kind === "command.failed") return "failed";
   return undefined;
@@ -2088,6 +2304,9 @@ function commandStateForEvent(kind: ThreadEvent["kind"]): CommandSummary["state"
 
 function taskStateForEvent(kind: ThreadEvent["kind"]): TaskSummary["state"] | undefined {
   if (kind === "command.started") return "running";
+  if (kind === "approval.requested") return "waiting_for_approval";
+  if (kind === "input.requested") return "waiting_for_input";
+  if (kind === "approval.resolved" || kind === "input.received") return "running";
   if (kind === "command.finished") return "done";
   if (kind === "command.failed") return "failed";
   return undefined;

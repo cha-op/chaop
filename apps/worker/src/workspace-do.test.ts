@@ -2793,6 +2793,7 @@ function dogfoodSafetyBlockedAgentEventDb(): D1Database & {
             kind: string,
             priority: string,
             summary: string,
+            payloadJson: string | null,
             createdAt: string
           ) {
             assert.match(id, /^event-/);
@@ -2807,6 +2808,7 @@ function dogfoodSafetyBlockedAgentEventDb(): D1Database & {
             } else {
               assert.equal(summary, "Started while paused");
             }
+            assert.equal(payloadJson, null);
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             return {
               async run() {
@@ -2964,6 +2966,7 @@ function dogfoodSafetyBlockedTerminalAgentEventDb(): D1Database & {
             kind: string,
             priority: string,
             summary: string,
+            payloadJson: string | null,
             createdAt: string
           ) {
             assert.match(id, /^event-/);
@@ -2974,6 +2977,7 @@ function dogfoodSafetyBlockedTerminalAgentEventDb(): D1Database & {
             assert.equal(kind, "command.finished");
             assert.equal(priority, "P1");
             assert.equal(summary, "Finished while paused");
+            assert.equal(payloadJson, null);
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             return {
               async run() {

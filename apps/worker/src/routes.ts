@@ -14,12 +14,15 @@ import {
   type HostSessionSummary,
   type LocalThreadCreateResult,
   type RefreshHostSessionsResponse,
+  type ResolveTurnInteractionRequest,
+  type ResolveTurnInteractionResponse,
   type SetDogfoodSafetyPauseRequest,
   type SetDogfoodSafetyPauseResponse,
   type TaskArchiveResponse,
   type TaskArchiveSyncSummary,
   type ThreadEvent,
-  type ThreadEventsResponse
+  type ThreadEventsResponse,
+  type TurnInteractionResponseDispatch
 } from "@chaop/protocol";
 import {
   authenticateAgentBootstrap,
@@ -49,6 +52,8 @@ import {
   loadDogfoodSafetyPostureFromDb,
   loadHostSessionInDb,
   markHostSessionAppServerPresentInDb,
+  prepareTurnInteractionResolutionInDb,
+  recordTurnInteractionResolutionInDb,
   recordHostSessionBackfillEvents,
   recordHostSessions,
   setDogfoodSafetyPauseInDb,
@@ -359,6 +364,50 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
   }
 
+  const turnInteractionMatch = url.pathname.match(/^\/api\/thread-events\/([^/]+)\/interaction$/);
+  if (request.method === "POST" && turnInteractionMatch) {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+    if (!env.WORKSPACE_DO) return json(request, env, { error: "Workspace Durable Object binding is unavailable" }, 503);
+
+    const payload = await readJson(request);
+    if (!payload.ok) {
+      return json(request, env, { error: payload.message }, 400);
+    }
+    if (!isResolveTurnInteractionRequest(payload.value)) {
+      return json(request, env, { error: "Invalid turn interaction payload" }, 400);
+    }
+
+    try {
+      const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "turn_interaction");
+      if (safetyResponse) return safetyResponse;
+      const eventId = decodeURIComponent(turnInteractionMatch[1] ?? "");
+      const dispatch = await prepareTurnInteractionResolutionInDb(env, eventId, payload.value);
+      await requestTurnInteractionResolution(env, dispatch);
+      const event = await recordTurnInteractionResolutionInDb(env, eventId, payload.value);
+      await broadcastThreadEvents(env, [event]);
+      const response: ResolveTurnInteractionResponse = {
+        accepted: true,
+        event
+      };
+      return json(request, env, response, 202);
+    } catch (error) {
+      if (error instanceof CommandTargetError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      if (error instanceof ConnectorRpcError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      if (error instanceof NotFoundError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      throw error;
+    }
+  }
+
   const attachHostSessionMatch = url.pathname.match(/^\/api\/host-sessions\/([^/]+)\/attach$/);
   if (request.method === "POST" && attachHostSessionMatch) {
     const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
@@ -657,6 +706,25 @@ async function broadcastThreadEvents(env: Env, events: ThreadEvent[]): Promise<v
     method: "POST",
     body: JSON.stringify({ events })
   });
+}
+
+async function requestTurnInteractionResolution(
+  env: Env,
+  dispatch: TurnInteractionResponseDispatch
+): Promise<void> {
+  if (!env.WORKSPACE_DO) {
+    throw new ConnectorRpcError("Workspace Durable Object binding is unavailable", 503);
+  }
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  const response = await stub.fetch("https://workspace-do/internal/resolve-turn-interaction", {
+    method: "POST",
+    body: JSON.stringify(dispatch)
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => undefined) as { error?: string } | undefined;
+    throw new ConnectorRpcError(body?.error ?? "Connector could not receive the turn interaction response", response.status);
+  }
 }
 
 async function requestHostSessionRefresh(env: Env): Promise<{
@@ -1045,6 +1113,27 @@ function isCreateCommandRequest(value: unknown): value is CreateCommandRequest {
   );
 }
 
+function isResolveTurnInteractionRequest(value: unknown): value is ResolveTurnInteractionRequest {
+  if (!isRecord(value)) return false;
+  if (value.kind === "approval") {
+    return (
+      value.decision === "accept" ||
+      value.decision === "acceptForSession" ||
+      value.decision === "decline" ||
+      value.decision === "cancel"
+    );
+  }
+  if (value.kind === "input") {
+    return isRecord(value.answers) &&
+      Object.values(value.answers).every((answer) =>
+        isRecord(answer) &&
+        Array.isArray(answer.answers) &&
+        answer.answers.every((item) => typeof item === "string")
+      );
+  }
+  return false;
+}
+
 function isSetDogfoodSafetyPauseRequest(value: unknown): value is SetDogfoodSafetyPauseRequest {
   return isRecord(value) && optionalString(value.reason);
 }
@@ -1124,6 +1213,9 @@ function isThreadEventKind(value: unknown): boolean {
     value === "command.finished" ||
     value === "command.failed" ||
     value === "approval.requested" ||
+    value === "approval.resolved" ||
+    value === "input.requested" ||
+    value === "input.received" ||
     value === "notice.throttled"
   );
 }

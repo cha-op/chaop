@@ -4,7 +4,8 @@ use crate::executor::{codex_exec_result_events_with_cancel, codex_exec_started_e
 use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
 use crate::session_inventory::{
-    AgentHostSessionsReport, InventoryScope, app_server_command_result_events_with_cancel,
+    AgentHostSessionsReport, AppServerCommandChannels, InventoryScope,
+    TurnInteractionResponseDispatch, app_server_command_result_events_with_cancel,
     app_server_command_started_event, build_host_session_backfill, build_host_sessions_report,
     create_app_server_thread, ensure_app_server_host_session, set_app_server_thread_archived,
 };
@@ -1202,19 +1203,29 @@ fn wait_for_app_server_command_events(
     let cwd = cwd.map(ToOwned::to_owned);
     let command_id = command_id.to_owned();
     let prompt = prompt.to_owned();
-    let (sender, receiver) = mpsc::channel();
+    let worker_session_id = session_id.clone();
+    let worker_cwd = cwd.clone();
+    let worker_command_id = command_id.clone();
+    let worker_prompt = prompt.clone();
+    let (result_sender, result_receiver) = mpsc::channel();
+    let (event_sender, event_receiver) = mpsc::channel();
+    let (interaction_sender, interaction_receiver) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     let mut worker = Some(thread::spawn(move || {
         let events = app_server_command_result_events_with_cancel(
             &worker_config,
-            &session_id,
-            cwd.as_deref(),
-            &command_id,
-            &prompt,
+            &worker_session_id,
+            worker_cwd.as_deref(),
+            &worker_command_id,
+            &worker_prompt,
             worker_cancel,
+            Some(AppServerCommandChannels {
+                event_sender,
+                interaction_receiver,
+            }),
         );
-        let _ = sender.send(events);
+        let _ = result_sender.send(events);
     }));
 
     set_socket_read_timeout(socket, Some(connector_read_tick()))?;
@@ -1223,7 +1234,7 @@ fn wait_for_app_server_command_events(
             cancel_codex_worker(&cancel, worker.take())?;
             return Err("connector shutdown requested while app-server command was running".into());
         }
-        match receiver.try_recv() {
+        match result_receiver.try_recv() {
             Ok(events) => {
                 join_codex_worker(worker.take())?;
                 set_socket_read_timeout(socket, Some(connector_read_tick()))?;
@@ -1233,6 +1244,31 @@ fn wait_for_app_server_command_events(
                 join_codex_worker(worker.take())?;
                 return Err("app-server command worker stopped before returning events".into());
             }
+            Err(TryRecvError::Empty) => {}
+        }
+
+        match event_receiver.try_recv() {
+            Ok(event) => {
+                if !dispatch_events(
+                    socket,
+                    &CommandPayload {
+                        id: command_id.clone(),
+                        command_type: CommandType::Codex,
+                        prompt: prompt.clone(),
+                    },
+                    vec![event],
+                    &runtime_config,
+                    app_server_instances_state,
+                    host_sessions_state,
+                    deferred_messages,
+                )? {
+                    cancel_codex_worker(&cancel, worker.take())?;
+                    return Err(
+                        "app-server interaction event was rejected by the control plane".into(),
+                    );
+                }
+            }
+            Err(TryRecvError::Disconnected) => {}
             Err(TryRecvError::Empty) => {}
         }
 
@@ -1256,17 +1292,25 @@ fn wait_for_app_server_command_events(
 
         let socket_result: Result<(), Box<dyn std::error::Error>> = match socket.read() {
             Ok(Message::Text(text)) => {
-                match apply_agent_ready_ack_text(text.as_ref(), agent_ready_state) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => handle_background_text_message(
-                        socket,
-                        text.as_ref(),
-                        &runtime_config,
-                        app_server_instances_state,
-                        host_sessions_state,
-                        deferred_messages,
-                    ),
-                    Err(error) => Err(Box::new(error)),
+                if handle_turn_interaction_response_text(
+                    text.as_ref(),
+                    &command_id,
+                    &interaction_sender,
+                )? {
+                    Ok(())
+                } else {
+                    match apply_agent_ready_ack_text(text.as_ref(), agent_ready_state) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => handle_background_text_message(
+                            socket,
+                            text.as_ref(),
+                            &runtime_config,
+                            app_server_instances_state,
+                            host_sessions_state,
+                            deferred_messages,
+                        ),
+                        Err(error) => Err(Box::new(error)),
+                    }
                 }
             }
             Ok(Message::Ping(payload)) => socket
@@ -1288,6 +1332,22 @@ fn wait_for_app_server_command_events(
             return Err(error);
         }
     }
+}
+
+fn handle_turn_interaction_response_text(
+    text: &str,
+    command_id: &str,
+    sender: &mpsc::Sender<TurnInteractionResponseDispatch>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let envelope: Envelope = serde_json::from_str(text)?;
+    if envelope.kind != "turn.interaction_response" {
+        return Ok(false);
+    }
+    let dispatch: TurnInteractionResponseDispatch = serde_json::from_value(envelope.payload)?;
+    if dispatch.command_id == command_id {
+        sender.send(dispatch)?;
+    }
+    Ok(true)
 }
 
 fn cancel_codex_worker(
@@ -1377,11 +1437,13 @@ fn command_events(command: &CommandPayload) -> Vec<ConnectorEvent> {
                 priority: "P1".to_owned(),
                 summary: "Connector received a Codex command, but the CLI fallback is disabled."
                     .to_owned(),
+                payload: None,
             },
             ConnectorEvent {
                 kind: "command.failed".to_owned(),
                 priority: "P1".to_owned(),
                 summary: "Codex CLI fallback is disabled in this connector config.".to_owned(),
+                payload: None,
             },
         ],
     }
@@ -1393,6 +1455,7 @@ fn app_server_missing_target_events() -> Vec<ConnectorEvent> {
         priority: "P1".to_owned(),
         summary: "Codex app-server execution requires an attached local app-server session."
             .to_owned(),
+        payload: None,
     }]
 }
 
@@ -1401,6 +1464,7 @@ fn app_server_wrong_execution_mode_events() -> Vec<ConnectorEvent> {
         kind: "command.failed".to_owned(),
         priority: "P1".to_owned(),
         summary: "Attached app-server sessions require execution.mode = \"app_server\".".to_owned(),
+        payload: None,
     }]
 }
 
@@ -1411,6 +1475,7 @@ fn app_server_non_app_server_target_events(session_id: &str) -> Vec<ConnectorEve
         summary: format!(
             "Attached local session {session_id} is not available through Codex app-server."
         ),
+        payload: None,
     }]
 }
 
@@ -1474,27 +1539,22 @@ fn agent_event_message(
     event: &ConnectorEvent,
     target_host_session_id: Option<&str>,
 ) -> Value {
-    match target_host_session_id.filter(|_| event.kind == "command.started") {
-        Some(session_id) => json!({
-            "kind": "agent.event",
-            "payload": {
-                "command_id": command.id,
-                "target_host_session_id": session_id,
-                "kind": event.kind,
-                "priority": event.priority,
-                "summary": event.summary
-            }
-        }),
-        None => json!({
-            "kind": "agent.event",
-            "payload": {
-                "command_id": command.id,
-                "kind": event.kind,
-                "priority": event.priority,
-                "summary": event.summary
-            }
-        }),
+    let mut payload = serde_json::Map::new();
+    payload.insert("command_id".to_owned(), json!(command.id));
+    if let Some(session_id) = target_host_session_id.filter(|_| event.kind == "command.started") {
+        payload.insert("target_host_session_id".to_owned(), json!(session_id));
     }
+    payload.insert("kind".to_owned(), json!(event.kind));
+    payload.insert("priority".to_owned(), json!(event.priority));
+    payload.insert("summary".to_owned(), json!(event.summary));
+    if let Some(event_payload) = &event.payload {
+        payload.insert("payload".to_owned(), event_payload.clone());
+    }
+
+    json!({
+        "kind": "agent.event",
+        "payload": Value::Object(payload)
+    })
 }
 
 fn configure_socket(socket: &mut AgentSocket) -> std::io::Result<()> {
@@ -1722,6 +1782,7 @@ mod tests {
             priority: "P1".to_owned(),
             summary: "Connector started Codex app-server turn for local thread session-1."
                 .to_owned(),
+            payload: None,
         };
 
         let message = agent_event_message(&command, &event, Some("session-1"));
@@ -1749,6 +1810,7 @@ mod tests {
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
             summary: "Progress".to_owned(),
+            payload: None,
         };
 
         let message = agent_event_message(&command, &event, Some("session-1"));

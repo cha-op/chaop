@@ -3335,6 +3335,7 @@ function staleExplicitAppServerTargetDb(options: {
             kind: string,
             priority: string,
             summary: string,
+            payloadJson: string | null,
             createdAt: string
           ) {
             assert.match(eventId, /^event-/);
@@ -3344,6 +3345,7 @@ function staleExplicitAppServerTargetDb(options: {
             assert.equal(seq, 1);
             assert.equal(kind, "command.failed");
             assert.equal(priority, "P1");
+            assert.equal(payloadJson, null);
             assert.equal(
               summary,
               targetConnectorIdSource === "explicit"

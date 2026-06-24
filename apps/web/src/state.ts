@@ -13,6 +13,7 @@ import type {
   HostSessionSyncSummary,
   TaskArchiveResponse,
   ThreadEvent,
+  TurnInteractionRequestPayload,
   ThreadSummary
 } from "@chaop/protocol";
 
@@ -32,6 +33,12 @@ export type ThreadTurnSummary = {
   last_seq: number;
   updated_at: string;
   events: ThreadEvent[];
+  pending_interactions: PendingTurnInteraction[];
+};
+
+export type PendingTurnInteraction = {
+  event_id: string;
+  payload: TurnInteractionRequestPayload;
 };
 
 export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
@@ -148,7 +155,8 @@ function historyTurnFromDraft(draft: HistoryTurnDraft): ThreadTurnSummary {
     event_count: sortedEvents.length,
     last_seq: Math.max(0, ...sortedEvents.map((event) => event.seq)),
     updated_at: historyTurnUpdatedAt(sortedEvents),
-    events: sortedEvents
+    events: sortedEvents,
+    pending_interactions: []
   };
 }
 
@@ -235,7 +243,8 @@ function buildThreadTurn(
     event_count: sortedEvents.length,
     last_seq: Math.max(0, ...sortedEvents.map((event) => event.seq)),
     updated_at: updatedAt,
-    events: sortedEvents
+    events: sortedEvents,
+    pending_interactions: pendingTurnInteractions(sortedEvents)
   };
 }
 
@@ -243,12 +252,44 @@ function threadTurnStatusFromEvents(events: ThreadEvent[]): ThreadTurnStatus | u
   let status: ThreadTurnStatus | undefined;
   for (const event of events) {
     if (event.kind === "command.accepted") status = "pending";
-    if (event.kind === "command.started" || event.kind === "command.output") status = "running";
-    if (event.kind === "approval.requested" || event.kind === "notice.throttled") status = "waiting";
+    if (
+      event.kind === "command.started" ||
+      event.kind === "command.output" ||
+      event.kind === "approval.resolved" ||
+      event.kind === "input.received"
+    ) {
+      status = "running";
+    }
+    if (
+      event.kind === "approval.requested" ||
+      event.kind === "input.requested" ||
+      event.kind === "notice.throttled"
+    ) {
+      status = "waiting";
+    }
     if (event.kind === "command.finished") status = "succeeded";
     if (event.kind === "command.failed") status = "failed";
   }
   return status;
+}
+
+function pendingTurnInteractions(events: ThreadEvent[]): PendingTurnInteraction[] {
+  const resolved = new Set<string>();
+  for (const event of events) {
+    const payload = event.payload;
+    if (payload?.type !== "turn_interaction_resolution") continue;
+    resolved.add(payload.interaction_id);
+  }
+
+  return events
+    .filter((event) => {
+      const payload = event.payload;
+      return payload?.type === "turn_interaction" && !resolved.has(payload.interaction_id);
+    })
+    .map((event) => ({
+      event_id: event.id,
+      payload: event.payload as TurnInteractionRequestPayload
+    }));
 }
 
 function threadTurnStatusFromCommand(command: CommandSummary): ThreadTurnStatus {
@@ -463,6 +504,7 @@ const DEFAULT_SAFETY_ACTIONS: DogfoodSafetyAction[] = [
   "host_session_attach",
   "host_session_detach",
   "task_archive",
+  "turn_interaction",
   "budget_bootstrap",
   "agent_event",
   "app_server_instances_report"

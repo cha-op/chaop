@@ -869,6 +869,104 @@ textarea {
   white-space: pre-wrap;
 }
 
+.turn-interactions {
+  display: grid;
+  gap: 10px;
+}
+
+.interaction-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #f6c86f;
+  border-radius: 8px;
+  background: #fffaf0;
+  padding: 12px;
+}
+
+.interaction-card.input {
+  border-color: #a7d7c5;
+  background: #f3fbf8;
+}
+
+.interaction-card header,
+.interaction-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.interaction-card header div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.interaction-card header span,
+.interaction-card label span,
+.interaction-card small {
+  color: #64748b;
+  font-size: 0.82rem;
+}
+
+.interaction-card p {
+  margin: 0;
+  color: #334155;
+  overflow-wrap: anywhere;
+}
+
+.interaction-card pre {
+  margin: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 10px;
+}
+
+.interaction-card dl {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.interaction-card dl div {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.interaction-card dt {
+  color: #64748b;
+}
+
+.interaction-card dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.interaction-questions {
+  display: grid;
+  gap: 10px;
+}
+
+.interaction-questions label {
+  display: grid;
+  gap: 6px;
+}
+
+.interaction-questions select,
+.interaction-questions input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: inherit;
+}
+
 .turn-progress {
   display: grid;
   gap: 4px;

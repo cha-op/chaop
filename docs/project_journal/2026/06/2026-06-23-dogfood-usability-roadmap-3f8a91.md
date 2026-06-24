@@ -42,5 +42,5 @@ superseded_by:
 
 ## Current Next Step
 - PR A landed through [PR #19](https://github.com/cha-op/chaop/pull/19).
-- PR B is implemented on `wip/thread-centre-chat-mvp`.
-- PR C is the next planned slice: human-in-the-loop approval and input handling for Codex app-server turns.
+- PR B landed through [PR #20](https://github.com/cha-op/chaop/pull/20).
+- PR C is being implemented on `wip/human-in-loop-turns`: human-in-the-loop approval and input handling for Codex app-server turns.

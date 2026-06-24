@@ -1015,6 +1015,79 @@ test("threadTurnsForDisplay preserves terminal command state when the event tail
   assert.equal(turns[0]?.assistant_summary, "Done.");
 });
 
+test("threadTurnsForDisplay exposes pending approval interactions", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [command("command-1", { state: "running" })],
+    [
+      event("event-1", "command-1", 1, "command.started", "Connector started Codex app-server turn."),
+      event("event-2", "command-1", 2, "approval.requested", "Approval requested.", {
+        payload: {
+          type: "turn_interaction",
+          interaction_id: "interaction-1",
+          status: "pending",
+          method: "item/commandExecution/requestApproval",
+          request_kind: "approval",
+          subject: "command_execution",
+          app_server_thread_id: "app-thread-1",
+          app_server_turn_id: "app-turn-1",
+          title: "Approve command execution",
+          command: "touch requested.txt",
+          cwd: "/tmp/project"
+        }
+      })
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "waiting");
+  assert.equal(turns[0]?.pending_interactions.length, 1);
+  assert.equal(turns[0]?.pending_interactions[0]?.payload.interaction_id, "interaction-1");
+});
+
+test("threadTurnsForDisplay clears resolved interactions", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [command("command-1", { state: "running" })],
+    [
+      event("event-1", "command-1", 1, "command.started", "Connector started Codex app-server turn."),
+      event("event-2", "command-1", 2, "input.requested", "Input requested.", {
+        payload: {
+          type: "turn_interaction",
+          interaction_id: "interaction-1",
+          status: "pending",
+          method: "item/tool/requestUserInput",
+          request_kind: "input",
+          app_server_thread_id: "app-thread-1",
+          app_server_turn_id: "app-turn-1",
+          title: "Provide requested input",
+          questions: [
+            {
+              id: "q1",
+              header: "Confirm",
+              question: "Continue?",
+              is_other: false,
+              is_secret: false
+            }
+          ]
+        }
+      }),
+      event("event-3", "command-1", 3, "input.received", "Input provided.", {
+        payload: {
+          type: "turn_interaction_resolution",
+          interaction_id: "interaction-1",
+          status: "answered",
+          answer_count: 1
+        }
+      })
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "running");
+  assert.equal(turns[0]?.pending_interactions.length, 0);
+});
+
 test("threadTurnsForDisplay renders commandless backfilled history turns", () => {
   const turns = threadTurnsForDisplay(
     "thread-1",
@@ -1272,6 +1345,7 @@ function safety(): BootstrapPayload["safety"] {
       "host_session_attach",
       "host_session_detach",
       "task_archive",
+      "turn_interaction",
       "budget_bootstrap",
       "agent_event",
       "app_server_instances_report"
