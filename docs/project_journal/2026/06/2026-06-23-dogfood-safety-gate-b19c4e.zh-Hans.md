@@ -1,6 +1,6 @@
 ---
 id: 20260623-b19c4e-zh-Hans
-title: Dogfood Safety Gate
+title: 试用安全闸门
 status: active
 created: 2026-06-23
 updated: 2026-06-23
@@ -12,7 +12,7 @@ superseded_by:
 
 [ [British English](2026-06-23-dogfood-safety-gate-b19c4e.md) | 简体中文 ]
 
-# Dogfood Safety Gate
+# 试用安全闸门
 
 ## 摘要
 - PR A 从已更新的 `master` 开始，app-server attach/resume PR 已经合并。
@@ -59,6 +59,7 @@ superseded_by:
 - 已修复同一 Cloudflare telemetry bucket 内的持久化路径：累计 counters 增长时会更新既有 bucket row，让后续 write guards 与最近一次显式 safety 或 budget refresh 对齐。
 - 受保护写路径读取 telemetry 时现在会按当前 UTC 日分别取每个 metric 的已持久化最大累计 counter，因此后续更低的 Cloudflare sample 不会放松更早触发的 hard limit。
 - production Host Session refresh 现在会在 D1 binding 不可用时 fail closed，同时 sample mode refresh 继续由 sample safety 控制。
+- `/api/safety-posture` 返回前现在会把 live safety refresh telemetry 和当前日已持久化最大值合并，保持 Browser controls 与受保护写入决策一致。
 
 ## 本地验证
 - `pnpm --filter @chaop/web test`

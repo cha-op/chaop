@@ -281,10 +281,11 @@ export async function loadDogfoodSafetyPostureFromDb(
     });
   }
 
-  const telemetryPromise = options.refreshCloudflareTelemetry
+  const liveTelemetryPromise = options.refreshCloudflareTelemetry
     ? loadCloudflareTelemetryBestEffort(env, effectiveGeneratedAt)
-    : loadMaxPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt);
-  const [pause, daily, fourHour, burst, connectorStates, taskStates, telemetry] = await Promise.all([
+    : Promise.resolve(undefined);
+  const persistedTelemetryPromise = loadMaxPersistedCloudflareTelemetrySample(env, effectiveGeneratedAt);
+  const [pause, daily, fourHour, burst, connectorStates, taskStates, liveTelemetry, persistedTelemetry] = await Promise.all([
     loadDogfoodSafetyPause(env, effectiveGeneratedAt),
     currentUsageWindow(env, "daily", effectiveGeneratedAt),
     currentUsageWindow(env, "four_hour", effectiveGeneratedAt),
@@ -295,10 +296,14 @@ export async function loadDogfoodSafetyPostureFromDb(
     snapshots.tasks
       ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
       : listTaskBudgetStates(env),
-    telemetryPromise
+    liveTelemetryPromise,
+    persistedTelemetryPromise
   ]);
+  const telemetry = options.refreshCloudflareTelemetry
+    ? mergeCloudflareTelemetrySamples(liveTelemetry, persistedTelemetry)
+    : persistedTelemetry;
   if (options.refreshCloudflareTelemetry) {
-    await persistBudgetTelemetrySampleBestEffort(env, telemetry, effectiveGeneratedAt);
+    await persistBudgetTelemetrySampleBestEffort(env, liveTelemetry, effectiveGeneratedAt);
   }
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
@@ -4614,6 +4619,32 @@ async function loadMaxPersistedCloudflareTelemetrySample(
     });
     return undefined;
   }
+}
+
+function mergeCloudflareTelemetrySamples(
+  live: CloudflareTelemetrySample | undefined,
+  persisted: CloudflareTelemetrySample | undefined
+): CloudflareTelemetrySample | undefined {
+  if (!live) return persisted;
+  if (!persisted) return live;
+  return {
+    windowStart: live.windowStart,
+    windowEnd: live.windowEnd,
+    updatedAt: newerIso(live.updatedAt, persisted.updatedAt),
+    workerRequestsDaily: maxOptionalMetric(live.workerRequestsDaily, persisted.workerRequestsDaily),
+    durableObjectRequestEquivalentsDaily: maxOptionalMetric(
+      live.durableObjectRequestEquivalentsDaily,
+      persisted.durableObjectRequestEquivalentsDaily
+    ),
+    d1RowsReadDaily: maxOptionalMetric(live.d1RowsReadDaily, persisted.d1RowsReadDaily),
+    d1RowsWrittenDaily: maxOptionalMetric(live.d1RowsWrittenDaily, persisted.d1RowsWrittenDaily)
+  };
+}
+
+function maxOptionalMetric(left: number | undefined, right: number | undefined): number | undefined {
+  if (left === undefined) return right;
+  if (right === undefined) return left;
+  return Math.max(left, right);
 }
 
 function cloudflareTelemetryCacheKey(env: Env, generatedAt: string): string {

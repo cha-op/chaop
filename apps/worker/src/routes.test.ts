@@ -2202,6 +2202,134 @@ test("safety posture uses live Cloudflare telemetry for hard limits", async () =
   }
 });
 
+test("safety posture keeps persisted max telemetry when live refresh is lower", async () => {
+  const originalFetch = globalThis.fetch;
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const tomorrowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const highSampleAt = new Date(todayStart.getTime() + 9 * 60 * 60 * 1000).toISOString();
+  const telemetrySamples: Record<string, unknown>[] = [
+    {
+      id: "sample-high",
+      sample_type: "cloudflare_daily",
+      sampled_at: highSampleAt,
+      window_start: todayStart.toISOString(),
+      window_end: tomorrowStart.toISOString(),
+      d1_rows_written_daily: 120_000,
+      d1_rows_read_daily: 100,
+      worker_requests_daily: 20,
+      durable_object_requests_daily: 40,
+      created_at: highSampleAt
+    }
+  ];
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 30 } }],
+            webWorkerInvocations: [],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 120, rowsWritten: 40_000 } }],
+            durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 50 } }],
+            durableObjectsPeriodicGroups: []
+          }
+        ]
+      }
+    }
+  }), {
+    headers: { "content-type": "application/json; charset=utf-8" }
+  })) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/safety-posture", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: safetyPauseDb({ telemetrySamples }),
+        CF_TELEMETRY_API_TOKEN: "safety-telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "safety-merge-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-safety-merge",
+        CF_TELEMETRY_D1_DATABASE_ID: "safety-merge-database"
+      }
+    );
+    const body = (await response.json()) as {
+      safety: {
+        state: string;
+        bottleneck_constraint?: { id?: string; state?: string; used_units?: number | null };
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.id, "d1_rows_written_daily");
+    assert.equal(body.safety.bottleneck_constraint?.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.used_units, 120_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("safety posture falls back to persisted max telemetry when live refresh fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const tomorrowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const highSampleAt = new Date(todayStart.getTime() + 9 * 60 * 60 * 1000).toISOString();
+  const telemetrySamples: Record<string, unknown>[] = [
+    {
+      id: "sample-high",
+      sample_type: "cloudflare_daily",
+      sampled_at: highSampleAt,
+      window_start: todayStart.toISOString(),
+      window_end: tomorrowStart.toISOString(),
+      d1_rows_written_daily: 120_000,
+      d1_rows_read_daily: 100,
+      worker_requests_daily: 20,
+      durable_object_requests_daily: 40,
+      created_at: highSampleAt
+    }
+  ];
+  globalThis.fetch = (async () => {
+    throw new Error("temporary telemetry failure");
+  }) as typeof fetch;
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/safety-posture", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: safetyPauseDb({ telemetrySamples }),
+        CF_TELEMETRY_API_TOKEN: "safety-telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "safety-fallback-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-safety-fallback",
+        CF_TELEMETRY_D1_DATABASE_ID: "safety-fallback-database"
+      }
+    );
+    const body = (await response.json()) as {
+      safety: {
+        state: string;
+        bottleneck_constraint?: { id?: string; state?: string; used_units?: number | null };
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.id, "d1_rows_written_daily");
+    assert.equal(body.safety.bottleneck_constraint?.state, "hard_limited");
+    assert.equal(body.safety.bottleneck_constraint?.used_units, 120_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("safety posture includes connector and task budget states", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/safety-posture", {
