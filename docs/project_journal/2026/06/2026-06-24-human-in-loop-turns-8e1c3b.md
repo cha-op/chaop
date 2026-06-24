@@ -46,10 +46,12 @@ superseded_by:
 - Browser-submitted interaction responses now must match the stored request payload: approval decisions are constrained by `available_decisions` when app-server supplied them, input answers must cover exactly the requested questions with non-empty answers, and Thread Centre renders the full network approval context so unknown safety-relevant fields are visible.
 - GitHub Codex follow-up fixes remove absolute workspace-shaped sample paths, use checked app-server auto-resolution deadline arithmetic, keep HITL response delivery acknowledgements pending until the app-server response is written, and handle HITL responses that arrive while the connector is still waiting for the request event acknowledgement.
 - The independent PR review found two fail-closed gaps. WorkspaceDO now rejects malformed required `approval.requested` and `input.requested` events with a negative ack before any DB write, and app-server `availableDecisions` now preserves an empty `available_decisions` list when supplied decisions are invalid so the browser and API do not fall back to unrestricted defaults.
+- Follow-up review found three remaining fail-closed and auditability gaps. Browser responses are now durably stored in the resolution claim before connector delivery, delivered claims can be retried without re-sending to app-server, input requests without valid questions are rejected before they become operator-visible, and malformed resolution payloads are rejected or ignored defensively before DB de-duplication code can throw.
 
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.
 - Resolution claims are scoped by command plus interaction so repeated app-server request IDs across turns do not strand later responses.
+- The response claim now also stores the submitted browser response and a delivered marker. This adds bounded low-frequency writes only when an operator resolves a HITL request, and avoids adding any background sweep or polling path.
 - Stale claim recovery is bounded to the response-dispatch path and does not add a background sweep.
 - WebSocket delivery remains the preferred realtime path. The existing 10-second fallback polling remains unchanged.
 - The new `turn_interaction` safety action allows the hard-limit and pause controls to block operator responses before they create D1 writes.

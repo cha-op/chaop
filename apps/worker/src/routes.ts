@@ -53,6 +53,7 @@ import {
   loadDogfoodSafetyPostureFromDb,
   loadHostSessionInDb,
   markHostSessionAppServerPresentInDb,
+  markTurnInteractionResolutionDeliveredInDb,
   prepareTurnInteractionResolutionInDb,
   recordTurnInteractionResolutionInDb,
   recordHostSessionBackfillEvents,
@@ -387,12 +388,24 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "turn_interaction");
       if (safetyResponse) return safetyResponse;
       const eventId = decodeURIComponent(turnInteractionMatch[1] ?? "");
-      const dispatch = await prepareTurnInteractionResolutionInDb(env, eventId, payload.value);
-      try {
-        await requestTurnInteractionResolution(env, dispatch);
-      } catch (error) {
-        await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
-        throw error;
+      const preparation = await prepareTurnInteractionResolutionInDb(env, eventId, payload.value);
+      const dispatch = preparation.dispatch;
+      let connectorDelivered = preparation.already_delivered;
+      if (!connectorDelivered) {
+        try {
+          await requestTurnInteractionResolution(env, dispatch);
+          connectorDelivered = true;
+        } catch (error) {
+          await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+          throw error;
+        }
+        try {
+          await markTurnInteractionResolutionDeliveredInDb(env, dispatch.command_id, dispatch.interaction_id);
+        } catch (error) {
+          console.warn("Turn interaction delivery marker failed", {
+            message: error instanceof Error ? error.message : String(error)
+          });
+        }
       }
       let event: ThreadEvent;
       try {
@@ -400,7 +413,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           allowExisting: true
         });
       } catch (error) {
-        await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+        if (!connectorDelivered) {
+          await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+        }
         throw error;
       }
       try {

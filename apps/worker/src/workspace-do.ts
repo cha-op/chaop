@@ -368,16 +368,16 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
-    const malformedRequiredTurnInteraction = malformedRequiredTurnInteractionEvent(message.payload);
-    if (message.kind === "agent.event" && malformedRequiredTurnInteraction) {
+    const malformedTurnInteraction = malformedTurnInteractionEvent(message.payload);
+    if (message.kind === "agent.event" && malformedTurnInteraction) {
       ws.send(
         JSON.stringify(
           createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
-            command_id: malformedRequiredTurnInteraction.command_id,
-            kind: malformedRequiredTurnInteraction.kind,
+            command_id: malformedTurnInteraction.command_id,
+            kind: malformedTurnInteraction.kind,
             accepted: false,
             dropped: true,
-            reason: "Turn interaction request payload is invalid"
+            reason: "Turn interaction payload is invalid"
           })
         )
       );
@@ -1544,6 +1544,8 @@ function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
   if (!validKind) return false;
   if (isRequiredTurnInteractionRequestKind(record.kind)) {
     if (!isTurnInteractionRequestPayloadForEvent(record.payload, record.kind)) return false;
+  } else if (isTurnInteractionResolutionKind(record.kind)) {
+    if (!isTurnInteractionResolutionPayloadForEvent(record.payload, record.kind)) return false;
   } else if (record.payload !== undefined && !isRecord(record.payload)) {
     return false;
   }
@@ -1559,13 +1561,20 @@ function isRequiredTurnInteractionRequestKind(kind: unknown): kind is "approval.
   return kind === "approval.requested" || kind === "input.requested";
 }
 
-function malformedRequiredTurnInteractionEvent(
+function malformedTurnInteractionEvent(
   value: unknown
-): { command_id: string; kind: "approval.requested" | "input.requested" } | undefined {
+): { command_id: string; kind: AgentCommandEvent["kind"] } | undefined {
   if (!isRecord(value)) return undefined;
-  if (!isRequiredTurnInteractionRequestKind(value.kind)) return undefined;
+  if (
+    !isRequiredTurnInteractionRequestKind(value.kind) &&
+    !isTurnInteractionResolutionKind(value.kind)
+  ) {
+    return undefined;
+  }
   if (isAgentCommandEvent(value)) return undefined;
-  return typeof value.command_id === "string" ? { command_id: value.command_id, kind: value.kind } : undefined;
+  return typeof value.command_id === "string"
+    ? { command_id: value.command_id, kind: value.kind as AgentCommandEvent["kind"] }
+    : undefined;
 }
 
 function isTurnInteractionRequestPayloadForEvent(
@@ -1574,19 +1583,89 @@ function isTurnInteractionRequestPayloadForEvent(
 ): value is TurnInteractionRequestPayload {
   if (!isRecord(value)) return false;
   const requestKind = kind === "approval.requested" ? "approval" : "input";
+  if (
+    !(
+      value.type === "turn_interaction" &&
+      typeof value.interaction_id === "string" &&
+      value.interaction_id.trim().length > 0 &&
+      value.status === "pending" &&
+      typeof value.method === "string" &&
+      value.request_kind === requestKind &&
+      typeof value.app_server_thread_id === "string" &&
+      value.app_server_thread_id.trim().length > 0 &&
+      typeof value.app_server_turn_id === "string" &&
+      value.app_server_turn_id.trim().length > 0 &&
+      typeof value.title === "string" &&
+      value.title.trim().length > 0
+    )
+  ) {
+    return false;
+  }
+  if (requestKind === "input") {
+    return Array.isArray(value.questions) &&
+      value.questions.length > 0 &&
+      value.questions.every(isTurnInteractionInputQuestion);
+  }
+  return true;
+}
+
+function isTurnInteractionInputQuestion(value: unknown): boolean {
+  if (!isRecord(value)) return false;
   return (
-    value.type === "turn_interaction" &&
-    typeof value.interaction_id === "string" &&
-    value.interaction_id.trim().length > 0 &&
-    value.status === "pending" &&
-    typeof value.method === "string" &&
-    value.request_kind === requestKind &&
-    typeof value.app_server_thread_id === "string" &&
-    value.app_server_thread_id.trim().length > 0 &&
-    typeof value.app_server_turn_id === "string" &&
-    value.app_server_turn_id.trim().length > 0 &&
-    typeof value.title === "string" &&
-    value.title.trim().length > 0
+    typeof value.id === "string" &&
+    value.id.trim().length > 0 &&
+    typeof value.header === "string" &&
+    value.header.trim().length > 0 &&
+    typeof value.question === "string" &&
+    value.question.trim().length > 0 &&
+    typeof value.is_other === "boolean" &&
+    typeof value.is_secret === "boolean" &&
+    (
+      value.options === undefined ||
+      (
+        Array.isArray(value.options) &&
+        value.options.every((option) =>
+          isRecord(option) &&
+          typeof option.label === "string" &&
+          option.label.trim().length > 0 &&
+          typeof option.description === "string"
+        )
+      )
+    )
+  );
+}
+
+function isTurnInteractionResolutionKind(kind: unknown): kind is "approval.resolved" | "input.received" {
+  return kind === "approval.resolved" || kind === "input.received";
+}
+
+function isTurnInteractionResolutionPayloadForEvent(
+  value: unknown,
+  kind: "approval.resolved" | "input.received"
+): boolean {
+  if (!isRecord(value)) return false;
+  if (
+    !(
+      value.type === "turn_interaction_resolution" &&
+      typeof value.interaction_id === "string" &&
+      value.interaction_id.trim().length > 0
+    )
+  ) {
+    return false;
+  }
+  if (kind === "input.received") {
+    return value.status === "answered" &&
+      (value.answer_count === undefined || isNonNegativeInteger(value.answer_count, 1000));
+  }
+  return (
+    (
+      value.status === "accepted" ||
+      value.status === "accepted_for_session" ||
+      value.status === "accepted_with_execpolicy_amendment" ||
+      value.status === "declined" ||
+      value.status === "cancelled"
+    ) &&
+    (value.decision === undefined || isTurnInteractionApprovalDecision(value.decision))
   );
 }
 

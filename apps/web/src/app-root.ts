@@ -726,7 +726,8 @@ export class ChaopApp extends LitElement {
     const submitting = Boolean(this.interactionSubmitting[interaction.event_id]);
     if (payload.request_kind === "input") {
       const questions = payload.questions ?? [];
-      const complete = questions.every((question) => this.resolvedInteractionAnswer(interaction.event_id, question.id).trim().length > 0);
+      const complete = questions.length > 0 &&
+        questions.every((question) => this.resolvedInteractionAnswer(interaction.event_id, question.id).trim().length > 0);
       return html`
         <section class="interaction-card input">
           <header>
@@ -738,9 +739,11 @@ export class ChaopApp extends LitElement {
           </header>
           ${payload.detail ? html`<p>${payload.detail}</p>` : nothing}
           <div class="interaction-questions">
-            ${questions.map(
-              (question) => this.renderInputQuestion(interaction.event_id, question)
-            )}
+            ${questions.length === 0
+              ? html`<small>No input questions are available.</small>`
+              : questions.map(
+                  (question) => this.renderInputQuestion(interaction.event_id, question)
+                )}
           </div>
           <div class="interaction-actions">
             <button

@@ -808,13 +808,15 @@ test("prepareTurnInteractionResolutionInDb rejects already resolved interactions
 test("prepareTurnInteractionResolutionInDb claims pending interactions before dispatch", async () => {
   const db = turnInteractionResolutionDb({ resolved: false });
 
-  const dispatch = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
     kind: "approval",
     decision: "accept"
   });
+  const dispatch = preparation.dispatch;
 
   assert.equal(dispatch.command_id, "command-1");
   assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.claimInserts, 1);
 });
@@ -835,16 +837,63 @@ test("prepareTurnInteractionResolutionInDb rejects claimed interactions before d
   assert.equal(db.claimInserts, 1);
 });
 
-test("prepareTurnInteractionResolutionInDb reclaims stale claims before dispatch", async () => {
-  const db = turnInteractionResolutionDb({ resolved: false, claimed: true, staleClaim: true });
+test("prepareTurnInteractionResolutionInDb reuses matching pending claims", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    claimed: true,
+    claimedResponse: {
+      kind: "approval",
+      decision: "accept"
+    }
+  });
 
-  const dispatch = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
     kind: "approval",
     decision: "accept"
   });
 
+  assert.equal(preparation.dispatch.command_id, "command-1");
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb recognises delivered matching claims", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    claimed: true,
+    deliveredClaim: true,
+    claimedResponse: {
+      kind: "approval",
+      decision: "accept"
+    }
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+
+  assert.equal(preparation.dispatch.command_id, "command-1");
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, true);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb reclaims stale claims before dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false, claimed: true, staleClaim: true });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+  const dispatch = preparation.dispatch;
+
   assert.equal(dispatch.command_id, "command-1");
   assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.staleClaimDeletes, 1);
   assert.equal(db.claimInserts, 1);
@@ -913,15 +962,17 @@ test("prepareTurnInteractionResolutionInDb accepts available approval decision o
     approvalAvailableDecisions: ["decline", amendmentDecision, "cancel"]
   });
 
-  const dispatch = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
     kind: "approval",
     decision: amendmentDecision
   });
+  const dispatch = preparation.dispatch;
 
   assert.deepEqual(dispatch.response, {
     kind: "approval",
     decision: amendmentDecision
   });
+  assert.equal(preparation.already_delivered, false);
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.claimInserts, 1);
 });
@@ -939,6 +990,29 @@ test("prepareTurnInteractionResolutionInDb rejects incomplete input answers", as
       error instanceof CommandTargetError &&
       error.status === 400 &&
       /missing a required answer/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects input requests without questions", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    inputQuestions: []
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "input",
+        answers: {}
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /payload is unavailable/.test(error.message)
   );
 
   assert.equal(db.resolutionChecks, 0);
@@ -1004,7 +1078,7 @@ test("prepareTurnInteractionResolutionInDb accepts input during explicit respons
     createdAt: "2999-01-01T00:00:00.000Z"
   });
 
-  const dispatch = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
     kind: "input",
     answers: {
       "question-1": {
@@ -1012,9 +1086,11 @@ test("prepareTurnInteractionResolutionInDb accepts input during explicit respons
       }
     }
   });
+  const dispatch = preparation.dispatch;
 
   assert.equal(dispatch.command_id, "command-1");
   assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.claimInserts, 1);
 });
@@ -1970,6 +2046,9 @@ function turnInteractionResolutionDb(options: {
   autoResolutionExpiresAt?: string;
   autoResolutionResponseGraceMs?: number | null;
   approvalAvailableDecisions?: unknown[];
+  claimedResponse?: unknown;
+  deliveredClaim?: boolean;
+  inputQuestions?: unknown[];
 }) {
   const requestKind = options.requestKind ?? "approval";
   const payload = JSON.stringify({
@@ -1991,7 +2070,7 @@ function turnInteractionResolutionDb(options: {
           : {})
       }
       : {
-        questions: [
+        questions: options.inputQuestions ?? [
           {
             id: "question-1",
             header: "Confirm",
@@ -2130,17 +2209,52 @@ function turnInteractionResolutionDb(options: {
             eventId: string,
             commandId: string,
             responseKind: string,
+            responseJson: string,
             createdAt: string
           ) {
             assert.equal(interactionId, "interaction-1");
             assert.equal(eventId, "event-request-1");
             assert.equal(commandId, "command-1");
             assert.equal(responseKind, requestKind);
+            assert.doesNotThrow(() => JSON.parse(responseJson));
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
             return {
               async run() {
                 counters.claimInserts += 1;
                 return { meta: { changes: options.claimed && !options.staleClaim ? 0 : 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT command_id, interaction_id, response_kind, response_json, delivered_at/.test(sql)) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async first() {
+                if (!options.claimed || options.staleClaim) return null;
+                const response = options.claimedResponse ?? {
+                  kind: requestKind,
+                  ...(requestKind === "approval"
+                    ? { decision: "decline" }
+                    : {
+                      answers: {
+                        "question-1": {
+                          answers: ["Different"]
+                        }
+                      }
+                    })
+                };
+                return {
+                  command_id: "command-1",
+                  interaction_id: "interaction-1",
+                  response_kind: requestKind,
+                  response_json: JSON.stringify(response),
+                  delivered_at: options.deliveredClaim ? "2026-06-24T10:00:01.000Z" : null
+                };
               }
             };
           }

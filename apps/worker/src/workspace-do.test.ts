@@ -2439,6 +2439,108 @@ test("malformed required turn interaction requests are rejected with a negative 
   assert.equal(browserSent.length, 0);
 });
 
+test("input turn interaction requests without questions are rejected with a negative ack", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    activeCommandIds: ["command-1"]
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, { DB: {} } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "input.requested",
+      priority: "P0",
+      summary: "Input requested",
+      payload: {
+        type: "turn_interaction",
+        interaction_id: "interaction-1",
+        status: "pending",
+        method: "item/tool/requestUserInput",
+        request_kind: "input",
+        app_server_thread_id: "thread-live-1",
+        app_server_turn_id: "turn-1",
+        title: "Provide input",
+        questions: []
+      }
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean; dropped?: boolean; reason?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.command_id, "command-1");
+  assert.equal(ack.payload?.kind, "input.requested");
+  assert.equal(ack.payload?.accepted, false);
+  assert.equal(ack.payload?.dropped, true);
+  assert.match(ack.payload?.reason ?? "", /payload is invalid/);
+  assert.equal(browserSent.length, 0);
+});
+
+test("malformed turn interaction resolution events are rejected with a negative ack", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    activeCommandIds: ["command-1"]
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, { DB: {} } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "input.received",
+      priority: "P1",
+      summary: "Input auto-resolved",
+      payload: {
+        type: "turn_interaction_resolution"
+      }
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean; dropped?: boolean; reason?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.command_id, "command-1");
+  assert.equal(ack.payload?.kind, "input.received");
+  assert.equal(ack.payload?.accepted, false);
+  assert.equal(ack.payload?.dropped, true);
+  assert.match(ack.payload?.reason ?? "", /payload is invalid/);
+  assert.equal(browserSent.length, 0);
+});
+
 test("dogfood safety pause still records command started events", async () => {
   const sent: string[] = [];
   const browserSent: string[] = [];

@@ -2179,6 +2179,11 @@ fn turn_interaction_event(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            if questions.is_empty() {
+                return Err(AppServerCommandError::Other(
+                    "app-server user input request did not include any valid questions".to_owned(),
+                ));
+            }
             let title = "Provide requested input";
             Ok(ConnectorEvent {
                 kind: "input.requested".to_owned(),
@@ -2337,9 +2342,18 @@ fn json_rpc_turn_request_id(value: Option<&Value>) -> Option<Value> {
 }
 
 fn turn_interaction_question(value: &Value) -> Option<Value> {
-    let id = value.get("id").and_then(Value::as_str)?;
-    let header = value.get("header").and_then(Value::as_str)?;
-    let question = value.get("question").and_then(Value::as_str)?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let header = value
+        .get("header")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let question = value
+        .get("question")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
     let mut item = serde_json::Map::new();
     item.insert("id".to_owned(), json!(id));
     item.insert("header".to_owned(), json!(header));
@@ -7959,6 +7973,40 @@ mod tests {
             &alternate_params,
         );
         assert_ne!(string, alternate);
+    }
+
+    #[test]
+    fn user_input_interaction_without_valid_questions_is_rejected() {
+        let params = json!({
+            "threadId": "thread-live-1",
+            "turnId": "turn-1",
+            "itemId": "item-input-1",
+            "questions": [
+                {
+                    "id": "",
+                    "header": "Confirm",
+                    "question": "Continue?",
+                    "isOther": false,
+                    "isSecret": false
+                }
+            ]
+        });
+
+        let error = match super::turn_interaction_event(
+            "item/tool/requestUserInput",
+            &json!("input-request-1"),
+            &params,
+        ) {
+            Ok(_) => panic!("invalid questions should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            super::AppServerCommandError::Other(
+                "app-server user input request did not include any valid questions".to_owned()
+            )
+        );
     }
 
     #[test]
