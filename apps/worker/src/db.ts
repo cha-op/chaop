@@ -1646,7 +1646,7 @@ export async function prepareTurnInteractionResolutionInDb(
   if (!row) {
     throw new NotFoundError("Turn interaction event not found");
   }
-  if (!row.command_id || !row.lease_owner_connector_id || !row.state || !isActiveCommandState(row.state)) {
+  if (!row.command_id) {
     throw new CommandTargetError("Turn interaction is no longer active", 409);
   }
   const payload = parseTurnInteractionRequestPayload(row.payload_json);
@@ -1677,6 +1677,9 @@ export async function prepareTurnInteractionResolutionInDb(
       already_delivered: true,
       resolution
     };
+  }
+  if (!row.lease_owner_connector_id || !row.state || !isActiveCommandState(row.state)) {
+    throw new CommandTargetError("Turn interaction is no longer active", 409);
   }
   if (turnInteractionAutoResolutionExpired(payload, row.created_at)) {
     throw new CommandTargetError("Turn interaction auto-resolution deadline has expired", 409);
@@ -1743,7 +1746,13 @@ export async function recordTurnInteractionResolutionInDb(
   if (!payload) {
     throw new CommandTargetError("Turn interaction payload is unavailable", 409);
   }
-  validateTurnInteractionResponseForRequest(response, payload);
+  if (options.resolution) {
+    if (response.kind !== payload.request_kind) {
+      throw new CommandTargetError("Turn interaction response does not match the request kind", 400);
+    }
+  } else {
+    validateTurnInteractionResponseForRequest(response, payload);
+  }
   const existing = await findTurnInteractionResolution(env, row.command_id, payload.interaction_id);
   if (existing) {
     if (options.allowExisting) {

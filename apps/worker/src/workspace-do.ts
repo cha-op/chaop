@@ -492,14 +492,6 @@ export class WorkspaceDO implements DurableObject {
 
     if (message.kind === "turn.interaction_response_ack" && isTurnInteractionResponseAck(message.payload)) {
       this.resolveTurnInteractionResponse(message.payload);
-      ws.send(
-        JSON.stringify(
-          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
-            kind: "turn.interaction_response_ack",
-            request_id: message.payload.request_id
-          })
-        )
-      );
       return;
     }
 

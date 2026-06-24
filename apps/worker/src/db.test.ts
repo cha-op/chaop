@@ -21,7 +21,7 @@ import {
   releaseTurnInteractionResolutionClaimInDb,
   updateConnectorCapabilities
 } from "./db.js";
-import type { AgentAppServerInstance } from "@chaop/protocol";
+import type { AgentAppServerInstance, CommandSummary } from "@chaop/protocol";
 import type { Env } from "./types.js";
 
 test("recordAppServerInstances inserts the first healthy report", async () => {
@@ -1131,11 +1131,7 @@ test("recordTurnInteractionResolutionInDb can recover a delivered input claim wi
     "event-request-1",
     {
       kind: "input",
-      answers: {
-        "question-1": {
-          answers: ["different retry answer"]
-        }
-      }
+      answers: {}
     },
     {
       allowExisting: true,
@@ -1153,6 +1149,31 @@ test("recordTurnInteractionResolutionInDb can recover a delivered input claim wi
   });
   assert.equal(db.eventInserts, 1);
   assert.equal(db.claimDeletes, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb recovers delivered claims after command completion", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    claimed: true,
+    deliveredClaim: true,
+    claimedResponse: null,
+    commandState: "succeeded"
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {}
+  });
+
+  assert.equal(preparation.already_delivered, true);
+  assert.deepEqual(preparation.resolution?.payload, {
+    type: "turn_interaction_resolution",
+    interaction_id: "interaction-1",
+    status: "answered",
+    answer_count: 1
+  });
+  assert.equal(db.claimInserts, 0);
 });
 
 test("prepareTurnInteractionResolutionInDb rejects incomplete input answers", async () => {
@@ -2321,6 +2342,7 @@ function turnInteractionResolutionDb(options: {
   dispatchStartedClaim?: boolean;
   staleDispatchStartedClaim?: boolean;
   deliveryUncertainClaim?: boolean;
+  commandState?: CommandSummary["state"];
   inputQuestions?: unknown[];
 }) {
   const requestKind = options.requestKind ?? "approval";
@@ -2401,7 +2423,7 @@ function turnInteractionResolutionDb(options: {
                   payload_json: payload,
                   created_at: createdAt,
                   lease_owner_connector_id: "connector-online",
-                  state: "running"
+                  state: options.commandState ?? "running"
                 };
               }
             };

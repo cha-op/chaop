@@ -2236,16 +2236,7 @@ test("turn interaction response waits for connector delivery acknowledgement", a
   const response = await responsePromise;
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { accepted: true });
-
-  const ack = JSON.parse(sent[1] ?? "{}") as {
-    kind?: string;
-    payload?: { kind?: string; request_id?: string };
-  };
-  assert.equal(ack.kind, "server.ack");
-  assert.deepEqual(ack.payload, {
-    kind: "turn.interaction_response_ack",
-    request_id: delivery.payload?.request_id
-  });
+  assert.equal(sent.length, 1);
 });
 
 test("agent event ack rejects stale command events", async () => {
