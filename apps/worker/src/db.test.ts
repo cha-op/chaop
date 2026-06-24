@@ -983,6 +983,32 @@ test("prepareTurnInteractionResolutionInDb reclaims stale dispatch-started claim
   assert.equal(db.claimInserts, 1);
 });
 
+test("prepareTurnInteractionResolutionInDb does not reclaim uncertain delivery claims", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    claimed: true,
+    staleClaim: true,
+    dispatchStartedClaim: true,
+    staleDispatchStartedClaim: true,
+    deliveryUncertainClaim: true
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /already being resolved/.test(error.message)
+  );
+
+  assert.equal(db.staleClaimDeletes, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
 test("prepareTurnInteractionResolutionInDb rejects unavailable approval decisions", async () => {
   const db = turnInteractionResolutionDb({
     resolved: false,
@@ -1146,6 +1172,81 @@ test("prepareTurnInteractionResolutionInDb rejects incomplete input answers", as
 
   assert.equal(db.resolutionChecks, 0);
   assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects input answers outside supplied options", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    inputQuestions: [
+      {
+        id: "question-1",
+        header: "Confirm",
+        question: "Continue?",
+        is_other: false,
+        is_secret: false,
+        options: [
+          {
+            label: "Yes",
+            description: "Continue"
+          }
+        ]
+      }
+    ]
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "input",
+        answers: {
+          "question-1": {
+            answers: ["No"]
+          }
+        }
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 400 &&
+      /unavailable answer/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb accepts custom input answers when other is allowed", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    inputQuestions: [
+      {
+        id: "question-1",
+        header: "Confirm",
+        question: "Continue?",
+        is_other: true,
+        is_secret: false,
+        options: [
+          {
+            label: "Yes",
+            description: "Continue"
+          }
+        ]
+      }
+    ]
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["Maybe later"]
+      }
+    }
+  });
+
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(db.claimInserts, 1);
 });
 
 test("prepareTurnInteractionResolutionInDb rejects input requests without questions", async () => {
@@ -2219,6 +2320,7 @@ function turnInteractionResolutionDb(options: {
   deliveredClaim?: boolean;
   dispatchStartedClaim?: boolean;
   staleDispatchStartedClaim?: boolean;
+  deliveryUncertainClaim?: boolean;
   inputQuestions?: unknown[];
 }) {
   const requestKind = options.requestKind ?? "approval";
@@ -2277,6 +2379,7 @@ function turnInteractionResolutionDb(options: {
     claimDeletes: 0,
     staleClaimDeletes: 0,
     dispatchStartUpdates: 0,
+    deliveryUncertainUpdates: 0,
     taskUpdates: 0,
     claimResponseJson: undefined as string | null | undefined,
     claimResolutionSummary: undefined as string | undefined,
@@ -2365,6 +2468,7 @@ function turnInteractionResolutionDb(options: {
 
       if (/DELETE FROM turn_interaction_resolution_claims[\s\S]*dispatch_started_at IS NULL AND created_at </.test(sql)) {
         assert.match(sql, /delivered_at IS NULL/);
+        assert.match(sql, /delivery_uncertain_at IS NULL/);
         assert.match(sql, /dispatch_started_at IS NOT NULL AND dispatch_started_at </);
         return {
           bind(
@@ -2387,6 +2491,7 @@ function turnInteractionResolutionDb(options: {
                 return {
                   meta: {
                     changes: options.staleClaim &&
+                      !options.deliveryUncertainClaim &&
                       (!options.dispatchStartedClaim || options.staleDispatchStartedClaim)
                       ? 1
                       : 0
@@ -2432,6 +2537,7 @@ function turnInteractionResolutionDb(options: {
               async run() {
                 counters.claimInserts += 1;
                 const claimReleased = options.staleClaim &&
+                  !options.deliveryUncertainClaim &&
                   (!options.dispatchStartedClaim || options.staleDispatchStartedClaim);
                 return {
                   meta: {
@@ -2444,7 +2550,7 @@ function turnInteractionResolutionDb(options: {
         };
       }
 
-      if (/SELECT command_id, interaction_id, response_kind, response_json,[\s\S]*resolution_summary, resolution_payload_json, dispatch_started_at, delivered_at/.test(sql)) {
+      if (/SELECT command_id, interaction_id, response_kind, response_json,[\s\S]*resolution_summary, resolution_payload_json, dispatch_started_at, delivery_uncertain_at, delivered_at/.test(sql)) {
         return {
           bind(commandId: string, interactionId: string) {
             assert.equal(commandId, "command-1");
@@ -2486,8 +2592,9 @@ function turnInteractionResolutionDb(options: {
                       interaction_id: "interaction-1",
                       status: "answered",
                       answer_count: 1
-                    }),
+                  }),
                   dispatch_started_at: options.dispatchStartedClaim ? "2026-06-24T10:00:00.500Z" : null,
+                  delivery_uncertain_at: options.deliveryUncertainClaim ? "2026-06-24T10:00:01.000Z" : null,
                   delivered_at: options.deliveredClaim ? "2026-06-24T10:00:01.000Z" : null
                 };
               }
@@ -2520,6 +2627,22 @@ function turnInteractionResolutionDb(options: {
             return {
               async run() {
                 counters.dispatchStartUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE turn_interaction_resolution_claims[\s\S]*delivery_uncertain_at = COALESCE/.test(sql)) {
+        return {
+          bind(uncertainAt: string, commandId: string, interactionId: string) {
+            assert.match(uncertainAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async run() {
+                counters.deliveryUncertainUpdates += 1;
                 return { meta: { changes: 1 } };
               }
             };

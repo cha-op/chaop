@@ -4151,7 +4151,21 @@ function validateTurnInteractionResponseForRequest(
     if (answer.answers.some((item) => item.trim().length === 0)) {
       throw new CommandTargetError("Turn interaction input response includes an empty answer", 400);
     }
+    if (!answer.answers.every((item) => turnInteractionInputAnswerIsAvailable(questions, questionId, item))) {
+      throw new CommandTargetError("Turn interaction input response includes an unavailable answer", 400);
+    }
   }
+}
+
+function turnInteractionInputAnswerIsAvailable(
+  questions: NonNullable<TurnInteractionRequestPayload["questions"]>,
+  questionId: string,
+  answer: string
+): boolean {
+  const question = questions.find((item) => item.id === questionId);
+  if (!question?.options || question.options.length === 0) return true;
+  if (question.options.some((option) => option.label === answer)) return true;
+  return question.is_other;
 }
 
 function jsonValueEquals(left: unknown, right: unknown): boolean {
@@ -4309,11 +4323,12 @@ async function findTurnInteractionResolutionClaim(
   resolution_summary: string | null;
   resolution_payload_json: string | null;
   dispatch_started_at: string | null;
+  delivery_uncertain_at: string | null;
   delivered_at: string | null;
 } | undefined> {
   const row = await env.DB!.prepare(
     `SELECT command_id, interaction_id, response_kind, response_json,
-            resolution_summary, resolution_payload_json, dispatch_started_at, delivered_at
+            resolution_summary, resolution_payload_json, dispatch_started_at, delivery_uncertain_at, delivered_at
      FROM turn_interaction_resolution_claims
      WHERE command_id = ?
        AND interaction_id = ?
@@ -4328,6 +4343,7 @@ async function findTurnInteractionResolutionClaim(
       resolution_summary: string | null;
       resolution_payload_json: string | null;
       dispatch_started_at: string | null;
+      delivery_uncertain_at: string | null;
       delivered_at: string | null;
     }>();
   return row ?? undefined;
@@ -4419,9 +4435,26 @@ export async function markTurnInteractionResolutionDeliveredInDb(
 ): Promise<void> {
   await env.DB!.prepare(
     `UPDATE turn_interaction_resolution_claims
-     SET delivered_at = COALESCE(delivered_at, ?)
+     SET delivered_at = COALESCE(delivered_at, ?),
+         delivery_uncertain_at = NULL
      WHERE command_id = ?
        AND interaction_id = ?`
+  )
+    .bind(new Date().toISOString(), commandId, interactionId)
+    .run();
+}
+
+export async function markTurnInteractionResolutionDeliveryUncertainInDb(
+  env: Env,
+  commandId: string,
+  interactionId: string
+): Promise<void> {
+  await env.DB!.prepare(
+    `UPDATE turn_interaction_resolution_claims
+     SET delivery_uncertain_at = COALESCE(delivery_uncertain_at, ?)
+     WHERE command_id = ?
+       AND interaction_id = ?
+       AND delivered_at IS NULL`
   )
     .bind(new Date().toISOString(), commandId, interactionId)
     .run();
@@ -4455,6 +4488,7 @@ async function deleteStaleTurnInteractionResolutionClaim(
      WHERE command_id = ?
        AND interaction_id = ?
        AND delivered_at IS NULL
+       AND delivery_uncertain_at IS NULL
        AND (
          (dispatch_started_at IS NULL AND created_at < ?)
          OR (dispatch_started_at IS NOT NULL AND dispatch_started_at < ?)

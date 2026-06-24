@@ -264,6 +264,7 @@ test("turn interaction response keeps claim when connector delivery is ambiguous
   assert.equal(internalPath, "/internal/resolve-turn-interaction");
   assert.equal(db.claimInserts, 1);
   assert.equal(db.dispatchStartUpdates, 1);
+  assert.equal(db.deliveryUncertainUpdates, 1);
   assert.equal(db.claimDeletes, 0);
 });
 
@@ -5062,6 +5063,7 @@ function turnInteractionResolutionRouteDb(): D1Database & {
   readonly claimDeletes: number;
   readonly claimInserts: number;
   readonly dispatchStartUpdates: number;
+  readonly deliveryUncertainUpdates: number;
 } {
   const safetyDb = safetyPauseDb();
   const payload = JSON.stringify({
@@ -5082,6 +5084,7 @@ function turnInteractionResolutionRouteDb(): D1Database & {
     claimDeletes: 0,
     claimInserts: 0,
     dispatchStartUpdates: 0,
+    deliveryUncertainUpdates: 0,
     staleClaimDeletes: 0
   };
   const db = {
@@ -5126,6 +5129,7 @@ function turnInteractionResolutionRouteDb(): D1Database & {
       }
 
       if (/DELETE FROM turn_interaction_resolution_claims[\s\S]*dispatch_started_at IS NULL AND created_at </.test(sql)) {
+        assert.match(sql, /delivery_uncertain_at IS NULL/);
         return {
           bind(
             commandId: string,
@@ -5181,7 +5185,7 @@ function turnInteractionResolutionRouteDb(): D1Database & {
         };
       }
 
-      if (/SELECT command_id, interaction_id, response_kind, response_json,[\s\S]*resolution_summary, resolution_payload_json, dispatch_started_at, delivered_at/.test(sql)) {
+      if (/SELECT command_id, interaction_id, response_kind, response_json,[\s\S]*resolution_summary, resolution_payload_json, dispatch_started_at, delivery_uncertain_at, delivered_at/.test(sql)) {
         return {
           bind(commandId: string, interactionId: string) {
             assert.equal(commandId, "command-1");
@@ -5204,6 +5208,22 @@ function turnInteractionResolutionRouteDb(): D1Database & {
             return {
               async run() {
                 counters.dispatchStartUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE turn_interaction_resolution_claims[\s\S]*delivery_uncertain_at = COALESCE/.test(sql)) {
+        return {
+          bind(uncertainAt: string, commandId: string, interactionId: string) {
+            assert.match(uncertainAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async run() {
+                counters.deliveryUncertainUpdates += 1;
                 return { meta: { changes: 1 } };
               }
             };
@@ -5243,6 +5263,9 @@ function turnInteractionResolutionRouteDb(): D1Database & {
     },
     get dispatchStartUpdates() {
       return counters.dispatchStartUpdates;
+    },
+    get deliveryUncertainUpdates() {
+      return counters.deliveryUncertainUpdates;
     }
   };
 
@@ -5250,6 +5273,7 @@ function turnInteractionResolutionRouteDb(): D1Database & {
     readonly claimDeletes: number;
     readonly claimInserts: number;
     readonly dispatchStartUpdates: number;
+    readonly deliveryUncertainUpdates: number;
   };
 }
 

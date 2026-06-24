@@ -1446,8 +1446,8 @@ export class ChaopApp extends LitElement {
     if (!this.guardSafetyAction("turn_interaction")) return;
     const answers: Record<string, { answers: string[] }> = {};
     for (const question of interaction.payload.questions ?? []) {
-      const answer = this.resolvedInteractionAnswer(interaction.event_id, question.id).trim();
-      if (answer.length > 0) {
+      const answer = this.resolvedInteractionAnswer(interaction.event_id, question.id);
+      if (answer.trim().length > 0) {
         answers[question.id] = { answers: [answer] };
       }
     }

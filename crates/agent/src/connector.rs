@@ -33,7 +33,7 @@ const CONNECTOR_RECONNECT_BACKOFF_SECONDS: u64 = 2;
 const AGENT_READY_RETRY_SECONDS: u64 = 10;
 const APP_SERVER_INSTANCE_SUMMARY_SECONDS: u64 = 5 * 60;
 const APP_SERVER_INSTANCE_TEXT_LIMIT: usize = 512;
-const TURN_INTERACTION_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+const TURN_INTERACTION_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {

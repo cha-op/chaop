@@ -55,6 +55,7 @@ import {
   markTurnInteractionResolutionDispatchStartedInDb,
   markHostSessionAppServerPresentInDb,
   markTurnInteractionResolutionDeliveredInDb,
+  markTurnInteractionResolutionDeliveryUncertainInDb,
   prepareTurnInteractionResolutionInDb,
   recordTurnInteractionResolutionInDb,
   recordHostSessionBackfillEvents,
@@ -403,18 +404,18 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           await requestTurnInteractionResolution(env, dispatch);
           connectorDelivered = true;
         } catch (error) {
-          if (shouldReleaseTurnInteractionClaimAfterDispatchError(error)) {
+          if (shouldMarkTurnInteractionDeliveryUncertain(error)) {
+            await markTurnInteractionResolutionDeliveryUncertainInDb(
+              env,
+              dispatch.command_id,
+              dispatch.interaction_id
+            );
+          } else if (shouldReleaseTurnInteractionClaimAfterDispatchError(error)) {
             await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
           }
           throw error;
         }
-        try {
-          await markTurnInteractionResolutionDeliveredInDb(env, dispatch.command_id, dispatch.interaction_id);
-        } catch (error) {
-          console.warn("Turn interaction delivery marker failed", {
-            message: error instanceof Error ? error.message : String(error)
-          });
-        }
+        await markTurnInteractionResolutionDeliveredInDb(env, dispatch.command_id, dispatch.interaction_id);
       }
       let event: ThreadEvent;
       try {
@@ -776,6 +777,7 @@ async function requestTurnInteractionResolution(
       ? body.error
       : "Connector could not receive the turn interaction response";
     throw new ConnectorRpcError(message, response.status, {
+      deliveryState: body?.delivery_state,
       releaseTurnInteractionClaim: turnInteractionDeliveryStateAllowsClaimRelease(body?.delivery_state)
     });
   }
@@ -811,12 +813,14 @@ class ConnectorRpcError extends Error {
   constructor(
     message: string,
     public readonly status = 502,
-    options: { releaseTurnInteractionClaim?: boolean | undefined } = {}
+    options: { deliveryState?: unknown; releaseTurnInteractionClaim?: boolean | undefined } = {}
   ) {
     super(message);
+    this.deliveryState = options.deliveryState;
     this.releaseTurnInteractionClaim = options.releaseTurnInteractionClaim;
   }
 
+  public readonly deliveryState: unknown;
   public readonly releaseTurnInteractionClaim: boolean | undefined;
 }
 
@@ -827,6 +831,10 @@ function turnInteractionDeliveryStateAllowsClaimRelease(deliveryState: unknown):
 function shouldReleaseTurnInteractionClaimAfterDispatchError(error: unknown): boolean {
   if (error instanceof ConnectorRpcError && error.releaseTurnInteractionClaim === false) return false;
   return true;
+}
+
+function shouldMarkTurnInteractionDeliveryUncertain(error: unknown): boolean {
+  return error instanceof ConnectorRpcError && error.deliveryState === "sent_unknown";
 }
 
 async function requestLocalThreadCreate(
