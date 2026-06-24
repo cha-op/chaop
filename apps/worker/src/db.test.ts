@@ -726,6 +726,36 @@ test("recordAgentEvent marks failed command tasks as failed", async () => {
   assert.equal(db.eventInserts, 1);
 });
 
+test("recordAgentEvent accepts duplicate turn interaction resolution events idempotently", async () => {
+  const db = agentEventGuardDb(
+    {
+      leaseOwnerConnectorId: "connector-online",
+      state: "running"
+    },
+    {
+      existingResolutionInteractionId: "interaction-1"
+    }
+  );
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    kind: "input.received",
+    priority: "P1",
+    summary: "Input auto-resolved.",
+    payload: {
+      type: "turn_interaction_resolution",
+      interaction_id: "interaction-1",
+      status: "answered",
+      answer_count: 0
+    }
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.event, undefined);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
 test("prepareTurnInteractionResolutionInDb rejects already resolved interactions before dispatch", async () => {
   const db = turnInteractionResolutionDb({ resolved: true });
 
@@ -1857,6 +1887,7 @@ function agentEventGuardDb(command: {
   expectedCommandState?: string;
   expectedTaskState?: string;
   failUsageWindowUpserts?: boolean;
+  existingResolutionInteractionId?: string;
 } = {}) {
   const expectedCommandState = options.expectedCommandState ?? "succeeded";
   const expectedTaskState = options.expectedTaskState ?? "done";
@@ -1911,6 +1942,21 @@ function agentEventGuardDb(command: {
               async run() {
                 counters.commandUpdates += 1;
                 return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/json_extract\(payload_json, '\$\.interaction_id'\)/.test(sql)) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                return options.existingResolutionInteractionId === interactionId
+                  ? { id: "event-resolution-1" }
+                  : null;
               }
             };
           }

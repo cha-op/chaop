@@ -2909,6 +2909,10 @@ export async function recordAgentEvent(
   if (command.lease_owner_connector_id !== connectorId) return { accepted: false };
   if (!isActiveCommandState(command.state)) return { accepted: false };
   const requireCurrentAppServerStartTarget = requiresCurrentAppServerStartTarget(command, event);
+  const resolutionInteractionId = turnInteractionResolutionInteractionId(event);
+  if (resolutionInteractionId && await hasTurnInteractionResolution(env, command.id, resolutionInteractionId)) {
+    return { accepted: true };
+  }
 
   const now = new Date().toISOString();
   if (requireCurrentAppServerStartTarget && !event.target_host_session_id) {
@@ -2959,17 +2963,29 @@ export async function recordAgentEvent(
     }
   }
 
-  const threadEvent = command.thread_id
-    ? await appendEvent(env, {
-      workspace_id: command.workspace_id,
-      thread_id: command.thread_id,
-      command_id: command.id,
-      kind: event.kind,
-      priority: event.priority,
-      summary: event.summary,
-      payload: event.payload
-    })
-    : undefined;
+  let threadEvent: ThreadEvent | undefined;
+  try {
+    threadEvent = command.thread_id
+      ? await appendEvent(env, {
+        workspace_id: command.workspace_id,
+        thread_id: command.thread_id,
+        command_id: command.id,
+        kind: event.kind,
+        priority: event.priority,
+        summary: event.summary,
+        payload: event.payload
+      })
+      : undefined;
+  } catch (error) {
+    if (
+      resolutionInteractionId &&
+      isUniqueConstraintError(error) &&
+      await hasTurnInteractionResolution(env, command.id, resolutionInteractionId)
+    ) {
+      return { accepted: true };
+    }
+    throw error;
+  }
 
   await env.DB.prepare(
     `UPDATE connectors
@@ -4017,6 +4033,19 @@ async function hasTurnInteractionResolution(
     .bind(commandId, interactionId)
     .first<{ id: string }>();
   return Boolean(row);
+}
+
+function turnInteractionResolutionInteractionId(event: AgentCommandEvent): string | undefined {
+  if (event.kind !== "approval.resolved" && event.kind !== "input.received") return undefined;
+  const payload = event.payload;
+  if (!payload || payload.type !== "turn_interaction_resolution") return undefined;
+  const interactionId = payload.interaction_id.trim();
+  return interactionId.length > 0 ? interactionId : undefined;
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /UNIQUE constraint failed|SQLITE_CONSTRAINT|constraint failed/i.test(message);
 }
 
 async function claimTurnInteractionResolution(
