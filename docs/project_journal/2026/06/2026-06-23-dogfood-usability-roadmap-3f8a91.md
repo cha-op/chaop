@@ -3,7 +3,7 @@ id: 20260623-3f8a91
 title: Dogfood Usability Roadmap
 status: active
 created: 2026-06-23
-updated: 2026-06-23
+updated: 2026-06-24
 branch: wip/dogfood-safety-gate
 pr:
 supersedes:
@@ -41,5 +41,6 @@ superseded_by:
 - Run three review lanes before merge, then resolve or explicitly close every GitHub conversation.
 
 ## Current Next Step
-- PR A is now active on `wip/dogfood-safety-gate`.
-- Implement the dogfood safety gate first: visible cost posture, server-side guards for costly write/refresh actions, and an emergency pause or stop path.
+- PR A landed through [PR #19](https://github.com/cha-op/chaop/pull/19).
+- PR B is implemented on `wip/thread-centre-chat-mvp`.
+- PR C is the next planned slice: human-in-the-loop approval and input handling for Codex app-server turns.

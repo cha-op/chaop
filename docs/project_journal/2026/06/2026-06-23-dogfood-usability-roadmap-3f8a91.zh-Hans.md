@@ -3,7 +3,7 @@ id: 20260623-3f8a91-zh-Hans
 title: Dogfood Usability Roadmap
 status: active
 created: 2026-06-23
-updated: 2026-06-23
+updated: 2026-06-24
 branch: wip/dogfood-safety-gate
 pr:
 supersedes:
@@ -41,5 +41,6 @@ superseded_by:
 - merge 前运行三路 review，然后 resolve 或明确关闭每个 GitHub conversation。
 
 ## 当前下一步
-- PR A 现在已经在 `wip/dogfood-safety-gate` 上开始。
-- 先实现 dogfood safety gate：可见 cost posture、对高成本 write/refresh actions 的 server-side guards，以及 emergency pause 或 stop path。
+- PR A 已通过 [PR #19](https://github.com/cha-op/chaop/pull/19) 合入。
+- PR B 已在 `wip/thread-centre-chat-mvp` 上实现。
+- PR C 是下一条计划切片：为 Codex app-server turns 增加 human-in-the-loop approval 和 input handling。

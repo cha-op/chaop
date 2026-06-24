@@ -12,12 +12,266 @@ import type {
   HostSessionSummary,
   HostSessionSyncSummary,
   TaskArchiveResponse,
+  ThreadEvent,
   ThreadSummary
 } from "@chaop/protocol";
 
 export type CommandExecutionMode = "placeholder" | "app_server" | "codex_cli_fallback";
 
+export type ThreadTurnStatus = "partial" | "pending" | "running" | "waiting" | "succeeded" | "failed";
+
+export type ThreadTurnSummary = {
+  command_id: string;
+  command?: CommandSummary | undefined;
+  prompt?: string | undefined;
+  status: ThreadTurnStatus;
+  assistant_summary?: string | undefined;
+  error_summary?: string | undefined;
+  progress_summaries: string[];
+  event_count: number;
+  last_seq: number;
+  updated_at: string;
+  events: ThreadEvent[];
+};
+
 export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
+
+export function threadTurnsForDisplay(
+  threadId: string,
+  commands: CommandSummary[],
+  events: ThreadEvent[]
+): ThreadTurnSummary[] {
+  const groups = new Map<string, { command?: CommandSummary; events: ThreadEvent[] }>();
+  for (const event of events) {
+    if (event.thread_id !== threadId || !event.command_id) continue;
+    const group = groups.get(event.command_id) ?? { events: [] };
+    group.events.push(event);
+    groups.set(event.command_id, group);
+  }
+
+  for (const command of commands) {
+    if (command.thread_id !== threadId) continue;
+    const group = groups.get(command.id) ?? { events: [] };
+    group.command = command;
+    groups.set(command.id, group);
+  }
+
+  return [
+    ...[...groups.entries()]
+      .map(([commandId, group]) => buildThreadTurn(commandId, group.command, group.events)),
+    ...buildHistoryTurns(threadId, events)
+  ].sort(compareThreadTurns);
+}
+
+function buildHistoryTurns(threadId: string, events: ThreadEvent[]): ThreadTurnSummary[] {
+  const historyEvents = events
+    .filter((event) => event.thread_id === threadId && !event.command_id)
+    .sort((left, right) => {
+      if (left.seq !== right.seq) return left.seq - right.seq;
+      return left.created_at.localeCompare(right.created_at);
+    });
+  const drafts: HistoryTurnDraft[] = [];
+  let current: HistoryTurnDraft | undefined;
+  const finishCurrent = () => {
+    if (!current) return;
+    drafts.push(current);
+    current = undefined;
+  };
+  const appendProgress = (event: ThreadEvent) => {
+    const target = current ?? drafts.at(-1);
+    if (target) {
+      target.events.push(event);
+      target.progress_summaries = appendProgressSummary(target.progress_summaries, event.summary);
+    }
+  };
+
+  for (const event of historyEvents) {
+    const message = parseBackfillMessage(event.summary);
+    if (message?.role === "user") {
+      finishCurrent();
+      current = {
+        id: `history-${event.id}`,
+        prompt: message.text,
+        events: [event]
+      };
+      continue;
+    }
+
+    if (message?.role === "assistant") {
+      if (current) {
+        current.assistant = message.text;
+        current.events.push(event);
+        drafts.push(current);
+        current = undefined;
+      } else {
+        const previous = drafts.at(-1);
+        if (previous) {
+          previous.assistant = message.text;
+          previous.events.push(event);
+        } else {
+          drafts.push({
+            id: `history-${event.id}`,
+            assistant: message.text,
+            events: [event]
+          });
+        }
+      }
+      continue;
+    }
+
+    appendProgress(event);
+  }
+
+  finishCurrent();
+  return drafts.map(historyTurnFromDraft);
+}
+
+function appendProgressSummary(current: string[] | undefined, summary: string): string[] {
+  if (!current) return [summary];
+  if (current.includes(summary)) return current;
+  return [...current, summary];
+}
+
+function historyTurnFromDraft(draft: HistoryTurnDraft): ThreadTurnSummary {
+  const sortedEvents = [...draft.events].sort((left, right) => {
+    if (left.seq !== right.seq) return left.seq - right.seq;
+    return left.created_at.localeCompare(right.created_at);
+  });
+  const failed = sortedEvents.some((event) => event.kind === "command.failed");
+  return {
+    command_id: draft.id,
+    prompt: draft.prompt,
+    status: failed ? "failed" : draft.assistant ? "succeeded" : "partial",
+    assistant_summary: draft.assistant,
+    error_summary: [...sortedEvents].reverse().find((event) => event.kind === "command.failed")?.summary,
+    progress_summaries: draft.progress_summaries ?? [],
+    event_count: sortedEvents.length,
+    last_seq: Math.max(0, ...sortedEvents.map((event) => event.seq)),
+    updated_at: historyTurnUpdatedAt(sortedEvents),
+    events: sortedEvents
+  };
+}
+
+function compareThreadTurns(left: ThreadTurnSummary, right: ThreadTurnSummary): number {
+  const leftTime = Date.parse(left.updated_at);
+  const rightTime = Date.parse(right.updated_at);
+  if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) {
+    return rightTime - leftTime;
+  }
+  return right.last_seq - left.last_seq;
+}
+
+function historyTurnUpdatedAt(events: ThreadEvent[]): string {
+  return events
+    .map((event) => event.created_at)
+    .filter((value) => value !== UNKNOWN_BACKFILL_CREATED_AT)
+    .sort()
+    .at(-1) ?? UNKNOWN_TURN_UPDATED_AT;
+}
+
+const UNKNOWN_BACKFILL_CREATED_AT = "1970-01-01T00:00:00.000Z";
+const UNKNOWN_TURN_UPDATED_AT = "unknown";
+
+function parseBackfillMessage(summary: string): { role: "user" | "assistant"; text: string } | undefined {
+  const timestamped = summary.match(
+    /^(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}|unknown time)\s+-\s+(User|Assistant):\s*(.+)$/s
+  );
+  const bare = summary.match(/^(User|Assistant):\s*(.+)$/s);
+  const match = timestamped ?? bare;
+  if (!match) return undefined;
+  const role = match[1] === "User" ? "user" : "assistant";
+  const text = match[2]?.trim();
+  return text ? { role, text } : undefined;
+}
+
+type HistoryTurnDraft = {
+  id: string;
+  prompt?: string | undefined;
+  assistant?: string | undefined;
+  progress_summaries?: string[] | undefined;
+  events: ThreadEvent[];
+};
+
+function buildThreadTurn(
+  commandId: string,
+  command: CommandSummary | undefined,
+  events: ThreadEvent[]
+): ThreadTurnSummary {
+  const sortedEvents = [...events].sort((left, right) => {
+    if (left.seq !== right.seq) return left.seq - right.seq;
+    return left.created_at.localeCompare(right.created_at);
+  });
+  const eventStatus = threadTurnStatusFromEvents(sortedEvents);
+  const commandStatus = command ? threadTurnStatusFromCommand(command) : undefined;
+  const hasTerminalEvent = sortedEvents.some((event) =>
+    event.kind === "command.finished" || event.kind === "command.failed"
+  );
+  const status = hasTerminalEvent
+    ? eventStatus ?? commandStatus ?? "pending"
+    : commandStatus === "succeeded" || commandStatus === "failed"
+      ? commandStatus
+      : eventStatus ?? commandStatus ?? "pending";
+  const assistantEvent = [...sortedEvents]
+    .reverse()
+    .find((event) => event.kind === "command.output" && assistantSummaryFromEvent(event) !== undefined);
+  const errorEvent = [...sortedEvents].reverse().find((event) => event.kind === "command.failed");
+  const progressSummaries = sortedEvents
+    .filter((event) => progressSummaryForEvent(event) !== undefined)
+    .map((event) => progressSummaryForEvent(event)!)
+    .filter((summary, index, all) => all.indexOf(summary) === index);
+  const updatedAt = [command?.updated_at, command?.created_at, ...sortedEvents.map((event) => event.created_at)]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .sort()
+    .at(-1) ?? new Date(0).toISOString();
+
+  return {
+    command_id: commandId,
+    command,
+    prompt: command?.prompt,
+    status,
+    assistant_summary: assistantEvent ? assistantSummaryFromEvent(assistantEvent) : undefined,
+    error_summary: errorEvent?.summary,
+    progress_summaries: progressSummaries,
+    event_count: sortedEvents.length,
+    last_seq: Math.max(0, ...sortedEvents.map((event) => event.seq)),
+    updated_at: updatedAt,
+    events: sortedEvents
+  };
+}
+
+function threadTurnStatusFromEvents(events: ThreadEvent[]): ThreadTurnStatus | undefined {
+  let status: ThreadTurnStatus | undefined;
+  for (const event of events) {
+    if (event.kind === "command.accepted") status = "pending";
+    if (event.kind === "command.started" || event.kind === "command.output") status = "running";
+    if (event.kind === "approval.requested" || event.kind === "notice.throttled") status = "waiting";
+    if (event.kind === "command.finished") status = "succeeded";
+    if (event.kind === "command.failed") status = "failed";
+  }
+  return status;
+}
+
+function threadTurnStatusFromCommand(command: CommandSummary): ThreadTurnStatus {
+  if (command.state === "running" || command.state === "leased" || command.state === "cancelling") {
+    return "running";
+  }
+  if (command.state === "succeeded") return "succeeded";
+  if (command.state === "failed" || command.state === "cancelled") return "failed";
+  return "pending";
+}
+
+function assistantSummaryFromEvent(event: ThreadEvent): string | undefined {
+  if (event.kind !== "command.output") return undefined;
+  const match = event.summary.match(/^Codex:\s*(.+)$/s);
+  return match?.[1]?.trim() || undefined;
+}
+
+function progressSummaryForEvent(event: ThreadEvent): string | undefined {
+  if (event.kind === "command.output" && assistantSummaryFromEvent(event) !== undefined) return undefined;
+  if (event.kind === "command.finished" || event.kind === "command.failed") return undefined;
+  if (event.kind === "command.accepted") return undefined;
+  return event.summary;
+}
 
 const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], number> = {
   degraded: 0,
