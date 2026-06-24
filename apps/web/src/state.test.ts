@@ -1088,6 +1088,36 @@ test("threadTurnsForDisplay clears resolved interactions", () => {
   assert.equal(turns[0]?.pending_interactions.length, 0);
 });
 
+test("threadTurnsForDisplay hides pending interactions after terminal events", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [command("command-1", { state: "failed" })],
+    [
+      event("event-1", "command-1", 1, "command.started", "Connector started Codex app-server turn."),
+      event("event-2", "command-1", 2, "approval.requested", "Approval requested.", {
+        payload: {
+          type: "turn_interaction",
+          interaction_id: "interaction-1",
+          status: "pending",
+          method: "item/commandExecution/requestApproval",
+          request_kind: "approval",
+          subject: "command_execution",
+          app_server_thread_id: "app-thread-1",
+          app_server_turn_id: "app-turn-1",
+          title: "Approve command execution",
+          command: "touch requested.txt",
+          cwd: "/tmp/project"
+        }
+      }),
+      event("event-3", "command-1", 3, "command.failed", "Codex app-server turn failed.")
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "failed");
+  assert.equal(turns[0]?.pending_interactions.length, 0);
+});
+
 test("threadTurnsForDisplay keeps terminal state after late interaction resolution", () => {
   const turns = threadTurnsForDisplay(
     "thread-1",

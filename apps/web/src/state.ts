@@ -244,7 +244,7 @@ function buildThreadTurn(
     last_seq: Math.max(0, ...sortedEvents.map((event) => event.seq)),
     updated_at: updatedAt,
     events: sortedEvents,
-    pending_interactions: pendingTurnInteractions(sortedEvents)
+    pending_interactions: status === "succeeded" || status === "failed" ? [] : pendingTurnInteractions(sortedEvents)
   };
 }
 
