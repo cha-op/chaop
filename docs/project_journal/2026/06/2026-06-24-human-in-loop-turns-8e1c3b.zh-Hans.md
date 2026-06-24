@@ -36,6 +36,8 @@ superseded_by:
 - 最后一轮 review 发现 permission approval 需要先向 operator 展示 requested `network` 和 `fileSystem` 明细，才能安全批准 turn 或 session scope。
 - Review 也发现 dogfood safety pause 不能对隐藏的 approval/input request event 做 fake accept；现在 control plane 拒绝必要 interaction event 时，connector 会让对应 turn 可见地失败。
 - App-server input auto-resolution 现在会发出 `input.received` resolution event，这样 Browser clients 能清掉过期的 pending input controls，迟到提交也会被现有 resolution guard 拒绝。
+- 后续 review 发现 connector race：final app-server events 可能先于已排队的 interaction events 返回。现在 connector 会先 drain pending interaction events，再返回最终 turn events。
+- Sample HITL 数据现在使用泛化 workspace 路径，不再使用 deployment-instance 或本机路径。
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。

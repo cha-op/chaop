@@ -36,6 +36,8 @@ superseded_by:
 - The final review pass found that permission approvals needed to show the requested `network` and `fileSystem` details before an operator could approve turn or session scope.
 - The review also found that dogfood safety pauses must not fake-accept hidden approval/input request events; the connector now fails the affected turn visibly when the control plane rejects a required interaction event.
 - App-server input auto-resolution now emits an `input.received` resolution event so Browser clients clear stale pending input controls and late submissions are rejected by the existing resolution guard.
+- A later review pass found a connector race where final app-server events could be returned before queued interaction events were dispatched. The connector now drains pending interaction events before returning final turn events.
+- Sample HITL data now uses generic workspace paths rather than deployment-instance or local-machine paths.
 
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.

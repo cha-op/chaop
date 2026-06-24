@@ -1207,6 +1207,11 @@ fn wait_for_app_server_command_events(
     let worker_cwd = cwd.clone();
     let worker_command_id = command_id.clone();
     let worker_prompt = prompt.clone();
+    let dispatch_command = CommandPayload {
+        id: command_id.clone(),
+        command_type: CommandType::Codex,
+        prompt: prompt.clone(),
+    };
     let (result_sender, result_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
     let (interaction_sender, interaction_receiver) = mpsc::channel();
@@ -1234,9 +1239,34 @@ fn wait_for_app_server_command_events(
             cancel_codex_worker(&cancel, worker.take())?;
             return Err("connector shutdown requested while app-server command was running".into());
         }
+        if !dispatch_pending_app_server_command_events(
+            socket,
+            &dispatch_command,
+            &event_receiver,
+            &runtime_config,
+            app_server_instances_state,
+            host_sessions_state,
+            deferred_messages,
+        )? {
+            cancel_codex_worker(&cancel, worker.take())?;
+            return Ok(vec![app_server_interaction_rejected_event()]);
+        }
+
         match result_receiver.try_recv() {
             Ok(events) => {
                 join_codex_worker(worker.take())?;
+                if !dispatch_pending_app_server_command_events(
+                    socket,
+                    &dispatch_command,
+                    &event_receiver,
+                    &runtime_config,
+                    app_server_instances_state,
+                    host_sessions_state,
+                    deferred_messages,
+                )? {
+                    set_socket_read_timeout(socket, Some(connector_read_tick()))?;
+                    return Ok(vec![app_server_interaction_rejected_event()]);
+                }
                 set_socket_read_timeout(socket, Some(connector_read_tick()))?;
                 return Ok(events);
             }
@@ -1244,29 +1274,6 @@ fn wait_for_app_server_command_events(
                 join_codex_worker(worker.take())?;
                 return Err("app-server command worker stopped before returning events".into());
             }
-            Err(TryRecvError::Empty) => {}
-        }
-
-        match event_receiver.try_recv() {
-            Ok(event) => {
-                if !dispatch_events(
-                    socket,
-                    &CommandPayload {
-                        id: command_id.clone(),
-                        command_type: CommandType::Codex,
-                        prompt: prompt.clone(),
-                    },
-                    vec![event],
-                    &runtime_config,
-                    app_server_instances_state,
-                    host_sessions_state,
-                    deferred_messages,
-                )? {
-                    cancel_codex_worker(&cancel, worker.take())?;
-                    return Ok(vec![app_server_interaction_rejected_event()]);
-                }
-            }
-            Err(TryRecvError::Disconnected) => {}
             Err(TryRecvError::Empty) => {}
         }
 
@@ -1328,6 +1335,47 @@ fn wait_for_app_server_command_events(
         if let Err(error) = socket_result {
             cancel_codex_worker(&cancel, worker.take())?;
             return Err(error);
+        }
+    }
+}
+
+fn dispatch_pending_app_server_command_events(
+    socket: &mut AgentSocket,
+    command: &CommandPayload,
+    event_receiver: &mpsc::Receiver<ConnectorEvent>,
+    config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
+    host_sessions_state: &mut HostSessionsSendState,
+    deferred_messages: &mut VecDeque<String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    drain_pending_connector_events(event_receiver, |event| {
+        dispatch_events(
+            socket,
+            command,
+            vec![event],
+            config,
+            app_server_instances_state,
+            host_sessions_state,
+            deferred_messages,
+        )
+    })
+}
+
+fn drain_pending_connector_events<F>(
+    event_receiver: &mpsc::Receiver<ConnectorEvent>,
+    mut dispatch: F,
+) -> Result<bool, Box<dyn std::error::Error>>
+where
+    F: FnMut(ConnectorEvent) -> Result<bool, Box<dyn std::error::Error>>,
+{
+    loop {
+        match event_receiver.try_recv() {
+            Ok(event) => {
+                if !dispatch(event)? {
+                    return Ok(false);
+                }
+            }
+            Err(TryRecvError::Disconnected | TryRecvError::Empty) => return Ok(true),
         }
     }
 }
@@ -1722,9 +1770,9 @@ mod tests {
         app_server_instances_message_with_report_id, apply_agent_ready_ack_text,
         apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
         bounded_app_server_instance_text, classify_ack_wait_text, command_events,
-        handle_background_ack_message, host_sessions_ack_message, host_sessions_message,
-        host_sessions_retry_interval, is_read_timeout, record_agent_ready_sent,
-        requires_app_server_execution_mode, should_send_agent_ready,
+        drain_pending_connector_events, handle_background_ack_message, host_sessions_ack_message,
+        host_sessions_message, host_sessions_retry_interval, is_read_timeout,
+        record_agent_ready_sent, requires_app_server_execution_mode, should_send_agent_ready,
         should_send_app_server_instances, should_send_host_sessions,
     };
     use crate::app_server_manager::AppServerManager;
@@ -1861,6 +1909,70 @@ mod tests {
         };
 
         assert!(!requires_app_server_execution_mode(&dispatch));
+    }
+
+    #[test]
+    fn drains_pending_connector_events_in_queue_order() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(ConnectorEvent {
+                kind: "input.requested".to_owned(),
+                priority: "P0".to_owned(),
+                summary: "Input requested".to_owned(),
+                payload: None,
+            })
+            .expect("send request event");
+        sender
+            .send(ConnectorEvent {
+                kind: "input.received".to_owned(),
+                priority: "P1".to_owned(),
+                summary: "Input auto-resolved".to_owned(),
+                payload: None,
+            })
+            .expect("send resolution event");
+        drop(sender);
+
+        let mut dispatched = Vec::new();
+        let accepted = drain_pending_connector_events(&receiver, |event| {
+            dispatched.push(event.kind);
+            Ok(true)
+        })
+        .expect("drain pending events");
+
+        assert!(accepted);
+        assert_eq!(dispatched, vec!["input.requested", "input.received"]);
+    }
+
+    #[test]
+    fn drain_pending_connector_events_stops_on_rejection() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(ConnectorEvent {
+                kind: "input.requested".to_owned(),
+                priority: "P0".to_owned(),
+                summary: "Input requested".to_owned(),
+                payload: None,
+            })
+            .expect("send request event");
+        sender
+            .send(ConnectorEvent {
+                kind: "input.received".to_owned(),
+                priority: "P1".to_owned(),
+                summary: "Input auto-resolved".to_owned(),
+                payload: None,
+            })
+            .expect("send resolution event");
+        drop(sender);
+
+        let mut dispatched = Vec::new();
+        let accepted = drain_pending_connector_events(&receiver, |event| {
+            dispatched.push(event.kind);
+            Ok(false)
+        })
+        .expect("drain pending events");
+
+        assert!(!accepted);
+        assert_eq!(dispatched, vec!["input.requested"]);
     }
 
     #[test]
