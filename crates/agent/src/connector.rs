@@ -5,9 +5,10 @@ use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
 use crate::session_inventory::{
     AgentHostSessionsReport, AppServerCommandChannels, InventoryScope,
-    TurnInteractionResponseDispatch, app_server_command_result_events_with_cancel,
-    app_server_command_started_event, build_host_session_backfill, build_host_sessions_report,
-    create_app_server_thread, ensure_app_server_host_session, set_app_server_thread_archived,
+    TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
+    app_server_command_result_events_with_cancel, app_server_command_started_event,
+    build_host_session_backfill, build_host_sessions_report, create_app_server_thread,
+    ensure_app_server_host_session, set_app_server_thread_archived,
 };
 use crate::shutdown::{install_signal_handlers, shutdown_requested};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, TryRecvError},
 };
@@ -32,6 +33,7 @@ const CONNECTOR_RECONNECT_BACKOFF_SECONDS: u64 = 2;
 const AGENT_READY_RETRY_SECONDS: u64 = 10;
 const APP_SERVER_INSTANCE_SUMMARY_SECONDS: u64 = 5 * 60;
 const APP_SERVER_INSTANCE_TEXT_LIMIT: usize = 512;
+const TURN_INTERACTION_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -1223,8 +1225,10 @@ fn wait_for_app_server_command_events(
     let (result_sender, result_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
     let (interaction_sender, interaction_receiver) = mpsc::channel();
+    let active_interaction = Arc::new(Mutex::new(None::<String>));
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
+    let worker_active_interaction = Arc::clone(&active_interaction);
     let mut worker = Some(thread::spawn(move || {
         let events = app_server_command_result_events_with_cancel(
             &worker_config,
@@ -1236,6 +1240,7 @@ fn wait_for_app_server_command_events(
             Some(AppServerCommandChannels {
                 event_sender,
                 interaction_receiver,
+                active_interaction: worker_active_interaction,
             }),
         );
         let _ = result_sender.send(events);
@@ -1310,6 +1315,7 @@ fn wait_for_app_server_command_events(
                     text.as_ref(),
                     &command_id,
                     &interaction_sender,
+                    &active_interaction,
                 )? {
                     Ok(())
                 } else {
@@ -1404,9 +1410,12 @@ fn handle_turn_interaction_response_text(
     socket: &mut AgentSocket,
     text: &str,
     command_id: &str,
-    sender: &mpsc::Sender<TurnInteractionResponseDispatch>,
+    sender: &mpsc::Sender<TurnInteractionResponseDelivery>,
+    active_interaction: &Arc<Mutex<Option<String>>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let Some(ack) = turn_interaction_response_ack_for_text(text, command_id, sender)? else {
+    let Some(ack) =
+        turn_interaction_response_ack_for_text(text, command_id, sender, active_interaction)?
+    else {
         return Ok(false);
     };
     send_turn_interaction_response_ack(socket, ack)?;
@@ -1416,7 +1425,8 @@ fn handle_turn_interaction_response_text(
 fn turn_interaction_response_ack_for_text(
     text: &str,
     command_id: &str,
-    sender: &mpsc::Sender<TurnInteractionResponseDispatch>,
+    sender: &mpsc::Sender<TurnInteractionResponseDelivery>,
+    active_interaction: &Arc<Mutex<Option<String>>>,
 ) -> Result<Option<TurnInteractionResponseAck>, Box<dyn std::error::Error>> {
     let envelope: Envelope = serde_json::from_str(text)?;
     if envelope.kind != "turn.interaction_response" {
@@ -1428,7 +1438,26 @@ fn turn_interaction_response_ack_for_text(
         .clone()
         .ok_or("turn interaction response did not include request_id")?;
     if dispatch.command_id == command_id {
-        let accepted = sender.send(dispatch).is_ok();
+        let active = active_turn_interaction(active_interaction)?;
+        if active.as_deref() != Some(dispatch.interaction_id.as_str()) {
+            return Ok(Some(TurnInteractionResponseAck {
+                request_id,
+                accepted: false,
+                error: Some("App-server turn is not waiting for this interaction".to_owned()),
+            }));
+        }
+        let (delivery_ack_sender, delivery_ack_receiver) = mpsc::channel();
+        let delivery = TurnInteractionResponseDelivery {
+            dispatch,
+            delivery_ack: delivery_ack_sender,
+        };
+        let accepted = sender.send(delivery).is_ok()
+            && delivery_ack_receiver
+                .recv_timeout(TURN_INTERACTION_DELIVERY_ACK_TIMEOUT)
+                .unwrap_or(false);
+        if accepted {
+            clear_active_turn_interaction(active_interaction)?;
+        }
         return Ok(Some(TurnInteractionResponseAck {
             request_id,
             accepted,
@@ -1441,6 +1470,25 @@ fn turn_interaction_response_ack_for_text(
         accepted: false,
         error: Some("Turn interaction response targeted a different command".to_owned()),
     }))
+}
+
+fn active_turn_interaction(
+    active_interaction: &Arc<Mutex<Option<String>>>,
+) -> Result<Option<String>, std::io::Error> {
+    let active = active_interaction.lock().map_err(|_| {
+        std::io::Error::new(ErrorKind::Other, "turn interaction state lock poisoned")
+    })?;
+    Ok(active.clone())
+}
+
+fn clear_active_turn_interaction(
+    active_interaction: &Arc<Mutex<Option<String>>>,
+) -> Result<(), std::io::Error> {
+    let mut active = active_interaction.lock().map_err(|_| {
+        std::io::Error::new(ErrorKind::Other, "turn interaction state lock poisoned")
+    })?;
+    *active = None;
+    Ok(())
 }
 
 fn send_turn_interaction_response_ack(
@@ -1830,9 +1878,11 @@ mod tests {
     use crate::app_server_manager::AppServerManager;
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use crate::placeholder::ConnectorEvent;
+    use crate::session_inventory::TurnInteractionResponseDelivery;
     use serde_json::Value;
     use std::fs;
     use std::io::{self, ErrorKind};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tungstenite::Error as WebSocketError;
 
@@ -2030,12 +2080,14 @@ mod tests {
     #[test]
     fn late_turn_interaction_response_is_rejected_after_receiver_closes() {
         let (sender, receiver) = std::sync::mpsc::channel();
+        let active_interaction = Arc::new(Mutex::new(Some("interaction-1".to_owned())));
         drop(receiver);
 
         let ack = turn_interaction_response_ack_for_text(
             r#"{"kind":"turn.interaction_response","payload":{"request_id":"response-1","command_id":"command-1","interaction_id":"interaction-1","response":{"kind":"input","answers":{}}}}"#,
             "command-1",
             &sender,
+            &active_interaction,
         )
         .expect("late response should not fail")
         .expect("turn response ack");
@@ -2047,6 +2099,72 @@ mod tests {
                 accepted: false,
                 error: Some("App-server turn is no longer waiting for this interaction".to_owned()),
             }
+        );
+    }
+
+    #[test]
+    fn turn_interaction_response_is_accepted_for_active_interaction() {
+        let (sender, receiver): (
+            std::sync::mpsc::Sender<TurnInteractionResponseDelivery>,
+            std::sync::mpsc::Receiver<TurnInteractionResponseDelivery>,
+        ) = std::sync::mpsc::channel();
+        let active_interaction = Arc::new(Mutex::new(Some("interaction-1".to_owned())));
+        let worker = std::thread::spawn(move || {
+            let delivery = receiver.recv().expect("delivered response");
+            assert_eq!(delivery.dispatch.interaction_id, "interaction-1");
+            delivery.delivery_ack.send(true).expect("delivery ack");
+        });
+
+        let ack = turn_interaction_response_ack_for_text(
+            r#"{"kind":"turn.interaction_response","payload":{"request_id":"response-1","command_id":"command-1","interaction_id":"interaction-1","response":{"kind":"input","answers":{}}}}"#,
+            "command-1",
+            &sender,
+            &active_interaction,
+        )
+        .expect("response should not fail")
+        .expect("turn response ack");
+
+        assert_eq!(
+            ack,
+            TurnInteractionResponseAck {
+                request_id: "response-1".to_owned(),
+                accepted: true,
+                error: None,
+            }
+        );
+        worker.join().expect("worker");
+        assert_eq!(
+            active_interaction.lock().expect("active lock").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn turn_interaction_response_is_rejected_for_inactive_interaction() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let active_interaction = Arc::new(Mutex::new(Some("interaction-2".to_owned())));
+
+        let ack = turn_interaction_response_ack_for_text(
+            r#"{"kind":"turn.interaction_response","payload":{"request_id":"response-1","command_id":"command-1","interaction_id":"interaction-1","response":{"kind":"input","answers":{}}}}"#,
+            "command-1",
+            &sender,
+            &active_interaction,
+        )
+        .expect("response should not fail")
+        .expect("turn response ack");
+
+        assert_eq!(
+            ack,
+            TurnInteractionResponseAck {
+                request_id: "response-1".to_owned(),
+                accepted: false,
+                error: Some("App-server turn is not waiting for this interaction".to_owned()),
+            }
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            active_interaction.lock().expect("active lock").as_deref(),
+            Some("interaction-2")
         );
     }
 

@@ -4449,25 +4449,45 @@ async function appendEvent(
     created_at: now
   };
   const payloadJson = input.payload ? JSON.stringify(input.payload) : null;
-  await env.DB!.prepare(
-    `INSERT INTO events (id, workspace_id, thread_id, command_id, seq, kind, priority, summary, payload_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      event.id,
-      input.workspace_id,
-      event.thread_id,
-      event.command_id ?? null,
-      event.seq,
-      event.kind,
-      event.priority,
-      event.summary,
-      payloadJson,
-      event.created_at
+  try {
+    await env.DB!.prepare(
+      `INSERT INTO events (id, workspace_id, thread_id, command_id, seq, kind, priority, summary, payload_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run();
+      .bind(
+        event.id,
+        input.workspace_id,
+        event.thread_id,
+        event.command_id ?? null,
+        event.seq,
+        event.kind,
+        event.priority,
+        event.summary,
+        payloadJson,
+        event.created_at
+      )
+      .run();
+  } catch (error) {
+    await rollbackAppendEventSequenceBestEffort(env, event.thread_id, event.seq);
+    throw error;
+  }
   await recordUsageWindowsForEventsBestEffort(env, [event]);
   return event;
+}
+
+async function rollbackAppendEventSequenceBestEffort(env: Env, threadId: string, seq: number): Promise<void> {
+  try {
+    await env.DB!.prepare(
+      `UPDATE threads
+       SET last_seq = last_seq - 1
+       WHERE id = ?
+         AND last_seq = ?`
+    )
+      .bind(threadId, seq)
+      .run();
+  } catch {
+    // A failed event insert should not mask the original database error.
+  }
 }
 
 async function recordUsageWindowsForEventsBestEffort(env: Env, events: ThreadEvent[], accountedAt?: string): Promise<void> {

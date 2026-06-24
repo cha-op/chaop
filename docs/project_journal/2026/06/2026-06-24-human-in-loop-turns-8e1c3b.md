@@ -39,6 +39,8 @@ superseded_by:
 - A later review pass found a connector race where final app-server events could be returned before queued interaction events were dispatched. The connector now drains pending interaction events before returning final turn events.
 - The readiness review found three remaining delivery races. Browser responses now require a connector delivery acknowledgement before persistence, Worker auto-resolution expiry honours the connector grace window, and stale resolution claims can be reclaimed after a short timeout.
 - Sample HITL data now uses generic workspace paths rather than deployment-instance or local-machine paths.
+- The final review found that response delivery acknowledgements still needed to prove the app-server worker consumed the matching interaction response. The connector now tracks the active interaction for each app-server turn and waits for a local worker delivery acknowledgement before the Worker records a browser response.
+- Duplicate interaction-resolution insert races now best-effort roll back the sequence number they allocated when the insert loses to the unique constraint, avoiding sequence gaps and unnecessary follow-on accounting.
 
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.

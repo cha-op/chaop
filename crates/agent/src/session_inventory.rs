@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
 };
@@ -28,7 +28,13 @@ type AppServerSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 pub struct AppServerCommandChannels {
     pub event_sender: Sender<ConnectorEvent>,
-    pub interaction_receiver: Receiver<TurnInteractionResponseDispatch>,
+    pub interaction_receiver: Receiver<TurnInteractionResponseDelivery>,
+    pub active_interaction: Arc<Mutex<Option<String>>>,
+}
+
+pub struct TurnInteractionResponseDelivery {
+    pub dispatch: TurnInteractionResponseDispatch,
+    pub delivery_ack: Sender<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1979,10 +1985,12 @@ fn handle_app_server_turn_request(
         })?
         .to_owned();
     let request_payload = event.payload.clone();
+    set_active_turn_interaction(channels, Some(interaction_id.clone()))?;
     channels.event_sender.send(event).map_err(|_| {
+        let _ = set_active_turn_interaction(channels, None);
         AppServerCommandError::Other("turn interaction event channel closed".to_owned())
     })?;
-    let response = match receive_turn_interaction_response(
+    let response_result = receive_turn_interaction_response(
         &channels.interaction_receiver,
         command_id,
         &interaction_id,
@@ -1990,7 +1998,9 @@ fn handle_app_server_turn_request(
         timeout_seconds,
         cancel,
         auto_resolution_deadline(method, params),
-    ) {
+    );
+    set_active_turn_interaction(channels, None)?;
+    let response = match response_result {
         Ok(response) => response,
         Err(AppServerCommandError::Cancelled) => {
             send_app_server_turn_interrupt(socket, *next_request_id, thread_id, turn_id);
@@ -2025,6 +2035,17 @@ fn handle_app_server_turn_request(
         ))
         .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
     Ok(true)
+}
+
+fn set_active_turn_interaction(
+    channels: &AppServerCommandChannels,
+    interaction_id: Option<String>,
+) -> Result<(), AppServerCommandError> {
+    let mut active = channels.active_interaction.lock().map_err(|_| {
+        AppServerCommandError::Other("turn interaction state lock poisoned".to_owned())
+    })?;
+    *active = interaction_id;
+    Ok(())
 }
 
 fn app_server_turn_request_method(method: &str) -> bool {
@@ -2325,7 +2346,7 @@ fn turn_interaction_question(value: &Value) -> Option<Value> {
 }
 
 fn receive_turn_interaction_response(
-    receiver: &Receiver<TurnInteractionResponseDispatch>,
+    receiver: &Receiver<TurnInteractionResponseDelivery>,
     command_id: &str,
     interaction_id: &str,
     deadline: Instant,
@@ -2350,13 +2371,16 @@ fn receive_turn_interaction_response(
                     let grace_wait = grace_deadline.saturating_duration_since(now);
                     let wait = remaining.min(grace_wait).min(Duration::from_millis(100));
                     match receiver.recv_timeout(wait) {
-                        Ok(dispatch)
-                            if dispatch.command_id == command_id
-                                && dispatch.interaction_id == interaction_id =>
-                        {
-                            return Ok(dispatch);
+                        Ok(delivery) => {
+                            if delivery.dispatch.command_id == command_id
+                                && delivery.dispatch.interaction_id == interaction_id
+                            {
+                                let _ = delivery.delivery_ack.send(true);
+                                return Ok(delivery.dispatch);
+                            }
+                            let _ = delivery.delivery_ack.send(false);
+                            continue;
                         }
-                        Ok(_) => continue,
                         Err(RecvTimeoutError::Timeout) => continue,
                         Err(RecvTimeoutError::Disconnected) => {
                             return Err(AppServerCommandError::Other(
@@ -2374,13 +2398,15 @@ fn receive_turn_interaction_response(
             wait = wait.min(auto_deadline.saturating_duration_since(now));
         }
         match receiver.recv_timeout(wait) {
-            Ok(dispatch)
-                if dispatch.command_id == command_id
-                    && dispatch.interaction_id == interaction_id =>
-            {
-                return Ok(dispatch);
+            Ok(delivery) => {
+                if delivery.dispatch.command_id == command_id
+                    && delivery.dispatch.interaction_id == interaction_id
+                {
+                    let _ = delivery.delivery_ack.send(true);
+                    return Ok(delivery.dispatch);
+                }
+                let _ = delivery.delivery_ack.send(false);
             }
-            Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(AppServerCommandError::Other(
@@ -2392,19 +2418,21 @@ fn receive_turn_interaction_response(
 }
 
 fn try_receive_turn_interaction_response(
-    receiver: &Receiver<TurnInteractionResponseDispatch>,
+    receiver: &Receiver<TurnInteractionResponseDelivery>,
     command_id: &str,
     interaction_id: &str,
 ) -> Result<Option<TurnInteractionResponseDispatch>, AppServerCommandError> {
     loop {
         match receiver.try_recv() {
-            Ok(dispatch)
-                if dispatch.command_id == command_id
-                    && dispatch.interaction_id == interaction_id =>
-            {
-                return Ok(Some(dispatch));
+            Ok(delivery) => {
+                if delivery.dispatch.command_id == command_id
+                    && delivery.dispatch.interaction_id == interaction_id
+                {
+                    let _ = delivery.delivery_ack.send(true);
+                    return Ok(Some(delivery.dispatch));
+                }
+                let _ = delivery.delivery_ack.send(false);
             }
-            Ok(_) => {}
             Err(TryRecvError::Empty) => return Ok(None),
             Err(TryRecvError::Disconnected) => {
                 return Err(AppServerCommandError::Other(
@@ -3695,11 +3723,12 @@ mod tests {
         APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AUTO_RESOLUTION_RESPONSE_GRACE_MS,
         AppServerCommandChannels, AppServerTurnOutput, HistorySession, InventoryScope,
         SessionDraft, TitleSource, TurnInteractionInputAnswer, TurnInteractionResponse,
-        TurnInteractionResponseDispatch, app_server_command_result_events_with_cancel,
-        app_server_sessions_from_response, app_server_thread_from_response,
-        app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
-        create_app_server_thread_at, ensure_app_server_host_session_at, load_app_server_sessions,
-        read_recent_lines, remaining_app_server_archive_timeout, resolve_session, rollout_paths,
+        TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
+        app_server_command_result_events_with_cancel, app_server_sessions_from_response,
+        app_server_thread_from_response, app_server_titles_from_response,
+        build_host_session_backfill, build_host_sessions_report, create_app_server_thread_at,
+        ensure_app_server_host_session_at, load_app_server_sessions, read_recent_lines,
+        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
         set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
         unix_seconds_to_iso,
     };
@@ -3709,13 +3738,40 @@ mod tests {
     use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     };
     use std::thread;
     use std::time::{Duration, Instant};
     use tungstenite::{Message, accept};
+
+    fn turn_interaction_delivery(
+        dispatch: TurnInteractionResponseDispatch,
+    ) -> (TurnInteractionResponseDelivery, Receiver<bool>) {
+        let (delivery_ack, ack_receiver) = mpsc::channel();
+        (
+            TurnInteractionResponseDelivery {
+                dispatch,
+                delivery_ack,
+            },
+            ack_receiver,
+        )
+    }
+
+    fn send_turn_interaction_response(
+        sender: &Sender<TurnInteractionResponseDelivery>,
+        dispatch: TurnInteractionResponseDispatch,
+    ) {
+        let (delivery, ack_receiver) = turn_interaction_delivery(dispatch);
+        sender.send(delivery).expect("send interaction response");
+        assert_eq!(
+            ack_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("delivery ack"),
+            true
+        );
+    }
 
     #[test]
     fn title_resolution_prefers_metadata_over_history() {
@@ -7202,6 +7258,7 @@ mod tests {
                 Some(AppServerCommandChannels {
                     event_sender: event_tx,
                     interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
                 }),
             )
         });
@@ -7225,8 +7282,9 @@ mod tests {
             .and_then(Value::as_str)
             .expect("interaction id")
             .to_owned();
-        response_tx
-            .send(TurnInteractionResponseDispatch {
+        send_turn_interaction_response(
+            &response_tx,
+            TurnInteractionResponseDispatch {
                 request_id: None,
                 command_id: "command-1".to_owned(),
                 interaction_id,
@@ -7234,8 +7292,8 @@ mod tests {
                     decision: "accept".to_owned(),
                 },
                 auto_resolved: false,
-            })
-            .expect("send interaction response");
+            },
+        );
 
         let app_response = app_responses
             .recv_timeout(Duration::from_secs(1))
@@ -7303,6 +7361,7 @@ mod tests {
                 Some(AppServerCommandChannels {
                     event_sender: event_tx,
                     interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
                 }),
             )
         });
@@ -7344,8 +7403,9 @@ mod tests {
             .and_then(Value::as_str)
             .expect("interaction id")
             .to_owned();
-        response_tx
-            .send(TurnInteractionResponseDispatch {
+        send_turn_interaction_response(
+            &response_tx,
+            TurnInteractionResponseDispatch {
                 request_id: None,
                 command_id: "command-1".to_owned(),
                 interaction_id,
@@ -7353,8 +7413,8 @@ mod tests {
                     decision: "acceptForSession".to_owned(),
                 },
                 auto_resolved: false,
-            })
-            .expect("send permissions response");
+            },
+        );
 
         let app_response = app_responses
             .recv_timeout(Duration::from_secs(1))
@@ -7433,6 +7493,7 @@ mod tests {
                 Some(AppServerCommandChannels {
                     event_sender: event_tx,
                     interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
                 }),
             )
         });
@@ -7463,15 +7524,16 @@ mod tests {
                 answers: vec!["Yes".to_owned()],
             },
         );
-        response_tx
-            .send(TurnInteractionResponseDispatch {
+        send_turn_interaction_response(
+            &response_tx,
+            TurnInteractionResponseDispatch {
                 request_id: None,
                 command_id: "command-1".to_owned(),
                 interaction_id,
                 response: TurnInteractionResponse::Input { answers },
                 auto_resolved: false,
-            })
-            .expect("send input response");
+            },
+        );
 
         let app_response = app_responses
             .recv_timeout(Duration::from_secs(1))
@@ -7540,6 +7602,7 @@ mod tests {
                 Some(AppServerCommandChannels {
                     event_sender: event_tx,
                     interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
                 }),
             )
         });
@@ -7649,6 +7712,7 @@ mod tests {
                 Some(AppServerCommandChannels {
                     event_sender: event_tx,
                     interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
                 }),
             )
         });
@@ -7671,15 +7735,16 @@ mod tests {
                 answers: vec!["Yes".to_owned()],
             },
         );
-        response_tx
-            .send(TurnInteractionResponseDispatch {
+        send_turn_interaction_response(
+            &response_tx,
+            TurnInteractionResponseDispatch {
                 request_id: None,
                 command_id: "command-1".to_owned(),
                 interaction_id,
                 response: TurnInteractionResponse::Input { answers },
                 auto_resolved: false,
-            })
-            .expect("send input response");
+            },
+        );
 
         let app_response = app_responses
             .recv_timeout(Duration::from_secs(1))
@@ -7750,6 +7815,7 @@ mod tests {
                 Some(AppServerCommandChannels {
                     event_sender: event_tx,
                     interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
                 }),
             )
         });
@@ -7831,14 +7897,15 @@ mod tests {
                 answers: vec!["Yes".to_owned()],
             },
         );
+        let (delivery, delivery_ack) = turn_interaction_delivery(TurnInteractionResponseDispatch {
+            request_id: None,
+            command_id: "command-1".to_owned(),
+            interaction_id: "interaction-1".to_owned(),
+            response: TurnInteractionResponse::Input { answers },
+            auto_resolved: false,
+        });
         response_tx
-            .send(TurnInteractionResponseDispatch {
-                request_id: None,
-                command_id: "command-1".to_owned(),
-                interaction_id: "interaction-1".to_owned(),
-                response: TurnInteractionResponse::Input { answers },
-                auto_resolved: false,
-            })
+            .send(delivery)
             .expect("queue interaction response");
         let cancel = AtomicBool::new(false);
 
@@ -7854,6 +7921,12 @@ mod tests {
         .expect("receive queued response");
 
         assert!(!response.auto_resolved);
+        assert_eq!(
+            delivery_ack
+                .recv_timeout(Duration::from_secs(1))
+                .expect("delivery ack"),
+            true
+        );
         match response.response {
             TurnInteractionResponse::Input { answers } => {
                 assert_eq!(

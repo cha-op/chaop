@@ -1,6 +1,6 @@
 ---
 id: 20260624-8e1c3b-zh-Hans
-title: Human-In-The-Loop Turns
+title: 人工介入回合
 status: active
 created: 2026-06-24
 updated: 2026-06-24
@@ -12,7 +12,7 @@ superseded_by:
 
 [ [British English](2026-06-24-human-in-loop-turns-8e1c3b.md) | 简体中文 ]
 
-# Human-In-The-Loop Turns
+# 人工介入回合
 
 ## 摘要
 - PR C 接在已经合入的 Thread Centre chat MVP 后面，继续让 dogfood safety gate 保护每个会产生写入的 operator action。
@@ -39,6 +39,8 @@ superseded_by:
 - 后续 review 发现 connector race：final app-server events 可能先于已排队的 interaction events 返回。现在 connector 会先 drain pending interaction events，再返回最终 turn events。
 - 合并准备复查又发现三处 delivery race：浏览器响应现在必须等 connector 明确确认已投递后才会持久化；Worker 的 auto-resolution expiry 会包含 connector 的 grace window；短暂超时后可以回收 stale resolution claim。
 - Sample HITL 数据现在使用泛化 workspace 路径，不再使用 deployment-instance 或本机路径。
+- 最终 review 发现 response delivery acknowledgement 还需要证明 app-server worker 已消费同一个 interaction response。现在 connector 会跟踪每个 app-server turn 的 active interaction，并等待本地 worker delivery acknowledgement 后，Worker 才会记录 browser response。
+- 重复 interaction-resolution insert 在输给 unique constraint 时，会 best-effort 回滚本次分配的 sequence number，避免 sequence gap 和后续不必要的 accounting。
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。

@@ -756,6 +756,39 @@ test("recordAgentEvent accepts duplicate turn interaction resolution events idem
   assert.equal(db.eventInserts, 0);
 });
 
+test("recordAgentEvent rolls back sequence allocation after raced duplicate resolution insert", async () => {
+  const db = agentEventGuardDb(
+    {
+      leaseOwnerConnectorId: "connector-online",
+      state: "running"
+    },
+    {
+      expectedTaskState: "running",
+      racedResolutionInteractionId: "interaction-1",
+      failEventInsertWithUniqueConstraint: true
+    }
+  );
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    kind: "input.received",
+    priority: "P1",
+    summary: "Input auto-resolved.",
+    payload: {
+      type: "turn_interaction_resolution",
+      interaction_id: "interaction-1",
+      status: "answered",
+      answer_count: 0
+    }
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.event, undefined);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.sequenceRollbacks, 1);
+  assert.equal(db.usageWindowUpserts, 0);
+});
+
 test("prepareTurnInteractionResolutionInDb rejects already resolved interactions before dispatch", async () => {
   const db = turnInteractionResolutionDb({ resolved: true });
 
@@ -2075,7 +2108,9 @@ function agentEventGuardDb(command: {
   expectedCommandState?: string;
   expectedTaskState?: string;
   failUsageWindowUpserts?: boolean;
+  failEventInsertWithUniqueConstraint?: boolean;
   existingResolutionInteractionId?: string;
+  racedResolutionInteractionId?: string;
 } = {}) {
   const expectedCommandState = options.expectedCommandState ?? "succeeded";
   const expectedTaskState = options.expectedTaskState ?? "done";
@@ -2083,6 +2118,8 @@ function agentEventGuardDb(command: {
     commandUpdates: 0,
     taskUpdates: 0,
     eventInserts: 0,
+    resolutionChecks: 0,
+    sequenceRollbacks: 0,
     usageWindowUpserts: 0,
     usageWindowBinds: [] as unknown[][]
   };
@@ -2142,7 +2179,12 @@ function agentEventGuardDb(command: {
             assert.equal(commandId, "command-1");
             return {
               async first() {
-                return options.existingResolutionInteractionId === interactionId
+                counters.resolutionChecks += 1;
+                return options.existingResolutionInteractionId === interactionId ||
+                  (
+                    options.racedResolutionInteractionId === interactionId &&
+                    counters.eventInserts > 0
+                  )
                   ? { id: "event-resolution-1" }
                   : null;
               }
@@ -2186,12 +2228,30 @@ function agentEventGuardDb(command: {
         };
       }
 
+      if (/UPDATE threads\s+SET last_seq = last_seq - 1/.test(sql)) {
+        return {
+          bind(threadId: string, seq: number) {
+            assert.equal(threadId, "thread-1");
+            assert.equal(seq, 1);
+            return {
+              async run() {
+                counters.sequenceRollbacks += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       if (/INSERT INTO events/.test(sql)) {
         return {
           bind() {
             return {
               async run() {
                 counters.eventInserts += 1;
+                if (options.failEventInsertWithUniqueConstraint) {
+                  throw new Error("UNIQUE constraint failed: events.command_id, events.interaction_id");
+                }
                 return { success: true };
               }
             };
@@ -2245,6 +2305,9 @@ function agentEventGuardDb(command: {
     },
     get eventInserts() {
       return counters.eventInserts;
+    },
+    get sequenceRollbacks() {
+      return counters.sequenceRollbacks;
     },
     get usageWindowUpserts() {
       return counters.usageWindowUpserts;
