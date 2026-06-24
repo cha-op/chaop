@@ -60,12 +60,7 @@ export function threadTurnsForDisplay(
     ...[...groups.entries()]
       .map(([commandId, group]) => buildThreadTurn(commandId, group.command, group.events)),
     ...buildHistoryTurns(threadId, events)
-  ]
-    .sort((left, right) => {
-      const updated = right.updated_at.localeCompare(left.updated_at);
-      if (updated !== 0) return updated;
-      return right.last_seq - left.last_seq;
-    });
+  ].sort(compareThreadTurns);
 }
 
 function buildHistoryTurns(threadId: string, events: ThreadEvent[]): ThreadTurnSummary[] {
@@ -152,10 +147,30 @@ function historyTurnFromDraft(draft: HistoryTurnDraft): ThreadTurnSummary {
     progress_summaries: draft.progress_summaries ?? [],
     event_count: sortedEvents.length,
     last_seq: Math.max(0, ...sortedEvents.map((event) => event.seq)),
-    updated_at: sortedEvents.map((event) => event.created_at).sort().at(-1) ?? new Date(0).toISOString(),
+    updated_at: historyTurnUpdatedAt(sortedEvents),
     events: sortedEvents
   };
 }
+
+function compareThreadTurns(left: ThreadTurnSummary, right: ThreadTurnSummary): number {
+  const leftTime = Date.parse(left.updated_at);
+  const rightTime = Date.parse(right.updated_at);
+  if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) {
+    return rightTime - leftTime;
+  }
+  return right.last_seq - left.last_seq;
+}
+
+function historyTurnUpdatedAt(events: ThreadEvent[]): string {
+  return events
+    .map((event) => event.created_at)
+    .filter((value) => value !== UNKNOWN_BACKFILL_CREATED_AT)
+    .sort()
+    .at(-1) ?? UNKNOWN_TURN_UPDATED_AT;
+}
+
+const UNKNOWN_BACKFILL_CREATED_AT = "1970-01-01T00:00:00.000Z";
+const UNKNOWN_TURN_UPDATED_AT = "unknown";
 
 function parseBackfillMessage(summary: string): { role: "user" | "assistant"; text: string } | undefined {
   const timestamped = summary.match(

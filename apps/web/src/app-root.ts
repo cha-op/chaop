@@ -1849,14 +1849,14 @@ function formatSyncStatus(iso: string | undefined, nowMs: number): string {
 
 function formatRelativeIso(iso: string, nowMs: number): string {
   const timestamp = new Date(iso).getTime();
-  if (Number.isNaN(timestamp)) return "unknown";
+  if (Number.isNaN(timestamp)) return "unknown time";
   const age = formatAge(nowMs - timestamp);
   return age === "just now" ? age : `${age} ago`;
 }
 
 function formatAbsoluteIso(iso: string): string {
   const timestamp = new Date(iso);
-  if (Number.isNaN(timestamp.getTime())) return "Unknown";
+  if (Number.isNaN(timestamp.getTime())) return "Unknown time";
   return timestamp.toLocaleString("en-GB", {
     dateStyle: "medium",
     timeStyle: "medium"

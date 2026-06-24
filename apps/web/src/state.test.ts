@@ -1050,8 +1050,12 @@ test("threadTurnsForDisplay parses backfilled history with unknown timestamps", 
     "thread-1",
     [],
     [
-      event("event-1", undefined, 1, "command.output", "unknown time - User: Recover the old session."),
-      event("event-2", undefined, 2, "command.output", "unknown time - Assistant: I found the old transcript.")
+      event("event-1", undefined, 1, "command.output", "unknown time - User: Recover the old session.", {
+        created_at: "1970-01-01T00:00:00.000Z"
+      }),
+      event("event-2", undefined, 2, "command.output", "unknown time - Assistant: I found the old transcript.", {
+        created_at: "1970-01-01T00:00:00.000Z"
+      })
     ]
   );
 
@@ -1059,6 +1063,7 @@ test("threadTurnsForDisplay parses backfilled history with unknown timestamps", 
   assert.equal(turns[0]?.status, "succeeded");
   assert.equal(turns[0]?.prompt, "Recover the old session.");
   assert.equal(turns[0]?.assistant_summary, "I found the old transcript.");
+  assert.equal(turns[0]?.updated_at, "unknown");
 });
 
 test("threadTurnsForDisplay marks user-only backfilled history as partial", () => {
@@ -1237,7 +1242,8 @@ function event(
   commandId: string | undefined,
   seq: number,
   kind: ThreadEvent["kind"],
-  summary: string
+  summary: string,
+  overrides: Partial<ThreadEvent> = {}
 ): ThreadEvent {
   const item: ThreadEvent = {
     id,
@@ -1249,6 +1255,7 @@ function event(
     created_at: `2026-06-12T10:00:0${seq}.000Z`
   };
   if (commandId) item.command_id = commandId;
+  Object.assign(item, overrides);
   return item;
 }
 
