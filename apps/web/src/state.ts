@@ -12,12 +12,139 @@ import type {
   HostSessionSummary,
   HostSessionSyncSummary,
   TaskArchiveResponse,
+  ThreadEvent,
   ThreadSummary
 } from "@chaop/protocol";
 
 export type CommandExecutionMode = "placeholder" | "app_server" | "codex_cli_fallback";
 
+export type ThreadTurnStatus = "pending" | "running" | "waiting" | "succeeded" | "failed";
+
+export type ThreadTurnSummary = {
+  command_id: string;
+  command?: CommandSummary | undefined;
+  prompt?: string | undefined;
+  status: ThreadTurnStatus;
+  assistant_summary?: string | undefined;
+  error_summary?: string | undefined;
+  progress_summaries: string[];
+  event_count: number;
+  last_seq: number;
+  updated_at: string;
+  events: ThreadEvent[];
+};
+
 export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
+
+export function threadTurnsForDisplay(
+  threadId: string,
+  commands: CommandSummary[],
+  events: ThreadEvent[]
+): ThreadTurnSummary[] {
+  const groups = new Map<string, { command?: CommandSummary; events: ThreadEvent[] }>();
+  for (const event of events) {
+    if (event.thread_id !== threadId || !event.command_id) continue;
+    const group = groups.get(event.command_id) ?? { events: [] };
+    group.events.push(event);
+    groups.set(event.command_id, group);
+  }
+
+  for (const command of commands) {
+    if (command.thread_id !== threadId) continue;
+    const group = groups.get(command.id) ?? { events: [] };
+    group.command = command;
+    groups.set(command.id, group);
+  }
+
+  return [...groups.entries()]
+    .map(([commandId, group]) => buildThreadTurn(commandId, group.command, group.events))
+    .sort((left, right) => {
+      const updated = right.updated_at.localeCompare(left.updated_at);
+      if (updated !== 0) return updated;
+      return right.last_seq - left.last_seq;
+    });
+}
+
+function buildThreadTurn(
+  commandId: string,
+  command: CommandSummary | undefined,
+  events: ThreadEvent[]
+): ThreadTurnSummary {
+  const sortedEvents = [...events].sort((left, right) => {
+    if (left.seq !== right.seq) return left.seq - right.seq;
+    return left.created_at.localeCompare(right.created_at);
+  });
+  const eventStatus = threadTurnStatusFromEvents(sortedEvents);
+  const commandStatus = command ? threadTurnStatusFromCommand(command) : undefined;
+  const hasTerminalEvent = sortedEvents.some((event) =>
+    event.kind === "command.finished" || event.kind === "command.failed"
+  );
+  const status = hasTerminalEvent
+    ? eventStatus ?? commandStatus ?? "pending"
+    : commandStatus === "succeeded" || commandStatus === "failed"
+      ? commandStatus
+      : eventStatus ?? commandStatus ?? "pending";
+  const assistantEvent = [...sortedEvents]
+    .reverse()
+    .find((event) => event.kind === "command.output" && assistantSummaryFromEvent(event) !== undefined);
+  const errorEvent = [...sortedEvents].reverse().find((event) => event.kind === "command.failed");
+  const progressSummaries = sortedEvents
+    .filter((event) => progressSummaryForEvent(event) !== undefined)
+    .map((event) => progressSummaryForEvent(event)!)
+    .filter((summary, index, all) => all.indexOf(summary) === index);
+  const updatedAt = [command?.updated_at, command?.created_at, ...sortedEvents.map((event) => event.created_at)]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .sort()
+    .at(-1) ?? new Date(0).toISOString();
+
+  return {
+    command_id: commandId,
+    command,
+    prompt: command?.prompt,
+    status,
+    assistant_summary: assistantEvent ? assistantSummaryFromEvent(assistantEvent) : undefined,
+    error_summary: errorEvent?.summary,
+    progress_summaries: progressSummaries,
+    event_count: sortedEvents.length,
+    last_seq: Math.max(0, ...sortedEvents.map((event) => event.seq)),
+    updated_at: updatedAt,
+    events: sortedEvents
+  };
+}
+
+function threadTurnStatusFromEvents(events: ThreadEvent[]): ThreadTurnStatus | undefined {
+  let status: ThreadTurnStatus | undefined;
+  for (const event of events) {
+    if (event.kind === "command.accepted") status = "pending";
+    if (event.kind === "command.started" || event.kind === "command.output") status = "running";
+    if (event.kind === "approval.requested" || event.kind === "notice.throttled") status = "waiting";
+    if (event.kind === "command.finished") status = "succeeded";
+    if (event.kind === "command.failed") status = "failed";
+  }
+  return status;
+}
+
+function threadTurnStatusFromCommand(command: CommandSummary): ThreadTurnStatus {
+  if (command.state === "running" || command.state === "leased" || command.state === "cancelling") {
+    return "running";
+  }
+  if (command.state === "succeeded") return "succeeded";
+  if (command.state === "failed" || command.state === "cancelled") return "failed";
+  return "pending";
+}
+
+function assistantSummaryFromEvent(event: ThreadEvent): string | undefined {
+  if (event.kind !== "command.output") return undefined;
+  const match = event.summary.match(/^Codex:\s*(.+)$/s);
+  return match?.[1]?.trim() || undefined;
+}
+
+function progressSummaryForEvent(event: ThreadEvent): string | undefined {
+  if (event.kind === "command.output" && assistantSummaryFromEvent(event) !== undefined) return undefined;
+  if (event.kind === "command.finished" || event.kind === "command.failed") return undefined;
+  if (event.kind === "command.accepted") return undefined;
+  return event.summary;
+}
 
 const APP_SERVER_INSTANCE_STATE_RANK: Record<AppServerInstanceSummary["state"], number> = {
   degraded: 0,

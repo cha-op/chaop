@@ -2,6 +2,7 @@ import type {
   AppServerInstanceSummary,
   BootstrapPayload,
   BudgetSummary,
+  CommandSummary,
   ConnectorSummary,
   DogfoodSafetyPosture,
   HostSessionSummary,
@@ -514,18 +515,54 @@ export const events: ThreadEvent[] = [
     seq: 1,
     kind: "command.accepted",
     priority: "P1",
-    summary: "Control plane accepted the placeholder command.",
+    summary: "Control plane accepted the codex command.",
     created_at: "2026-06-09T21:58:01.000Z"
   },
   {
-    id: "event-placeholder-output",
+    id: "event-placeholder-started",
     thread_id: "thread-orders-500",
     command_id: "command-placeholder",
     seq: 2,
+    kind: "command.started",
+    priority: "P1",
+    summary: "Connector started Codex app-server turn for local thread 019d3109-210d-7492-be2b-902b10993a3d.",
+    created_at: "2026-06-09T21:58:02.000Z"
+  },
+  {
+    id: "event-placeholder-answer",
+    thread_id: "thread-orders-500",
+    command_id: "command-placeholder",
+    seq: 3,
     kind: "command.output",
     priority: "P2",
-    summary: "Summary stream is current; full log detail is deferred.",
-    created_at: "2026-06-09T21:58:02.000Z"
+    summary: "Codex: The newest failures cluster around stale app-server attachment state. Re-run attach for the selected session, then retry the turn after the connector reports a healthy managed app-server.",
+    created_at: "2026-06-09T21:58:03.000Z"
+  },
+  {
+    id: "event-placeholder-finished",
+    thread_id: "thread-orders-500",
+    command_id: "command-placeholder",
+    seq: 4,
+    kind: "command.finished",
+    priority: "P1",
+    summary: "Codex app-server turn completed successfully.",
+    created_at: "2026-06-09T21:58:04.000Z"
+  }
+];
+
+export const runningCommands: CommandSummary[] = [
+  {
+    id: "command-placeholder",
+    workspace_id: "workspace-api",
+    thread_id: "thread-orders-500",
+    task_id: "task-orders-500",
+    type: "codex",
+    execution_mode: "app_server",
+    prompt: "Summarise the current 500-error failure pattern and propose the next fix.",
+    state: "succeeded",
+    target_connector_id: "connector-mac-studio",
+    created_at: "2026-06-09T21:58:00.000Z",
+    updated_at: "2026-06-09T21:58:04.000Z"
   }
 ];
 
@@ -635,7 +672,7 @@ export function sampleBootstrap(email = "operator@example.com"): BootstrapPayloa
     host_session_syncs: hostSessionSyncs,
     app_server_instances: appServerInstances,
     task_categories: taskCategories,
-    running_commands: [],
+    running_commands: runningCommands,
     events,
     budget,
     safety,

@@ -332,7 +332,8 @@ h2 {
 .chip.realtime,
 .chip.normal,
 .chip.live,
-.chip.healthy {
+.chip.healthy,
+.chip.succeeded {
   background: #dcfce7;
   color: #166534;
 }
@@ -345,7 +346,9 @@ h2 {
 .chip.polling,
 .chip.degraded,
 .chip.draining,
-.chip.restarting {
+.chip.restarting,
+.chip.pending,
+.chip.running {
   background: #fef3c7;
   color: #92400e;
 }
@@ -358,12 +361,14 @@ h2 {
 .status.offline,
 .chip.throttled,
 .chip.hard_limited,
-.chip.stopped {
+.chip.stopped,
+.chip.failed {
   background: #fee2e2;
   color: #991b1b;
 }
 
-.chip.waiting_for_upload {
+.chip.waiting_for_upload,
+.chip.waiting {
   background: #e0f2fe;
   color: #075985;
 }
@@ -782,7 +787,104 @@ textarea {
   color: #991b1b;
 }
 
+.subsection-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  margin: 22px 0 10px;
+}
+
+.subsection-heading h3 {
+  margin: 0;
+  font-size: 0.98rem;
+}
+
+.subsection-heading span {
+  color: #64748b;
+  font-size: 0.84rem;
+}
+
+.turn-stream {
+  display: grid;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.turn-row {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #dbe5ef;
+  border-radius: 8px;
+  background: #fbfdff;
+  padding: 14px;
+}
+
+.turn-row header,
+.turn-row footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.turn-row header div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.turn-row header span,
+.assistant-answer span,
+.turn-row footer {
+  color: #64748b;
+  font-size: 0.84rem;
+}
+
+.turn-row header strong {
+  overflow-wrap: anywhere;
+}
+
+.assistant-answer {
+  display: grid;
+  gap: 4px;
+  border-left: 3px solid #93c5fd;
+  padding-left: 12px;
+}
+
+.assistant-answer.failed {
+  border-left-color: #fca5a5;
+}
+
+.assistant-answer.empty,
+.assistant-answer.pending {
+  border-left-color: #cbd5e1;
+}
+
+.assistant-answer p {
+  margin: 0;
+  color: #334155;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.turn-progress {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+  color: #64748b;
+  font-size: 0.88rem;
+}
+
+.turn-row footer {
+  flex-wrap: wrap;
+  border-top: 1px solid #e6ebf2;
+  padding-top: 10px;
+}
+
 .timeline {
+  margin-top: 18px;
   border-bottom: 1px solid #e6ebf2;
 }
 

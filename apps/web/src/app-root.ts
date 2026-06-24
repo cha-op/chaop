@@ -66,7 +66,9 @@ import {
   normaliseCommandMode,
   safetyActionBlocked,
   safetyActionReason,
-  type CommandExecutionMode
+  threadTurnsForDisplay,
+  type CommandExecutionMode,
+  type ThreadTurnSummary
 } from "./state.js";
 
 type View = "operations-map" | "task-board" | "host-sessions" | "thread-centre" | "budget-board";
@@ -522,9 +524,11 @@ export class ChaopApp extends LitElement {
     if (!thread) return this.renderEmptyThreadCentre();
     const task = this.taskForThread(thread.id);
     const events = this.eventsForThread(thread.id);
+    const turns = threadTurnsForDisplay(thread.id, this.data!.running_commands, events);
     const command = this.lastCommandId
-      ? this.data!.running_commands.find((item) => item.id === this.lastCommandId)
-      : this.data!.running_commands[0];
+      ? turns.find((turn) => turn.command_id === this.lastCommandId)?.command
+      : turns.find((turn) => turn.command)?.command
+        ?? this.data!.running_commands.find((item) => item.thread_id === thread.id);
 
     return html`
       <section class="page-grid thread-grid">
@@ -548,7 +552,7 @@ export class ChaopApp extends LitElement {
             </div>
           </div>
           <label class="command-box">
-            <span>Command</span>
+            <span>Prompt</span>
             <textarea
               .value=${this.commandPrompt}
               @input=${(event: InputEvent) => {
@@ -570,17 +574,22 @@ export class ChaopApp extends LitElement {
             ?disabled=${this.commandState === "submitting" || this.commandPrompt.trim().length === 0 || this.safetyBlocked("command_create")}
             @click=${this.submitCommand}
           >
-            ${this.commandState === "submitting" ? "Submitting..." : `Run ${commandModeLabel(this.commandMode)} command`}
+            ${this.commandState === "submitting" ? "Submitting..." : `Send with ${commandModeLabel(this.commandMode)}`}
           </button>
           ${this.commandState === "accepted"
             ? html`<p class="command-status success">
-                ${commandModeLabel(this.commandMode)} command accepted${this.lastCommandId ? `: ${this.lastCommandId}` : ""}.
+                Prompt accepted${this.lastCommandId ? `: ${this.lastCommandId}` : ""}.
               </p>`
             : nothing}
           ${this.commandState === "failed"
             ? html`<p class="command-status failed">Command request failed.</p>`
             : nothing}
-          <div class="timeline">
+          ${this.renderTurnStream(turns)}
+          <div class="timeline event-log">
+            <div class="subsection-heading">
+              <h3>Raw events</h3>
+              <span>${events.length} recorded</span>
+            </div>
             ${events.length > 0
             ? events.map(
                   (event) => html`
@@ -619,6 +628,80 @@ export class ChaopApp extends LitElement {
           </dl>
         </aside>
       </section>
+    `;
+  }
+
+  private renderTurnStream(turns: ThreadTurnSummary[]) {
+    return html`
+      <section class="turn-stream" aria-label="Thread turns">
+        <div class="subsection-heading">
+          <h3>Turns</h3>
+          <span>${turns.length} ${turns.length === 1 ? "turn" : "turns"}</span>
+        </div>
+        ${turns.length > 0
+          ? turns.map((turn) => this.renderThreadTurn(turn))
+          : html`<p class="muted">No turns recorded for this thread yet.</p>`}
+      </section>
+    `;
+  }
+
+  private renderThreadTurn(turn: ThreadTurnSummary) {
+    const latestProgress = turn.progress_summaries.slice(-3).reverse();
+    return html`
+      <article class=${`turn-row ${turn.status}`}>
+        <header>
+          <div>
+            <span>Prompt</span>
+            <strong>${turn.prompt ?? "Prompt unavailable from retained command history"}</strong>
+          </div>
+          <span class=${`chip ${turn.status}`}>${turnStatusLabel(turn.status)}</span>
+        </header>
+        ${turn.assistant_summary
+          ? html`
+              <div class="assistant-answer">
+                <span>Assistant</span>
+                <p>${turn.assistant_summary}</p>
+              </div>
+            `
+          : this.renderPendingTurnBody(turn)}
+        ${latestProgress.length > 0
+          ? html`
+              <ul class="turn-progress">
+                ${latestProgress.map((summary) => html`<li>${summary}</li>`)}
+              </ul>
+            `
+          : nothing}
+        <footer>
+          <span>${turn.command_id}</span>
+          <span>${turn.event_count} ${turn.event_count === 1 ? "event" : "events"}</span>
+          <span title=${formatAbsoluteIso(turn.updated_at)}>${formatRelativeIso(turn.updated_at, this.clockNow)}</span>
+        </footer>
+      </article>
+    `;
+  }
+
+  private renderPendingTurnBody(turn: ThreadTurnSummary) {
+    if (turn.status === "failed") {
+      return html`
+        <div class="assistant-answer failed">
+          <span>Failure</span>
+          <p>${turn.error_summary ?? "The turn failed before an assistant message was recorded."}</p>
+        </div>
+      `;
+    }
+    if (turn.status === "succeeded") {
+      return html`
+        <div class="assistant-answer empty">
+          <span>Assistant</span>
+          <p>The turn completed without an assistant message.</p>
+        </div>
+      `;
+    }
+    return html`
+      <div class="assistant-answer pending">
+        <span>Assistant</span>
+        <p>${turn.status === "waiting" ? "Waiting for a required action." : "Waiting for the next update."}</p>
+      </div>
     `;
   }
 
@@ -1965,6 +2048,16 @@ function taskStateForEvent(kind: ThreadEvent["kind"]): TaskSummary["state"] | un
   if (kind === "command.finished") return "done";
   if (kind === "command.failed") return "failed";
   return undefined;
+}
+
+function turnStatusLabel(status: ThreadTurnSummary["status"]): string {
+  return {
+    pending: "Accepted",
+    running: "Running",
+    waiting: "Waiting",
+    succeeded: "Done",
+    failed: "Failed"
+  }[status];
 }
 
 function parseEnvelope(value: unknown): { kind?: string; payload?: unknown } | undefined {

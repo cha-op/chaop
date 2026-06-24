@@ -3,8 +3,10 @@ import test from "node:test";
 import type {
   AppServerInstanceSummary,
   BootstrapPayload,
+  CommandSummary,
   HostSessionSummary,
-  TaskArchiveResponse
+  TaskArchiveResponse,
+  ThreadEvent
 } from "@chaop/protocol";
 import {
   appServerInstanceForHostSession,
@@ -34,7 +36,8 @@ import {
   normaliseCommandMode,
   primaryAppServerInstanceForConnector,
   safetyActionBlocked,
-  safetyActionReason
+  safetyActionReason,
+  threadTurnsForDisplay
 } from "./state.ts";
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
@@ -930,6 +933,65 @@ test("archiveSyncWarning reports app-server sync failures", () => {
   );
 });
 
+test("threadTurnsForDisplay renders a completed assistant turn from command events", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [
+      command("command-1", {
+        prompt: "Summarise the failure.",
+        state: "succeeded",
+        updated_at: "2026-06-12T10:04:00.000Z"
+      })
+    ],
+    [
+      event("event-1", "command-1", 1, "command.accepted", "Control plane accepted the codex command."),
+      event("event-2", "command-1", 2, "command.started", "Connector started Codex app-server turn."),
+      event("event-3", "command-1", 3, "command.output", "Codex: The likely failure is a stale app-server lease."),
+      event("event-4", "command-1", 4, "command.finished", "Codex app-server turn completed successfully.")
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "succeeded");
+  assert.equal(turns[0]?.prompt, "Summarise the failure.");
+  assert.equal(turns[0]?.assistant_summary, "The likely failure is a stale app-server lease.");
+  assert.deepEqual(turns[0]?.progress_summaries, ["Connector started Codex app-server turn."]);
+});
+
+test("threadTurnsForDisplay keeps failed event-only turns diagnosable", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [],
+    [
+      event("event-1", "command-1", 1, "command.accepted", "Control plane accepted the codex command."),
+      event("event-2", "command-1", 2, "command.failed", "Codex app-server turn could not start.")
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "failed");
+  assert.equal(turns[0]?.prompt, undefined);
+  assert.equal(turns[0]?.error_summary, "Codex app-server turn could not start.");
+});
+
+test("threadTurnsForDisplay preserves terminal command state when the event tail is partial", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [
+      command("command-1", {
+        state: "succeeded",
+        updated_at: "2026-06-12T10:05:00.000Z"
+      })
+    ],
+    [
+      event("event-1", "command-1", 1, "command.output", "Codex: Done.")
+    ]
+  );
+
+  assert.equal(turns[0]?.status, "succeeded");
+  assert.equal(turns[0]?.assistant_summary, "Done.");
+});
+
 function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   return {
     user: {
@@ -963,6 +1025,42 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
     safety: safety(),
     server_time: "2026-06-12T10:00:00.000Z",
     ...overrides
+  };
+}
+
+function command(id: string, overrides: Partial<CommandSummary> = {}): CommandSummary {
+  return {
+    id,
+    workspace_id: "workspace-1",
+    thread_id: "thread-1",
+    task_id: "task-1",
+    type: "codex",
+    execution_mode: "app_server",
+    prompt: "Run the next turn.",
+    state: "pending",
+    target_connector_id: "connector-1",
+    created_at: "2026-06-12T10:00:00.000Z",
+    updated_at: "2026-06-12T10:00:00.000Z",
+    ...overrides
+  };
+}
+
+function event(
+  id: string,
+  commandId: string,
+  seq: number,
+  kind: ThreadEvent["kind"],
+  summary: string
+): ThreadEvent {
+  return {
+    id,
+    thread_id: "thread-1",
+    command_id: commandId,
+    seq,
+    kind,
+    priority: "P1",
+    summary,
+    created_at: `2026-06-12T10:00:0${seq}.000Z`
   };
 }
 
