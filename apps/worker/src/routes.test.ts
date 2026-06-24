@@ -1762,6 +1762,81 @@ test("browser bootstrap derives safety from the same live telemetry as budget", 
   }
 });
 
+test("browser bootstrap keeps persisted max telemetry when live refresh is lower", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  console.warn = () => undefined;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 10 } }],
+            webWorkerInvocations: [],
+            durableObjectsInvocationsAdaptiveGroups: [],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 10, rowsWritten: 50_000 } }]
+          }
+        ]
+      }
+    }
+  }))) as typeof fetch;
+
+  const now = new Date();
+  const dayStart = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate()
+  )).toISOString();
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/bootstrap"),
+      {
+        ...devEnv,
+        DB: readOnlyBootstrapTelemetryPersistFailDb([
+          {
+            id: "bootstrap-persisted-high",
+            sample_type: "cloudflare_daily",
+            sampled_at: now.toISOString(),
+            window_start: dayStart,
+            window_end: now.toISOString(),
+            d1_rows_written_daily: 120_000,
+            d1_rows_read_daily: 2_500,
+            worker_requests_daily: 75,
+            durable_object_requests_daily: 80,
+            created_at: now.toISOString()
+          }
+        ]),
+        CF_TELEMETRY_API_TOKEN: "bootstrap-safety-token",
+        CF_TELEMETRY_ACCOUNT_ID: "bootstrap-persisted-max-account",
+        CF_TELEMETRY_API_WORKER: "chaop-api-bootstrap-persisted-max",
+        CF_TELEMETRY_D1_DATABASE_ID: "bootstrap-persisted-max-database",
+        CF_TELEMETRY_CACHE_SECONDS: "1",
+        CF_TELEMETRY_SAMPLE_SECONDS: "300"
+      }
+    );
+    const body = (await response.json()) as {
+      budget: { state: string; bottleneck_constraint?: { id: string; used_units: number } };
+      safety: { state: string; actions: Array<{ action: string; state: string }> };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.budget.state, "hard_limited");
+    assert.deepEqual(
+      [body.budget.bottleneck_constraint?.id, body.budget.bottleneck_constraint?.used_units],
+      ["d1_rows_written_daily", 120_000]
+    );
+    assert.equal(body.safety.state, "hard_limited");
+    assert.equal(
+      body.safety.actions.find((guard) => guard.action === "command_create")?.state,
+      "blocked"
+    );
+  } finally {
+    console.warn = originalWarn;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("usage summary returns bounded D1 budget windows", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/usage-summary", {
@@ -2978,6 +3053,104 @@ test("usage summary samples Cloudflare telemetry constraints when configured", a
         ["estimated_event_persistence_daily", false, null],
         ["estimated_non_event_residual_daily", false, null]
       ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("usage summary keeps persisted max telemetry when live refresh is lower", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    data: {
+      viewer: {
+        accounts: [
+          {
+            apiWorkerInvocations: [{ sum: { requests: 20 } }],
+            webWorkerInvocations: [{ sum: { requests: 5 } }],
+            d1AnalyticsAdaptiveGroups: [{ sum: { rowsRead: 1234, rowsWritten: 50_000 } }],
+            durableObjectsInvocationsAdaptiveGroups: [{ sum: { requests: 40 } }],
+            durableObjectsPeriodicGroups: [{ sum: { inboundWebsocketMsgCount: 41 } }]
+          }
+        ]
+      }
+    }
+  }), {
+    headers: { "content-type": "application/json; charset=utf-8" }
+  })) as typeof fetch;
+
+  const now = new Date();
+  const dayStart = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate()
+  )).toISOString();
+  const telemetrySamples: Record<string, unknown>[] = [
+    {
+      id: "persisted-high-current-day",
+      sample_type: "cloudflare_daily",
+      sampled_at: now.toISOString(),
+      window_start: dayStart,
+      window_end: now.toISOString(),
+      d1_rows_written_daily: 120_000,
+      d1_rows_read_daily: 2_500,
+      worker_requests_daily: 75,
+      durable_object_requests_daily: 80,
+      created_at: now.toISOString()
+    }
+  ];
+
+  try {
+    const response = await handleRequest(
+      new Request("https://api.example.com/api/usage-summary", {
+        headers: {
+          origin: "https://app.example.com"
+        }
+      }),
+      {
+        ...devEnv,
+        DB: budgetSummaryDb([], {
+          expiredWindowTypes: ["daily", "four_hour", "burst"],
+          telemetrySamples
+        }),
+        CF_TELEMETRY_API_TOKEN: "telemetry-token",
+        CF_TELEMETRY_ACCOUNT_ID: "account-1",
+        CF_TELEMETRY_API_WORKER: "chaop-api",
+        CF_TELEMETRY_WEB_WORKER: "chaop-web",
+        CF_TELEMETRY_D1_DATABASE_ID: "database-1",
+        CF_TELEMETRY_DO_NAMESPACE_NAME: "WorkspaceDO"
+      }
+    );
+    const body = (await response.json()) as {
+      state: string;
+      bottleneck_constraint: { id: string; state: string; used_units: number };
+      constraints: Array<{ id: string; state: string; sampled: boolean; source: string; used_units: number | null }>;
+      d1_activity: {
+        signals: Array<{ id: string; sampled: boolean; rows_written_daily: number | null }>;
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.state, "hard_limited");
+    assert.deepEqual(
+      [body.bottleneck_constraint.id, body.bottleneck_constraint.state, body.bottleneck_constraint.used_units],
+      ["d1_rows_written_daily", "hard_limited", 120_000]
+    );
+    const writtenConstraint = body.constraints.find((constraint) => constraint.id === "d1_rows_written_daily");
+    assert.deepEqual(
+      [
+        writtenConstraint?.id,
+        writtenConstraint?.state,
+        writtenConstraint?.sampled,
+        writtenConstraint?.source,
+        writtenConstraint?.used_units
+      ],
+      ["d1_rows_written_daily", "hard_limited", true, "cloudflare_analytics", 120_000]
+    );
+    const d1Activity = body.d1_activity.signals.find((signal) => signal.id === "cloudflare_d1_rows_written_daily");
+    assert.deepEqual(
+      [d1Activity?.id, d1Activity?.sampled, d1Activity?.rows_written_daily],
+      ["cloudflare_d1_rows_written_daily", true, 120_000]
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -4215,7 +4388,7 @@ function readOnlyBootstrapDb(): D1Database {
   } as unknown as D1Database;
 }
 
-function readOnlyBootstrapTelemetryPersistFailDb(): D1Database {
+function readOnlyBootstrapTelemetryPersistFailDb(telemetrySamples?: Record<string, unknown>[]): D1Database {
   return {
     prepare(sql: string) {
       assert.doesNotMatch(sql, /INSERT INTO users/);
@@ -4223,6 +4396,12 @@ function readOnlyBootstrapTelemetryPersistFailDb(): D1Database {
       if (/INSERT INTO budget_telemetry_samples/.test(sql)) {
         throw new Error("telemetry sample persistence unavailable");
       }
+      const safetyQuery = dogfoodSafetyQueryFake(sql, {
+        includeUsageWindows: false,
+        includeBudgetStateCounts: false,
+        telemetrySamples
+      });
+      if (safetyQuery) return safetyQuery;
       if (/FROM host_sessions hs/.test(sql)) {
         assert.match(sql, /INNER JOIN connectors c ON c\.id = hs\.connector_id/);
         assert.match(sql, /c\.status <> 'offline'/);

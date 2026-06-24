@@ -219,7 +219,7 @@ export async function loadBudgetSummaryFromDb(
     return emptyBudgetSummary(generatedAt);
   }
 
-  const [daily, fourHour, burst, connectorStates, taskStates, telemetry] = await Promise.all([
+  const [daily, fourHour, burst, connectorStates, taskStates, liveTelemetry, persistedTelemetry] = await Promise.all([
     currentUsageWindow(env, "daily", generatedAt),
     currentUsageWindow(env, "four_hour", generatedAt),
     currentUsageWindow(env, "burst", generatedAt),
@@ -229,13 +229,15 @@ export async function loadBudgetSummaryFromDb(
     snapshots.tasks
       ? Promise.resolve(taskBudgetStateCounts(snapshots.tasks))
       : listTaskBudgetStates(env),
-    loadCloudflareTelemetryBestEffort(env, generatedAt)
+    loadCloudflareTelemetryBestEffort(env, generatedAt),
+    loadMaxPersistedCloudflareTelemetrySample(env, generatedAt)
   ]);
+  const telemetry = mergeCloudflareTelemetrySamples(liveTelemetry, persistedTelemetry);
   const windows = [daily, fourHour, burst].filter((row): row is UsageWindowRow => row !== undefined);
   const primaryWindow = daily ?? fourHour ?? burst;
   const windowSignals = windows.map((window) => budgetWindowSignalFromRow(env, window));
   const localBaselines = localBudgetWindowBaselines(env, generatedAt);
-  const telemetrySampleInserted = await persistBudgetTelemetrySampleBestEffort(env, telemetry, generatedAt);
+  const telemetrySampleInserted = await persistBudgetTelemetrySampleBestEffort(env, liveTelemetry, generatedAt);
   const telemetryHistory = await loadBudgetTelemetryHistoryBestEffort(env, generatedAt, {
     force: telemetrySampleInserted
   });

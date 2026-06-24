@@ -64,6 +64,7 @@ superseded_by:
 - Added `app_server_instances_report` safety coverage so emergency pause, throttling, and hard limits also block connector status-report persistence.
 - Derived bootstrap safety from the same Budget Summary constraints and state used by the Budget Board, so live telemetry cannot make the initial budget and safety postures disagree.
 - Kept terminal command events as the cleanup path under safety blocks, and prevented that cleanup from dispatching new work while `command_create` is blocked.
+- Merged current-day persisted maximum Cloudflare telemetry into Budget Summary calculations, keeping `/api/bootstrap` and `/api/usage-summary` aligned with guarded write decisions when a later live sample is lower.
 
 ## Local Validation
 - `pnpm --filter @chaop/web test`
