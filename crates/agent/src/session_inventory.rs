@@ -12,7 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tungstenite::{
     Message, WebSocket, client::client, connect, handshake::HandshakeError, http::Uri,
     stream::MaybeTlsStream,
@@ -894,12 +894,6 @@ fn resolve_session(
 
 fn unix_seconds_to_iso(seconds: i64) -> Option<String> {
     unix_timestamp_to_iso(seconds, 0)
-}
-
-fn system_time_to_iso_millis(value: SystemTime) -> Option<String> {
-    let duration = value.duration_since(UNIX_EPOCH).ok()?;
-    let seconds = i64::try_from(duration.as_secs()).ok()?;
-    unix_timestamp_to_iso(seconds, duration.subsec_millis())
 }
 
 fn unix_timestamp_to_iso(seconds: i64, millis: u32) -> Option<String> {
@@ -2325,17 +2319,8 @@ fn turn_interaction_payload(
             "auto_resolution_response_grace_ms".to_owned(),
             json!(AUTO_RESOLUTION_RESPONSE_GRACE_MS),
         );
-        if let Some(expires_at) = auto_resolution_expires_at(auto_resolution_ms) {
-            payload.insert("auto_resolution_expires_at".to_owned(), json!(expires_at));
-        }
     }
     Ok(Value::Object(payload))
-}
-
-fn auto_resolution_expires_at(auto_resolution_ms: u64) -> Option<String> {
-    SystemTime::now()
-        .checked_add(Duration::from_millis(auto_resolution_ms))
-        .and_then(system_time_to_iso_millis)
 }
 
 fn turn_interaction_id(method: &str, request_id: &Value, params: &Value) -> String {
@@ -8155,14 +8140,9 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(10)
         );
-        assert!(
-            event
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("auto_resolution_expires_at"))
-                .and_then(Value::as_str)
-                .is_some()
-        );
+        assert!(event.payload.as_ref().map_or(true, |payload| {
+            payload.get("auto_resolution_expires_at").is_none()
+        }));
         assert_eq!(
             event
                 .payload

@@ -1711,6 +1711,11 @@ type TurnInteractionRecordedResolution = {
   payload: NonNullable<ThreadEvent["payload"]>;
 };
 
+type TurnInteractionResolutionRow = {
+  task_id: string | null;
+  lease_owner_connector_id: string | null;
+};
+
 export async function recordTurnInteractionResolutionInDb(
   env: Env,
   eventId: string,
@@ -1756,6 +1761,7 @@ export async function recordTurnInteractionResolutionInDb(
   const existing = await findTurnInteractionResolution(env, row.command_id, payload.interaction_id);
   if (existing) {
     if (options.allowExisting) {
+      await resumeWaitingTaskForTurnInteractionResolution(env, row, existing.created_at);
       await releaseTurnInteractionResolutionClaimBestEffort(env, row.command_id, payload.interaction_id);
       return existing;
     }
@@ -1778,6 +1784,7 @@ export async function recordTurnInteractionResolutionInDb(
       ? await findTurnInteractionResolution(env, row.command_id, payload.interaction_id)
       : undefined;
     if (raced && isUniqueConstraintError(error)) {
+      await resumeWaitingTaskForTurnInteractionResolution(env, row, raced.created_at);
       await releaseTurnInteractionResolutionClaimBestEffort(env, row.command_id, payload.interaction_id);
       return raced;
     }
@@ -1786,7 +1793,20 @@ export async function recordTurnInteractionResolutionInDb(
   if (!event) {
     throw new NotFoundError("Thread not found");
   }
+  await resumeWaitingTaskForTurnInteractionResolution(env, row, event.created_at);
+  await releaseTurnInteractionResolutionClaimBestEffort(env, row.command_id, payload.interaction_id);
+  return event;
+}
+
+async function resumeWaitingTaskForTurnInteractionResolution(
+  env: Env,
+  row: TurnInteractionResolutionRow,
+  updatedAt: string
+): Promise<void> {
   if (row.task_id) {
+    if (!env.DB) {
+      throw new Error("DB binding is required for turn interaction task repair");
+    }
     await env.DB.prepare(
       `UPDATE tasks
        SET state = 'running',
@@ -1796,11 +1816,9 @@ export async function recordTurnInteractionResolutionInDb(
        WHERE id = ?
          AND state IN ('waiting_for_approval', 'waiting_for_input')`
     )
-      .bind(row.lease_owner_connector_id, row.lease_owner_connector_id, event.created_at, row.task_id)
+      .bind(row.lease_owner_connector_id, row.lease_owner_connector_id, updatedAt, row.task_id)
       .run();
   }
-  await releaseTurnInteractionResolutionClaimBestEffort(env, row.command_id, payload.interaction_id);
-  return event;
 }
 
 export async function releaseTurnInteractionResolutionClaimInDb(
@@ -4115,12 +4133,6 @@ function turnInteractionAutoResolutionExpired(
     payload.auto_resolution_response_grace_ms >= 0
       ? payload.auto_resolution_response_grace_ms
       : DEFAULT_TURN_INTERACTION_AUTO_RESOLUTION_RESPONSE_GRACE_MS;
-  if (typeof payload.auto_resolution_expires_at === "string") {
-    const expiresAtMs = Date.parse(payload.auto_resolution_expires_at);
-    if (Number.isFinite(expiresAtMs)) {
-      return nowMs >= expiresAtMs + graceMs;
-    }
-  }
   const createdMs = Date.parse(createdAt);
   if (!Number.isFinite(createdMs)) return false;
   return nowMs >= createdMs + autoResolutionMs + graceMs;

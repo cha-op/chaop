@@ -41,7 +41,44 @@ export type PendingTurnInteraction = {
   payload: TurnInteractionRequestPayload;
 };
 
+export type PendingTurnInteractionQuestion = NonNullable<TurnInteractionRequestPayload["questions"]>[number];
+
 export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
+export const TURN_INTERACTION_OTHER_SELECT_VALUE = "other";
+
+const TURN_INTERACTION_OPTION_SELECT_PREFIX = "option:";
+
+export function turnInteractionOptionSelectValue(index: number): string {
+  return `${TURN_INTERACTION_OPTION_SELECT_PREFIX}${index}`;
+}
+
+export function turnInteractionQuestionSelectValue(
+  question: PendingTurnInteractionQuestion,
+  answer: string,
+  otherSelected: boolean
+): string {
+  if (question.is_other && otherSelected) return TURN_INTERACTION_OTHER_SELECT_VALUE;
+  const optionIndex = question.options?.findIndex((option) => option.label === answer) ?? -1;
+  return optionIndex >= 0 ? turnInteractionOptionSelectValue(optionIndex) : "";
+}
+
+export function turnInteractionAnswerForSelectValue(
+  question: PendingTurnInteractionQuestion,
+  selectValue: string
+): { answer: string; otherSelected: boolean } {
+  if (question.is_other && selectValue === TURN_INTERACTION_OTHER_SELECT_VALUE) {
+    return { answer: "", otherSelected: true };
+  }
+  if (!selectValue.startsWith(TURN_INTERACTION_OPTION_SELECT_PREFIX)) {
+    return { answer: "", otherSelected: false };
+  }
+  const indexText = selectValue.slice(TURN_INTERACTION_OPTION_SELECT_PREFIX.length);
+  const index = Number.parseInt(indexText, 10);
+  if (!Number.isInteger(index) || index < 0) {
+    return { answer: "", otherSelected: false };
+  }
+  return { answer: question.options?.[index]?.label ?? "", otherSelected: false };
+}
 
 export function threadTurnsForDisplay(
   threadId: string,

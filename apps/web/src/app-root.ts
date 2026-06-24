@@ -69,8 +69,13 @@ import {
   safetyActionBlocked,
   safetyActionReason,
   threadTurnsForDisplay,
+  TURN_INTERACTION_OTHER_SELECT_VALUE,
+  turnInteractionAnswerForSelectValue,
+  turnInteractionOptionSelectValue,
+  turnInteractionQuestionSelectValue,
   type CommandExecutionMode,
   type PendingTurnInteraction,
+  type PendingTurnInteractionQuestion,
   type ThreadTurnSummary
 } from "./state.js";
 
@@ -88,7 +93,6 @@ const FALLBACK_POLL_MS = 10_000;
 const BUDGET_REFRESH_MS = 60_000;
 const HOST_SESSIONS_AUTO_REFRESH_MS = 60_000;
 const SOCKET_RECONNECT_MS = 3_000;
-const OTHER_ANSWER_VALUE = "__chaop_other__";
 const SHOW_CODEX_CLI_FALLBACK = import.meta.env.VITE_CHAOP_SHOW_CODEX_CLI_FALLBACK === "true";
 
 @customElement("chaop-app")
@@ -727,7 +731,7 @@ export class ChaopApp extends LitElement {
     if (payload.request_kind === "input") {
       const questions = payload.questions ?? [];
       const complete = questions.length > 0 &&
-        questions.every((question) => this.resolvedInteractionAnswer(interaction.event_id, question.id).trim().length > 0);
+        questions.every((question) => this.resolvedInteractionAnswer(interaction.event_id, question).trim().length > 0);
       return html`
         <section class="interaction-card input">
           <header>
@@ -846,10 +850,11 @@ export class ChaopApp extends LitElement {
 
   private renderInputQuestion(
     eventId: string,
-    question: NonNullable<PendingTurnInteraction["payload"]["questions"]>[number]
+    question: PendingTurnInteractionQuestion
   ) {
     const answer = this.interactionAnswer(eventId, question.id);
-    const otherSelected = question.is_other && answer === OTHER_ANSWER_VALUE;
+    const otherSelected = this.interactionOtherSelected(eventId, question.id);
+    const selectValue = turnInteractionQuestionSelectValue(question, answer, otherSelected);
     return html`
       <label>
         <span>${question.header}</span>
@@ -857,19 +862,19 @@ export class ChaopApp extends LitElement {
         ${question.options && question.options.length > 0
           ? html`
               <select
-                .value=${answer}
+                .value=${selectValue}
                 @change=${(event: Event) =>
-                  this.setInteractionAnswer(
+                  this.setInteractionSelectedAnswer(
                     eventId,
-                    question.id,
+                    question,
                     (event.target as HTMLSelectElement).value
                   )}
               >
                 <option value="">Choose an answer</option>
                 ${question.options.map(
-                  (option) => html`<option value=${option.label}>${option.label}</option>`
+                  (option, index) => html`<option value=${turnInteractionOptionSelectValue(index)}>${option.label}</option>`
                 )}
-                ${question.is_other ? html`<option value=${OTHER_ANSWER_VALUE}>Other</option>` : nothing}
+                ${question.is_other ? html`<option value=${TURN_INTERACTION_OTHER_SELECT_VALUE}>Other</option>` : nothing}
               </select>
               ${otherSelected
                 ? html`
@@ -1386,9 +1391,14 @@ export class ChaopApp extends LitElement {
     return this.interactionDrafts[eventId]?.[this.interactionOtherKey(questionId)] ?? "";
   }
 
-  private resolvedInteractionAnswer(eventId: string, questionId: string): string {
-    const answer = this.interactionAnswer(eventId, questionId);
-    return answer === OTHER_ANSWER_VALUE ? this.interactionOtherAnswer(eventId, questionId) : answer;
+  private interactionOtherSelected(eventId: string, questionId: string): boolean {
+    return this.interactionDrafts[eventId]?.[this.interactionOtherSelectedKey(questionId)] === "true";
+  }
+
+  private resolvedInteractionAnswer(eventId: string, question: PendingTurnInteractionQuestion): string {
+    return question.is_other && this.interactionOtherSelected(eventId, question.id)
+      ? this.interactionOtherAnswer(eventId, question.id)
+      : this.interactionAnswer(eventId, question.id);
   }
 
   private setInteractionAnswer(eventId: string, questionId: string, value: string): void {
@@ -1401,12 +1411,32 @@ export class ChaopApp extends LitElement {
     };
   }
 
+  private setInteractionSelectedAnswer(
+    eventId: string,
+    question: PendingTurnInteractionQuestion,
+    selectValue: string
+  ): void {
+    const selected = turnInteractionAnswerForSelectValue(question, selectValue);
+    this.interactionDrafts = {
+      ...this.interactionDrafts,
+      [eventId]: {
+        ...(this.interactionDrafts[eventId] ?? {}),
+        [question.id]: selected.answer,
+        [this.interactionOtherSelectedKey(question.id)]: selected.otherSelected ? "true" : ""
+      }
+    };
+  }
+
   private setInteractionOtherAnswer(eventId: string, questionId: string, value: string): void {
     this.setInteractionAnswer(eventId, this.interactionOtherKey(questionId), value);
   }
 
   private interactionOtherKey(questionId: string): string {
     return `${questionId}:other`;
+  }
+
+  private interactionOtherSelectedKey(questionId: string): string {
+    return `${questionId}:other-selected`;
   }
 
   private setInteractionSubmitting(eventId: string, submitting: boolean): void {
@@ -1446,7 +1476,7 @@ export class ChaopApp extends LitElement {
     if (!this.guardSafetyAction("turn_interaction")) return;
     const answers: Record<string, { answers: string[] }> = {};
     for (const question of interaction.payload.questions ?? []) {
-      const answer = this.resolvedInteractionAnswer(interaction.event_id, question.id);
+      const answer = this.resolvedInteractionAnswer(interaction.event_id, question);
       if (answer.trim().length > 0) {
         answers[question.id] = { answers: [answer] };
       }

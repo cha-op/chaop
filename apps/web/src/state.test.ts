@@ -37,8 +37,58 @@ import {
   primaryAppServerInstanceForConnector,
   safetyActionBlocked,
   safetyActionReason,
-  threadTurnsForDisplay
+  threadTurnsForDisplay,
+  TURN_INTERACTION_OTHER_SELECT_VALUE,
+  turnInteractionAnswerForSelectValue,
+  turnInteractionOptionSelectValue,
+  turnInteractionQuestionSelectValue,
+  type PendingTurnInteractionQuestion
 } from "./state.ts";
+
+test("turn interaction select helpers keep answer values separate from UI sentinel values", () => {
+  const sentinelAnswer = "__chaop_other__";
+  const question: PendingTurnInteractionQuestion = {
+    id: "question-1",
+    header: "Mode",
+    question: "Choose a mode",
+    is_other: true,
+    is_secret: false,
+    options: [
+      { label: "Normal", description: "Use normal mode" },
+      { label: sentinelAnswer, description: "Use the literal sentinel text" }
+    ]
+  };
+
+  assert.equal(
+    turnInteractionQuestionSelectValue(question, sentinelAnswer, false),
+    turnInteractionOptionSelectValue(1)
+  );
+  assert.deepEqual(turnInteractionAnswerForSelectValue(question, turnInteractionOptionSelectValue(1)), {
+    answer: sentinelAnswer,
+    otherSelected: false
+  });
+  assert.deepEqual(turnInteractionAnswerForSelectValue(question, TURN_INTERACTION_OTHER_SELECT_VALUE), {
+    answer: "",
+    otherSelected: true
+  });
+});
+
+test("turn interaction select helpers ignore other sentinel when custom answers are not allowed", () => {
+  const question: PendingTurnInteractionQuestion = {
+    id: "question-1",
+    header: "Mode",
+    question: "Choose a mode",
+    is_other: false,
+    is_secret: false,
+    options: [{ label: "Normal", description: "Use normal mode" }]
+  };
+
+  assert.deepEqual(turnInteractionAnswerForSelectValue(question, TURN_INTERACTION_OTHER_SELECT_VALUE), {
+    answer: "",
+    otherSelected: false
+  });
+  assert.equal(turnInteractionQuestionSelectValue(question, "Normal", true), turnInteractionOptionSelectValue(0));
+});
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
   const currentSession = hostSession("session-old");

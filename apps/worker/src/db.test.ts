@@ -1312,7 +1312,7 @@ test("prepareTurnInteractionResolutionInDb rejects expired auto-resolving input 
   assert.equal(db.claimInserts, 0);
 });
 
-test("prepareTurnInteractionResolutionInDb uses explicit auto-resolution expiry before dispatch", async () => {
+test("prepareTurnInteractionResolutionInDb ignores agent auto-resolution expiry skew before dispatch", async () => {
   const db = turnInteractionResolutionDb({
     resolved: false,
     requestKind: "input",
@@ -1321,20 +1321,20 @@ test("prepareTurnInteractionResolutionInDb uses explicit auto-resolution expiry 
     createdAt: "2999-01-01T00:00:00.000Z"
   });
 
-  await assert.rejects(
-    () =>
-      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
-        kind: "input",
-        answers: {}
-      }),
-    (error: unknown) =>
-      error instanceof CommandTargetError &&
-      error.status === 409 &&
-      /auto-resolution deadline has expired/.test(error.message)
-  );
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["Yes"]
+      }
+    }
+  });
 
-  assert.equal(db.resolutionChecks, 0);
-  assert.equal(db.claimInserts, 0);
+  assert.equal(preparation.dispatch.command_id, "command-1");
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
 });
 
 test("prepareTurnInteractionResolutionInDb accepts input during explicit response grace", async () => {
@@ -1388,7 +1388,7 @@ test("recordTurnInteractionResolutionInDb rejects already resolved interactions 
   assert.equal(db.eventInserts, 0);
 });
 
-test("recordTurnInteractionResolutionInDb can return an existing resolution after dispatch", async () => {
+test("recordTurnInteractionResolutionInDb repairs waiting tasks for existing resolutions after dispatch", async () => {
   const db = turnInteractionResolutionDb({ resolved: true });
 
   const event = await recordTurnInteractionResolutionInDb(
@@ -1406,7 +1406,7 @@ test("recordTurnInteractionResolutionInDb can return an existing resolution afte
   assert.equal(event.payload?.type, "turn_interaction_resolution");
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.eventInserts, 0);
-  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.taskUpdates, 1);
   assert.equal(db.claimDeletes, 1);
 });
 

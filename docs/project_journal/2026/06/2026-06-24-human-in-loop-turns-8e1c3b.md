@@ -54,6 +54,7 @@ superseded_by:
 - The latest recovery pass handles the case where app-server consumed a browser response, then the command finished before Worker could record the resolution event. Delivered claims are now recovered before active-command checks, input recovery relies only on the stored safe resolution summary rather than secret answers, and WorkspaceDO no longer sends an acknowledgement for a connector acknowledgement that the connector does not consume.
 - The independent PR review found that `sent_unknown` claims could still deadlock after the response left Worker but before a connector acknowledgement was observed. Worker now treats uncertain delivery as a non-retryable dispatch, records the safe resolution event immediately when possible, and lets later explicit retries recover from the claim without sending the response to app-server again.
 - GitHub Codex found that a failed `delivered_at` marker write after confirmed connector delivery could still abort before the durable resolution event was recorded. Worker now treats that marker as recoverable, best-effort marks the claim uncertain if the delivered marker fails, and continues to append the resolution event.
+- The latest independent review found three recovery and input-selection edge cases. Existing resolution recovery now also repairs the task state before releasing the claim, Worker derives auto-resolution expiry from its own event creation time rather than the agent host clock, and Thread Centre separates the Other selection state from actual input answer text.
 
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.
@@ -64,6 +65,8 @@ superseded_by:
 - Delivered-claim recovery remains opportunistic on the next explicit response attempt. It does not add polling or a new write path, and it avoids re-sending a response that app-server may already have consumed.
 - Uncertain-delivery recovery uses the same explicit response path as delivered-claim recovery. It adds no background sweep, poller, or connector inventory refresh, and it avoids duplicate app-server responses after a `sent_unknown` timeout.
 - Confirmed-delivery marker fallback is also limited to the explicit operator response path. It does not add a normal-case write; only marker failures attempt one bounded `delivery_uncertain_at` fallback before the existing resolution event append.
+- Existing-resolution task repair is an idempotent retry-path update only. It does not add a background process, and it runs only when an operator retries a resolution that already has a durable event.
+- Worker-owned auto-resolution expiry and the frontend Other-selection change do not add D1 writes.
 - Dispatch-started claim recovery is opportunistic on the next operator response attempt after the longer timeout. It does not add a background job, poller, or sweep.
 - Stale claim recovery is bounded to the response-dispatch path and does not add a background sweep.
 - WebSocket delivery remains the preferred realtime path. The existing 10-second fallback polling remains unchanged.
