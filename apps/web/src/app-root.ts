@@ -1394,9 +1394,6 @@ export class ChaopApp extends LitElement {
     this.commandModeExplicit = false;
     this.ensureCommandMode();
     window.location.hash = `thread-centre?thread=${encodeURIComponent(threadId)}`;
-    void this.loadSelectedThreadEvents().catch((error) => {
-      this.actionError = actionErrorMessage("Thread events refresh failed", error);
-    });
   }
 
   private selectedThread(): ThreadSummary | undefined {
