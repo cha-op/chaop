@@ -1445,6 +1445,7 @@ export class ChaopApp extends LitElement {
   }
 
   private async loadSelectedThreadEvents(): Promise<void> {
+    if (this.view !== "thread-centre") return;
     if (!this.data) return;
     const thread = this.selectedThread();
     if (!thread) return;
