@@ -14,12 +14,16 @@ import {
   type HostSessionSummary,
   type LocalThreadCreateResult,
   type RefreshHostSessionsResponse,
+  type ResolveTurnInteractionRequest,
+  type ResolveTurnInteractionResponse,
   type SetDogfoodSafetyPauseRequest,
   type SetDogfoodSafetyPauseResponse,
   type TaskArchiveResponse,
   type TaskArchiveSyncSummary,
   type ThreadEvent,
-  type ThreadEventsResponse
+  type ThreadEventsResponse,
+  type TurnInteractionApprovalDecision,
+  type TurnInteractionResponseDispatch
 } from "@chaop/protocol";
 import {
   authenticateAgentBootstrap,
@@ -48,9 +52,15 @@ import {
   loadBootstrapFromDb,
   loadDogfoodSafetyPostureFromDb,
   loadHostSessionInDb,
+  markTurnInteractionResolutionDispatchStartedInDb,
   markHostSessionAppServerPresentInDb,
+  markTurnInteractionResolutionDeliveredInDb,
+  markTurnInteractionResolutionDeliveryUncertainInDb,
+  prepareTurnInteractionResolutionInDb,
+  recordTurnInteractionResolutionInDb,
   recordHostSessionBackfillEvents,
   recordHostSessions,
+  releaseTurnInteractionResolutionClaimInDb,
   setDogfoodSafetyPauseInDb,
   unarchiveTaskInDb
 } from "./db.js";
@@ -359,6 +369,99 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
   }
 
+  const turnInteractionMatch = url.pathname.match(/^\/api\/thread-events\/([^/]+)\/interaction$/);
+  if (request.method === "POST" && turnInteractionMatch) {
+    const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
+    if (!originCheck.ok) return json(request, env, { error: originCheck.message }, originCheck.status);
+    const auth = await authenticateBrowser(request, env);
+    if (!auth.ok) return json(request, env, { error: auth.message }, auth.status);
+    if (!env.DB) return json(request, env, { error: "DB binding is required" }, 503);
+    if (!env.WORKSPACE_DO) return json(request, env, { error: "Workspace Durable Object binding is unavailable" }, 503);
+
+    const payload = await readJson(request);
+    if (!payload.ok) {
+      return json(request, env, { error: payload.message }, 400);
+    }
+    if (!isResolveTurnInteractionRequest(payload.value)) {
+      return json(request, env, { error: "Invalid turn interaction payload" }, 400);
+    }
+
+    try {
+      const safetyResponse = await dogfoodSafetyGuardResponse(request, env, "turn_interaction");
+      if (safetyResponse) return safetyResponse;
+      const eventId = decodeURIComponent(turnInteractionMatch[1] ?? "");
+      const preparation = await prepareTurnInteractionResolutionInDb(env, eventId, payload.value);
+      const dispatch = preparation.dispatch;
+      let connectorDelivered = preparation.already_delivered;
+      let confirmedConnectorDelivery = false;
+      if (!connectorDelivered) {
+        try {
+          await markTurnInteractionResolutionDispatchStartedInDb(env, dispatch.command_id, dispatch.interaction_id);
+        } catch (error) {
+          await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+          throw error;
+        }
+        try {
+          await requestTurnInteractionResolution(env, dispatch);
+          connectorDelivered = true;
+          confirmedConnectorDelivery = true;
+        } catch (error) {
+          if (shouldMarkTurnInteractionDeliveryUncertain(error)) {
+            await markTurnInteractionResolutionDeliveryUncertainInDb(
+              env,
+              dispatch.command_id,
+              dispatch.interaction_id
+            );
+            connectorDelivered = true;
+          } else {
+            if (shouldReleaseTurnInteractionClaimAfterDispatchError(error)) {
+              await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+            }
+            throw error;
+          }
+        }
+        if (confirmedConnectorDelivery) {
+          await markConfirmedTurnInteractionDeliveryBestEffort(env, dispatch);
+        }
+      }
+      let event: ThreadEvent;
+      try {
+        event = await recordTurnInteractionResolutionInDb(env, eventId, payload.value, {
+          allowExisting: true,
+          resolution: preparation.resolution
+        });
+      } catch (error) {
+        if (!connectorDelivered) {
+          await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+        }
+        throw error;
+      }
+      try {
+        await broadcastThreadEvents(env, [event]);
+      } catch (error) {
+        console.warn("Turn interaction resolution broadcast failed", {
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+      const response: ResolveTurnInteractionResponse = {
+        accepted: true,
+        event
+      };
+      return json(request, env, response, 202);
+    } catch (error) {
+      if (error instanceof CommandTargetError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      if (error instanceof ConnectorRpcError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      if (error instanceof NotFoundError) {
+        return json(request, env, { error: error.message }, error.status);
+      }
+      throw error;
+    }
+  }
+
   const attachHostSessionMatch = url.pathname.match(/^\/api\/host-sessions\/([^/]+)\/attach$/);
   if (request.method === "POST" && attachHostSessionMatch) {
     const originCheck = validateBrowserOrigin(request, env, { requireOrigin: true });
@@ -648,6 +751,27 @@ async function dispatchPendingCommandsBestEffort(env: Env): Promise<void> {
   }
 }
 
+async function markConfirmedTurnInteractionDeliveryBestEffort(
+  env: Env,
+  dispatch: TurnInteractionResponseDispatch
+): Promise<void> {
+  try {
+    await markTurnInteractionResolutionDeliveredInDb(env, dispatch.command_id, dispatch.interaction_id);
+    return;
+  } catch (error) {
+    console.warn("Turn interaction delivered marker failed", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
+  try {
+    await markTurnInteractionResolutionDeliveryUncertainInDb(env, dispatch.command_id, dispatch.interaction_id);
+  } catch (error) {
+    console.warn("Turn interaction uncertain delivery fallback failed", {
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
 async function broadcastThreadEvents(env: Env, events: ThreadEvent[]): Promise<void> {
   if (!env.WORKSPACE_DO || events.length === 0) return;
 
@@ -657,6 +781,34 @@ async function broadcastThreadEvents(env: Env, events: ThreadEvent[]): Promise<v
     method: "POST",
     body: JSON.stringify({ events })
   });
+}
+
+async function requestTurnInteractionResolution(
+  env: Env,
+  dispatch: TurnInteractionResponseDispatch
+): Promise<void> {
+  if (!env.WORKSPACE_DO) {
+    throw new ConnectorRpcError("Workspace Durable Object binding is unavailable", 503);
+  }
+  const id = env.WORKSPACE_DO.idFromName("global");
+  const stub = env.WORKSPACE_DO.get(id);
+  const response = await stub.fetch("https://workspace-do/internal/resolve-turn-interaction", {
+    method: "POST",
+    body: JSON.stringify(dispatch)
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => undefined) as {
+      error?: unknown;
+      delivery_state?: unknown;
+    } | undefined;
+    const message = typeof body?.error === "string"
+      ? body.error
+      : "Connector could not receive the turn interaction response";
+    throw new ConnectorRpcError(message, response.status, {
+      deliveryState: body?.delivery_state,
+      releaseTurnInteractionClaim: turnInteractionDeliveryStateAllowsClaimRelease(body?.delivery_state)
+    });
+  }
 }
 
 async function requestHostSessionRefresh(env: Env): Promise<{
@@ -688,10 +840,29 @@ async function requestHostSessionRefresh(env: Env): Promise<{
 class ConnectorRpcError extends Error {
   constructor(
     message: string,
-    public readonly status = 502
+    public readonly status = 502,
+    options: { deliveryState?: unknown; releaseTurnInteractionClaim?: boolean | undefined } = {}
   ) {
     super(message);
+    this.deliveryState = options.deliveryState;
+    this.releaseTurnInteractionClaim = options.releaseTurnInteractionClaim;
   }
+
+  public readonly deliveryState: unknown;
+  public readonly releaseTurnInteractionClaim: boolean | undefined;
+}
+
+function turnInteractionDeliveryStateAllowsClaimRelease(deliveryState: unknown): boolean {
+  return deliveryState === "not_sent" || deliveryState === "rejected";
+}
+
+function shouldReleaseTurnInteractionClaimAfterDispatchError(error: unknown): boolean {
+  if (error instanceof ConnectorRpcError && error.releaseTurnInteractionClaim === false) return false;
+  return true;
+}
+
+function shouldMarkTurnInteractionDeliveryUncertain(error: unknown): boolean {
+  return error instanceof ConnectorRpcError && error.deliveryState === "sent_unknown";
 }
 
 async function requestLocalThreadCreate(
@@ -1045,6 +1216,39 @@ function isCreateCommandRequest(value: unknown): value is CreateCommandRequest {
   );
 }
 
+function isResolveTurnInteractionRequest(value: unknown): value is ResolveTurnInteractionRequest {
+  if (!isRecord(value)) return false;
+  if (value.kind === "approval") {
+    return isTurnInteractionApprovalDecision(value.decision);
+  }
+  if (value.kind === "input") {
+    return isRecord(value.answers) &&
+      Object.values(value.answers).every((answer) =>
+        isRecord(answer) &&
+        Array.isArray(answer.answers) &&
+        answer.answers.every((item) => typeof item === "string")
+      );
+  }
+  return false;
+}
+
+function isTurnInteractionApprovalDecision(value: unknown): value is TurnInteractionApprovalDecision {
+  if (
+    value === "accept" ||
+    value === "acceptForSession" ||
+    value === "decline" ||
+    value === "cancel"
+  ) {
+    return true;
+  }
+  if (!isRecord(value)) return false;
+  const amendment = value.acceptWithExecpolicyAmendment;
+  return isRecord(amendment) &&
+    Array.isArray(amendment.execpolicy_amendment) &&
+    amendment.execpolicy_amendment.length > 0 &&
+    amendment.execpolicy_amendment.every((item) => typeof item === "string" && item.trim().length > 0);
+}
+
 function isSetDogfoodSafetyPauseRequest(value: unknown): value is SetDogfoodSafetyPauseRequest {
   return isRecord(value) && optionalString(value.reason);
 }
@@ -1124,6 +1328,9 @@ function isThreadEventKind(value: unknown): boolean {
     value === "command.finished" ||
     value === "command.failed" ||
     value === "approval.requested" ||
+    value === "approval.resolved" ||
+    value === "input.requested" ||
+    value === "input.received" ||
     value === "notice.throttled"
   );
 }

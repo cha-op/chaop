@@ -14,7 +14,12 @@ import {
   type LocalThreadCreateResult,
   type ThreadArchiveSyncDispatch,
   type ThreadArchiveSyncResult,
-  type ThreadEvent
+  type ThreadEvent,
+  type TurnInteractionApprovalDecision,
+  type TurnInteractionRequestPayload,
+  type TurnInteractionResponseAck,
+  type TurnInteractionResponseDelivery,
+  type TurnInteractionResponseDispatch
 } from "@chaop/protocol";
 import {
   DogfoodSafetyError,
@@ -40,6 +45,7 @@ const THREAD_CREATE_TIMEOUT_MS = 15_000;
 const HOST_SESSION_APP_SERVER_ENSURE_TIMEOUT_MS = 15_000;
 const HOST_SESSION_BACKFILL_TIMEOUT_MS = 15_000;
 const THREAD_ARCHIVE_SYNC_TIMEOUT_MS = 20_000;
+const TURN_INTERACTION_RESPONSE_TIMEOUT_MS = 10_000;
 const APP_SERVER_REPORT_CACHE_MS = 60_000;
 const HOST_SESSIONS_REFRESH_COOLDOWN_MS = 60_000;
 const HOST_SESSIONS_REFRESH_DISPATCH_WAIT_MS = 30_000;
@@ -87,6 +93,14 @@ export class WorkspaceDO implements DurableObject {
       reject: (error: Error) => void;
     }
   >();
+  private readonly pendingTurnInteractionResponses = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      resolve: (result: TurnInteractionResponseAck) => void;
+      reject: (error: Error) => void;
+    }
+  >();
   private readonly appServerReportCache = new Map<
     string,
     {
@@ -129,6 +143,10 @@ export class WorkspaceDO implements DurableObject {
 
     if (url.pathname === "/internal/broadcast-thread-events") {
       return this.broadcastThreadEvents(request);
+    }
+
+    if (url.pathname === "/internal/resolve-turn-interaction") {
+      return this.resolveTurnInteraction(request);
     }
 
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -350,10 +368,27 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    const malformedTurnInteraction = malformedTurnInteractionEvent(message.payload);
+    if (message.kind === "agent.event" && malformedTurnInteraction) {
+      ws.send(
+        JSON.stringify(
+          createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
+            command_id: malformedTurnInteraction.command_id,
+            kind: malformedTurnInteraction.kind,
+            accepted: false,
+            dropped: true,
+            reason: "Turn interaction payload is invalid"
+          })
+        )
+      );
+      return;
+    }
+
     if (message.kind === "agent.event" && isAgentCommandEvent(message.payload)) {
       const finalCommandEvent =
         message.payload.kind === "command.finished" || message.payload.kind === "command.failed";
       const progressEvent = !finalCommandEvent && message.payload.kind !== "command.started";
+      const turnInteractionEvent = isTurnInteractionEventKind(message.payload.kind);
       if (progressEvent) {
         try {
           await assertDogfoodSafetyActionAllowed(this.env, "agent_event");
@@ -364,7 +399,7 @@ export class WorkspaceDO implements DurableObject {
                 createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, {
                   command_id: message.payload.command_id,
                   kind: message.payload.kind,
-                  accepted: true,
+                  accepted: !turnInteractionEvent,
                   dropped: true,
                   reason: error.message
                 })
@@ -455,6 +490,11 @@ export class WorkspaceDO implements DurableObject {
       return;
     }
 
+    if (message.kind === "turn.interaction_response_ack" && isTurnInteractionResponseAck(message.payload)) {
+      this.resolveTurnInteractionResponse(message.payload);
+      return;
+    }
+
     ws.send(JSON.stringify(createEnvelope("server.ack", { type: "worker", id: "workspace-do-global" }, { received: text.length })));
   }
 
@@ -512,6 +552,51 @@ export class WorkspaceDO implements DurableObject {
     return new Response(JSON.stringify({ broadcasted: events.length }), {
       headers: { "content-type": "application/json; charset=utf-8" }
     });
+  }
+
+  private async resolveTurnInteraction(request: Request): Promise<Response> {
+    const dispatch = await request.json().catch(() => undefined) as unknown;
+    if (!isTurnInteractionResponseDispatch(dispatch)) {
+      return jsonResponse({ error: "Invalid turn interaction dispatch" }, 400);
+    }
+    const socket = this.agentSocketForActiveCommand(dispatch.command_id);
+    if (!socket) {
+      return jsonResponse({
+        error: "No active connector socket is handling this turn",
+        delivery_state: "not_sent"
+      }, 409);
+    }
+    const requestId = `turn-interaction-${cryptoRandomId().slice(0, 16)}`;
+    const delivery: TurnInteractionResponseDelivery = {
+      ...dispatch,
+      request_id: requestId
+    };
+    let sent = false;
+    try {
+      const ack = await this.waitForTurnInteractionResponse(requestId, () => {
+        socket.send(
+          JSON.stringify(
+            createEnvelope("turn.interaction_response", { type: "worker", id: "workspace-do-global" }, delivery, {
+              command_id: dispatch.command_id,
+              target: { type: "connector" }
+            })
+          )
+        );
+        sent = true;
+      });
+      if (!ack.accepted) {
+        return jsonResponse({
+          error: ack.error ?? "Connector did not accept the turn interaction response",
+          delivery_state: "rejected"
+        }, 409);
+      }
+    } catch (error) {
+      return jsonResponse({
+        error: error instanceof Error ? error.message : "Connector could not receive the turn interaction response",
+        delivery_state: sent ? "sent_unknown" : "not_sent"
+      }, sent ? 504 : 409);
+    }
+    return jsonResponse({ accepted: true });
   }
 
   private async handleSocketGone(ws: WebSocket): Promise<void> {
@@ -918,6 +1003,36 @@ export class WorkspaceDO implements DurableObject {
     pending.resolve(result);
   }
 
+  private async waitForTurnInteractionResponse(
+    requestId: string,
+    send: () => void
+  ): Promise<TurnInteractionResponseAck> {
+    return await new Promise<TurnInteractionResponseAck>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingTurnInteractionResponses.delete(requestId);
+        reject(new Error("Connector timed out while receiving the turn interaction response"));
+      }, TURN_INTERACTION_RESPONSE_TIMEOUT_MS);
+      this.pendingTurnInteractionResponses.set(requestId, { timer, resolve, reject });
+      try {
+        send();
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingTurnInteractionResponses.delete(requestId);
+        reject(error instanceof Error ? error : new Error("Connector send failed"));
+      }
+    });
+  }
+
+  private resolveTurnInteractionResponse(result: TurnInteractionResponseAck): void {
+    const pending = this.pendingTurnInteractionResponses.get(result.request_id);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingTurnInteractionResponses.delete(result.request_id);
+    pending.resolve(result);
+  }
+
   private async sendPendingCommands(
     ws: WebSocket,
     connectorId: string,
@@ -1174,6 +1289,19 @@ export class WorkspaceDO implements DurableObject {
     });
   }
 
+  private agentSocketForActiveCommand(commandId: string): WebSocket | undefined {
+    return this.ctx.getWebSockets("agent")
+      .find((socket) => {
+        const attachment = socket.deserializeAttachment() as SocketAttachment | undefined;
+        return (
+          attachment?.socketType === "agent" &&
+          typeof attachment.connectorId === "string" &&
+          isReadyAgentSocket(socket, attachment.connectorId) &&
+          socketActiveCommandIds(socket, attachment.connectorId).includes(commandId)
+        );
+      });
+  }
+
   private markSocketDispatchUnavailable(ws: WebSocket, connectorId: string): boolean {
     const attachment = ws.deserializeAttachment() as SocketAttachment | undefined;
     if (
@@ -1405,15 +1533,151 @@ function jsonResponse(payload: unknown, status = 200): Response {
 function isAgentCommandEvent(value: unknown): value is AgentCommandEvent {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
+  const validKind =
+    record.kind === "command.started" ||
+    record.kind === "command.output" ||
+    record.kind === "command.finished" ||
+    record.kind === "command.failed" ||
+    record.kind === "approval.requested" ||
+    record.kind === "approval.resolved" ||
+    record.kind === "input.requested" ||
+    record.kind === "input.received";
+  if (!validKind) return false;
+  if (isRequiredTurnInteractionRequestKind(record.kind)) {
+    if (!isTurnInteractionRequestPayloadForEvent(record.payload, record.kind)) return false;
+  } else if (isTurnInteractionResolutionKind(record.kind)) {
+    if (!isTurnInteractionResolutionPayloadForEvent(record.payload, record.kind)) return false;
+  } else if (record.payload !== undefined && !isRecord(record.payload)) {
+    return false;
+  }
   return (
     typeof record.command_id === "string" &&
-    (record.kind === "command.started" ||
-      record.kind === "command.output" ||
-      record.kind === "command.finished" ||
-      record.kind === "command.failed") &&
     (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
     (record.target_host_session_id === undefined || typeof record.target_host_session_id === "string") &&
     typeof record.summary === "string"
+  );
+}
+
+function isRequiredTurnInteractionRequestKind(kind: unknown): kind is "approval.requested" | "input.requested" {
+  return kind === "approval.requested" || kind === "input.requested";
+}
+
+function malformedTurnInteractionEvent(
+  value: unknown
+): { command_id: string; kind: AgentCommandEvent["kind"] } | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    !isRequiredTurnInteractionRequestKind(value.kind) &&
+    !isTurnInteractionResolutionKind(value.kind)
+  ) {
+    return undefined;
+  }
+  if (isAgentCommandEvent(value)) return undefined;
+  return typeof value.command_id === "string"
+    ? { command_id: value.command_id, kind: value.kind as AgentCommandEvent["kind"] }
+    : undefined;
+}
+
+function isTurnInteractionRequestPayloadForEvent(
+  value: unknown,
+  kind: "approval.requested" | "input.requested"
+): value is TurnInteractionRequestPayload {
+  if (!isRecord(value)) return false;
+  const requestKind = kind === "approval.requested" ? "approval" : "input";
+  if (
+    !(
+      value.type === "turn_interaction" &&
+      typeof value.interaction_id === "string" &&
+      value.interaction_id.trim().length > 0 &&
+      value.status === "pending" &&
+      typeof value.method === "string" &&
+      value.request_kind === requestKind &&
+      typeof value.app_server_thread_id === "string" &&
+      value.app_server_thread_id.trim().length > 0 &&
+      typeof value.app_server_turn_id === "string" &&
+      value.app_server_turn_id.trim().length > 0 &&
+      typeof value.title === "string" &&
+      value.title.trim().length > 0
+    )
+  ) {
+    return false;
+  }
+  if (requestKind === "input") {
+    return Array.isArray(value.questions) &&
+      value.questions.length > 0 &&
+      value.questions.every(isTurnInteractionInputQuestion);
+  }
+  return Array.isArray(value.available_decisions) &&
+    value.available_decisions.length > 0 &&
+    value.available_decisions.every(isTurnInteractionApprovalDecision);
+}
+
+function isTurnInteractionInputQuestion(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    value.id.trim().length > 0 &&
+    typeof value.header === "string" &&
+    value.header.trim().length > 0 &&
+    typeof value.question === "string" &&
+    value.question.trim().length > 0 &&
+    typeof value.is_other === "boolean" &&
+    typeof value.is_secret === "boolean" &&
+    (
+      value.options === undefined ||
+      (
+        Array.isArray(value.options) &&
+        value.options.every((option) =>
+          isRecord(option) &&
+          typeof option.label === "string" &&
+          option.label.trim().length > 0 &&
+          typeof option.description === "string"
+        )
+      )
+    )
+  );
+}
+
+function isTurnInteractionResolutionKind(kind: unknown): kind is "approval.resolved" | "input.received" {
+  return kind === "approval.resolved" || kind === "input.received";
+}
+
+function isTurnInteractionResolutionPayloadForEvent(
+  value: unknown,
+  kind: "approval.resolved" | "input.received"
+): boolean {
+  if (!isRecord(value)) return false;
+  if (
+    !(
+      value.type === "turn_interaction_resolution" &&
+      typeof value.interaction_id === "string" &&
+      value.interaction_id.trim().length > 0
+    )
+  ) {
+    return false;
+  }
+  if (kind === "input.received") {
+    return value.status === "answered" &&
+      (value.answer_count === undefined || isNonNegativeInteger(value.answer_count, 1000));
+  }
+  return (
+    (
+      value.status === "accepted" ||
+      value.status === "accepted_for_session" ||
+      value.status === "accepted_with_execpolicy_amendment" ||
+      value.status === "declined" ||
+      value.status === "cancelled"
+    ) &&
+    (value.decision === undefined || isTurnInteractionApprovalDecision(value.decision))
+  );
+}
+
+function isTurnInteractionEventKind(kind: AgentCommandEvent["kind"]): boolean {
+  return (
+    kind === "approval.requested" ||
+    kind === "approval.resolved" ||
+    kind === "input.requested" ||
+    kind === "input.received"
   );
 }
 
@@ -1430,6 +1694,53 @@ function isThreadEvent(value: unknown): value is ThreadEvent {
     (record.priority === "P0" || record.priority === "P1" || record.priority === "P2" || record.priority === "P3") &&
     typeof record.summary === "string" &&
     typeof record.created_at === "string"
+  );
+}
+
+function isTurnInteractionResponseDispatch(value: unknown): value is TurnInteractionResponseDispatch {
+  if (!isRecord(value)) return false;
+  if (typeof value.command_id !== "string" || value.command_id.trim().length === 0) return false;
+  if (typeof value.interaction_id !== "string" || value.interaction_id.trim().length === 0) return false;
+  const response = value.response;
+  if (!isRecord(response)) return false;
+  if (response.kind === "approval") {
+    return isTurnInteractionApprovalDecision(response.decision);
+  }
+  if (response.kind === "input") {
+    return isRecord(response.answers) &&
+      Object.values(response.answers).every((answer) =>
+        isRecord(answer) &&
+        Array.isArray(answer.answers) &&
+        answer.answers.every((item) => typeof item === "string")
+      );
+  }
+  return false;
+}
+
+function isTurnInteractionApprovalDecision(value: unknown): value is TurnInteractionApprovalDecision {
+  if (
+    value === "accept" ||
+    value === "acceptForSession" ||
+    value === "decline" ||
+    value === "cancel"
+  ) {
+    return true;
+  }
+  if (!isRecord(value)) return false;
+  const amendment = value.acceptWithExecpolicyAmendment;
+  return isRecord(amendment) &&
+    Array.isArray(amendment.execpolicy_amendment) &&
+    amendment.execpolicy_amendment.length > 0 &&
+    amendment.execpolicy_amendment.every((item) => typeof item === "string" && item.trim().length > 0);
+}
+
+function isTurnInteractionResponseAck(value: unknown): value is TurnInteractionResponseAck {
+  return (
+    isRecord(value) &&
+    typeof value.request_id === "string" &&
+    value.request_id.trim().length > 0 &&
+    typeof value.accepted === "boolean" &&
+    (value.error === undefined || typeof value.error === "string")
   );
 }
 
@@ -1550,8 +1861,15 @@ function isThreadEventKind(value: unknown): boolean {
     value === "command.finished" ||
     value === "command.failed" ||
     value === "approval.requested" ||
+    value === "approval.resolved" ||
+    value === "input.requested" ||
+    value === "input.received" ||
     value === "notice.throttled"
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isAgentHostSessionsReport(value: unknown): value is AgentHostSessionsReport {
@@ -1581,4 +1899,10 @@ function isAgentHostSession(value: unknown): boolean {
     (record.cwd === undefined || typeof record.cwd === "string") &&
     typeof record.updated_at === "string"
   );
+}
+
+function cryptoRandomId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

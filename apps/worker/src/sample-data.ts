@@ -628,6 +628,15 @@ export const safety: DogfoodSafetyPosture = {
       remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
     },
     {
+      action: "turn_interaction",
+      state: "allowed",
+      reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",
+      budget_state: "conservative",
+      constraint_id: budget.bottleneck_constraint?.id,
+      constraint_label: budget.bottleneck_constraint?.label,
+      remaining_event_capacity: budget.bottleneck_constraint?.remaining_event_capacity
+    },
+    {
       action: "budget_bootstrap",
       state: "allowed",
       reason: "Allowed, but broad refresh remains blocked until cost posture returns to normal.",

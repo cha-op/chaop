@@ -37,8 +37,58 @@ import {
   primaryAppServerInstanceForConnector,
   safetyActionBlocked,
   safetyActionReason,
-  threadTurnsForDisplay
+  threadTurnsForDisplay,
+  TURN_INTERACTION_OTHER_SELECT_VALUE,
+  turnInteractionAnswerForSelectValue,
+  turnInteractionOptionSelectValue,
+  turnInteractionQuestionSelectValue,
+  type PendingTurnInteractionQuestion
 } from "./state.ts";
+
+test("turn interaction select helpers keep answer values separate from UI sentinel values", () => {
+  const sentinelAnswer = "__chaop_other__";
+  const question: PendingTurnInteractionQuestion = {
+    id: "question-1",
+    header: "Mode",
+    question: "Choose a mode",
+    is_other: true,
+    is_secret: false,
+    options: [
+      { label: "Normal", description: "Use normal mode" },
+      { label: sentinelAnswer, description: "Use the literal sentinel text" }
+    ]
+  };
+
+  assert.equal(
+    turnInteractionQuestionSelectValue(question, sentinelAnswer, false),
+    turnInteractionOptionSelectValue(1)
+  );
+  assert.deepEqual(turnInteractionAnswerForSelectValue(question, turnInteractionOptionSelectValue(1)), {
+    answer: sentinelAnswer,
+    otherSelected: false
+  });
+  assert.deepEqual(turnInteractionAnswerForSelectValue(question, TURN_INTERACTION_OTHER_SELECT_VALUE), {
+    answer: "",
+    otherSelected: true
+  });
+});
+
+test("turn interaction select helpers ignore other sentinel when custom answers are not allowed", () => {
+  const question: PendingTurnInteractionQuestion = {
+    id: "question-1",
+    header: "Mode",
+    question: "Choose a mode",
+    is_other: false,
+    is_secret: false,
+    options: [{ label: "Normal", description: "Use normal mode" }]
+  };
+
+  assert.deepEqual(turnInteractionAnswerForSelectValue(question, TURN_INTERACTION_OTHER_SELECT_VALUE), {
+    answer: "",
+    otherSelected: false
+  });
+  assert.equal(turnInteractionQuestionSelectValue(question, "Normal", true), turnInteractionOptionSelectValue(0));
+});
 
 test("mergeBootstrapPayload keeps current host sessions after newer server sync", () => {
   const currentSession = hostSession("session-old");
@@ -1015,6 +1065,153 @@ test("threadTurnsForDisplay preserves terminal command state when the event tail
   assert.equal(turns[0]?.assistant_summary, "Done.");
 });
 
+test("threadTurnsForDisplay exposes pending approval interactions", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [command("command-1", { state: "running" })],
+    [
+      event("event-1", "command-1", 1, "command.started", "Connector started Codex app-server turn."),
+      event("event-2", "command-1", 2, "approval.requested", "Approval requested.", {
+        payload: {
+          type: "turn_interaction",
+          interaction_id: "interaction-1",
+          status: "pending",
+          method: "item/commandExecution/requestApproval",
+          request_kind: "approval",
+          subject: "command_execution",
+          app_server_thread_id: "app-thread-1",
+          app_server_turn_id: "app-turn-1",
+          title: "Approve command execution",
+          command: "touch requested.txt",
+          cwd: "/tmp/project",
+          network_approval_context: {
+            host: "registry.npmjs.org",
+            protocol: "https",
+            port: 443
+          },
+          proposed_execpolicy_amendment: ["touch", "requested.txt"],
+          available_decisions: [
+            "decline",
+            {
+              acceptWithExecpolicyAmendment: {
+                execpolicy_amendment: ["touch", "requested.txt"]
+              }
+            },
+            "cancel"
+          ]
+        }
+      })
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "waiting");
+  assert.equal(turns[0]?.pending_interactions.length, 1);
+  assert.equal(turns[0]?.pending_interactions[0]?.payload.interaction_id, "interaction-1");
+  assert.equal(turns[0]?.pending_interactions[0]?.payload.network_approval_context?.host, "registry.npmjs.org");
+  assert.deepEqual(turns[0]?.pending_interactions[0]?.payload.available_decisions?.[1], {
+    acceptWithExecpolicyAmendment: {
+      execpolicy_amendment: ["touch", "requested.txt"]
+    }
+  });
+});
+
+test("threadTurnsForDisplay clears resolved interactions", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [command("command-1", { state: "running" })],
+    [
+      event("event-1", "command-1", 1, "command.started", "Connector started Codex app-server turn."),
+      event("event-2", "command-1", 2, "input.requested", "Input requested.", {
+        payload: {
+          type: "turn_interaction",
+          interaction_id: "interaction-1",
+          status: "pending",
+          method: "item/tool/requestUserInput",
+          request_kind: "input",
+          app_server_thread_id: "app-thread-1",
+          app_server_turn_id: "app-turn-1",
+          title: "Provide requested input",
+          questions: [
+            {
+              id: "q1",
+              header: "Confirm",
+              question: "Continue?",
+              is_other: false,
+              is_secret: false
+            }
+          ]
+        }
+      }),
+      event("event-3", "command-1", 3, "input.received", "Input provided.", {
+        payload: {
+          type: "turn_interaction_resolution",
+          interaction_id: "interaction-1",
+          status: "answered",
+          answer_count: 1
+        }
+      })
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "running");
+  assert.equal(turns[0]?.pending_interactions.length, 0);
+});
+
+test("threadTurnsForDisplay hides pending interactions after terminal events", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [command("command-1", { state: "failed" })],
+    [
+      event("event-1", "command-1", 1, "command.started", "Connector started Codex app-server turn."),
+      event("event-2", "command-1", 2, "approval.requested", "Approval requested.", {
+        payload: {
+          type: "turn_interaction",
+          interaction_id: "interaction-1",
+          status: "pending",
+          method: "item/commandExecution/requestApproval",
+          request_kind: "approval",
+          subject: "command_execution",
+          app_server_thread_id: "app-thread-1",
+          app_server_turn_id: "app-turn-1",
+          title: "Approve command execution",
+          command: "touch requested.txt",
+          cwd: "/tmp/project",
+          available_decisions: ["accept", "decline", "cancel"]
+        }
+      }),
+      event("event-3", "command-1", 3, "command.failed", "Codex app-server turn failed.")
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "failed");
+  assert.equal(turns[0]?.pending_interactions.length, 0);
+});
+
+test("threadTurnsForDisplay keeps terminal state after late interaction resolution", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [command("command-1", { state: "succeeded" })],
+    [
+      event("event-1", "command-1", 1, "command.started", "Connector started Codex app-server turn."),
+      event("event-2", "command-1", 2, "command.finished", "Command finished."),
+      event("event-3", "command-1", 3, "approval.resolved", "Approval accepted.", {
+        payload: {
+          type: "turn_interaction_resolution",
+          interaction_id: "interaction-1",
+          status: "accepted",
+          decision: "accept"
+        }
+      })
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "succeeded");
+});
+
 test("threadTurnsForDisplay renders commandless backfilled history turns", () => {
   const turns = threadTurnsForDisplay(
     "thread-1",
@@ -1272,6 +1469,7 @@ function safety(): BootstrapPayload["safety"] {
       "host_session_attach",
       "host_session_detach",
       "task_archive",
+      "turn_interaction",
       "budget_bootstrap",
       "agent_event",
       "app_server_instances_report"

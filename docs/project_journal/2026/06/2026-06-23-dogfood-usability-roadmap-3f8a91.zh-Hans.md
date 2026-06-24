@@ -42,5 +42,5 @@ superseded_by:
 
 ## 当前下一步
 - PR A 已通过 [PR #19](https://github.com/cha-op/chaop/pull/19) 合入。
-- PR B 已在 `wip/thread-centre-chat-mvp` 上实现。
-- PR C 是下一条计划切片：为 Codex app-server turns 增加 human-in-the-loop approval 和 input handling。
+- PR B 已通过 [PR #20](https://github.com/cha-op/chaop/pull/20) 合入。
+- PR C 正在 `wip/human-in-loop-turns` 上实现：为 Codex app-server turns 增加 human-in-the-loop approval 和 input handling。

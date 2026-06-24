@@ -1,15 +1,16 @@
 use crate::config::AgentConfig;
 use crate::placeholder::ConnectorEvent;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
 };
 use std::time::{Duration, Instant};
 use tungstenite::{
@@ -21,8 +22,52 @@ const APP_SERVER_THREAD_SOURCE_KINDS: [&str; 3] = ["cli", "vscode", "appServer"]
 const APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE: usize = 200;
 const APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE: usize = 2;
 const APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS: u64 = 12;
+const AUTO_RESOLUTION_RESPONSE_GRACE_MS: u64 = 250;
 
 type AppServerSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+pub struct AppServerCommandChannels {
+    pub event_sender: Sender<ConnectorEvent>,
+    pub interaction_receiver: Receiver<TurnInteractionResponseDelivery>,
+    pub active_interaction: Arc<Mutex<Option<String>>>,
+}
+
+pub struct TurnInteractionResponseDelivery {
+    pub dispatch: TurnInteractionResponseDispatch,
+    pub delivery_ack: Sender<bool>,
+}
+
+struct ReceivedTurnInteractionResponse {
+    dispatch: TurnInteractionResponseDispatch,
+    delivery_ack: Option<Sender<bool>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct TurnInteractionResponseDispatch {
+    #[serde(default)]
+    pub request_id: Option<String>,
+    pub command_id: String,
+    pub interaction_id: String,
+    pub response: TurnInteractionResponse,
+    #[serde(default)]
+    pub auto_resolved: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum TurnInteractionResponse {
+    #[serde(rename = "approval")]
+    Approval { decision: Value },
+    #[serde(rename = "input")]
+    Input {
+        answers: HashMap<String, TurnInteractionInputAnswer>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TurnInteractionInputAnswer {
+    pub answers: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentHostSessionsReport {
@@ -848,6 +893,10 @@ fn resolve_session(
 }
 
 fn unix_seconds_to_iso(seconds: i64) -> Option<String> {
+    unix_timestamp_to_iso(seconds, 0)
+}
+
+fn unix_timestamp_to_iso(seconds: i64, millis: u32) -> Option<String> {
     if seconds < 0 {
         return None;
     }
@@ -858,7 +907,7 @@ fn unix_seconds_to_iso(seconds: i64) -> Option<String> {
     let minute = (seconds_of_day % 3_600) / 60;
     let second = seconds_of_day % 60;
     Some(format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z"
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
     ))
 }
 
@@ -1222,6 +1271,7 @@ pub fn app_server_command_started_event(session_id: &str) -> ConnectorEvent {
         kind: "command.started".to_owned(),
         priority: "P1".to_owned(),
         summary: format!("Connector started Codex app-server turn for local thread {session_id}."),
+        payload: None,
     }
 }
 
@@ -1232,24 +1282,30 @@ pub fn app_server_command_result_events_with_cancel(
     command_id: &str,
     prompt: &str,
     cancel: Arc<AtomicBool>,
+    channels: Option<AppServerCommandChannels>,
 ) -> Vec<ConnectorEvent> {
-    match run_app_server_command(config, session_id, cwd, command_id, prompt, cancel) {
+    match run_app_server_command(
+        config, session_id, cwd, command_id, prompt, cancel, channels,
+    ) {
         Ok(events) => events,
         Err(AppServerCommandError::Cancelled) => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
             summary: "Codex app-server turn was cancelled because the connector connection closed."
                 .to_owned(),
+            payload: None,
         }],
         Err(AppServerCommandError::TimedOut(seconds)) => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
             summary: format!("Codex app-server turn timed out after {seconds} seconds."),
+            payload: None,
         }],
         Err(AppServerCommandError::Other(error)) => vec![ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
             summary: format!("Codex app-server turn could not start: {error}."),
+            payload: None,
         }],
     }
 }
@@ -1268,6 +1324,7 @@ fn run_app_server_command(
     command_id: &str,
     prompt: &str,
     cancel: Arc<AtomicBool>,
+    channels: Option<AppServerCommandChannels>,
 ) -> Result<Vec<ConnectorEvent>, AppServerCommandError> {
     let url = config
         .session_inventory
@@ -1410,7 +1467,8 @@ fn run_app_server_command(
             }],
             "cwd": turn_cwd.clone(),
             "runtimeWorkspaceRoots": [turn_cwd],
-            "approvalPolicy": "never"
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user"
         }),
         socket_timeout,
         deadline,
@@ -1437,16 +1495,19 @@ fn run_app_server_command(
     if turn_is_terminal(turn) {
         return Ok(app_server_command_events_from_turn(turn, None));
     }
+    let channels_ref = channels.as_ref();
     wait_for_app_server_turn_completion(
         &mut socket,
         &thread_id,
         &turn_id,
+        command_id,
         socket_timeout,
         deadline,
         timeout_seconds,
         config.execution.codex_output_max_bytes,
         &cancel,
         &mut request_id,
+        channels_ref,
     )
 }
 
@@ -1736,12 +1797,14 @@ fn wait_for_app_server_turn_completion(
     socket: &mut AppServerSocket,
     thread_id: &str,
     turn_id: &str,
+    command_id: &str,
     timeout: Duration,
     deadline: Instant,
     timeout_seconds: u64,
     output_max_bytes: usize,
     cancel: &AtomicBool,
     next_request_id: &mut i64,
+    channels: Option<&AppServerCommandChannels>,
 ) -> Result<Vec<ConnectorEvent>, AppServerCommandError> {
     let mut output = AppServerTurnOutput::new(output_max_bytes);
     loop {
@@ -1764,9 +1827,19 @@ fn wait_for_app_server_turn_completion(
             Ok(Message::Text(text)) => {
                 let value = serde_json::from_str::<Value>(text.as_ref())
                     .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
-                if let Some(events) =
-                    handle_app_server_turn_notification(&value, thread_id, turn_id, &mut output)?
-                {
+                if let Some(events) = handle_app_server_turn_message(
+                    socket,
+                    &value,
+                    thread_id,
+                    turn_id,
+                    command_id,
+                    &mut output,
+                    deadline,
+                    timeout_seconds,
+                    cancel,
+                    next_request_id,
+                    channels,
+                )? {
                     return Ok(events);
                 }
             }
@@ -1805,16 +1878,41 @@ fn send_app_server_turn_interrupt(
     ));
 }
 
-fn handle_app_server_turn_notification(
+fn handle_app_server_turn_message(
+    socket: &mut AppServerSocket,
     value: &Value,
     thread_id: &str,
     turn_id: &str,
+    command_id: &str,
     output: &mut AppServerTurnOutput,
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+    next_request_id: &mut i64,
+    channels: Option<&AppServerCommandChannels>,
 ) -> Result<Option<Vec<ConnectorEvent>>, AppServerCommandError> {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
         return Ok(None);
     };
     let params = value.get("params").unwrap_or(&Value::Null);
+    if let Some(request_id) = json_rpc_turn_request_id(value.get("id"))
+        && handle_app_server_turn_request(
+            socket,
+            &request_id,
+            method,
+            params,
+            thread_id,
+            turn_id,
+            command_id,
+            deadline,
+            timeout_seconds,
+            cancel,
+            next_request_id,
+            channels,
+        )?
+    {
+        return Ok(None);
+    }
     match method {
         "item/agentMessage/delta" if notification_matches(params, thread_id, turn_id) => {
             if let Some(delta) = params.get("delta").and_then(Value::as_str) {
@@ -1849,6 +1947,800 @@ fn handle_app_server_turn_notification(
     Ok(None)
 }
 
+fn handle_app_server_turn_request(
+    socket: &mut AppServerSocket,
+    request_id: &Value,
+    method: &str,
+    params: &Value,
+    thread_id: &str,
+    turn_id: &str,
+    command_id: &str,
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+    next_request_id: &mut i64,
+    channels: Option<&AppServerCommandChannels>,
+) -> Result<bool, AppServerCommandError> {
+    if !app_server_turn_request_method(method) || !notification_matches(params, thread_id, turn_id)
+    {
+        return Ok(false);
+    }
+    let Some(channels) = channels else {
+        return Err(AppServerCommandError::Other(
+            "app-server requested user interaction, but the connector interaction channel is unavailable"
+                .to_owned(),
+        ));
+    };
+    let event = turn_interaction_event(method, request_id, params)?;
+    let interaction_id = event
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("interaction_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppServerCommandError::Other(
+                "turn interaction event did not include interaction_id".to_owned(),
+            )
+        })?
+        .to_owned();
+    let request_payload = event.payload.clone();
+    set_active_turn_interaction(channels, Some(interaction_id.clone()))?;
+    channels.event_sender.send(event).map_err(|_| {
+        let _ = set_active_turn_interaction(channels, None);
+        AppServerCommandError::Other("turn interaction event channel closed".to_owned())
+    })?;
+    let response_result = receive_turn_interaction_response(
+        &channels.interaction_receiver,
+        command_id,
+        &interaction_id,
+        deadline,
+        timeout_seconds,
+        cancel,
+        auto_resolution_deadline(method, params),
+    );
+    set_active_turn_interaction(channels, None)?;
+    let response = match response_result {
+        Ok(response) => response,
+        Err(AppServerCommandError::Cancelled) => {
+            send_app_server_turn_interrupt(socket, *next_request_id, thread_id, turn_id);
+            *next_request_id += 1;
+            return Err(AppServerCommandError::Cancelled);
+        }
+        Err(error @ AppServerCommandError::TimedOut(_)) => {
+            send_app_server_turn_interrupt(socket, *next_request_id, thread_id, turn_id);
+            *next_request_id += 1;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    let result =
+        match app_server_turn_interaction_result(method, params, &response.dispatch.response) {
+            Ok(result) => result,
+            Err(error) => {
+                acknowledge_turn_interaction_delivery(response.delivery_ack, false);
+                return Err(error);
+            }
+        };
+    if let Err(error) = socket.send(Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result
+        })
+        .to_string()
+        .into(),
+    )) {
+        acknowledge_turn_interaction_delivery(response.delivery_ack, false);
+        return Err(AppServerCommandError::Other(error.to_string()));
+    }
+    acknowledge_turn_interaction_delivery(response.delivery_ack, true);
+    if response.dispatch.auto_resolved {
+        let event =
+            turn_interaction_resolution_event(&response.dispatch, request_payload.as_ref())?;
+        channels.event_sender.send(event).map_err(|_| {
+            AppServerCommandError::Other(
+                "turn interaction resolution event channel closed".to_owned(),
+            )
+        })?;
+    }
+    Ok(true)
+}
+
+fn set_active_turn_interaction(
+    channels: &AppServerCommandChannels,
+    interaction_id: Option<String>,
+) -> Result<(), AppServerCommandError> {
+    let mut active = channels.active_interaction.lock().map_err(|_| {
+        AppServerCommandError::Other("turn interaction state lock poisoned".to_owned())
+    })?;
+    *active = interaction_id;
+    Ok(())
+}
+
+fn app_server_turn_request_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+    )
+}
+
+fn turn_interaction_event(
+    method: &str,
+    request_id: &Value,
+    params: &Value,
+) -> Result<ConnectorEvent, AppServerCommandError> {
+    match method {
+        "item/commandExecution/requestApproval" => {
+            let command = params
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned);
+            let cwd = params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let title = "Approve command execution";
+            Ok(ConnectorEvent {
+                kind: "approval.requested".to_owned(),
+                priority: "P0".to_owned(),
+                summary: match command.as_deref() {
+                    Some(command) => format!("Approval requested for command: {command}"),
+                    None => "Approval requested for command execution.".to_owned(),
+                },
+                payload: Some(turn_interaction_payload(
+                    method,
+                    request_id,
+                    params,
+                    "approval",
+                    Some("command_execution"),
+                    title,
+                    params.get("reason").and_then(Value::as_str),
+                    command,
+                    cwd,
+                    None,
+                    None,
+                    None,
+                )?),
+            })
+        }
+        "item/fileChange/requestApproval" => {
+            let grant_root = params
+                .get("grantRoot")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let title = "Approve file change";
+            Ok(ConnectorEvent {
+                kind: "approval.requested".to_owned(),
+                priority: "P0".to_owned(),
+                summary: match grant_root.as_deref() {
+                    Some(root) => format!("Approval requested for file changes under {root}."),
+                    None => "Approval requested for file changes.".to_owned(),
+                },
+                payload: Some(turn_interaction_payload(
+                    method,
+                    request_id,
+                    params,
+                    "approval",
+                    Some("file_change"),
+                    title,
+                    params.get("reason").and_then(Value::as_str),
+                    None,
+                    None,
+                    grant_root,
+                    None,
+                    None,
+                )?),
+            })
+        }
+        "item/permissions/requestApproval" => {
+            let cwd = params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let title = "Approve permissions";
+            Ok(ConnectorEvent {
+                kind: "approval.requested".to_owned(),
+                priority: "P0".to_owned(),
+                summary: "Approval requested for app-server permissions.".to_owned(),
+                payload: Some(turn_interaction_payload(
+                    method,
+                    request_id,
+                    params,
+                    "approval",
+                    Some("permissions"),
+                    title,
+                    params.get("reason").and_then(Value::as_str),
+                    None,
+                    cwd,
+                    None,
+                    None,
+                    None,
+                )?),
+            })
+        }
+        "item/tool/requestUserInput" => {
+            let questions = params
+                .get("questions")
+                .and_then(Value::as_array)
+                .map(|questions| {
+                    questions
+                        .iter()
+                        .filter_map(turn_interaction_question)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if questions.is_empty() {
+                return Err(AppServerCommandError::Other(
+                    "app-server user input request did not include any valid questions".to_owned(),
+                ));
+            }
+            let title = "Provide requested input";
+            Ok(ConnectorEvent {
+                kind: "input.requested".to_owned(),
+                priority: "P0".to_owned(),
+                summary: format!(
+                    "Codex requested {} input {}.",
+                    questions.len(),
+                    if questions.len() == 1 {
+                        "answer"
+                    } else {
+                        "answers"
+                    }
+                ),
+                payload: Some(turn_interaction_payload(
+                    method,
+                    request_id,
+                    params,
+                    "input",
+                    None,
+                    title,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(questions),
+                    params.get("autoResolutionMs").and_then(Value::as_u64),
+                )?),
+            })
+        }
+        _ => Err(AppServerCommandError::Other(format!(
+            "unsupported app-server interaction method: {method}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn turn_interaction_payload(
+    method: &str,
+    request_id: &Value,
+    params: &Value,
+    request_kind: &str,
+    subject: Option<&str>,
+    title: &str,
+    detail: Option<&str>,
+    command: Option<String>,
+    cwd: Option<String>,
+    grant_root: Option<String>,
+    questions: Option<Vec<Value>>,
+    auto_resolution_ms: Option<u64>,
+) -> Result<Value, AppServerCommandError> {
+    let thread_id = params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppServerCommandError::Other(
+                "app-server interaction request did not include threadId".to_owned(),
+            )
+        })?;
+    let turn_id = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppServerCommandError::Other(
+                "app-server interaction request did not include turnId".to_owned(),
+            )
+        })?;
+    let interaction_id = turn_interaction_id(method, request_id, params);
+    let mut payload = serde_json::Map::new();
+    payload.insert("type".to_owned(), json!("turn_interaction"));
+    payload.insert("interaction_id".to_owned(), json!(interaction_id));
+    payload.insert("status".to_owned(), json!("pending"));
+    payload.insert("method".to_owned(), json!(method));
+    payload.insert("request_kind".to_owned(), json!(request_kind));
+    if let Some(subject) = subject {
+        payload.insert("subject".to_owned(), json!(subject));
+    }
+    payload.insert("app_server_thread_id".to_owned(), json!(thread_id));
+    payload.insert("app_server_turn_id".to_owned(), json!(turn_id));
+    if let Some(item_id) = params.get("itemId").and_then(Value::as_str) {
+        payload.insert("app_server_item_id".to_owned(), json!(item_id));
+    }
+    payload.insert("title".to_owned(), json!(title));
+    if let Some(detail) = detail.filter(|value| !value.trim().is_empty()) {
+        payload.insert("detail".to_owned(), json!(detail));
+    }
+    if let Some(command) = command.filter(|value| !value.trim().is_empty()) {
+        payload.insert("command".to_owned(), json!(command));
+    }
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        payload.insert("cwd".to_owned(), json!(cwd));
+    }
+    if request_kind == "approval" {
+        if let Some(command_actions) = params
+            .get("commandActions")
+            .and_then(Value::as_array)
+            .filter(|value| !value.is_empty())
+        {
+            payload.insert(
+                "command_actions".to_owned(),
+                Value::Array(command_actions.to_vec()),
+            );
+        }
+        if let Some(amendment) = proposed_execpolicy_amendment_from_request(params) {
+            payload.insert("proposed_execpolicy_amendment".to_owned(), amendment);
+        }
+        if let Some(network_context) = network_approval_context_from_request(params) {
+            payload.insert("network_approval_context".to_owned(), network_context);
+        }
+        let Some(available_decisions) = available_approval_decisions_from_request(params) else {
+            return Err(AppServerCommandError::Other(
+                "app-server approval request did not include any valid approval decisions"
+                    .to_owned(),
+            ));
+        };
+        if available_decisions
+            .as_array()
+            .map(|decisions| decisions.is_empty())
+            .unwrap_or(true)
+        {
+            return Err(AppServerCommandError::Other(
+                "app-server approval request did not include any valid approval decisions"
+                    .to_owned(),
+            ));
+        }
+        payload.insert("available_decisions".to_owned(), available_decisions);
+    }
+    if let Some(grant_root) = grant_root.filter(|value| !value.trim().is_empty()) {
+        payload.insert("grant_root".to_owned(), json!(grant_root));
+    }
+    if let Some(requested_permissions) = requested_permissions_from_request(params) {
+        payload.insert("requested_permissions".to_owned(), requested_permissions);
+    }
+    if let Some(questions) = questions.filter(|value| !value.is_empty()) {
+        payload.insert("questions".to_owned(), Value::Array(questions));
+    }
+    if let Some(auto_resolution_ms) = auto_resolution_ms {
+        payload.insert("auto_resolution_ms".to_owned(), json!(auto_resolution_ms));
+        payload.insert(
+            "auto_resolution_response_grace_ms".to_owned(),
+            json!(AUTO_RESOLUTION_RESPONSE_GRACE_MS),
+        );
+    }
+    Ok(Value::Object(payload))
+}
+
+fn turn_interaction_id(method: &str, request_id: &Value, params: &Value) -> String {
+    let target_id = params
+        .get("approvalId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("itemId").and_then(Value::as_str));
+    serde_json::to_string(&json!([method, target_id, request_id]))
+        .unwrap_or_else(|_| format!("{method}:{}:{}", target_id.unwrap_or_default(), request_id))
+}
+
+fn json_rpc_turn_request_id(value: Option<&Value>) -> Option<Value> {
+    match value? {
+        Value::String(_) => value.cloned(),
+        Value::Number(number) if number.is_i64() || number.is_u64() => value.cloned(),
+        _ => None,
+    }
+}
+
+fn turn_interaction_question(value: &Value) -> Option<Value> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let header = value
+        .get("header")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let question = value
+        .get("question")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let mut item = serde_json::Map::new();
+    item.insert("id".to_owned(), json!(id));
+    item.insert("header".to_owned(), json!(header));
+    item.insert("question".to_owned(), json!(question));
+    item.insert(
+        "is_other".to_owned(),
+        json!(
+            value
+                .get("isOther")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        ),
+    );
+    item.insert(
+        "is_secret".to_owned(),
+        json!(
+            value
+                .get("isSecret")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        ),
+    );
+    if let Some(options) = value.get("options").and_then(Value::as_array) {
+        let mapped = options
+            .iter()
+            .filter_map(|option| {
+                let label = option.get("label").and_then(Value::as_str)?;
+                let description = option.get("description").and_then(Value::as_str)?;
+                Some(json!({
+                    "label": label,
+                    "description": description
+                }))
+            })
+            .collect::<Vec<_>>();
+        if !mapped.is_empty() {
+            item.insert("options".to_owned(), Value::Array(mapped));
+        }
+    }
+    Some(Value::Object(item))
+}
+
+fn available_approval_decisions_from_request(params: &Value) -> Option<Value> {
+    match params.get("availableDecisions") {
+        None => None,
+        Some(Value::Array(decisions)) => Some(Value::Array(
+            decisions
+                .iter()
+                .filter_map(normalized_approval_decision)
+                .collect::<Vec<_>>(),
+        )),
+        Some(_) => Some(Value::Array(Vec::new())),
+    }
+}
+
+fn normalized_approval_decision(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(decision)
+            if matches!(
+                decision.as_str(),
+                "accept" | "acceptForSession" | "decline" | "cancel"
+            ) =>
+        {
+            Some(Value::String(decision.to_owned()))
+        }
+        Value::Object(map) => {
+            let amendment = map.get("acceptWithExecpolicyAmendment")?;
+            let amendment = amendment.get("execpolicy_amendment")?;
+            if execpolicy_amendment_is_valid(amendment) {
+                Some(json!({
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": amendment
+                    }
+                }))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn proposed_execpolicy_amendment_from_request(params: &Value) -> Option<Value> {
+    let amendment = params.get("proposedExecpolicyAmendment")?;
+    if execpolicy_amendment_is_valid(amendment) {
+        Some(amendment.clone())
+    } else {
+        None
+    }
+}
+
+fn execpolicy_amendment_is_valid(value: &Value) -> bool {
+    value
+        .as_array()
+        .map(|items| {
+            !items.is_empty()
+                && items
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(|part| !part.trim().is_empty()))
+        })
+        .unwrap_or(false)
+}
+
+fn network_approval_context_from_request(params: &Value) -> Option<Value> {
+    let context = params.get("networkApprovalContext")?.as_object()?;
+    if context.is_empty() {
+        None
+    } else {
+        Some(Value::Object(context.clone()))
+    }
+}
+
+fn receive_turn_interaction_response(
+    receiver: &Receiver<TurnInteractionResponseDelivery>,
+    command_id: &str,
+    interaction_id: &str,
+    deadline: Instant,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+    auto_resolution_deadline: Option<Instant>,
+) -> Result<ReceivedTurnInteractionResponse, AppServerCommandError> {
+    let auto_resolution_grace_deadline = auto_resolution_deadline.and_then(|deadline| {
+        deadline.checked_add(Duration::from_millis(AUTO_RESOLUTION_RESPONSE_GRACE_MS))
+    });
+    loop {
+        ensure_app_server_command_budget(deadline, timeout_seconds, cancel)?;
+        if let Some(dispatch) =
+            try_receive_turn_interaction_response(receiver, command_id, interaction_id)?
+        {
+            return Ok(dispatch);
+        }
+        let now = Instant::now();
+        if auto_resolution_deadline.is_some_and(|auto_deadline| now >= auto_deadline) {
+            if let Some(grace_deadline) = auto_resolution_grace_deadline {
+                if now < grace_deadline {
+                    let remaining = deadline.saturating_duration_since(now);
+                    let grace_wait = grace_deadline.saturating_duration_since(now);
+                    let wait = remaining.min(grace_wait).min(Duration::from_millis(100));
+                    match receiver.recv_timeout(wait) {
+                        Ok(delivery) => {
+                            if delivery.dispatch.command_id == command_id
+                                && delivery.dispatch.interaction_id == interaction_id
+                            {
+                                return Ok(ReceivedTurnInteractionResponse {
+                                    dispatch: delivery.dispatch,
+                                    delivery_ack: Some(delivery.delivery_ack),
+                                });
+                            }
+                            let _ = delivery.delivery_ack.send(false);
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err(AppServerCommandError::Other(
+                                "turn interaction response channel closed".to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
+            return Ok(ReceivedTurnInteractionResponse {
+                dispatch: auto_resolved_input_response(command_id, interaction_id),
+                delivery_ack: None,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let mut wait = remaining.min(Duration::from_millis(100));
+        if let Some(auto_deadline) = auto_resolution_deadline {
+            wait = wait.min(auto_deadline.saturating_duration_since(now));
+        }
+        match receiver.recv_timeout(wait) {
+            Ok(delivery) => {
+                if delivery.dispatch.command_id == command_id
+                    && delivery.dispatch.interaction_id == interaction_id
+                {
+                    return Ok(ReceivedTurnInteractionResponse {
+                        dispatch: delivery.dispatch,
+                        delivery_ack: Some(delivery.delivery_ack),
+                    });
+                }
+                let _ = delivery.delivery_ack.send(false);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(AppServerCommandError::Other(
+                    "turn interaction response channel closed".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+fn try_receive_turn_interaction_response(
+    receiver: &Receiver<TurnInteractionResponseDelivery>,
+    command_id: &str,
+    interaction_id: &str,
+) -> Result<Option<ReceivedTurnInteractionResponse>, AppServerCommandError> {
+    loop {
+        match receiver.try_recv() {
+            Ok(delivery) => {
+                if delivery.dispatch.command_id == command_id
+                    && delivery.dispatch.interaction_id == interaction_id
+                {
+                    return Ok(Some(ReceivedTurnInteractionResponse {
+                        dispatch: delivery.dispatch,
+                        delivery_ack: Some(delivery.delivery_ack),
+                    }));
+                }
+                let _ = delivery.delivery_ack.send(false);
+            }
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                return Err(AppServerCommandError::Other(
+                    "turn interaction response channel closed".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+fn auto_resolution_deadline(method: &str, params: &Value) -> Option<Instant> {
+    if method != "item/tool/requestUserInput" {
+        return None;
+    }
+    params
+        .get("autoResolutionMs")
+        .and_then(Value::as_u64)
+        .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)))
+}
+
+fn acknowledge_turn_interaction_delivery(delivery_ack: Option<Sender<bool>>, accepted: bool) {
+    if let Some(delivery_ack) = delivery_ack {
+        let _ = delivery_ack.send(accepted);
+    }
+}
+
+fn auto_resolved_input_response(
+    command_id: &str,
+    interaction_id: &str,
+) -> TurnInteractionResponseDispatch {
+    TurnInteractionResponseDispatch {
+        request_id: None,
+        command_id: command_id.to_owned(),
+        interaction_id: interaction_id.to_owned(),
+        response: TurnInteractionResponse::Input {
+            answers: HashMap::new(),
+        },
+        auto_resolved: true,
+    }
+}
+
+fn turn_interaction_resolution_event(
+    dispatch: &TurnInteractionResponseDispatch,
+    request_payload: Option<&Value>,
+) -> Result<ConnectorEvent, AppServerCommandError> {
+    let request_payload = request_payload.ok_or_else(|| {
+        AppServerCommandError::Other(
+            "turn interaction resolution did not include request payload".to_owned(),
+        )
+    })?;
+    let title = request_payload
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("requested interaction");
+    match &dispatch.response {
+        TurnInteractionResponse::Input { answers } => Ok(ConnectorEvent {
+            kind: "input.received".to_owned(),
+            priority: "P1".to_owned(),
+            summary: format!("Input auto-resolved for {title}."),
+            payload: Some(json!({
+                "type": "turn_interaction_resolution",
+                "interaction_id": dispatch.interaction_id,
+                "status": "answered",
+                "answer_count": answers.len()
+            })),
+        }),
+        TurnInteractionResponse::Approval { decision } => {
+            let status = approval_resolution_status(decision);
+            Ok(ConnectorEvent {
+                kind: "approval.resolved".to_owned(),
+                priority: "P1".to_owned(),
+                summary: format!("Approval {} for {title}.", status.replace('_', " ")),
+                payload: Some(json!({
+                    "type": "turn_interaction_resolution",
+                    "interaction_id": dispatch.interaction_id,
+                    "status": status,
+                    "decision": decision
+                })),
+            })
+        }
+    }
+}
+
+fn app_server_turn_interaction_result(
+    method: &str,
+    params: &Value,
+    response: &TurnInteractionResponse,
+) -> Result<Value, AppServerCommandError> {
+    match (method, response) {
+        (
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
+            TurnInteractionResponse::Approval { decision },
+        ) => Ok(json!({ "decision": decision })),
+        ("item/permissions/requestApproval", TurnInteractionResponse::Approval { decision }) => {
+            let permissions = if approval_decision_is(decision, "accept")
+                || approval_decision_is(decision, "acceptForSession")
+            {
+                granted_permissions_from_request(params)
+            } else {
+                json!({})
+            };
+            let scope = if approval_decision_is(decision, "acceptForSession") {
+                "session"
+            } else {
+                "turn"
+            };
+            Ok(json!({
+                "permissions": permissions,
+                "scope": scope
+            }))
+        }
+        ("item/tool/requestUserInput", TurnInteractionResponse::Input { answers }) => Ok(json!({
+            "answers": answers
+        })),
+        ("item/tool/requestUserInput", TurnInteractionResponse::Approval { .. }) => Err(
+            AppServerCommandError::Other("input request received an approval response".to_owned()),
+        ),
+        (_, TurnInteractionResponse::Input { .. }) => Err(AppServerCommandError::Other(
+            "approval request received an input response".to_owned(),
+        )),
+        _ => Err(AppServerCommandError::Other(format!(
+            "unsupported app-server interaction method: {method}"
+        ))),
+    }
+}
+
+fn approval_resolution_status(decision: &Value) -> &'static str {
+    if approval_decision_is(decision, "accept") {
+        "accepted"
+    } else if approval_decision_is(decision, "acceptForSession") {
+        "accepted_for_session"
+    } else if approval_decision_is(decision, "decline") {
+        "declined"
+    } else if approval_decision_is(decision, "acceptWithExecpolicyAmendment") {
+        "accepted_with_execpolicy_amendment"
+    } else {
+        "cancelled"
+    }
+}
+
+fn approval_decision_is(decision: &Value, expected: &str) -> bool {
+    decision.as_str() == Some(expected)
+        || (expected == "acceptWithExecpolicyAmendment"
+            && decision
+                .get("acceptWithExecpolicyAmendment")
+                .and_then(|value| value.get("execpolicy_amendment"))
+                .is_some_and(execpolicy_amendment_is_valid))
+}
+
+fn granted_permissions_from_request(params: &Value) -> Value {
+    let Some(requested) = params.get("permissions") else {
+        return json!({});
+    };
+    let mut granted = serde_json::Map::new();
+    if let Some(network) = requested.get("network").filter(|value| !value.is_null()) {
+        granted.insert("network".to_owned(), network.clone());
+    }
+    if let Some(file_system) = requested.get("fileSystem").filter(|value| !value.is_null()) {
+        granted.insert("fileSystem".to_owned(), file_system.clone());
+    }
+    Value::Object(granted)
+}
+
+fn requested_permissions_from_request(params: &Value) -> Option<Value> {
+    let requested = params.get("permissions")?;
+    let mut permissions = serde_json::Map::new();
+    if let Some(network) = requested.get("network").filter(|value| !value.is_null()) {
+        permissions.insert("network".to_owned(), network.clone());
+    }
+    if let Some(file_system) = requested.get("fileSystem").filter(|value| !value.is_null()) {
+        permissions.insert("fileSystem".to_owned(), file_system.clone());
+    }
+    if permissions.is_empty() {
+        None
+    } else {
+        Some(Value::Object(permissions))
+    }
+}
+
 fn notification_matches(params: &Value, thread_id: &str, turn_id: &str) -> bool {
     params.get("threadId").and_then(Value::as_str) == Some(thread_id)
         && params.get("turnId").and_then(Value::as_str) == Some(turn_id)
@@ -1876,12 +2768,14 @@ fn app_server_command_events_from_turn(
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
             summary: format!("Codex: {message}"),
+            payload: None,
         });
     } else if turn_status(turn) == Some("completed") {
         events.push(ConnectorEvent {
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
             summary: "Codex app-server turn completed without an assistant message.".to_owned(),
+            payload: None,
         });
     }
 
@@ -1890,11 +2784,13 @@ fn app_server_command_events_from_turn(
             kind: "command.finished".to_owned(),
             priority: "P1".to_owned(),
             summary: "Codex app-server turn completed successfully.".to_owned(),
+            payload: None,
         }),
         Some("interrupted") => events.push(ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
             summary: "Codex app-server turn was interrupted.".to_owned(),
+            payload: None,
         }),
         Some("failed") => events.push(ConnectorEvent {
             kind: "command.failed".to_owned(),
@@ -1903,11 +2799,13 @@ fn app_server_command_events_from_turn(
                 "Codex app-server turn failed: {}",
                 app_server_turn_error_message(turn.get("error"))
             ),
+            payload: None,
         }),
         _ => events.push(ConnectorEvent {
             kind: "command.failed".to_owned(),
             priority: "P1".to_owned(),
             summary: "Codex app-server turn ended with an unknown status.".to_owned(),
+            payload: None,
         }),
     }
     events
@@ -2976,8 +3874,11 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AppServerTurnOutput, HistorySession,
-        InventoryScope, SessionDraft, TitleSource, app_server_command_result_events_with_cancel,
+        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AUTO_RESOLUTION_RESPONSE_GRACE_MS,
+        AppServerCommandChannels, AppServerTurnOutput, HistorySession, InventoryScope,
+        SessionDraft, TitleSource, TurnInteractionInputAnswer, TurnInteractionResponse,
+        TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
+        acknowledge_turn_interaction_delivery, app_server_command_result_events_with_cancel,
         app_server_sessions_from_response, app_server_thread_from_response,
         app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
         create_app_server_thread_at, ensure_app_server_host_session_at, load_app_server_sessions,
@@ -2986,18 +3887,45 @@ mod tests {
         unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     };
     use std::thread;
     use std::time::{Duration, Instant};
     use tungstenite::{Message, accept};
+
+    fn turn_interaction_delivery(
+        dispatch: TurnInteractionResponseDispatch,
+    ) -> (TurnInteractionResponseDelivery, Receiver<bool>) {
+        let (delivery_ack, ack_receiver) = mpsc::channel();
+        (
+            TurnInteractionResponseDelivery {
+                dispatch,
+                delivery_ack,
+            },
+            ack_receiver,
+        )
+    }
+
+    fn send_turn_interaction_response(
+        sender: &Sender<TurnInteractionResponseDelivery>,
+        dispatch: TurnInteractionResponseDispatch,
+    ) {
+        let (delivery, ack_receiver) = turn_interaction_delivery(dispatch);
+        sender.send(delivery).expect("send interaction response");
+        assert_eq!(
+            ack_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("delivery ack"),
+            true
+        );
+    }
 
     #[test]
     fn title_resolution_prefers_metadata_over_history() {
@@ -5782,6 +6710,7 @@ mod tests {
             "command-1",
             "Say exactly: chaop-smoke",
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         assert_eq!(events.len(), 2);
@@ -5849,7 +6778,13 @@ mod tests {
             turn_start_request
                 .pointer("/params/approvalPolicy")
                 .and_then(serde_json::Value::as_str),
-            Some("never")
+            Some("on-request")
+        );
+        assert_eq!(
+            turn_start_request
+                .pointer("/params/approvalsReviewer")
+                .and_then(serde_json::Value::as_str),
+            Some("user")
         );
         assert_eq!(
             turn_start_request
@@ -5923,6 +6858,7 @@ mod tests {
             "command-1",
             "Use the recovered thread",
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         assert_eq!(events.len(), 2);
@@ -6046,6 +6982,7 @@ mod tests {
             "command-1",
             "Use the recovered thread",
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         assert_eq!(events.len(), 1);
@@ -6128,6 +7065,7 @@ mod tests {
             "command-1",
             "Use the recovered thread",
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         assert_eq!(events.len(), 1);
@@ -6242,6 +7180,7 @@ mod tests {
             "command-1",
             "Find me on page three",
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         assert_eq!(events.len(), 2);
@@ -6343,6 +7282,7 @@ mod tests {
             "command-1",
             "Run risky command",
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         assert_eq!(events.len(), 1);
@@ -6419,11 +7359,901 @@ mod tests {
             "command-1",
             "Wait for completion",
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].summary, "Codex: done after notification");
         assert_eq!(events[1].kind, "command.finished");
+    }
+
+    #[test]
+    fn app_server_command_forwards_command_approval_interaction() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": 80,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-approval-1",
+                "startedAtMs": 1781263443000_i64,
+                "approvalId": null,
+                "environmentId": null,
+                "reason": "Needs write access",
+                "command": "touch requested.txt",
+                "cwd": "/tmp/project",
+                "commandActions": [
+                    {
+                        "kind": "run",
+                        "command": "touch requested.txt"
+                    }
+                ],
+                "proposedExecpolicyAmendment": ["touch", "requested.txt"],
+                "networkApprovalContext": {
+                    "host": "registry.npmjs.org",
+                    "protocol": "https",
+                    "port": 443
+                },
+                "availableDecisions": [
+                    "decline",
+                    {
+                        "acceptWithExecpolicyAmendment": {
+                            "execpolicy_amendment": ["touch", "requested.txt"]
+                        }
+                    },
+                    "cancel"
+                ]
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                Some("/tmp/project"),
+                "command-1",
+                "Run approved command",
+                Arc::new(AtomicBool::new(false)),
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("approval event");
+        assert_eq!(event.kind, "approval.requested");
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("subject"))
+                .and_then(Value::as_str),
+            Some("command_execution")
+        );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.pointer("/network_approval_context/host"))
+                .and_then(Value::as_str),
+            Some("registry.npmjs.org")
+        );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.pointer("/proposed_execpolicy_amendment/0"))
+                .and_then(Value::as_str),
+            Some("touch")
+        );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| {
+                    payload.pointer(
+                        "/available_decisions/1/acceptWithExecpolicyAmendment/execpolicy_amendment/0",
+                    )
+                })
+                .and_then(Value::as_str),
+            Some("touch")
+        );
+        let interaction_id = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("interaction_id"))
+            .and_then(Value::as_str)
+            .expect("interaction id")
+            .to_owned();
+        send_turn_interaction_response(
+            &response_tx,
+            TurnInteractionResponseDispatch {
+                request_id: None,
+                command_id: "command-1".to_owned(),
+                interaction_id,
+                response: TurnInteractionResponse::Approval {
+                    decision: json!({
+                        "acceptWithExecpolicyAmendment": {
+                            "execpolicy_amendment": ["touch", "requested.txt"]
+                        }
+                    }),
+                },
+                auto_resolved: false,
+            },
+        );
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("app-server interaction response");
+        assert_eq!(
+            app_response
+                .pointer("/result/decision/acceptWithExecpolicyAmendment/execpolicy_amendment/0")
+                .and_then(Value::as_str),
+            Some("touch")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn app_server_command_rejects_empty_available_decisions_when_options_are_invalid() {
+        let params = json!({
+            "threadId": "thread-live-1",
+            "turnId": "turn-1",
+            "itemId": "item-approval-1",
+            "reason": "Needs write access",
+            "command": "touch requested.txt",
+            "cwd": "/tmp/project",
+            "availableDecisions": [
+                "approveForever",
+                {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": []
+                    }
+                }
+            ]
+        });
+
+        let error = match super::turn_interaction_event(
+            "item/commandExecution/requestApproval",
+            &json!(82),
+            &params,
+        ) {
+            Ok(_) => panic!("invalid approval decisions should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            super::AppServerCommandError::Other(
+                "app-server approval request did not include any valid approval decisions"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn app_server_command_rejects_missing_available_decisions() {
+        let params = json!({
+            "threadId": "thread-live-1",
+            "turnId": "turn-1",
+            "itemId": "item-approval-1",
+            "reason": "Needs write access",
+            "command": "touch requested.txt",
+            "cwd": "/tmp/project"
+        });
+
+        let error = match super::turn_interaction_event(
+            "item/commandExecution/requestApproval",
+            &json!(82),
+            &params,
+        ) {
+            Ok(_) => panic!("missing approval decisions should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            super::AppServerCommandError::Other(
+                "app-server approval request did not include any valid approval decisions"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn app_server_command_forwards_permissions_approval_details() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": 83,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-permissions-1",
+                "reason": "Needs access to inspect the workspace and fetch package metadata.",
+                "cwd": "/tmp/project",
+                "permissions": {
+                    "network": {
+                        "host": "registry.npmjs.org"
+                    },
+                    "fileSystem": {
+                        "read": ["/tmp/project"],
+                        "write": ["/tmp/project/package-lock.json"]
+                    }
+                },
+                "availableDecisions": ["accept", "acceptForSession", "decline", "cancel"]
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                Some("/tmp/project"),
+                "command-1",
+                "Inspect dependencies",
+                Arc::new(AtomicBool::new(false)),
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("permissions approval event");
+        assert_eq!(event.kind, "approval.requested");
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("subject"))
+                .and_then(Value::as_str),
+            Some("permissions")
+        );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.pointer("/requested_permissions/network/host"))
+                .and_then(Value::as_str),
+            Some("registry.npmjs.org")
+        );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| {
+                    payload.pointer("/requested_permissions/fileSystem/write/0")
+                })
+                .and_then(Value::as_str),
+            Some("/tmp/project/package-lock.json")
+        );
+        let interaction_id = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("interaction_id"))
+            .and_then(Value::as_str)
+            .expect("interaction id")
+            .to_owned();
+        send_turn_interaction_response(
+            &response_tx,
+            TurnInteractionResponseDispatch {
+                request_id: None,
+                command_id: "command-1".to_owned(),
+                interaction_id,
+                response: TurnInteractionResponse::Approval {
+                    decision: json!("acceptForSession"),
+                },
+                auto_resolved: false,
+            },
+        );
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("app-server permissions response");
+        assert_eq!(
+            app_response
+                .pointer("/result/scope")
+                .and_then(Value::as_str),
+            Some("session")
+        );
+        assert_eq!(
+            app_response
+                .pointer("/result/permissions/network/host")
+                .and_then(Value::as_str),
+            Some("registry.npmjs.org")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn app_server_command_forwards_user_input_interaction() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": 81,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-input-1",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "header": "Confirm",
+                        "question": "Continue?",
+                        "isOther": false,
+                        "isSecret": false,
+                        "options": [
+                            {
+                                "label": "Yes",
+                                "description": "Continue this turn."
+                            }
+                        ]
+                    }
+                ],
+                "autoResolutionMs": null
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                None,
+                "command-1",
+                "Ask for input",
+                Arc::new(AtomicBool::new(false)),
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input event");
+        assert_eq!(event.kind, "input.requested");
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.pointer("/questions/0/is_secret"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let interaction_id = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("interaction_id"))
+            .and_then(Value::as_str)
+            .expect("interaction id")
+            .to_owned();
+        let mut answers = HashMap::new();
+        answers.insert(
+            "q1".to_owned(),
+            TurnInteractionInputAnswer {
+                answers: vec!["Yes".to_owned()],
+            },
+        );
+        send_turn_interaction_response(
+            &response_tx,
+            TurnInteractionResponseDispatch {
+                request_id: None,
+                command_id: "command-1".to_owned(),
+                interaction_id,
+                response: TurnInteractionResponse::Input { answers },
+                auto_resolved: false,
+            },
+        );
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("app-server input response");
+        assert_eq!(
+            app_response
+                .pointer("/result/answers/q1/answers/0")
+                .and_then(Value::as_str),
+            Some("Yes")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn app_server_command_interrupts_turn_when_cancelled_during_user_input_interaction() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": 81,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-input-1",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "header": "Confirm",
+                        "question": "Continue?",
+                        "isOther": false,
+                        "isSecret": false
+                    }
+                ],
+                "autoResolutionMs": null
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_response_tx, response_rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let command_cancel = Arc::clone(&cancel);
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                None,
+                "command-1",
+                "Ask for input",
+                command_cancel,
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input event");
+        assert_eq!(event.kind, "input.requested");
+        cancel.store(true, Ordering::Relaxed);
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("app-server interrupt request");
+        assert_eq!(
+            app_response.get("method").and_then(Value::as_str),
+            Some("turn/interrupt")
+        );
+        assert_eq!(
+            app_response
+                .pointer("/params/threadId")
+                .and_then(Value::as_str),
+            Some("thread-live-1")
+        );
+        assert_eq!(
+            app_response
+                .pointer("/params/turnId")
+                .and_then(Value::as_str),
+            Some("turn-1")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.failed")
+        );
+    }
+
+    #[test]
+    fn turn_interaction_id_distinguishes_json_rpc_id_type_and_boundaries() {
+        let params = json!({
+            "threadId": "thread-live-1",
+            "turnId": "turn-1",
+            "itemId": "item:1"
+        });
+        let numeric = super::turn_interaction_id("item/tool/requestUserInput", &json!(1), &params);
+        let string = super::turn_interaction_id("item/tool/requestUserInput", &json!("1"), &params);
+        assert_ne!(numeric, string);
+
+        let alternate_params = json!({
+            "threadId": "thread-live-1",
+            "turnId": "turn-1",
+            "itemId": "item"
+        });
+        let alternate = super::turn_interaction_id(
+            "item/tool/requestUserInput",
+            &json!("1:1"),
+            &alternate_params,
+        );
+        assert_ne!(string, alternate);
+    }
+
+    #[test]
+    fn user_input_interaction_without_valid_questions_is_rejected() {
+        let params = json!({
+            "threadId": "thread-live-1",
+            "turnId": "turn-1",
+            "itemId": "item-input-1",
+            "questions": [
+                {
+                    "id": "",
+                    "header": "Confirm",
+                    "question": "Continue?",
+                    "isOther": false,
+                    "isSecret": false
+                }
+            ]
+        });
+
+        let error = match super::turn_interaction_event(
+            "item/tool/requestUserInput",
+            &json!("input-request-1"),
+            &params,
+        ) {
+            Ok(_) => panic!("invalid questions should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            super::AppServerCommandError::Other(
+                "app-server user input request did not include any valid questions".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn app_server_command_handles_string_json_rpc_interaction_id() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": "input-request-1",
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-input-1",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "header": "Confirm",
+                        "question": "Continue?",
+                        "isOther": false,
+                        "isSecret": false
+                    }
+                ],
+                "autoResolutionMs": null
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                None,
+                "command-1",
+                "Ask for input",
+                Arc::new(AtomicBool::new(false)),
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input event");
+        assert_eq!(event.kind, "input.requested");
+        let interaction_id = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("interaction_id"))
+            .and_then(Value::as_str)
+            .expect("interaction id")
+            .to_owned();
+        let mut answers = HashMap::new();
+        answers.insert(
+            "q1".to_owned(),
+            TurnInteractionInputAnswer {
+                answers: vec!["Yes".to_owned()],
+            },
+        );
+        send_turn_interaction_response(
+            &response_tx,
+            TurnInteractionResponseDispatch {
+                request_id: None,
+                command_id: "command-1".to_owned(),
+                interaction_id,
+                response: TurnInteractionResponse::Input { answers },
+                auto_resolved: false,
+            },
+        );
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("app-server input response");
+        assert_eq!(
+            app_response.get("id").and_then(Value::as_str),
+            Some("input-request-1")
+        );
+        assert_eq!(
+            app_response
+                .pointer("/result/answers/q1/answers/0")
+                .and_then(Value::as_str),
+            Some("Yes")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn app_server_command_auto_resolves_user_input_interaction() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": 82,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-input-1",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "header": "Confirm",
+                        "question": "Continue?",
+                        "isOther": false,
+                        "isSecret": false
+                    }
+                ],
+                "autoResolutionMs": 10
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_response_tx, response_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                None,
+                "command-1",
+                "Ask for input",
+                Arc::new(AtomicBool::new(false)),
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                    active_interaction: Arc::new(Mutex::new(None)),
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input event");
+        assert_eq!(event.kind, "input.requested");
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("auto_resolution_ms"))
+                .and_then(Value::as_u64),
+            Some(10)
+        );
+        assert!(event.payload.as_ref().map_or(true, |payload| {
+            payload.get("auto_resolution_expires_at").is_none()
+        }));
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("auto_resolution_response_grace_ms"))
+                .and_then(Value::as_u64),
+            Some(AUTO_RESOLUTION_RESPONSE_GRACE_MS)
+        );
+
+        let resolution_event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("auto-resolution event");
+        assert_eq!(resolution_event.kind, "input.received");
+        assert_eq!(
+            resolution_event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str),
+            Some("turn_interaction_resolution")
+        );
+        assert_eq!(
+            resolution_event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("answer_count"))
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("auto-resolved app-server input response");
+        assert_eq!(
+            app_response
+                .pointer("/result/answers")
+                .and_then(Value::as_object)
+                .map(serde_json::Map::len),
+            Some(0)
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn receive_turn_interaction_response_prefers_queued_response_at_auto_deadline() {
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut answers = HashMap::new();
+        answers.insert(
+            "q1".to_owned(),
+            TurnInteractionInputAnswer {
+                answers: vec!["Yes".to_owned()],
+            },
+        );
+        let (delivery, delivery_ack) = turn_interaction_delivery(TurnInteractionResponseDispatch {
+            request_id: None,
+            command_id: "command-1".to_owned(),
+            interaction_id: "interaction-1".to_owned(),
+            response: TurnInteractionResponse::Input { answers },
+            auto_resolved: false,
+        });
+        response_tx
+            .send(delivery)
+            .expect("queue interaction response");
+        let cancel = AtomicBool::new(false);
+
+        let response = super::receive_turn_interaction_response(
+            &response_rx,
+            "command-1",
+            "interaction-1",
+            Instant::now() + Duration::from_secs(1),
+            1,
+            &cancel,
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .expect("receive queued response");
+
+        assert!(!response.dispatch.auto_resolved);
+        acknowledge_turn_interaction_delivery(response.delivery_ack, true);
+        assert_eq!(
+            delivery_ack
+                .recv_timeout(Duration::from_secs(1))
+                .expect("delivery ack"),
+            true
+        );
+        match response.dispatch.response {
+            TurnInteractionResponse::Input { answers } => {
+                assert_eq!(
+                    answers.get("q1").and_then(|answer| answer.answers.first()),
+                    Some(&"Yes".to_owned())
+                );
+            }
+            TurnInteractionResponse::Approval { .. } => panic!("expected input response"),
+        }
+    }
+
+    #[test]
+    fn auto_resolution_deadline_handles_large_deadlines_without_panicking() {
+        let deadline = std::panic::catch_unwind(|| {
+            super::auto_resolution_deadline(
+                "item/tool/requestUserInput",
+                &json!({
+                    "autoResolutionMs": u64::MAX
+                }),
+            )
+        });
+
+        assert!(deadline.is_ok());
     }
 
     #[test]
@@ -6449,12 +8279,14 @@ mod tests {
             &mut socket,
             "thread-live-1",
             "turn-1",
+            "command-1",
             Duration::from_secs(1),
             Instant::now() + Duration::from_secs(5),
             5,
             1024,
             &cancel,
             &mut next_request_id,
+            None,
         );
 
         assert_eq!(result, Err(super::AppServerCommandError::Cancelled));
@@ -6509,6 +8341,7 @@ mod tests {
                 "command-1",
                 "Continue carefully",
                 command_cancel,
+                None,
             )
         });
 
@@ -6654,6 +8487,7 @@ mod tests {
             "command-1",
             "Run local command",
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         assert_eq!(events.len(), 2);
@@ -6667,6 +8501,131 @@ mod tests {
 
     fn run_fake_app_server(responses: Vec<serde_json::Value>) -> String {
         run_fake_app_server_with_requests(responses).0
+    }
+
+    fn run_fake_app_server_with_turn_interaction(
+        interaction_request: serde_json::Value,
+    ) -> (
+        String,
+        Receiver<serde_json::Value>,
+        Receiver<serde_json::Value>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+        let address = listener.local_addr().expect("fake app-server address");
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let (responses_tx, responses_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("method").and_then(serde_json::Value::as_str),
+                Some("initialize")
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {
+                            "userAgent": "codex-test",
+                            "codexHome": "/tmp/codex",
+                            "platformFamily": "unix",
+                            "platformOs": "macos"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized
+                    .get("method")
+                    .and_then(serde_json::Value::as_str),
+                Some("initialized")
+            );
+
+            let list_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(list_request);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "data": [
+                                {
+                                    "id": "thread-live-1",
+                                    "sessionId": "session-tree-1",
+                                    "updatedAt": 1781263443
+                                }
+                            ]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send thread/list response");
+
+            let resume_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(resume_request);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": "thread-live-1",
+                                "sessionId": "session-tree-1",
+                                "turns": []
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send thread/resume response");
+
+            let turn_start_request = read_fake_app_server_message(&mut socket);
+            let _ = requests_tx.send(turn_start_request);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "result": {
+                            "turn": in_progress_turn("turn-1")
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send turn/start response");
+
+            socket
+                .send(Message::Text(interaction_request.to_string().into()))
+                .expect("send interaction request");
+            let interaction_response = read_fake_app_server_message(&mut socket);
+            let _ = responses_tx.send(interaction_response);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-live-1",
+                            "turn": completed_turn("turn-1", "interaction complete")
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send turn/completed notification");
+        });
+        (format!("ws://{address}"), requests_rx, responses_rx)
     }
 
     fn completed_turn(turn_id: &str, text: &str) -> serde_json::Value {

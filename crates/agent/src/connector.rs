@@ -4,19 +4,21 @@ use crate::executor::{codex_exec_result_events_with_cancel, codex_exec_started_e
 use crate::placeholder::ConnectorEvent;
 use crate::placeholder::placeholder_event_stream;
 use crate::session_inventory::{
-    AgentHostSessionsReport, InventoryScope, app_server_command_result_events_with_cancel,
-    app_server_command_started_event, build_host_session_backfill, build_host_sessions_report,
-    create_app_server_thread, ensure_app_server_host_session, set_app_server_thread_archived,
+    AgentHostSessionsReport, AppServerCommandChannels, InventoryScope,
+    TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
+    app_server_command_result_events_with_cancel, app_server_command_started_event,
+    build_host_session_backfill, build_host_sessions_report, create_app_server_thread,
+    ensure_app_server_host_session, set_app_server_thread_archived,
 };
 use crate::shutdown::{install_signal_handlers, shutdown_requested};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, TryRecvError},
 };
@@ -31,6 +33,7 @@ const CONNECTOR_RECONNECT_BACKOFF_SECONDS: u64 = 2;
 const AGENT_READY_RETRY_SECONDS: u64 = 10;
 const APP_SERVER_INSTANCE_SUMMARY_SECONDS: u64 = 5 * 60;
 const APP_SERVER_INSTANCE_TEXT_LIMIT: usize = 512;
+const TURN_INTERACTION_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -42,6 +45,20 @@ pub enum RunMode {
 struct Envelope {
     kind: String,
     payload: serde_json::Value,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct TurnInteractionResponseAck {
+    request_id: String,
+    accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+struct TurnInteractionAckWaitContext<'a> {
+    command_id: &'a str,
+    sender: &'a mpsc::Sender<TurnInteractionResponseDelivery>,
+    active_interaction: &'a Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -783,6 +800,7 @@ fn handle_text_message(
             app_server_instances_state,
             host_sessions_state,
             deferred_messages,
+            None,
         )? {
             return Ok(true);
         }
@@ -1202,19 +1220,37 @@ fn wait_for_app_server_command_events(
     let cwd = cwd.map(ToOwned::to_owned);
     let command_id = command_id.to_owned();
     let prompt = prompt.to_owned();
-    let (sender, receiver) = mpsc::channel();
+    let worker_session_id = session_id.clone();
+    let worker_cwd = cwd.clone();
+    let worker_command_id = command_id.clone();
+    let worker_prompt = prompt.clone();
+    let dispatch_command = CommandPayload {
+        id: command_id.clone(),
+        command_type: CommandType::Codex,
+        prompt: prompt.clone(),
+    };
+    let (result_sender, result_receiver) = mpsc::channel();
+    let (event_sender, event_receiver) = mpsc::channel();
+    let (interaction_sender, interaction_receiver) = mpsc::channel();
+    let active_interaction = Arc::new(Mutex::new(None::<String>));
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
+    let worker_active_interaction = Arc::clone(&active_interaction);
     let mut worker = Some(thread::spawn(move || {
         let events = app_server_command_result_events_with_cancel(
             &worker_config,
-            &session_id,
-            cwd.as_deref(),
-            &command_id,
-            &prompt,
+            &worker_session_id,
+            worker_cwd.as_deref(),
+            &worker_command_id,
+            &worker_prompt,
             worker_cancel,
+            Some(AppServerCommandChannels {
+                event_sender,
+                interaction_receiver,
+                active_interaction: worker_active_interaction,
+            }),
         );
-        let _ = sender.send(events);
+        let _ = result_sender.send(events);
     }));
 
     set_socket_read_timeout(socket, Some(connector_read_tick()))?;
@@ -1223,9 +1259,44 @@ fn wait_for_app_server_command_events(
             cancel_codex_worker(&cancel, worker.take())?;
             return Err("connector shutdown requested while app-server command was running".into());
         }
-        match receiver.try_recv() {
+        if !dispatch_pending_app_server_command_events(
+            socket,
+            &dispatch_command,
+            &event_receiver,
+            &runtime_config,
+            app_server_instances_state,
+            host_sessions_state,
+            deferred_messages,
+            Some(&TurnInteractionAckWaitContext {
+                command_id: &command_id,
+                sender: &interaction_sender,
+                active_interaction: &active_interaction,
+            }),
+        )? {
+            cancel_codex_worker(&cancel, worker.take())?;
+            return Ok(vec![app_server_interaction_rejected_event()]);
+        }
+
+        match result_receiver.try_recv() {
             Ok(events) => {
                 join_codex_worker(worker.take())?;
+                if !dispatch_pending_app_server_command_events(
+                    socket,
+                    &dispatch_command,
+                    &event_receiver,
+                    &runtime_config,
+                    app_server_instances_state,
+                    host_sessions_state,
+                    deferred_messages,
+                    Some(&TurnInteractionAckWaitContext {
+                        command_id: &command_id,
+                        sender: &interaction_sender,
+                        active_interaction: &active_interaction,
+                    }),
+                )? {
+                    set_socket_read_timeout(socket, Some(connector_read_tick()))?;
+                    return Ok(vec![app_server_interaction_rejected_event()]);
+                }
                 set_socket_read_timeout(socket, Some(connector_read_tick()))?;
                 return Ok(events);
             }
@@ -1256,17 +1327,27 @@ fn wait_for_app_server_command_events(
 
         let socket_result: Result<(), Box<dyn std::error::Error>> = match socket.read() {
             Ok(Message::Text(text)) => {
-                match apply_agent_ready_ack_text(text.as_ref(), agent_ready_state) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => handle_background_text_message(
-                        socket,
-                        text.as_ref(),
-                        &runtime_config,
-                        app_server_instances_state,
-                        host_sessions_state,
-                        deferred_messages,
-                    ),
-                    Err(error) => Err(Box::new(error)),
+                if handle_turn_interaction_response_text(
+                    socket,
+                    text.as_ref(),
+                    &command_id,
+                    &interaction_sender,
+                    &active_interaction,
+                )? {
+                    Ok(())
+                } else {
+                    match apply_agent_ready_ack_text(text.as_ref(), agent_ready_state) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => handle_background_text_message(
+                            socket,
+                            text.as_ref(),
+                            &runtime_config,
+                            app_server_instances_state,
+                            host_sessions_state,
+                            deferred_messages,
+                        ),
+                        Err(error) => Err(Box::new(error)),
+                    }
                 }
             }
             Ok(Message::Ping(payload)) => socket
@@ -1288,6 +1369,160 @@ fn wait_for_app_server_command_events(
             return Err(error);
         }
     }
+}
+
+fn dispatch_pending_app_server_command_events(
+    socket: &mut AgentSocket,
+    command: &CommandPayload,
+    event_receiver: &mpsc::Receiver<ConnectorEvent>,
+    config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
+    host_sessions_state: &mut HostSessionsSendState,
+    deferred_messages: &mut VecDeque<String>,
+    turn_interaction_context: Option<&TurnInteractionAckWaitContext<'_>>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    drain_pending_connector_events(event_receiver, |event| {
+        dispatch_events_with_turn_interaction_context(
+            socket,
+            command,
+            vec![event],
+            config,
+            app_server_instances_state,
+            host_sessions_state,
+            deferred_messages,
+            turn_interaction_context,
+        )
+    })
+}
+
+fn drain_pending_connector_events<F>(
+    event_receiver: &mpsc::Receiver<ConnectorEvent>,
+    mut dispatch: F,
+) -> Result<bool, Box<dyn std::error::Error>>
+where
+    F: FnMut(ConnectorEvent) -> Result<bool, Box<dyn std::error::Error>>,
+{
+    loop {
+        match event_receiver.try_recv() {
+            Ok(event) => {
+                if !dispatch(event)? {
+                    return Ok(false);
+                }
+            }
+            Err(TryRecvError::Disconnected | TryRecvError::Empty) => return Ok(true),
+        }
+    }
+}
+
+fn app_server_interaction_rejected_event() -> ConnectorEvent {
+    ConnectorEvent {
+        kind: "command.failed".to_owned(),
+        priority: "P1".to_owned(),
+        summary:
+            "Codex app-server turn stopped because the control plane rejected the required interaction request."
+                .to_owned(),
+        payload: None,
+    }
+}
+
+fn handle_turn_interaction_response_text(
+    socket: &mut AgentSocket,
+    text: &str,
+    command_id: &str,
+    sender: &mpsc::Sender<TurnInteractionResponseDelivery>,
+    active_interaction: &Arc<Mutex<Option<String>>>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(ack) =
+        turn_interaction_response_ack_for_text(text, command_id, sender, active_interaction)?
+    else {
+        return Ok(false);
+    };
+    send_turn_interaction_response_ack(socket, ack)?;
+    Ok(true)
+}
+
+fn turn_interaction_response_ack_for_text(
+    text: &str,
+    command_id: &str,
+    sender: &mpsc::Sender<TurnInteractionResponseDelivery>,
+    active_interaction: &Arc<Mutex<Option<String>>>,
+) -> Result<Option<TurnInteractionResponseAck>, Box<dyn std::error::Error>> {
+    let envelope: Envelope = serde_json::from_str(text)?;
+    if envelope.kind != "turn.interaction_response" {
+        return Ok(None);
+    }
+    let dispatch: TurnInteractionResponseDispatch = serde_json::from_value(envelope.payload)?;
+    let request_id = dispatch
+        .request_id
+        .clone()
+        .ok_or("turn interaction response did not include request_id")?;
+    if dispatch.command_id == command_id {
+        let active = active_turn_interaction(active_interaction)?;
+        if active.as_deref() != Some(dispatch.interaction_id.as_str()) {
+            return Ok(Some(TurnInteractionResponseAck {
+                request_id,
+                accepted: false,
+                error: Some("App-server turn is not waiting for this interaction".to_owned()),
+            }));
+        }
+        let (delivery_ack_sender, delivery_ack_receiver) = mpsc::channel();
+        let delivery = TurnInteractionResponseDelivery {
+            dispatch,
+            delivery_ack: delivery_ack_sender,
+        };
+        let accepted = sender.send(delivery).is_ok()
+            && delivery_ack_receiver
+                .recv_timeout(TURN_INTERACTION_DELIVERY_ACK_TIMEOUT)
+                .unwrap_or(false);
+        if accepted {
+            clear_active_turn_interaction(active_interaction)?;
+        }
+        return Ok(Some(TurnInteractionResponseAck {
+            request_id,
+            accepted,
+            error: (!accepted)
+                .then_some("App-server turn is no longer waiting for this interaction".to_owned()),
+        }));
+    }
+    Ok(Some(TurnInteractionResponseAck {
+        request_id,
+        accepted: false,
+        error: Some("Turn interaction response targeted a different command".to_owned()),
+    }))
+}
+
+fn active_turn_interaction(
+    active_interaction: &Arc<Mutex<Option<String>>>,
+) -> Result<Option<String>, std::io::Error> {
+    let active = active_interaction.lock().map_err(|_| {
+        std::io::Error::new(ErrorKind::Other, "turn interaction state lock poisoned")
+    })?;
+    Ok(active.clone())
+}
+
+fn clear_active_turn_interaction(
+    active_interaction: &Arc<Mutex<Option<String>>>,
+) -> Result<(), std::io::Error> {
+    let mut active = active_interaction.lock().map_err(|_| {
+        std::io::Error::new(ErrorKind::Other, "turn interaction state lock poisoned")
+    })?;
+    *active = None;
+    Ok(())
+}
+
+fn send_turn_interaction_response_ack(
+    socket: &mut AgentSocket,
+    ack: TurnInteractionResponseAck,
+) -> Result<(), Box<dyn std::error::Error>> {
+    socket.send(Message::Text(
+        json!({
+            "kind": "turn.interaction_response_ack",
+            "payload": ack
+        })
+        .to_string()
+        .into(),
+    ))?;
+    Ok(())
 }
 
 fn cancel_codex_worker(
@@ -1377,11 +1612,13 @@ fn command_events(command: &CommandPayload) -> Vec<ConnectorEvent> {
                 priority: "P1".to_owned(),
                 summary: "Connector received a Codex command, but the CLI fallback is disabled."
                     .to_owned(),
+                payload: None,
             },
             ConnectorEvent {
                 kind: "command.failed".to_owned(),
                 priority: "P1".to_owned(),
                 summary: "Codex CLI fallback is disabled in this connector config.".to_owned(),
+                payload: None,
             },
         ],
     }
@@ -1393,6 +1630,7 @@ fn app_server_missing_target_events() -> Vec<ConnectorEvent> {
         priority: "P1".to_owned(),
         summary: "Codex app-server execution requires an attached local app-server session."
             .to_owned(),
+        payload: None,
     }]
 }
 
@@ -1401,6 +1639,7 @@ fn app_server_wrong_execution_mode_events() -> Vec<ConnectorEvent> {
         kind: "command.failed".to_owned(),
         priority: "P1".to_owned(),
         summary: "Attached app-server sessions require execution.mode = \"app_server\".".to_owned(),
+        payload: None,
     }]
 }
 
@@ -1411,6 +1650,7 @@ fn app_server_non_app_server_target_events(session_id: &str) -> Vec<ConnectorEve
         summary: format!(
             "Attached local session {session_id} is not available through Codex app-server."
         ),
+        payload: None,
     }]
 }
 
@@ -1423,6 +1663,28 @@ fn dispatch_events(
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    dispatch_events_with_turn_interaction_context(
+        socket,
+        command,
+        events,
+        config,
+        app_server_instances_state,
+        host_sessions_state,
+        deferred_messages,
+        None,
+    )
+}
+
+fn dispatch_events_with_turn_interaction_context(
+    socket: &mut AgentSocket,
+    command: &CommandPayload,
+    events: Vec<ConnectorEvent>,
+    config: &AgentConfig,
+    app_server_instances_state: &mut AppServerInstancesSendState,
+    host_sessions_state: &mut HostSessionsSendState,
+    deferred_messages: &mut VecDeque<String>,
+    turn_interaction_context: Option<&TurnInteractionAckWaitContext<'_>>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     dispatch_events_for_target_host_session(
         socket,
         command,
@@ -1432,6 +1694,7 @@ fn dispatch_events(
         app_server_instances_state,
         host_sessions_state,
         deferred_messages,
+        turn_interaction_context,
     )
 }
 
@@ -1444,6 +1707,7 @@ fn dispatch_events_for_target_host_session(
     app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
+    turn_interaction_context: Option<&TurnInteractionAckWaitContext<'_>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     for event in events {
         if event.kind == "command.accepted" {
@@ -1462,6 +1726,7 @@ fn dispatch_events_for_target_host_session(
             app_server_instances_state,
             host_sessions_state,
             deferred_messages,
+            turn_interaction_context,
         )? {
             return Ok(false);
         }
@@ -1474,27 +1739,22 @@ fn agent_event_message(
     event: &ConnectorEvent,
     target_host_session_id: Option<&str>,
 ) -> Value {
-    match target_host_session_id.filter(|_| event.kind == "command.started") {
-        Some(session_id) => json!({
-            "kind": "agent.event",
-            "payload": {
-                "command_id": command.id,
-                "target_host_session_id": session_id,
-                "kind": event.kind,
-                "priority": event.priority,
-                "summary": event.summary
-            }
-        }),
-        None => json!({
-            "kind": "agent.event",
-            "payload": {
-                "command_id": command.id,
-                "kind": event.kind,
-                "priority": event.priority,
-                "summary": event.summary
-            }
-        }),
+    let mut payload = serde_json::Map::new();
+    payload.insert("command_id".to_owned(), json!(command.id));
+    if let Some(session_id) = target_host_session_id.filter(|_| event.kind == "command.started") {
+        payload.insert("target_host_session_id".to_owned(), json!(session_id));
     }
+    payload.insert("kind".to_owned(), json!(event.kind));
+    payload.insert("priority".to_owned(), json!(event.priority));
+    payload.insert("summary".to_owned(), json!(event.summary));
+    if let Some(event_payload) = &event.payload {
+        payload.insert("payload".to_owned(), event_payload.clone());
+    }
+
+    json!({
+        "kind": "agent.event",
+        "payload": Value::Object(payload)
+    })
 }
 
 fn configure_socket(socket: &mut AgentSocket) -> std::io::Result<()> {
@@ -1553,6 +1813,7 @@ fn wait_for_ack(
     app_server_instances_state: &mut AppServerInstancesSendState,
     host_sessions_state: &mut HostSessionsSendState,
     deferred_messages: &mut VecDeque<String>,
+    turn_interaction_context: Option<&TurnInteractionAckWaitContext<'_>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     set_socket_read_timeout(socket, Some(Duration::from_secs(10)))?;
     loop {
@@ -1570,14 +1831,27 @@ fn wait_for_ack(
                     AckWaitAction::HostSessionsRefresh => {
                         send_host_sessions(socket, config, host_sessions_state, true)?;
                     }
-                    AckWaitAction::Defer => handle_background_text_message(
-                        socket,
-                        text.as_ref(),
-                        config,
-                        app_server_instances_state,
-                        host_sessions_state,
-                        deferred_messages,
-                    )?,
+                    AckWaitAction::Defer => {
+                        if let Some(context) = turn_interaction_context {
+                            if handle_turn_interaction_response_text(
+                                socket,
+                                text.as_ref(),
+                                context.command_id,
+                                context.sender,
+                                context.active_interaction,
+                            )? {
+                                continue;
+                            }
+                        }
+                        handle_background_text_message(
+                            socket,
+                            text.as_ref(),
+                            config,
+                            app_server_instances_state,
+                            host_sessions_state,
+                            deferred_messages,
+                        )?;
+                    }
                 }
             }
             Message::Ping(payload) => socket.send(Message::Pong(payload))?,
@@ -1646,24 +1920,27 @@ mod tests {
     use super::{
         AckWaitAction, AgentReadyState, AppServerInstancesSendState, CommandDispatch,
         CommandPayload, CommandTargetHostSession, CommandType, Envelope, HostSessionsSendState,
-        acknowledge_agent_ready, acknowledge_app_server_instances, acknowledge_host_sessions,
-        agent_event_message, agent_ready_ack_message, agent_ready_message,
-        agent_ready_retry_interval, app_server_instance_summary_interval,
+        TurnInteractionResponseAck, acknowledge_agent_ready, acknowledge_app_server_instances,
+        acknowledge_host_sessions, agent_event_message, agent_ready_ack_message,
+        agent_ready_message, agent_ready_retry_interval, app_server_instance_summary_interval,
         app_server_instances_message, app_server_instances_message_key,
         app_server_instances_message_with_report_id, apply_agent_ready_ack_text,
         apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
         bounded_app_server_instance_text, classify_ack_wait_text, command_events,
-        handle_background_ack_message, host_sessions_ack_message, host_sessions_message,
-        host_sessions_retry_interval, is_read_timeout, record_agent_ready_sent,
-        requires_app_server_execution_mode, should_send_agent_ready,
+        drain_pending_connector_events, handle_background_ack_message, host_sessions_ack_message,
+        host_sessions_message, host_sessions_retry_interval, is_read_timeout,
+        record_agent_ready_sent, requires_app_server_execution_mode, should_send_agent_ready,
         should_send_app_server_instances, should_send_host_sessions,
+        turn_interaction_response_ack_for_text,
     };
     use crate::app_server_manager::AppServerManager;
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use crate::placeholder::ConnectorEvent;
+    use crate::session_inventory::TurnInteractionResponseDelivery;
     use serde_json::Value;
     use std::fs;
     use std::io::{self, ErrorKind};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tungstenite::Error as WebSocketError;
 
@@ -1722,6 +1999,7 @@ mod tests {
             priority: "P1".to_owned(),
             summary: "Connector started Codex app-server turn for local thread session-1."
                 .to_owned(),
+            payload: None,
         };
 
         let message = agent_event_message(&command, &event, Some("session-1"));
@@ -1749,6 +2027,7 @@ mod tests {
             kind: "command.output".to_owned(),
             priority: "P2".to_owned(),
             summary: "Progress".to_owned(),
+            payload: None,
         };
 
         let message = agent_event_message(&command, &event, Some("session-1"));
@@ -1790,6 +2069,161 @@ mod tests {
         };
 
         assert!(!requires_app_server_execution_mode(&dispatch));
+    }
+
+    #[test]
+    fn drains_pending_connector_events_in_queue_order() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(ConnectorEvent {
+                kind: "input.requested".to_owned(),
+                priority: "P0".to_owned(),
+                summary: "Input requested".to_owned(),
+                payload: None,
+            })
+            .expect("send request event");
+        sender
+            .send(ConnectorEvent {
+                kind: "input.received".to_owned(),
+                priority: "P1".to_owned(),
+                summary: "Input auto-resolved".to_owned(),
+                payload: None,
+            })
+            .expect("send resolution event");
+        drop(sender);
+
+        let mut dispatched = Vec::new();
+        let accepted = drain_pending_connector_events(&receiver, |event| {
+            dispatched.push(event.kind);
+            Ok(true)
+        })
+        .expect("drain pending events");
+
+        assert!(accepted);
+        assert_eq!(dispatched, vec!["input.requested", "input.received"]);
+    }
+
+    #[test]
+    fn drain_pending_connector_events_stops_on_rejection() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(ConnectorEvent {
+                kind: "input.requested".to_owned(),
+                priority: "P0".to_owned(),
+                summary: "Input requested".to_owned(),
+                payload: None,
+            })
+            .expect("send request event");
+        sender
+            .send(ConnectorEvent {
+                kind: "input.received".to_owned(),
+                priority: "P1".to_owned(),
+                summary: "Input auto-resolved".to_owned(),
+                payload: None,
+            })
+            .expect("send resolution event");
+        drop(sender);
+
+        let mut dispatched = Vec::new();
+        let accepted = drain_pending_connector_events(&receiver, |event| {
+            dispatched.push(event.kind);
+            Ok(false)
+        })
+        .expect("drain pending events");
+
+        assert!(!accepted);
+        assert_eq!(dispatched, vec!["input.requested"]);
+    }
+
+    #[test]
+    fn late_turn_interaction_response_is_rejected_after_receiver_closes() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let active_interaction = Arc::new(Mutex::new(Some("interaction-1".to_owned())));
+        drop(receiver);
+
+        let ack = turn_interaction_response_ack_for_text(
+            r#"{"kind":"turn.interaction_response","payload":{"request_id":"response-1","command_id":"command-1","interaction_id":"interaction-1","response":{"kind":"input","answers":{}}}}"#,
+            "command-1",
+            &sender,
+            &active_interaction,
+        )
+        .expect("late response should not fail")
+        .expect("turn response ack");
+
+        assert_eq!(
+            ack,
+            TurnInteractionResponseAck {
+                request_id: "response-1".to_owned(),
+                accepted: false,
+                error: Some("App-server turn is no longer waiting for this interaction".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn turn_interaction_response_is_accepted_for_active_interaction() {
+        let (sender, receiver): (
+            std::sync::mpsc::Sender<TurnInteractionResponseDelivery>,
+            std::sync::mpsc::Receiver<TurnInteractionResponseDelivery>,
+        ) = std::sync::mpsc::channel();
+        let active_interaction = Arc::new(Mutex::new(Some("interaction-1".to_owned())));
+        let worker = std::thread::spawn(move || {
+            let delivery = receiver.recv().expect("delivered response");
+            assert_eq!(delivery.dispatch.interaction_id, "interaction-1");
+            delivery.delivery_ack.send(true).expect("delivery ack");
+        });
+
+        let ack = turn_interaction_response_ack_for_text(
+            r#"{"kind":"turn.interaction_response","payload":{"request_id":"response-1","command_id":"command-1","interaction_id":"interaction-1","response":{"kind":"input","answers":{}}}}"#,
+            "command-1",
+            &sender,
+            &active_interaction,
+        )
+        .expect("response should not fail")
+        .expect("turn response ack");
+
+        assert_eq!(
+            ack,
+            TurnInteractionResponseAck {
+                request_id: "response-1".to_owned(),
+                accepted: true,
+                error: None,
+            }
+        );
+        worker.join().expect("worker");
+        assert_eq!(
+            active_interaction.lock().expect("active lock").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn turn_interaction_response_is_rejected_for_inactive_interaction() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let active_interaction = Arc::new(Mutex::new(Some("interaction-2".to_owned())));
+
+        let ack = turn_interaction_response_ack_for_text(
+            r#"{"kind":"turn.interaction_response","payload":{"request_id":"response-1","command_id":"command-1","interaction_id":"interaction-1","response":{"kind":"input","answers":{}}}}"#,
+            "command-1",
+            &sender,
+            &active_interaction,
+        )
+        .expect("response should not fail")
+        .expect("turn response ack");
+
+        assert_eq!(
+            ack,
+            TurnInteractionResponseAck {
+                request_id: "response-1".to_owned(),
+                accepted: false,
+                error: Some("App-server turn is not waiting for this interaction".to_owned()),
+            }
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            active_interaction.lock().expect("active lock").as_deref(),
+            Some("interaction-2")
+        );
     }
 
     #[test]

@@ -11,6 +11,8 @@ import type {
   DetachHostSessionResponse,
   DogfoodSafetyPostureResponse,
   RefreshHostSessionsResponse,
+  ResolveTurnInteractionRequest,
+  ResolveTurnInteractionResponse,
   SetDogfoodSafetyPauseRequest,
   SetDogfoodSafetyPauseResponse,
   TaskArchiveResponse,
@@ -163,6 +165,13 @@ export async function loadThreadEvents(threadId: string): Promise<ThreadEventsRe
     }
     throw error;
   }
+}
+
+export async function resolveTurnInteraction(
+  eventId: string,
+  request: ResolveTurnInteractionRequest
+): Promise<ResolveTurnInteractionResponse> {
+  return postJson(`/api/thread-events/${encodeURIComponent(eventId)}/interaction`, request);
 }
 
 export function browserSocketUrl(): string {

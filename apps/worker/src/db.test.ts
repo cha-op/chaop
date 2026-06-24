@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  CommandTargetError,
   LocalThreadTargetError,
   chooseConnectorForLocalThread,
   cleanupStaleExplicitAppServerCommandTargets,
@@ -9,14 +10,18 @@ import {
   listThreadEventsInDb,
   markAppServerInstancesStoppedForConnector,
   markConnectorDisconnected,
+  markTurnInteractionResolutionDispatchStartedInDb,
   pendingCommandsForConnector,
+  prepareTurnInteractionResolutionInDb,
   recordAgentEvent,
   recordAppServerInstances,
   recordHostSessionBackfillEvents,
   recordHostSessions,
+  recordTurnInteractionResolutionInDb,
+  releaseTurnInteractionResolutionClaimInDb,
   updateConnectorCapabilities
 } from "./db.js";
-import type { AgentAppServerInstance } from "@chaop/protocol";
+import type { AgentAppServerInstance, CommandSummary } from "@chaop/protocol";
 import type { Env } from "./types.js";
 
 test("recordAppServerInstances inserts the first healthy report", async () => {
@@ -720,6 +725,774 @@ test("recordAgentEvent marks failed command tasks as failed", async () => {
   assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
+});
+
+test("recordAgentEvent accepts duplicate turn interaction resolution events idempotently", async () => {
+  const db = agentEventGuardDb(
+    {
+      leaseOwnerConnectorId: "connector-online",
+      state: "running"
+    },
+    {
+      existingResolutionInteractionId: "interaction-1"
+    }
+  );
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    kind: "input.received",
+    priority: "P1",
+    summary: "Input auto-resolved.",
+    payload: {
+      type: "turn_interaction_resolution",
+      interaction_id: "interaction-1",
+      status: "answered",
+      answer_count: 0
+    }
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.event, undefined);
+  assert.equal(db.taskUpdates, 0);
+  assert.equal(db.eventInserts, 0);
+});
+
+test("recordAgentEvent rolls back sequence allocation after raced duplicate resolution insert", async () => {
+  const db = agentEventGuardDb(
+    {
+      leaseOwnerConnectorId: "connector-online",
+      state: "running"
+    },
+    {
+      expectedTaskState: "running",
+      racedResolutionInteractionId: "interaction-1",
+      failEventInsertWithUniqueConstraint: true
+    }
+  );
+
+  const result = await recordAgentEvent({ DB: db } as Env, "connector-online", {
+    command_id: "command-1",
+    kind: "input.received",
+    priority: "P1",
+    summary: "Input auto-resolved.",
+    payload: {
+      type: "turn_interaction_resolution",
+      interaction_id: "interaction-1",
+      status: "answered",
+      answer_count: 0
+    }
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.event, undefined);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.sequenceRollbacks, 1);
+  assert.equal(db.usageWindowUpserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb returns existing resolutions before dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: true });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+
+  assert.equal(preparation.dispatch.command_id, "command-1");
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, true);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb returns existing resolutions after input expiry", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: true,
+    requestKind: "input",
+    autoResolutionMs: 1,
+    createdAt: "2000-01-01T00:00:00.000Z"
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["Yes"]
+      }
+    }
+  });
+
+  assert.equal(preparation.dispatch.command_id, "command-1");
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, true);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.staleClaimDeletes, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb claims pending interactions before dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+  const dispatch = preparation.dispatch;
+
+  assert.equal(dispatch.command_id, "command-1");
+  assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects claimed interactions before dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false, claimed: true });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) => error instanceof CommandTargetError && error.status === 409
+  );
+
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects matching pending claims without redispatch", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    claimed: true,
+    claimedResponse: {
+      kind: "approval",
+      decision: "accept"
+    }
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /already being resolved/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb recognises delivered matching claims", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    claimed: true,
+    deliveredClaim: true,
+    claimedResponse: {
+      kind: "approval",
+      decision: "accept"
+    }
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+
+  assert.equal(preparation.dispatch.command_id, "command-1");
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, true);
+  assert.equal(preparation.resolution?.payload.type, "turn_interaction_resolution");
+  assert.equal(preparation.resolution?.payload.status, "accepted");
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb recovers delivered claims after auto-resolution expiry", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    claimed: true,
+    deliveredClaim: true,
+    claimedResponse: null,
+    autoResolutionMs: 1,
+    createdAt: "2000-01-01T00:00:00.000Z"
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["retry answer"]
+      }
+    }
+  });
+
+  assert.equal(preparation.already_delivered, true);
+  assert.deepEqual(preparation.resolution?.payload, {
+    type: "turn_interaction_resolution",
+    interaction_id: "interaction-1",
+    status: "answered",
+    answer_count: 1
+  });
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb reclaims stale claims before dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false, claimed: true, staleClaim: true });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+  const dispatch = preparation.dispatch;
+
+  assert.equal(dispatch.command_id, "command-1");
+  assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.staleClaimDeletes, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb does not reclaim dispatch-started claims", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    claimed: true,
+    staleClaim: true,
+    dispatchStartedClaim: true
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /already being resolved/.test(error.message)
+  );
+
+  assert.equal(db.staleClaimDeletes, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb reclaims stale dispatch-started claims", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    claimed: true,
+    staleClaim: true,
+    dispatchStartedClaim: true,
+    staleDispatchStartedClaim: true
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+  const dispatch = preparation.dispatch;
+
+  assert.equal(dispatch.command_id, "command-1");
+  assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
+  assert.equal(db.staleClaimDeletes, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb recovers uncertain delivery claims without redispatch", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    claimed: true,
+    dispatchStartedClaim: true,
+    staleDispatchStartedClaim: true,
+    deliveryUncertainClaim: true
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+
+  assert.equal(preparation.already_delivered, true);
+  assert.equal(preparation.resolution?.payload.type, "turn_interaction_resolution");
+  assert.equal(preparation.resolution?.payload.status, "accepted");
+  assert.equal(db.staleClaimDeletes, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects unavailable approval decisions", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    approvalAvailableDecisions: [
+      "decline",
+      {
+        acceptWithExecpolicyAmendment: {
+          execpolicy_amendment: ["touch", "requested.txt"]
+        }
+      },
+      "cancel"
+    ]
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 400 &&
+      /decision is not available/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects approval decisions when availability is empty", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    approvalAvailableDecisions: []
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /payload is unavailable/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects approval requests without availability", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    omitApprovalAvailableDecisions: true
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /payload is unavailable/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb accepts available approval decision objects", async () => {
+  const amendmentDecision = {
+    acceptWithExecpolicyAmendment: {
+      execpolicy_amendment: ["touch", "requested.txt"]
+    }
+  };
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    approvalAvailableDecisions: ["decline", amendmentDecision, "cancel"]
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: amendmentDecision
+  });
+  const dispatch = preparation.dispatch;
+
+  assert.deepEqual(dispatch.response, {
+    kind: "approval",
+    decision: amendmentDecision
+  });
+  assert.equal(preparation.already_delivered, false);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("recordTurnInteractionResolutionInDb can recover a delivered input claim without stored answers", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    claimed: true,
+    deliveredClaim: true,
+    claimedResponse: null
+  });
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["secret answer"]
+      }
+    }
+  });
+
+  const event = await recordTurnInteractionResolutionInDb(
+    { DB: db } as Env,
+    "event-request-1",
+    {
+      kind: "input",
+      answers: {}
+    },
+    {
+      allowExisting: true,
+      resolution: preparation.resolution
+    }
+  );
+
+  assert.equal(preparation.already_delivered, true);
+  assert.equal(event.kind, "input.received");
+  assert.deepEqual(event.payload, {
+    type: "turn_interaction_resolution",
+    interaction_id: "interaction-1",
+    status: "answered",
+    answer_count: 1
+  });
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.claimDeletes, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb recovers delivered claims after command completion", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    claimed: true,
+    deliveredClaim: true,
+    claimedResponse: null,
+    commandState: "succeeded"
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {}
+  });
+
+  assert.equal(preparation.already_delivered, true);
+  assert.deepEqual(preparation.resolution?.payload, {
+    type: "turn_interaction_resolution",
+    interaction_id: "interaction-1",
+    status: "answered",
+    answer_count: 1
+  });
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects incomplete input answers", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false, requestKind: "input" });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "input",
+        answers: {}
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 400 &&
+      /missing a required answer/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects input answers outside supplied options", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    inputQuestions: [
+      {
+        id: "question-1",
+        header: "Confirm",
+        question: "Continue?",
+        is_other: false,
+        is_secret: false,
+        options: [
+          {
+            label: "Yes",
+            description: "Continue"
+          }
+        ]
+      }
+    ]
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "input",
+        answers: {
+          "question-1": {
+            answers: ["No"]
+          }
+        }
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 400 &&
+      /unavailable answer/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb accepts custom input answers when other is allowed", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    inputQuestions: [
+      {
+        id: "question-1",
+        header: "Confirm",
+        question: "Continue?",
+        is_other: true,
+        is_secret: false,
+        options: [
+          {
+            label: "Yes",
+            description: "Continue"
+          }
+        ]
+      }
+    ]
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["Maybe later"]
+      }
+    }
+  });
+
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects input requests without questions", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    inputQuestions: []
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "input",
+        answers: {}
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /payload is unavailable/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects expired auto-resolving input before dispatch", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    autoResolutionMs: 1,
+    createdAt: "2000-01-01T00:00:00.000Z"
+  });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "input",
+        answers: {
+          "question-1": {
+            answers: ["Yes"]
+          }
+        }
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /auto-resolution deadline has expired/.test(error.message)
+  );
+
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb ignores agent auto-resolution expiry skew before dispatch", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    autoResolutionMs: 60_000,
+    autoResolutionExpiresAt: "2000-01-01T00:00:00.000Z",
+    createdAt: "2999-01-01T00:00:00.000Z"
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["Yes"]
+      }
+    }
+  });
+
+  assert.equal(preparation.dispatch.command_id, "command-1");
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb accepts input during explicit response grace", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    autoResolutionMs: 60_000,
+    autoResolutionExpiresAt: new Date(Date.now() - 100).toISOString(),
+    autoResolutionResponseGraceMs: 10_000,
+    createdAt: "2999-01-01T00:00:00.000Z"
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["Yes"]
+      }
+    }
+  });
+  const dispatch = preparation.dispatch;
+
+  assert.equal(dispatch.command_id, "command-1");
+  assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+  assert.equal(db.claimResponseJson, null);
+  assert.equal(db.claimResolutionSummary, "Input provided for Provide input.");
+  assert.deepEqual(JSON.parse(db.claimResolutionPayloadJson ?? "{}"), {
+    type: "turn_interaction_resolution",
+    interaction_id: "interaction-1",
+    status: "answered",
+    answer_count: 1
+  });
+});
+
+test("recordTurnInteractionResolutionInDb rejects already resolved interactions before append", async () => {
+  const db = turnInteractionResolutionDb({ resolved: true });
+
+  await assert.rejects(
+    () =>
+      recordTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) => error instanceof CommandTargetError && error.status === 409
+  );
+
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.eventInserts, 0);
+});
+
+test("recordTurnInteractionResolutionInDb repairs waiting tasks for existing resolutions after dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: true });
+
+  const event = await recordTurnInteractionResolutionInDb(
+    { DB: db } as Env,
+    "event-request-1",
+    {
+      kind: "approval",
+      decision: "accept"
+    },
+    { allowExisting: true }
+  );
+
+  assert.equal(event.id, "event-resolution-1");
+  assert.equal(event.kind, "approval.resolved");
+  assert.equal(event.payload?.type, "turn_interaction_resolution");
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.eventInserts, 0);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.claimDeletes, 1);
+});
+
+test("recordTurnInteractionResolutionInDb resumes waiting tasks after append", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false });
+
+  const event = await recordTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+
+  assert.equal(event.kind, "approval.resolved");
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.taskUpdates, 1);
+  assert.equal(db.claimDeletes, 1);
+});
+
+test("recordTurnInteractionResolutionInDb preserves exec-policy amendment approval decisions", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false });
+
+  const event = await recordTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: {
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: ["touch", "requested.txt"]
+      }
+    }
+  });
+
+  assert.equal(event.kind, "approval.resolved");
+  assert.equal(event.payload?.type, "turn_interaction_resolution");
+  if (event.payload?.type !== "turn_interaction_resolution") {
+    throw new Error("expected turn interaction resolution payload");
+  }
+  assert.equal(event.payload.status, "accepted_with_execpolicy_amendment");
+  assert.deepEqual(event.payload.decision, {
+    acceptWithExecpolicyAmendment: {
+      execpolicy_amendment: ["touch", "requested.txt"]
+    }
+  });
+  assert.equal(db.eventInserts, 1);
+});
+
+test("releaseTurnInteractionResolutionClaimInDb deletes pending claims", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false });
+
+  await releaseTurnInteractionResolutionClaimInDb({ DB: db } as Env, "command-1", "interaction-1");
+
+  assert.equal(db.claimDeletes, 1);
+});
+
+test("markTurnInteractionResolutionDispatchStartedInDb records dispatch attempts", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false });
+
+  await markTurnInteractionResolutionDispatchStartedInDb({ DB: db } as Env, "command-1", "interaction-1");
+
+  assert.equal(db.dispatchStartUpdates, 1);
 });
 
 test("markConnectorDisconnected fails active commands and marks connector offline", async () => {
@@ -1577,6 +2350,445 @@ test("chooseConnectorForLocalThread rejects connectors without app-server suppor
   );
 });
 
+function turnInteractionResolutionDb(options: {
+  resolved: boolean;
+  claimed?: boolean;
+  staleClaim?: boolean;
+  createdAt?: string;
+  requestKind?: "approval" | "input";
+  autoResolutionMs?: number | null;
+  autoResolutionExpiresAt?: string;
+  autoResolutionResponseGraceMs?: number | null;
+  approvalAvailableDecisions?: unknown[];
+  omitApprovalAvailableDecisions?: boolean;
+  claimedResponse?: unknown;
+  deliveredClaim?: boolean;
+  dispatchStartedClaim?: boolean;
+  staleDispatchStartedClaim?: boolean;
+  deliveryUncertainClaim?: boolean;
+  commandState?: CommandSummary["state"];
+  inputQuestions?: unknown[];
+}) {
+  const requestKind = options.requestKind ?? "approval";
+  const defaultApprovalAvailableDecisions = [
+    "accept",
+    {
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: ["touch", "requested.txt"]
+      }
+    },
+    "decline",
+    "cancel"
+  ];
+  const payload = JSON.stringify({
+    type: "turn_interaction",
+    interaction_id: "interaction-1",
+    status: "pending",
+    method: requestKind === "approval" ? "item/commandExecution/requestApproval" : "item/tool/requestUserInput",
+    request_kind: requestKind,
+    ...(requestKind === "approval" ? { subject: "command_execution" } : {}),
+    app_server_thread_id: "thread-local-1",
+    app_server_turn_id: "turn-1",
+    title: requestKind === "approval" ? "Approve command execution" : "Provide input",
+    ...(requestKind === "approval"
+      ? {
+        command: "cat config.json",
+        cwd: "/workspace",
+        ...(!options.omitApprovalAvailableDecisions
+          ? { available_decisions: options.approvalAvailableDecisions ?? defaultApprovalAvailableDecisions }
+          : {})
+      }
+      : {
+        questions: options.inputQuestions ?? [
+          {
+            id: "question-1",
+            header: "Confirm",
+            question: "Continue?",
+            is_other: false,
+            is_secret: false
+          }
+        ],
+        auto_resolution_ms: options.autoResolutionMs,
+        ...(options.autoResolutionExpiresAt
+          ? { auto_resolution_expires_at: options.autoResolutionExpiresAt }
+          : {}),
+        ...(options.autoResolutionResponseGraceMs !== undefined
+          ? { auto_resolution_response_grace_ms: options.autoResolutionResponseGraceMs }
+          : {})
+      })
+  });
+  const createdAt = options.createdAt ?? "2026-06-24T10:00:00.000Z";
+  const counters = {
+    eventInserts: 0,
+    resolutionChecks: 0,
+    claimInserts: 0,
+    claimDeletes: 0,
+    staleClaimDeletes: 0,
+    dispatchStartUpdates: 0,
+    deliveryUncertainUpdates: 0,
+    taskUpdates: 0,
+    claimResponseJson: undefined as string | null | undefined,
+    claimResolutionSummary: undefined as string | undefined,
+    claimResolutionPayloadJson: undefined as string | undefined
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/SELECT e\.id, e\.thread_id, e\.command_id, e\.kind, e\.payload_json,/.test(sql)) {
+        return {
+          bind(eventId: string) {
+            assert.equal(eventId, "event-request-1");
+            return {
+              async first() {
+                return {
+                  id: "event-request-1",
+                  thread_id: "thread-1",
+                  command_id: "command-1",
+                  kind: requestKind === "approval" ? "approval.requested" : "input.requested",
+                  payload_json: payload,
+                  created_at: createdAt,
+                  lease_owner_connector_id: "connector-online",
+                  state: options.commandState ?? "running"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT e\.id, e\.workspace_id, e\.thread_id, e\.command_id, e\.kind, e\.payload_json,/.test(sql)) {
+        return {
+          bind(eventId: string) {
+            assert.equal(eventId, "event-request-1");
+            return {
+              async first() {
+                return {
+                  id: "event-request-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  command_id: "command-1",
+                  kind: requestKind === "approval" ? "approval.requested" : "input.requested",
+                  payload_json: payload,
+                  task_id: "task-1",
+                  lease_owner_connector_id: "connector-online"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (
+        /SELECT id, thread_id, command_id, seq, kind, priority, summary, payload_json, created_at/.test(sql) &&
+        /json_extract\(payload_json, '\$\.interaction_id'\)/.test(sql)
+      ) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async first() {
+                counters.resolutionChecks += 1;
+                return options.resolved
+                  ? {
+                    id: "event-resolution-1",
+                    thread_id: "thread-1",
+                    command_id: "command-1",
+                    seq: 3,
+                    kind: requestKind === "approval" ? "approval.resolved" : "input.received",
+                    priority: "P1",
+                    summary:
+                      requestKind === "approval"
+                        ? "Approval accepted for command execution."
+                        : "Input provided for Provide input.",
+                    payload_json: JSON.stringify(
+                      requestKind === "approval"
+                        ? {
+                            type: "turn_interaction_resolution",
+                            interaction_id: "interaction-1",
+                            status: "accepted",
+                            decision: "accept"
+                          }
+                        : {
+                            type: "turn_interaction_resolution",
+                            interaction_id: "interaction-1",
+                            status: "answered",
+                            answer_count: 1
+                          }
+                    ),
+                    created_at: "2026-06-24T10:00:00.000Z"
+                  }
+                  : null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/DELETE FROM turn_interaction_resolution_claims[\s\S]*dispatch_started_at IS NULL AND created_at </.test(sql)) {
+        assert.match(sql, /delivered_at IS NULL/);
+        assert.match(sql, /delivery_uncertain_at IS NULL/);
+        assert.match(sql, /dispatch_started_at IS NOT NULL AND dispatch_started_at </);
+        return {
+          bind(
+            commandId: string,
+            interactionId: string,
+            staleClaimBefore: string,
+            staleDispatchBefore: string,
+            resolutionCommandId: string,
+            resolutionInteractionId: string
+          ) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            assert.match(staleClaimBefore, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(staleDispatchBefore, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(resolutionCommandId, "command-1");
+            assert.equal(resolutionInteractionId, "interaction-1");
+            return {
+              async run() {
+                counters.staleClaimDeletes += 1;
+                return {
+                  meta: {
+                    changes: options.staleClaim &&
+                      !options.deliveryUncertainClaim &&
+                      (!options.dispatchStartedClaim || options.staleDispatchStartedClaim)
+                      ? 1
+                      : 0
+                  }
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO turn_interaction_resolution_claims/.test(sql)) {
+        return {
+          bind(
+            interactionId: string,
+            eventId: string,
+            commandId: string,
+            responseKind: string,
+            responseJson: string | null,
+            resolutionSummary: string,
+            resolutionPayloadJson: string,
+            createdAt: string
+          ) {
+            assert.equal(interactionId, "interaction-1");
+            assert.equal(eventId, "event-request-1");
+            assert.equal(commandId, "command-1");
+            assert.equal(responseKind, requestKind);
+            if (requestKind === "input") {
+              assert.equal(responseJson, null);
+            } else {
+              if (typeof responseJson !== "string") {
+                assert.fail("approval claim response_json should be persisted");
+              }
+              assert.doesNotThrow(() => JSON.parse(responseJson));
+            }
+            assert.equal(typeof resolutionSummary, "string");
+            assert.doesNotThrow(() => JSON.parse(resolutionPayloadJson));
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            counters.claimResponseJson = responseJson;
+            counters.claimResolutionSummary = resolutionSummary;
+            counters.claimResolutionPayloadJson = resolutionPayloadJson;
+            return {
+              async run() {
+                counters.claimInserts += 1;
+                const claimReleased = options.staleClaim &&
+                  !options.deliveryUncertainClaim &&
+                  (!options.dispatchStartedClaim || options.staleDispatchStartedClaim);
+                return {
+                  meta: {
+                    changes: options.claimed && !claimReleased ? 0 : 1
+                  }
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT command_id, interaction_id, response_kind, response_json,[\s\S]*resolution_summary, resolution_payload_json, dispatch_started_at, delivery_uncertain_at, delivered_at/.test(sql)) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async first() {
+                if (!options.claimed || options.staleClaim) return null;
+                const response = Object.prototype.hasOwnProperty.call(options, "claimedResponse")
+                  ? options.claimedResponse
+                  : {
+                    kind: requestKind,
+                    ...(requestKind === "approval"
+                      ? { decision: "decline" }
+                      : {
+                        answers: {
+                          "question-1": {
+                            answers: ["Different"]
+                          }
+                        }
+                      })
+                  };
+                return {
+                  command_id: "command-1",
+                  interaction_id: "interaction-1",
+                  response_kind: requestKind,
+                  response_json: response === null ? null : JSON.stringify(response),
+                  resolution_summary: requestKind === "approval"
+                    ? "Approval accepted for Approve command execution."
+                    : "Input provided for Provide input.",
+                  resolution_payload_json: JSON.stringify(requestKind === "approval"
+                    ? {
+                      type: "turn_interaction_resolution",
+                      interaction_id: "interaction-1",
+                      status: "accepted",
+                      decision: "accept"
+                    }
+                    : {
+                      type: "turn_interaction_resolution",
+                      interaction_id: "interaction-1",
+                      status: "answered",
+                      answer_count: 1
+                  }),
+                  dispatch_started_at: options.dispatchStartedClaim ? "2026-06-24T10:00:00.500Z" : null,
+                  delivery_uncertain_at: options.deliveryUncertainClaim ? "2026-06-24T10:00:01.000Z" : null,
+                  delivered_at: options.deliveredClaim ? "2026-06-24T10:00:01.000Z" : null
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/DELETE FROM turn_interaction_resolution_claims/.test(sql)) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async run() {
+                counters.claimDeletes += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE turn_interaction_resolution_claims[\s\S]*dispatch_started_at = COALESCE/.test(sql)) {
+        return {
+          bind(startedAt: string, commandId: string, interactionId: string) {
+            assert.match(startedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async run() {
+                counters.dispatchStartUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE turn_interaction_resolution_claims[\s\S]*delivery_uncertain_at = COALESCE/.test(sql)) {
+        return {
+          bind(uncertainAt: string, commandId: string, interactionId: string) {
+            assert.match(uncertainAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async run() {
+                counters.deliveryUncertainUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks\s+SET state = 'running'/.test(sql)) {
+        return {
+          bind(connectorId: string | null, assignedAgentConnectorId: string | null, updatedAt: string, taskId: string) {
+            assert.equal(connectorId, "connector-online");
+            assert.equal(assignedAgentConnectorId, "connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId, "task-1");
+            return {
+              async run() {
+                counters.taskUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads\s+SET last_seq = last_seq \+ 1/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 2 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get eventInserts() {
+      return counters.eventInserts;
+    },
+    get resolutionChecks() {
+      return counters.resolutionChecks;
+    },
+    get claimInserts() {
+      return counters.claimInserts;
+    },
+    get claimDeletes() {
+      return counters.claimDeletes;
+    },
+    get staleClaimDeletes() {
+      return counters.staleClaimDeletes;
+    },
+    get dispatchStartUpdates() {
+      return counters.dispatchStartUpdates;
+    },
+    get taskUpdates() {
+      return counters.taskUpdates;
+    },
+    get claimResponseJson() {
+      return counters.claimResponseJson;
+    },
+    get claimResolutionSummary() {
+      return counters.claimResolutionSummary;
+    },
+    get claimResolutionPayloadJson() {
+      return counters.claimResolutionPayloadJson;
+    }
+  };
+
+  return db as D1Database & typeof counters;
+}
+
 function agentEventGuardDb(command: {
   leaseOwnerConnectorId: string;
   state: "leased" | "running" | "succeeded";
@@ -1584,6 +2796,9 @@ function agentEventGuardDb(command: {
   expectedCommandState?: string;
   expectedTaskState?: string;
   failUsageWindowUpserts?: boolean;
+  failEventInsertWithUniqueConstraint?: boolean;
+  existingResolutionInteractionId?: string;
+  racedResolutionInteractionId?: string;
 } = {}) {
   const expectedCommandState = options.expectedCommandState ?? "succeeded";
   const expectedTaskState = options.expectedTaskState ?? "done";
@@ -1591,6 +2806,8 @@ function agentEventGuardDb(command: {
     commandUpdates: 0,
     taskUpdates: 0,
     eventInserts: 0,
+    resolutionChecks: 0,
+    sequenceRollbacks: 0,
     usageWindowUpserts: 0,
     usageWindowBinds: [] as unknown[][]
   };
@@ -1644,6 +2861,26 @@ function agentEventGuardDb(command: {
         };
       }
 
+      if (/json_extract\(payload_json, '\$\.interaction_id'\)/.test(sql)) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            return {
+              async first() {
+                counters.resolutionChecks += 1;
+                return options.existingResolutionInteractionId === interactionId ||
+                  (
+                    options.racedResolutionInteractionId === interactionId &&
+                    counters.eventInserts > 0
+                  )
+                  ? { id: "event-resolution-1" }
+                  : null;
+              }
+            };
+          }
+        };
+      }
+
       if (/UPDATE tasks/.test(sql)) {
         return {
           bind(taskState: string, connectorId: string, updatedAt: string, taskId: string) {
@@ -1679,12 +2916,30 @@ function agentEventGuardDb(command: {
         };
       }
 
+      if (/UPDATE threads\s+SET last_seq = last_seq - 1/.test(sql)) {
+        return {
+          bind(threadId: string, seq: number) {
+            assert.equal(threadId, "thread-1");
+            assert.equal(seq, 1);
+            return {
+              async run() {
+                counters.sequenceRollbacks += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       if (/INSERT INTO events/.test(sql)) {
         return {
           bind() {
             return {
               async run() {
                 counters.eventInserts += 1;
+                if (options.failEventInsertWithUniqueConstraint) {
+                  throw new Error("UNIQUE constraint failed: events.command_id, events.interaction_id");
+                }
                 return { success: true };
               }
             };
@@ -1738,6 +2993,9 @@ function agentEventGuardDb(command: {
     },
     get eventInserts() {
       return counters.eventInserts;
+    },
+    get sequenceRollbacks() {
+      return counters.sequenceRollbacks;
     },
     get usageWindowUpserts() {
       return counters.usageWindowUpserts;
@@ -3335,6 +4593,7 @@ function staleExplicitAppServerTargetDb(options: {
             kind: string,
             priority: string,
             summary: string,
+            payloadJson: string | null,
             createdAt: string
           ) {
             assert.match(eventId, /^event-/);
@@ -3344,6 +4603,7 @@ function staleExplicitAppServerTargetDb(options: {
             assert.equal(seq, 1);
             assert.equal(kind, "command.failed");
             assert.equal(priority, "P1");
+            assert.equal(payloadJson, null);
             assert.equal(
               summary,
               targetConnectorIdSource === "explicit"
