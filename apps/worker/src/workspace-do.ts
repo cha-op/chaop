@@ -569,13 +569,17 @@ export class WorkspaceDO implements DurableObject {
     }
     const socket = this.agentSocketForActiveCommand(dispatch.command_id);
     if (!socket) {
-      return jsonResponse({ error: "No active connector socket is handling this turn" }, 409);
+      return jsonResponse({
+        error: "No active connector socket is handling this turn",
+        delivery_state: "not_sent"
+      }, 409);
     }
     const requestId = `turn-interaction-${cryptoRandomId().slice(0, 16)}`;
     const delivery: TurnInteractionResponseDelivery = {
       ...dispatch,
       request_id: requestId
     };
+    let sent = false;
     try {
       const ack = await this.waitForTurnInteractionResponse(requestId, () => {
         socket.send(
@@ -586,14 +590,19 @@ export class WorkspaceDO implements DurableObject {
             })
           )
         );
+        sent = true;
       });
       if (!ack.accepted) {
-        return jsonResponse({ error: ack.error ?? "Connector did not accept the turn interaction response" }, 409);
+        return jsonResponse({
+          error: ack.error ?? "Connector did not accept the turn interaction response",
+          delivery_state: "rejected"
+        }, 409);
       }
     } catch (error) {
       return jsonResponse({
-        error: error instanceof Error ? error.message : "Connector could not receive the turn interaction response"
-      }, 409);
+        error: error instanceof Error ? error.message : "Connector could not receive the turn interaction response",
+        delivery_state: sent ? "sent_unknown" : "not_sent"
+      }, sent ? 504 : 409);
     }
     return jsonResponse({ accepted: true });
   }

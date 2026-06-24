@@ -52,6 +52,7 @@ const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
 const DEFAULT_TURN_INTERACTION_AUTO_RESOLUTION_RESPONSE_GRACE_MS = 250;
 const TURN_INTERACTION_RESOLUTION_CLAIM_TTL_MS = 60_000;
+const TURN_INTERACTION_RESOLUTION_DISPATCH_TTL_MS = 5 * 60_000;
 const CLOUDFLARE_FREE_WORKER_REQUESTS_PER_DAY = 100_000;
 const CLOUDFLARE_FREE_D1_ROWS_WRITTEN_PER_DAY = 100_000;
 const CLOUDFLARE_FREE_D1_ROWS_READ_PER_DAY = 5_000_000;
@@ -4446,14 +4447,18 @@ async function deleteStaleTurnInteractionResolutionClaim(
   commandId: string,
   interactionId: string
 ): Promise<void> {
-  const staleBefore = new Date(Date.now() - TURN_INTERACTION_RESOLUTION_CLAIM_TTL_MS).toISOString();
+  const now = Date.now();
+  const staleClaimBefore = new Date(now - TURN_INTERACTION_RESOLUTION_CLAIM_TTL_MS).toISOString();
+  const staleDispatchBefore = new Date(now - TURN_INTERACTION_RESOLUTION_DISPATCH_TTL_MS).toISOString();
   await env.DB!.prepare(
     `DELETE FROM turn_interaction_resolution_claims
      WHERE command_id = ?
        AND interaction_id = ?
-       AND created_at < ?
        AND delivered_at IS NULL
-       AND dispatch_started_at IS NULL
+       AND (
+         (dispatch_started_at IS NULL AND created_at < ?)
+         OR (dispatch_started_at IS NOT NULL AND dispatch_started_at < ?)
+       )
        AND NOT EXISTS (
          SELECT 1
          FROM events
@@ -4462,7 +4467,7 @@ async function deleteStaleTurnInteractionResolutionClaim(
            AND json_extract(payload_json, '$.interaction_id') = ?
        )`
   )
-    .bind(commandId, interactionId, staleBefore, commandId, interactionId)
+    .bind(commandId, interactionId, staleClaimBefore, staleDispatchBefore, commandId, interactionId)
     .run();
 }
 

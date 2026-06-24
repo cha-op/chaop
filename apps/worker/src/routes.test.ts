@@ -223,6 +223,90 @@ test("host session refresh requires D1 binding outside sample mode", async () =>
   }
 });
 
+test("turn interaction response keeps claim when connector delivery is ambiguous", async () => {
+  const db = turnInteractionResolutionRouteDb();
+  let internalPath = "";
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/thread-events/event-request-1/interaction", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        kind: "approval",
+        decision: "accept"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async (input: RequestInfo | URL) => {
+            internalPath = new URL(String(input)).pathname;
+            return new Response(JSON.stringify({
+              error: "Connector timed out while receiving the turn interaction response",
+              delivery_state: "sent_unknown"
+            }), {
+              status: 504,
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = await response.json() as { error?: string };
+
+  assert.equal(response.status, 504);
+  assert.match(body.error ?? "", /timed out/);
+  assert.equal(internalPath, "/internal/resolve-turn-interaction");
+  assert.equal(db.claimInserts, 1);
+  assert.equal(db.dispatchStartUpdates, 1);
+  assert.equal(db.claimDeletes, 0);
+});
+
+test("turn interaction response releases claim when connector was not sent", async () => {
+  const db = turnInteractionResolutionRouteDb();
+  const response = await handleRequest(
+    new Request("https://api.example.com/api/thread-events/event-request-1/interaction", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com"
+      },
+      body: JSON.stringify({
+        kind: "approval",
+        decision: "accept"
+      })
+    }),
+    {
+      ...devEnv,
+      DB: db,
+      WORKSPACE_DO: {
+        idFromName: () => ({}) as DurableObjectId,
+        get: () => ({
+          fetch: async () =>
+            new Response(JSON.stringify({
+              error: "No active connector socket is handling this turn",
+              delivery_state: "not_sent"
+            }), {
+              status: 409,
+              headers: { "content-type": "application/json; charset=utf-8" }
+            })
+        }) as unknown as DurableObjectStub
+      } as unknown as DurableObjectNamespace
+    }
+  );
+  const body = await response.json() as { error?: string };
+
+  assert.equal(response.status, 409);
+  assert.match(body.error ?? "", /No active connector/);
+  assert.equal(db.claimInserts, 1);
+  assert.equal(db.dispatchStartUpdates, 1);
+  assert.equal(db.claimDeletes, 1);
+});
+
 test("sample safety blocks host session refresh before Durable Object dispatch", async () => {
   const response = await handleRequest(
     new Request("https://api.example.com/api/host-sessions/refresh", {
@@ -4972,6 +5056,201 @@ function safetyPauseDb(options: DogfoodSafetyFakeOptions = {}): D1Database {
       throw new Error(`Unexpected SQL in safety pause fake: ${sql}`);
     }
   } as unknown as D1Database;
+}
+
+function turnInteractionResolutionRouteDb(): D1Database & {
+  readonly claimDeletes: number;
+  readonly claimInserts: number;
+  readonly dispatchStartUpdates: number;
+} {
+  const safetyDb = safetyPauseDb();
+  const payload = JSON.stringify({
+    type: "turn_interaction",
+    interaction_id: "interaction-1",
+    status: "pending",
+    method: "item/commandExecution/requestApproval",
+    request_kind: "approval",
+    subject: "command_execution",
+    app_server_thread_id: "thread-local-1",
+    app_server_turn_id: "turn-1",
+    title: "Approve command execution",
+    command: "cat config.json",
+    cwd: "/workspace",
+    available_decisions: ["accept", "decline", "cancel"]
+  });
+  const counters = {
+    claimDeletes: 0,
+    claimInserts: 0,
+    dispatchStartUpdates: 0,
+    staleClaimDeletes: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/SELECT e\.id, e\.thread_id, e\.command_id, e\.kind, e\.payload_json,/.test(sql)) {
+        return {
+          bind(eventId: string) {
+            assert.equal(eventId, "event-request-1");
+            return {
+              async first() {
+                return {
+                  id: "event-request-1",
+                  thread_id: "thread-1",
+                  command_id: "command-1",
+                  kind: "approval.requested",
+                  payload_json: payload,
+                  created_at: "2026-06-24T10:00:00.000Z",
+                  lease_owner_connector_id: "connector-online",
+                  state: "running"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (
+        /SELECT id, thread_id, command_id, seq, kind, priority, summary, payload_json, created_at/.test(sql) &&
+        /json_extract\(payload_json, '\$\.interaction_id'\)/.test(sql)
+      ) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async first() {
+                return null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/DELETE FROM turn_interaction_resolution_claims[\s\S]*dispatch_started_at IS NULL AND created_at </.test(sql)) {
+        return {
+          bind(
+            commandId: string,
+            interactionId: string,
+            staleClaimBefore: string,
+            staleDispatchBefore: string,
+            resolutionCommandId: string,
+            resolutionInteractionId: string
+          ) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            assert.match(staleClaimBefore, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(staleDispatchBefore, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(resolutionCommandId, "command-1");
+            assert.equal(resolutionInteractionId, "interaction-1");
+            return {
+              async run() {
+                counters.staleClaimDeletes += 1;
+                return { meta: { changes: 0 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO turn_interaction_resolution_claims/.test(sql)) {
+        return {
+          bind(
+            interactionId: string,
+            eventId: string,
+            commandId: string,
+            responseKind: string,
+            responseJson: string,
+            resolutionSummary: string,
+            resolutionPayloadJson: string,
+            createdAt: string
+          ) {
+            assert.equal(interactionId, "interaction-1");
+            assert.equal(eventId, "event-request-1");
+            assert.equal(commandId, "command-1");
+            assert.equal(responseKind, "approval");
+            assert.doesNotThrow(() => JSON.parse(responseJson));
+            assert.equal(typeof resolutionSummary, "string");
+            assert.doesNotThrow(() => JSON.parse(resolutionPayloadJson));
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                counters.claimInserts += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT command_id, interaction_id, response_kind, response_json,[\s\S]*resolution_summary, resolution_payload_json, dispatch_started_at, delivered_at/.test(sql)) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async first() {
+                return null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE turn_interaction_resolution_claims[\s\S]*dispatch_started_at = COALESCE/.test(sql)) {
+        return {
+          bind(startedAt: string, commandId: string, interactionId: string) {
+            assert.match(startedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async run() {
+                counters.dispatchStartUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/DELETE FROM turn_interaction_resolution_claims\s+WHERE command_id = \? AND interaction_id = \?/.test(sql)) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async run() {
+                counters.claimDeletes += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      try {
+        return safetyDb.prepare(sql);
+      } catch (error) {
+        if (error instanceof Error && /Unexpected SQL in safety pause fake/.test(error.message)) {
+          throw new Error(`Unexpected SQL in turn interaction route fake: ${sql}`);
+        }
+        throw error;
+      }
+    },
+    get claimDeletes() {
+      return counters.claimDeletes;
+    },
+    get claimInserts() {
+      return counters.claimInserts;
+    },
+    get dispatchStartUpdates() {
+      return counters.dispatchStartUpdates;
+    }
+  };
+
+  return db as D1Database & {
+    readonly claimDeletes: number;
+    readonly claimInserts: number;
+    readonly dispatchStartUpdates: number;
+  };
 }
 
 function safetyUsageWindow(windowType: "daily" | "four_hour" | "burst", eventsReceived: number) {

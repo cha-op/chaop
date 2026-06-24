@@ -961,6 +961,28 @@ test("prepareTurnInteractionResolutionInDb does not reclaim dispatch-started cla
   assert.equal(db.claimInserts, 1);
 });
 
+test("prepareTurnInteractionResolutionInDb reclaims stale dispatch-started claims", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    claimed: true,
+    staleClaim: true,
+    dispatchStartedClaim: true,
+    staleDispatchStartedClaim: true
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+  const dispatch = preparation.dispatch;
+
+  assert.equal(dispatch.command_id, "command-1");
+  assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, false);
+  assert.equal(db.staleClaimDeletes, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
 test("prepareTurnInteractionResolutionInDb rejects unavailable approval decisions", async () => {
   const db = turnInteractionResolutionDb({
     resolved: false,
@@ -2196,6 +2218,7 @@ function turnInteractionResolutionDb(options: {
   claimedResponse?: unknown;
   deliveredClaim?: boolean;
   dispatchStartedClaim?: boolean;
+  staleDispatchStartedClaim?: boolean;
   inputQuestions?: unknown[];
 }) {
   const requestKind = options.requestKind ?? "approval";
@@ -2340,26 +2363,35 @@ function turnInteractionResolutionDb(options: {
         };
       }
 
-      if (/DELETE FROM turn_interaction_resolution_claims[\s\S]*created_at </.test(sql)) {
+      if (/DELETE FROM turn_interaction_resolution_claims[\s\S]*dispatch_started_at IS NULL AND created_at </.test(sql)) {
         assert.match(sql, /delivered_at IS NULL/);
-        assert.match(sql, /dispatch_started_at IS NULL/);
+        assert.match(sql, /dispatch_started_at IS NOT NULL AND dispatch_started_at </);
         return {
           bind(
             commandId: string,
             interactionId: string,
-            staleBefore: string,
+            staleClaimBefore: string,
+            staleDispatchBefore: string,
             resolutionCommandId: string,
             resolutionInteractionId: string
           ) {
             assert.equal(commandId, "command-1");
             assert.equal(interactionId, "interaction-1");
-            assert.match(staleBefore, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(staleClaimBefore, /^\d{4}-\d{2}-\d{2}T/);
+            assert.match(staleDispatchBefore, /^\d{4}-\d{2}-\d{2}T/);
             assert.equal(resolutionCommandId, "command-1");
             assert.equal(resolutionInteractionId, "interaction-1");
             return {
               async run() {
                 counters.staleClaimDeletes += 1;
-                return { meta: { changes: options.staleClaim && !options.dispatchStartedClaim ? 1 : 0 } };
+                return {
+                  meta: {
+                    changes: options.staleClaim &&
+                      (!options.dispatchStartedClaim || options.staleDispatchStartedClaim)
+                      ? 1
+                      : 0
+                  }
+                };
               }
             };
           }
@@ -2399,9 +2431,11 @@ function turnInteractionResolutionDb(options: {
             return {
               async run() {
                 counters.claimInserts += 1;
+                const claimReleased = options.staleClaim &&
+                  (!options.dispatchStartedClaim || options.staleDispatchStartedClaim);
                 return {
                   meta: {
-                    changes: options.claimed && (!options.staleClaim || options.dispatchStartedClaim) ? 0 : 1
+                    changes: options.claimed && !claimReleased ? 0 : 1
                   }
                 };
               }

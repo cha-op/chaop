@@ -403,7 +403,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           await requestTurnInteractionResolution(env, dispatch);
           connectorDelivered = true;
         } catch (error) {
-          await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+          if (shouldReleaseTurnInteractionClaimAfterDispatchError(error)) {
+            await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+          }
           throw error;
         }
         try {
@@ -766,8 +768,16 @@ async function requestTurnInteractionResolution(
     body: JSON.stringify(dispatch)
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => undefined) as { error?: string } | undefined;
-    throw new ConnectorRpcError(body?.error ?? "Connector could not receive the turn interaction response", response.status);
+    const body = await response.json().catch(() => undefined) as {
+      error?: unknown;
+      delivery_state?: unknown;
+    } | undefined;
+    const message = typeof body?.error === "string"
+      ? body.error
+      : "Connector could not receive the turn interaction response";
+    throw new ConnectorRpcError(message, response.status, {
+      releaseTurnInteractionClaim: turnInteractionDeliveryStateAllowsClaimRelease(body?.delivery_state)
+    });
   }
 }
 
@@ -800,10 +810,23 @@ async function requestHostSessionRefresh(env: Env): Promise<{
 class ConnectorRpcError extends Error {
   constructor(
     message: string,
-    public readonly status = 502
+    public readonly status = 502,
+    options: { releaseTurnInteractionClaim?: boolean | undefined } = {}
   ) {
     super(message);
+    this.releaseTurnInteractionClaim = options.releaseTurnInteractionClaim;
   }
+
+  public readonly releaseTurnInteractionClaim: boolean | undefined;
+}
+
+function turnInteractionDeliveryStateAllowsClaimRelease(deliveryState: unknown): boolean {
+  return deliveryState === "not_sent" || deliveryState === "rejected";
+}
+
+function shouldReleaseTurnInteractionClaimAfterDispatchError(error: unknown): boolean {
+  if (error instanceof ConnectorRpcError && error.releaseTurnInteractionClaim === false) return false;
+  return true;
 }
 
 async function requestLocalThreadCreate(
