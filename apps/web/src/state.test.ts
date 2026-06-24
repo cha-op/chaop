@@ -1045,6 +1045,22 @@ test("threadTurnsForDisplay renders commandless backfilled history turns", () =>
   assert.equal(turns[0]?.event_count, 2);
 });
 
+test("threadTurnsForDisplay parses backfilled history with unknown timestamps", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [],
+    [
+      event("event-1", undefined, 1, "command.output", "unknown time - User: Recover the old session."),
+      event("event-2", undefined, 2, "command.output", "unknown time - Assistant: I found the old transcript.")
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "succeeded");
+  assert.equal(turns[0]?.prompt, "Recover the old session.");
+  assert.equal(turns[0]?.assistant_summary, "I found the old transcript.");
+});
+
 test("threadTurnsForDisplay marks user-only backfilled history as partial", () => {
   const turns = threadTurnsForDisplay(
     "thread-1",

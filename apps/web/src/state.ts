@@ -158,7 +158,9 @@ function historyTurnFromDraft(draft: HistoryTurnDraft): ThreadTurnSummary {
 }
 
 function parseBackfillMessage(summary: string): { role: "user" | "assistant"; text: string } | undefined {
-  const timestamped = summary.match(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+-\s+(User|Assistant):\s*(.+)$/s);
+  const timestamped = summary.match(
+    /^(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}|unknown time)\s+-\s+(User|Assistant):\s*(.+)$/s
+  );
   const bare = summary.match(/^(User|Assistant):\s*(.+)$/s);
   const match = timestamped ?? bare;
   if (!match) return undefined;
