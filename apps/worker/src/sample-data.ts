@@ -150,7 +150,7 @@ export const hostSessions: HostSessionSummary[] = [
     connector_id: "connector-mac-studio",
     hostname: "mac-studio.local",
     workspace_id: "workspace-api",
-    session_id: "019d3109-210d-7492-be2b-902b10993a3d",
+    session_id: "sample-thread-orders-500",
     title: "Investigate 500 errors on /api/orders",
     title_source: "metadata",
     app_server_present: true,
@@ -525,7 +525,7 @@ export const events: ThreadEvent[] = [
     seq: 2,
     kind: "command.started",
     priority: "P1",
-    summary: "Connector started Codex app-server turn for local thread 019d3109-210d-7492-be2b-902b10993a3d.",
+    summary: "Connector started Codex app-server turn for local thread sample-thread-orders-500.",
     created_at: "2026-06-09T21:58:02.000Z"
   },
   {

@@ -18,7 +18,7 @@ import type {
 
 export type CommandExecutionMode = "placeholder" | "app_server" | "codex_cli_fallback";
 
-export type ThreadTurnStatus = "pending" | "running" | "waiting" | "succeeded" | "failed";
+export type ThreadTurnStatus = "partial" | "pending" | "running" | "waiting" | "succeeded" | "failed";
 
 export type ThreadTurnSummary = {
   command_id: string;
@@ -146,7 +146,7 @@ function historyTurnFromDraft(draft: HistoryTurnDraft): ThreadTurnSummary {
   return {
     command_id: draft.id,
     prompt: draft.prompt,
-    status: failed ? "failed" : "succeeded",
+    status: failed ? "failed" : draft.assistant ? "succeeded" : "partial",
     assistant_summary: draft.assistant,
     error_summary: [...sortedEvents].reverse().find((event) => event.kind === "command.failed")?.summary,
     progress_summaries: draft.progress_summaries ?? [],

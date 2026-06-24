@@ -974,6 +974,29 @@ test("threadTurnsForDisplay keeps failed event-only turns diagnosable", () => {
   assert.equal(turns[0]?.error_summary, "Codex app-server turn could not start.");
 });
 
+test("threadTurnsForDisplay keeps failure and partial assistant output on failed turns", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [
+      command("command-1", {
+        prompt: "Run the failing turn.",
+        state: "failed",
+        updated_at: "2026-06-12T10:04:00.000Z"
+      })
+    ],
+    [
+      event("event-1", "command-1", 1, "command.started", "Connector started Codex app-server turn."),
+      event("event-2", "command-1", 2, "command.output", "Codex: I inspected the failing path."),
+      event("event-3", "command-1", 3, "command.failed", "Codex app-server turn could not start.")
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "failed");
+  assert.equal(turns[0]?.assistant_summary, "I inspected the failing path.");
+  assert.equal(turns[0]?.error_summary, "Codex app-server turn could not start.");
+});
+
 test("threadTurnsForDisplay preserves terminal command state when the event tail is partial", () => {
   const turns = threadTurnsForDisplay(
     "thread-1",
@@ -1020,6 +1043,27 @@ test("threadTurnsForDisplay renders commandless backfilled history turns", () =>
   assert.equal(turns[0]?.prompt, "Inspect the app-server attach failure.");
   assert.equal(turns[0]?.assistant_summary, "The attach path is using the wrong thread lookup.");
   assert.equal(turns[0]?.event_count, 2);
+});
+
+test("threadTurnsForDisplay marks user-only backfilled history as partial", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [],
+    [
+      event(
+        "event-1",
+        undefined,
+        1,
+        "command.output",
+        "2026-06-12 10:00 - User: Inspect the app-server attach failure."
+      )
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "partial");
+  assert.equal(turns[0]?.prompt, "Inspect the app-server attach failure.");
+  assert.equal(turns[0]?.assistant_summary, undefined);
 });
 
 test("threadTurnsForDisplay attaches commandless tool history to the previous turn", () => {

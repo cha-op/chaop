@@ -353,7 +353,8 @@ h2 {
   color: #92400e;
 }
 
-.chip.missing {
+.chip.missing,
+.chip.partial {
   background: #e2e8f0;
   color: #475569;
 }

@@ -659,14 +659,7 @@ export class ChaopApp extends LitElement {
           </div>
           <span class=${`chip ${turn.status}`}>${turnStatusLabel(turn.status)}</span>
         </header>
-        ${turn.assistant_summary
-          ? html`
-              <div class="assistant-answer">
-                <span>Assistant</span>
-                <p>${turn.assistant_summary}</p>
-              </div>
-            `
-          : this.renderPendingTurnBody(turn)}
+        ${this.renderTurnBody(turn)}
         ${latestProgress.length > 0
           ? html`
               <ul class="turn-progress">
@@ -683,6 +676,31 @@ export class ChaopApp extends LitElement {
     `;
   }
 
+  private renderTurnBody(turn: ThreadTurnSummary) {
+    if (turn.status === "failed") {
+      return html`
+        ${this.renderPendingTurnBody(turn)}
+        ${turn.assistant_summary
+          ? html`
+              <div class="assistant-answer">
+                <span>Assistant before failure</span>
+                <p>${turn.assistant_summary}</p>
+              </div>
+            `
+          : nothing}
+      `;
+    }
+    if (turn.assistant_summary) {
+      return html`
+        <div class="assistant-answer">
+          <span>Assistant</span>
+          <p>${turn.assistant_summary}</p>
+        </div>
+      `;
+    }
+    return this.renderPendingTurnBody(turn);
+  }
+
   private renderPendingTurnBody(turn: ThreadTurnSummary) {
     if (turn.status === "failed") {
       return html`
@@ -697,6 +715,14 @@ export class ChaopApp extends LitElement {
         <div class="assistant-answer empty">
           <span>Assistant</span>
           <p>The turn completed without an assistant message.</p>
+        </div>
+      `;
+    }
+    if (turn.status === "partial") {
+      return html`
+        <div class="assistant-answer empty">
+          <span>Assistant</span>
+          <p>Assistant output is unavailable from retained history.</p>
         </div>
       `;
     }
@@ -2072,6 +2098,7 @@ function taskStateForEvent(kind: ThreadEvent["kind"]): TaskSummary["state"] | un
 
 function turnStatusLabel(status: ThreadTurnSummary["status"]): string {
   return {
+    partial: "Partial",
     pending: "Accepted",
     running: "Running",
     waiting: "Waiting",
