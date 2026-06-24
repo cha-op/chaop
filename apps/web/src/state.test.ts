@@ -992,6 +992,36 @@ test("threadTurnsForDisplay preserves terminal command state when the event tail
   assert.equal(turns[0]?.assistant_summary, "Done.");
 });
 
+test("threadTurnsForDisplay renders commandless backfilled history turns", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [],
+    [
+      event(
+        "event-1",
+        undefined,
+        1,
+        "command.output",
+        "2026-06-12 10:00 - User: Inspect the app-server attach failure."
+      ),
+      event(
+        "event-2",
+        undefined,
+        2,
+        "command.output",
+        "2026-06-12 10:01 - Assistant: The attach path is using the wrong thread lookup."
+      )
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.command_id, "history-event-1");
+  assert.equal(turns[0]?.status, "succeeded");
+  assert.equal(turns[0]?.prompt, "Inspect the app-server attach failure.");
+  assert.equal(turns[0]?.assistant_summary, "The attach path is using the wrong thread lookup.");
+  assert.equal(turns[0]?.event_count, 2);
+});
+
 function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   return {
     user: {
@@ -1047,21 +1077,22 @@ function command(id: string, overrides: Partial<CommandSummary> = {}): CommandSu
 
 function event(
   id: string,
-  commandId: string,
+  commandId: string | undefined,
   seq: number,
   kind: ThreadEvent["kind"],
   summary: string
 ): ThreadEvent {
-  return {
+  const item: ThreadEvent = {
     id,
     thread_id: "thread-1",
-    command_id: commandId,
     seq,
     kind,
     priority: "P1",
     summary,
     created_at: `2026-06-12T10:00:0${seq}.000Z`
   };
+  if (commandId) item.command_id = commandId;
+  return item;
 }
 
 function safety(): BootstrapPayload["safety"] {

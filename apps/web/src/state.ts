@@ -56,14 +56,108 @@ export function threadTurnsForDisplay(
     groups.set(command.id, group);
   }
 
-  return [...groups.entries()]
-    .map(([commandId, group]) => buildThreadTurn(commandId, group.command, group.events))
+  return [
+    ...[...groups.entries()]
+      .map(([commandId, group]) => buildThreadTurn(commandId, group.command, group.events)),
+    ...buildHistoryTurns(threadId, events)
+  ]
     .sort((left, right) => {
       const updated = right.updated_at.localeCompare(left.updated_at);
       if (updated !== 0) return updated;
       return right.last_seq - left.last_seq;
     });
 }
+
+function buildHistoryTurns(threadId: string, events: ThreadEvent[]): ThreadTurnSummary[] {
+  const historyEvents = events
+    .filter((event) => event.thread_id === threadId && !event.command_id)
+    .sort((left, right) => {
+      if (left.seq !== right.seq) return left.seq - right.seq;
+      return left.created_at.localeCompare(right.created_at);
+    });
+  const turns: ThreadTurnSummary[] = [];
+  let current: HistoryTurnDraft | undefined;
+
+  for (const event of historyEvents) {
+    const message = parseBackfillMessage(event.summary);
+    if (message?.role === "user") {
+      if (current) turns.push(historyTurnFromDraft(current));
+      current = {
+        id: `history-${event.id}`,
+        prompt: message.text,
+        events: [event]
+      };
+      continue;
+    }
+
+    if (message?.role === "assistant") {
+      if (current) {
+        current.assistant = message.text;
+        current.events.push(event);
+        turns.push(historyTurnFromDraft(current));
+        current = undefined;
+      } else {
+        turns.push(historyTurnFromDraft({
+          id: `history-${event.id}`,
+          assistant: message.text,
+          events: [event]
+        }));
+      }
+      continue;
+    }
+
+    if (current) {
+      turns.push(historyTurnFromDraft(current));
+      current = undefined;
+    }
+    turns.push(historyTurnFromDraft({
+      id: `history-${event.id}`,
+      events: [event],
+      progress_summaries: [event.summary]
+    }));
+  }
+
+  if (current) turns.push(historyTurnFromDraft(current));
+  return turns;
+}
+
+function historyTurnFromDraft(draft: HistoryTurnDraft): ThreadTurnSummary {
+  const sortedEvents = [...draft.events].sort((left, right) => {
+    if (left.seq !== right.seq) return left.seq - right.seq;
+    return left.created_at.localeCompare(right.created_at);
+  });
+  const failed = sortedEvents.some((event) => event.kind === "command.failed");
+  return {
+    command_id: draft.id,
+    prompt: draft.prompt,
+    status: failed ? "failed" : draft.assistant ? "succeeded" : "pending",
+    assistant_summary: draft.assistant,
+    error_summary: [...sortedEvents].reverse().find((event) => event.kind === "command.failed")?.summary,
+    progress_summaries: draft.progress_summaries ?? [],
+    event_count: sortedEvents.length,
+    last_seq: Math.max(0, ...sortedEvents.map((event) => event.seq)),
+    updated_at: sortedEvents.map((event) => event.created_at).sort().at(-1) ?? new Date(0).toISOString(),
+    events: sortedEvents
+  };
+}
+
+function parseBackfillMessage(summary: string): { role: "user" | "assistant"; text: string } | undefined {
+  const timestamped = summary.match(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+-\s+(User|Assistant):\s*(.+)$/s);
+  const bare = summary.match(/^(User|Assistant):\s*(.+)$/s);
+  const match = timestamped ?? bare;
+  if (!match) return undefined;
+  const role = match[1] === "User" ? "user" : "assistant";
+  const text = match[2]?.trim();
+  return text ? { role, text } : undefined;
+}
+
+type HistoryTurnDraft = {
+  id: string;
+  prompt?: string | undefined;
+  assistant?: string | undefined;
+  progress_summaries?: string[] | undefined;
+  events: ThreadEvent[];
+};
 
 function buildThreadTurn(
   commandId: string,
