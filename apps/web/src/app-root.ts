@@ -757,6 +757,7 @@ export class ChaopApp extends LitElement {
       `;
     }
 
+    const approvalDecisions = approvalDecisionsForPayload(payload);
     return html`
       <section class="interaction-card approval">
         <header>
@@ -768,12 +769,43 @@ export class ChaopApp extends LitElement {
         </header>
         ${payload.detail ? html`<p>${payload.detail}</p>` : nothing}
         ${payload.command ? html`<pre><code>${payload.command}</code></pre>` : nothing}
+        ${payload.network_approval_context
+          ? html`
+              <dl>
+                ${payload.network_approval_context.host
+                  ? html`<div><dt>Network host</dt><dd>${payload.network_approval_context.host}</dd></div>`
+                  : nothing}
+                ${payload.network_approval_context.protocol
+                  ? html`<div><dt>Protocol</dt><dd>${payload.network_approval_context.protocol}</dd></div>`
+                  : nothing}
+                ${payload.network_approval_context.port
+                  ? html`<div><dt>Port</dt><dd>${payload.network_approval_context.port}</dd></div>`
+                  : nothing}
+              </dl>
+            `
+          : nothing}
         ${payload.cwd || payload.grant_root
           ? html`
               <dl>
                 ${payload.cwd ? html`<div><dt>Cwd</dt><dd>${payload.cwd}</dd></div>` : nothing}
                 ${payload.grant_root ? html`<div><dt>Grant root</dt><dd>${payload.grant_root}</dd></div>` : nothing}
               </dl>
+            `
+          : nothing}
+        ${payload.proposed_execpolicy_amendment
+          ? html`
+              <div class="interaction-permissions">
+                <span>Proposed exec-policy amendment</span>
+                <pre><code>${formatJson(payload.proposed_execpolicy_amendment)}</code></pre>
+              </div>
+            `
+          : nothing}
+        ${payload.command_actions
+          ? html`
+              <div class="interaction-permissions">
+                <span>Command actions</span>
+                <pre><code>${formatJson(payload.command_actions)}</code></pre>
+              </div>
             `
           : nothing}
         ${payload.requested_permissions
@@ -785,39 +817,19 @@ export class ChaopApp extends LitElement {
             `
           : nothing}
         <div class="interaction-actions">
-          <button
-            type="button"
-            class="primary-action"
-            title=${this.safetyButtonTitle("turn_interaction")}
-            ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
-            @click=${() => void this.resolveApprovalInteraction(interaction, "accept")}
-          >
-            Approve
-          </button>
-          <button
-            type="button"
-            title=${this.safetyButtonTitle("turn_interaction")}
-            ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
-            @click=${() => void this.resolveApprovalInteraction(interaction, "acceptForSession")}
-          >
-            Approve for session
-          </button>
-          <button
-            type="button"
-            title=${this.safetyButtonTitle("turn_interaction")}
-            ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
-            @click=${() => void this.resolveApprovalInteraction(interaction, "decline")}
-          >
-            Decline
-          </button>
-          <button
-            type="button"
-            title=${this.safetyButtonTitle("turn_interaction")}
-            ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
-            @click=${() => void this.resolveApprovalInteraction(interaction, "cancel")}
-          >
-            Cancel turn
-          </button>
+          ${approvalDecisions.map(
+            (decision) => html`
+              <button
+                type="button"
+                class=${approvalDecisionIsPrimary(decision) ? "primary-action" : ""}
+                title=${this.safetyButtonTitle("turn_interaction")}
+                ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
+                @click=${() => void this.resolveApprovalInteraction(interaction, decision)}
+              >
+                ${approvalDecisionLabel(decision)}
+              </button>
+            `
+          )}
         </div>
       </section>
     `;
@@ -2057,6 +2069,26 @@ function viewQuestion(view: View): string {
 
 function formatMode(mode: string): string {
   return mode.replaceAll("_", " ");
+}
+
+function approvalDecisionsForPayload(
+  payload: PendingTurnInteraction["payload"]
+): TurnInteractionApprovalDecision[] {
+  return payload.available_decisions && payload.available_decisions.length > 0
+    ? payload.available_decisions
+    : ["accept", "acceptForSession", "decline", "cancel"];
+}
+
+function approvalDecisionLabel(decision: TurnInteractionApprovalDecision): string {
+  if (decision === "accept") return "Approve";
+  if (decision === "acceptForSession") return "Approve for session";
+  if (decision === "decline") return "Decline";
+  if (decision === "cancel") return "Cancel turn";
+  return "Approve with exec-policy amendment";
+}
+
+function approvalDecisionIsPrimary(decision: TurnInteractionApprovalDecision): boolean {
+  return decision === "accept" || typeof decision === "object";
 }
 
 function formatCommandType(type: CommandSummary["type"]): string {

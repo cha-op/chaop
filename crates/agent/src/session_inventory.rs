@@ -52,7 +52,7 @@ pub struct TurnInteractionResponseDispatch {
 #[serde(tag = "kind")]
 pub enum TurnInteractionResponse {
     #[serde(rename = "approval")]
-    Approval { decision: String },
+    Approval { decision: Value },
     #[serde(rename = "input")]
     Input {
         answers: HashMap<String, TurnInteractionInputAnswer>,
@@ -2255,6 +2255,27 @@ fn turn_interaction_payload(
     if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
         payload.insert("cwd".to_owned(), json!(cwd));
     }
+    if request_kind == "approval" {
+        if let Some(command_actions) = params
+            .get("commandActions")
+            .and_then(Value::as_array)
+            .filter(|value| !value.is_empty())
+        {
+            payload.insert(
+                "command_actions".to_owned(),
+                Value::Array(command_actions.to_vec()),
+            );
+        }
+        if let Some(amendment) = proposed_execpolicy_amendment_from_request(params) {
+            payload.insert("proposed_execpolicy_amendment".to_owned(), amendment);
+        }
+        if let Some(network_context) = network_approval_context_from_request(params) {
+            payload.insert("network_approval_context".to_owned(), network_context);
+        }
+        if let Some(available_decisions) = available_approval_decisions_from_request(params) {
+            payload.insert("available_decisions".to_owned(), available_decisions);
+        }
+    }
     if let Some(grant_root) = grant_root.filter(|value| !value.trim().is_empty()) {
         payload.insert("grant_root".to_owned(), json!(grant_root));
     }
@@ -2343,6 +2364,77 @@ fn turn_interaction_question(value: &Value) -> Option<Value> {
         }
     }
     Some(Value::Object(item))
+}
+
+fn available_approval_decisions_from_request(params: &Value) -> Option<Value> {
+    let mapped = params
+        .get("availableDecisions")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(normalized_approval_decision)
+        .collect::<Vec<_>>();
+    if mapped.is_empty() {
+        None
+    } else {
+        Some(Value::Array(mapped))
+    }
+}
+
+fn normalized_approval_decision(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(decision)
+            if matches!(
+                decision.as_str(),
+                "accept" | "acceptForSession" | "decline" | "cancel"
+            ) =>
+        {
+            Some(Value::String(decision.to_owned()))
+        }
+        Value::Object(map) => {
+            let amendment = map.get("acceptWithExecpolicyAmendment")?;
+            let amendment = amendment.get("execpolicy_amendment")?;
+            if execpolicy_amendment_is_valid(amendment) {
+                Some(json!({
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": amendment
+                    }
+                }))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn proposed_execpolicy_amendment_from_request(params: &Value) -> Option<Value> {
+    let amendment = params.get("proposedExecpolicyAmendment")?;
+    if execpolicy_amendment_is_valid(amendment) {
+        Some(amendment.clone())
+    } else {
+        None
+    }
+}
+
+fn execpolicy_amendment_is_valid(value: &Value) -> bool {
+    value
+        .as_array()
+        .map(|items| {
+            !items.is_empty()
+                && items
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(|part| !part.trim().is_empty()))
+        })
+        .unwrap_or(false)
+}
+
+fn network_approval_context_from_request(params: &Value) -> Option<Value> {
+    let context = params.get("networkApprovalContext")?.as_object()?;
+    if context.is_empty() {
+        None
+    } else {
+        Some(Value::Object(context.clone()))
+    }
 }
 
 fn receive_turn_interaction_response(
@@ -2494,13 +2586,7 @@ fn turn_interaction_resolution_event(
             })),
         }),
         TurnInteractionResponse::Approval { decision } => {
-            let status = match decision.as_str() {
-                "accept" => "accepted",
-                "acceptForSession" => "accepted_for_session",
-                "decline" => "declined",
-                "cancel" => "cancelled",
-                _ => "cancelled",
-            };
+            let status = approval_resolution_status(decision);
             Ok(ConnectorEvent {
                 kind: "approval.resolved".to_owned(),
                 priority: "P1".to_owned(),
@@ -2527,12 +2613,14 @@ fn app_server_turn_interaction_result(
             TurnInteractionResponse::Approval { decision },
         ) => Ok(json!({ "decision": decision })),
         ("item/permissions/requestApproval", TurnInteractionResponse::Approval { decision }) => {
-            let permissions = if decision == "accept" || decision == "acceptForSession" {
+            let permissions = if approval_decision_is(decision, "accept")
+                || approval_decision_is(decision, "acceptForSession")
+            {
                 granted_permissions_from_request(params)
             } else {
                 json!({})
             };
-            let scope = if decision == "acceptForSession" {
+            let scope = if approval_decision_is(decision, "acceptForSession") {
                 "session"
             } else {
                 "turn"
@@ -2555,6 +2643,29 @@ fn app_server_turn_interaction_result(
             "unsupported app-server interaction method: {method}"
         ))),
     }
+}
+
+fn approval_resolution_status(decision: &Value) -> &'static str {
+    if approval_decision_is(decision, "accept") {
+        "accepted"
+    } else if approval_decision_is(decision, "acceptForSession") {
+        "accepted_for_session"
+    } else if approval_decision_is(decision, "decline") {
+        "declined"
+    } else if approval_decision_is(decision, "acceptWithExecpolicyAmendment") {
+        "accepted_with_execpolicy_amendment"
+    } else {
+        "cancelled"
+    }
+}
+
+fn approval_decision_is(decision: &Value, expected: &str) -> bool {
+    decision.as_str() == Some(expected)
+        || (expected == "acceptWithExecpolicyAmendment"
+            && decision
+                .get("acceptWithExecpolicyAmendment")
+                .and_then(|value| value.get("execpolicy_amendment"))
+                .is_some_and(execpolicy_amendment_is_valid))
 }
 
 fn granted_permissions_from_request(params: &Value) -> Value {
@@ -7229,7 +7340,28 @@ mod tests {
                 "environmentId": null,
                 "reason": "Needs write access",
                 "command": "touch requested.txt",
-                "cwd": "/tmp/project"
+                "cwd": "/tmp/project",
+                "commandActions": [
+                    {
+                        "kind": "run",
+                        "command": "touch requested.txt"
+                    }
+                ],
+                "proposedExecpolicyAmendment": ["touch", "requested.txt"],
+                "networkApprovalContext": {
+                    "host": "registry.npmjs.org",
+                    "protocol": "https",
+                    "port": 443
+                },
+                "availableDecisions": [
+                    "decline",
+                    {
+                        "acceptWithExecpolicyAmendment": {
+                            "execpolicy_amendment": ["touch", "requested.txt"]
+                        }
+                    },
+                    "cancel"
+                ]
             }
         }));
         let config = AgentConfig {
@@ -7275,6 +7407,34 @@ mod tests {
                 .and_then(Value::as_str),
             Some("command_execution")
         );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.pointer("/network_approval_context/host"))
+                .and_then(Value::as_str),
+            Some("registry.npmjs.org")
+        );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.pointer("/proposed_execpolicy_amendment/0"))
+                .and_then(Value::as_str),
+            Some("touch")
+        );
+        assert_eq!(
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| {
+                    payload.pointer(
+                        "/available_decisions/1/acceptWithExecpolicyAmendment/execpolicy_amendment/0",
+                    )
+                })
+                .and_then(Value::as_str),
+            Some("touch")
+        );
         let interaction_id = event
             .payload
             .as_ref()
@@ -7289,7 +7449,11 @@ mod tests {
                 command_id: "command-1".to_owned(),
                 interaction_id,
                 response: TurnInteractionResponse::Approval {
-                    decision: "accept".to_owned(),
+                    decision: json!({
+                        "acceptWithExecpolicyAmendment": {
+                            "execpolicy_amendment": ["touch", "requested.txt"]
+                        }
+                    }),
                 },
                 auto_resolved: false,
             },
@@ -7300,9 +7464,9 @@ mod tests {
             .expect("app-server interaction response");
         assert_eq!(
             app_response
-                .pointer("/result/decision")
+                .pointer("/result/decision/acceptWithExecpolicyAmendment/execpolicy_amendment/0")
                 .and_then(Value::as_str),
-            Some("accept")
+            Some("touch")
         );
         let events = handle.join().expect("command thread");
         assert_eq!(
@@ -7410,7 +7574,7 @@ mod tests {
                 command_id: "command-1".to_owned(),
                 interaction_id,
                 response: TurnInteractionResponse::Approval {
-                    decision: "acceptForSession".to_owned(),
+                    decision: json!("acceptForSession"),
                 },
                 auto_resolved: false,
             },

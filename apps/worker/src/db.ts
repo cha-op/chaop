@@ -4204,13 +4204,7 @@ function turnInteractionResolutionEvent(
       }
     };
   }
-  const status = response.decision === "accept"
-    ? "accepted"
-    : response.decision === "acceptForSession"
-      ? "accepted_for_session"
-      : response.decision === "decline"
-        ? "declined"
-        : "cancelled";
+  const status = turnInteractionApprovalResolutionStatus(response.decision);
   return {
     summary: `Approval ${status.replaceAll("_", " ")} for ${request.title}.`,
     payload: {
@@ -4220,6 +4214,16 @@ function turnInteractionResolutionEvent(
       decision: response.decision
     }
   };
+}
+
+function turnInteractionApprovalResolutionStatus(
+  decision: Extract<ResolveTurnInteractionRequest, { kind: "approval" }>["decision"]
+): "accepted" | "accepted_for_session" | "accepted_with_execpolicy_amendment" | "declined" | "cancelled" {
+  if (decision === "accept") return "accepted";
+  if (decision === "acceptForSession") return "accepted_for_session";
+  if (decision === "decline") return "declined";
+  if (decision === "cancel") return "cancelled";
+  return "accepted_with_execpolicy_amendment";
 }
 
 async function chooseConnectorForWorkspace(

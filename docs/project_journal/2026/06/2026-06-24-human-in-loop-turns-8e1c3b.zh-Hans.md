@@ -30,7 +30,7 @@ superseded_by:
 - 跑聚焦的 Web 和 Worker 测试，覆盖 turn aggregation、payload persistence、safety posture 和 interaction resolution。
 - 跑聚焦的 Rust connector 测试，覆盖 command approval 和 request-user-input app-server flows。
 - PR review 前跑完整本地 test/build gate。
-- 最终代码修改后刷新 API 和 Web 部署，然后运行 deployed E2E smoke，并检查 budget/safety posture。
+- 每批代码修改后都刷新 API 和 Web 部署，然后运行 deployed E2E smoke，并检查 budget/safety posture；确认通过后再报告这个 slice ready。
 
 ## 复查跟进
 - 最后一轮 review 发现 permission approval 需要先向 operator 展示 requested `network` 和 `fileSystem` 明细，才能安全批准 turn 或 session scope。
@@ -41,6 +41,7 @@ superseded_by:
 - Sample HITL 数据现在使用泛化 workspace 路径，不再使用 deployment-instance 或本机路径。
 - 最终 review 发现 response delivery acknowledgement 还需要证明 app-server worker 已消费同一个 interaction response。现在 connector 会跟踪每个 app-server turn 的 active interaction，并等待本地 worker delivery acknowledgement 后，Worker 才会记录 browser response。
 - 重复 interaction-resolution insert 在输给 unique constraint 时，会 best-effort 回滚本次分配的 sequence number，避免 sequence gap 和后续不必要的 accounting。
+- App-server v2 command approval 兼容性现在会保留 `availableDecisions`、object 形态的 `acceptWithExecpolicyAmendment` response、`proposedExecpolicyAmendment`、`commandActions` 和 `networkApprovalContext`，让 Thread Centre 能显示 network-specific approval，并把准确的 accepted decision 回写给 app-server。
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。

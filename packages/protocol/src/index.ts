@@ -458,7 +458,19 @@ export type TurnInteractionApprovalDecision =
   | "accept"
   | "acceptForSession"
   | "decline"
-  | "cancel";
+  | "cancel"
+  | {
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: string[];
+      };
+    };
+
+export type TurnInteractionNetworkApprovalContext = {
+  host?: string | undefined;
+  protocol?: string | undefined;
+  port?: number | string | undefined;
+  [key: string]: unknown;
+};
 
 export type TurnInteractionInputAnswer = {
   answers: string[];
@@ -490,6 +502,10 @@ export type TurnInteractionRequestPayload = {
   detail?: string | undefined;
   command?: string | undefined;
   cwd?: string | undefined;
+  command_actions?: unknown[] | undefined;
+  proposed_execpolicy_amendment?: string[] | undefined;
+  network_approval_context?: TurnInteractionNetworkApprovalContext | undefined;
+  available_decisions?: TurnInteractionApprovalDecision[] | undefined;
   grant_root?: string | undefined;
   requested_permissions?: Record<string, unknown> | undefined;
   questions?: TurnInteractionInputQuestion[] | undefined;
@@ -501,7 +517,7 @@ export type TurnInteractionRequestPayload = {
 export type TurnInteractionResolutionPayload = {
   type: "turn_interaction_resolution";
   interaction_id: string;
-  status: "accepted" | "accepted_for_session" | "declined" | "cancelled" | "answered";
+  status: "accepted" | "accepted_for_session" | "accepted_with_execpolicy_amendment" | "declined" | "cancelled" | "answered";
   decision?: TurnInteractionApprovalDecision | undefined;
   answer_count?: number | undefined;
 };

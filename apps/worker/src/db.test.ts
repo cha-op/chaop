@@ -972,6 +972,32 @@ test("recordTurnInteractionResolutionInDb resumes waiting tasks after append", a
   assert.equal(db.claimDeletes, 1);
 });
 
+test("recordTurnInteractionResolutionInDb preserves exec-policy amendment approval decisions", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false });
+
+  const event = await recordTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: {
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: ["touch", "requested.txt"]
+      }
+    }
+  });
+
+  assert.equal(event.kind, "approval.resolved");
+  assert.equal(event.payload?.type, "turn_interaction_resolution");
+  if (event.payload?.type !== "turn_interaction_resolution") {
+    throw new Error("expected turn interaction resolution payload");
+  }
+  assert.equal(event.payload.status, "accepted_with_execpolicy_amendment");
+  assert.deepEqual(event.payload.decision, {
+    acceptWithExecpolicyAmendment: {
+      execpolicy_amendment: ["touch", "requested.txt"]
+    }
+  });
+  assert.equal(db.eventInserts, 1);
+});
+
 test("releaseTurnInteractionResolutionClaimInDb deletes pending claims", async () => {
   const db = turnInteractionResolutionDb({ resolved: false });
 

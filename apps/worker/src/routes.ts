@@ -22,6 +22,7 @@ import {
   type TaskArchiveSyncSummary,
   type ThreadEvent,
   type ThreadEventsResponse,
+  type TurnInteractionApprovalDecision,
   type TurnInteractionResponseDispatch
 } from "@chaop/protocol";
 import {
@@ -1136,12 +1137,7 @@ function isCreateCommandRequest(value: unknown): value is CreateCommandRequest {
 function isResolveTurnInteractionRequest(value: unknown): value is ResolveTurnInteractionRequest {
   if (!isRecord(value)) return false;
   if (value.kind === "approval") {
-    return (
-      value.decision === "accept" ||
-      value.decision === "acceptForSession" ||
-      value.decision === "decline" ||
-      value.decision === "cancel"
-    );
+    return isTurnInteractionApprovalDecision(value.decision);
   }
   if (value.kind === "input") {
     return isRecord(value.answers) &&
@@ -1152,6 +1148,23 @@ function isResolveTurnInteractionRequest(value: unknown): value is ResolveTurnIn
       );
   }
   return false;
+}
+
+function isTurnInteractionApprovalDecision(value: unknown): value is TurnInteractionApprovalDecision {
+  if (
+    value === "accept" ||
+    value === "acceptForSession" ||
+    value === "decline" ||
+    value === "cancel"
+  ) {
+    return true;
+  }
+  if (!isRecord(value)) return false;
+  const amendment = value.acceptWithExecpolicyAmendment;
+  return isRecord(amendment) &&
+    Array.isArray(amendment.execpolicy_amendment) &&
+    amendment.execpolicy_amendment.length > 0 &&
+    amendment.execpolicy_amendment.every((item) => typeof item === "string" && item.trim().length > 0);
 }
 
 function isSetDogfoodSafetyPauseRequest(value: unknown): value is SetDogfoodSafetyPauseRequest {

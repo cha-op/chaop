@@ -1033,7 +1033,22 @@ test("threadTurnsForDisplay exposes pending approval interactions", () => {
           app_server_turn_id: "app-turn-1",
           title: "Approve command execution",
           command: "touch requested.txt",
-          cwd: "/tmp/project"
+          cwd: "/tmp/project",
+          network_approval_context: {
+            host: "registry.npmjs.org",
+            protocol: "https",
+            port: 443
+          },
+          proposed_execpolicy_amendment: ["touch", "requested.txt"],
+          available_decisions: [
+            "decline",
+            {
+              acceptWithExecpolicyAmendment: {
+                execpolicy_amendment: ["touch", "requested.txt"]
+              }
+            },
+            "cancel"
+          ]
         }
       })
     ]
@@ -1043,6 +1058,12 @@ test("threadTurnsForDisplay exposes pending approval interactions", () => {
   assert.equal(turns[0]?.status, "waiting");
   assert.equal(turns[0]?.pending_interactions.length, 1);
   assert.equal(turns[0]?.pending_interactions[0]?.payload.interaction_id, "interaction-1");
+  assert.equal(turns[0]?.pending_interactions[0]?.payload.network_approval_context?.host, "registry.npmjs.org");
+  assert.deepEqual(turns[0]?.pending_interactions[0]?.payload.available_decisions?.[1], {
+    acceptWithExecpolicyAmendment: {
+      execpolicy_amendment: ["touch", "requested.txt"]
+    }
+  });
 });
 
 test("threadTurnsForDisplay clears resolved interactions", () => {

@@ -30,7 +30,7 @@ superseded_by:
 - Run focused Web and Worker tests for turn aggregation, payload persistence, safety posture, and interaction resolution.
 - Run focused Rust connector tests for command approval and request-user-input app-server flows.
 - Run the full local test/build gate before PR review.
-- Refresh API and Web deployments after the final code changes, then run the deployed E2E smoke with budget/safety checks.
+- Refresh API and Web deployments after each code-change batch, then run the deployed E2E smoke with budget/safety checks before reporting the slice ready.
 
 ## Review Follow-Up
 - The final review pass found that permission approvals needed to show the requested `network` and `fileSystem` details before an operator could approve turn or session scope.
@@ -41,6 +41,7 @@ superseded_by:
 - Sample HITL data now uses generic workspace paths rather than deployment-instance or local-machine paths.
 - The final review found that response delivery acknowledgements still needed to prove the app-server worker consumed the matching interaction response. The connector now tracks the active interaction for each app-server turn and waits for a local worker delivery acknowledgement before the Worker records a browser response.
 - Duplicate interaction-resolution insert races now best-effort roll back the sequence number they allocated when the insert loses to the unique constraint, avoiding sequence gaps and unnecessary follow-on accounting.
+- App-server v2 command approval compatibility now preserves `availableDecisions`, object-shaped `acceptWithExecpolicyAmendment` responses, `proposedExecpolicyAmendment`, `commandActions`, and `networkApprovalContext` so Thread Centre can render network-specific approvals and send the exact accepted decision back to app-server.
 
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.
