@@ -1819,6 +1819,7 @@ fn wait_for_app_server_turn_completion(
                     deadline,
                     timeout_seconds,
                     cancel,
+                    next_request_id,
                     channels,
                 )? {
                     return Ok(events);
@@ -1869,6 +1870,7 @@ fn handle_app_server_turn_message(
     deadline: Instant,
     timeout_seconds: u64,
     cancel: &AtomicBool,
+    next_request_id: &mut i64,
     channels: Option<&AppServerCommandChannels>,
 ) -> Result<Option<Vec<ConnectorEvent>>, AppServerCommandError> {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
@@ -1887,6 +1889,7 @@ fn handle_app_server_turn_message(
             deadline,
             timeout_seconds,
             cancel,
+            next_request_id,
             channels,
         )?
     {
@@ -1937,6 +1940,7 @@ fn handle_app_server_turn_request(
     deadline: Instant,
     timeout_seconds: u64,
     cancel: &AtomicBool,
+    next_request_id: &mut i64,
     channels: Option<&AppServerCommandChannels>,
 ) -> Result<bool, AppServerCommandError> {
     if !app_server_turn_request_method(method) || !notification_matches(params, thread_id, turn_id)
@@ -1965,7 +1969,7 @@ fn handle_app_server_turn_request(
     channels.event_sender.send(event).map_err(|_| {
         AppServerCommandError::Other("turn interaction event channel closed".to_owned())
     })?;
-    let response = receive_turn_interaction_response(
+    let response = match receive_turn_interaction_response(
         &channels.interaction_receiver,
         command_id,
         &interaction_id,
@@ -1973,7 +1977,20 @@ fn handle_app_server_turn_request(
         timeout_seconds,
         cancel,
         auto_resolution_deadline(method, params),
-    )?;
+    ) {
+        Ok(response) => response,
+        Err(AppServerCommandError::Cancelled) => {
+            send_app_server_turn_interrupt(socket, *next_request_id, thread_id, turn_id);
+            *next_request_id += 1;
+            return Err(AppServerCommandError::Cancelled);
+        }
+        Err(error @ AppServerCommandError::TimedOut(_)) => {
+            send_app_server_turn_interrupt(socket, *next_request_id, thread_id, turn_id);
+            *next_request_id += 1;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     if response.auto_resolved {
         let event = turn_interaction_resolution_event(&response, request_payload.as_ref())?;
         channels.event_sender.send(event).map_err(|_| {
@@ -7395,6 +7412,93 @@ mod tests {
         assert_eq!(
             events.last().map(|event| event.kind.as_str()),
             Some("command.finished")
+        );
+    }
+
+    #[test]
+    fn app_server_command_interrupts_turn_when_cancelled_during_user_input_interaction() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, _requests, app_responses) = run_fake_app_server_with_turn_interaction(json!({
+            "jsonrpc": "2.0",
+            "id": 81,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-live-1",
+                "turnId": "turn-1",
+                "itemId": "item-input-1",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "header": "Confirm",
+                        "question": "Continue?",
+                        "isOther": false,
+                        "isSecret": false
+                    }
+                ],
+                "autoResolutionMs": null
+            }
+        }));
+        let config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_response_tx, response_rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let command_cancel = Arc::clone(&cancel);
+
+        let handle = thread::spawn(move || {
+            app_server_command_result_events_with_cancel(
+                &config,
+                "session-tree-1",
+                None,
+                "command-1",
+                "Ask for input",
+                command_cancel,
+                Some(AppServerCommandChannels {
+                    event_sender: event_tx,
+                    interaction_receiver: response_rx,
+                }),
+            )
+        });
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input event");
+        assert_eq!(event.kind, "input.requested");
+        cancel.store(true, Ordering::Relaxed);
+
+        let app_response = app_responses
+            .recv_timeout(Duration::from_secs(1))
+            .expect("app-server interrupt request");
+        assert_eq!(
+            app_response.get("method").and_then(Value::as_str),
+            Some("turn/interrupt")
+        );
+        assert_eq!(
+            app_response
+                .pointer("/params/threadId")
+                .and_then(Value::as_str),
+            Some("thread-live-1")
+        );
+        assert_eq!(
+            app_response
+                .pointer("/params/turnId")
+                .and_then(Value::as_str),
+            Some("turn-1")
+        );
+        let events = handle.join().expect("command thread");
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.failed")
         );
     }
 
