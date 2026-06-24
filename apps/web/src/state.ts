@@ -115,11 +115,17 @@ function buildHistoryTurns(threadId: string, events: ThreadEvent[]): ThreadTurnS
         drafts.push(current);
         current = undefined;
       } else {
-        drafts.push({
-          id: `history-${event.id}`,
-          assistant: message.text,
-          events: [event]
-        });
+        const previous = drafts.at(-1);
+        if (previous) {
+          previous.assistant = message.text;
+          previous.events.push(event);
+        } else {
+          drafts.push({
+            id: `history-${event.id}`,
+            assistant: message.text,
+            events: [event]
+          });
+        }
       }
       continue;
     }

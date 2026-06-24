@@ -1058,6 +1058,49 @@ test("threadTurnsForDisplay attaches commandless tool history to the previous tu
   assert.equal(turns[0]?.event_count, 3);
 });
 
+test("threadTurnsForDisplay keeps final assistant history on the same tool turn", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [],
+    [
+      event(
+        "event-1",
+        undefined,
+        1,
+        "command.output",
+        "2026-06-12 10:00 - User: Inspect the app-server attach failure."
+      ),
+      event(
+        "event-2",
+        undefined,
+        2,
+        "command.output",
+        "2026-06-12 10:01 - Assistant: I will inspect the failing path."
+      ),
+      event(
+        "event-3",
+        undefined,
+        3,
+        "command.output",
+        "2026-06-12 10:02 - Tool call: exec_command"
+      ),
+      event(
+        "event-4",
+        undefined,
+        4,
+        "command.output",
+        "2026-06-12 10:03 - Assistant: The failing path is fixed."
+      )
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.prompt, "Inspect the app-server attach failure.");
+  assert.equal(turns[0]?.assistant_summary, "The failing path is fixed.");
+  assert.deepEqual(turns[0]?.progress_summaries, ["2026-06-12 10:02 - Tool call: exec_command"]);
+  assert.equal(turns[0]?.event_count, 4);
+});
+
 function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   return {
     user: {
