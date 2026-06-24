@@ -393,6 +393,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const preparation = await prepareTurnInteractionResolutionInDb(env, eventId, payload.value);
       const dispatch = preparation.dispatch;
       let connectorDelivered = preparation.already_delivered;
+      let confirmedConnectorDelivery = false;
       if (!connectorDelivered) {
         try {
           await markTurnInteractionResolutionDispatchStartedInDb(env, dispatch.command_id, dispatch.interaction_id);
@@ -403,6 +404,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         try {
           await requestTurnInteractionResolution(env, dispatch);
           connectorDelivered = true;
+          confirmedConnectorDelivery = true;
         } catch (error) {
           if (shouldMarkTurnInteractionDeliveryUncertain(error)) {
             await markTurnInteractionResolutionDeliveryUncertainInDb(
@@ -410,12 +412,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
               dispatch.command_id,
               dispatch.interaction_id
             );
-          } else if (shouldReleaseTurnInteractionClaimAfterDispatchError(error)) {
-            await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+            connectorDelivered = true;
+          } else {
+            if (shouldReleaseTurnInteractionClaimAfterDispatchError(error)) {
+              await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
+            }
+            throw error;
           }
-          throw error;
         }
-        await markTurnInteractionResolutionDeliveredInDb(env, dispatch.command_id, dispatch.interaction_id);
+        if (confirmedConnectorDelivery) {
+          await markTurnInteractionResolutionDeliveredInDb(env, dispatch.command_id, dispatch.interaction_id);
+        }
       }
       let event: ThreadEvent;
       try {

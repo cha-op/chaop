@@ -1662,9 +1662,9 @@ export async function prepareTurnInteractionResolutionInDb(
   if (response.kind === "input" && row.kind !== "input.requested") {
     throw new CommandTargetError("Turn interaction is not an input request", 400);
   }
-  const deliveredClaim = await findTurnInteractionResolutionClaim(env, row.command_id, payload.interaction_id);
-  if (claimDeliveredAt(deliveredClaim)) {
-    const resolution = turnInteractionResolutionFromClaim(deliveredClaim, payload);
+  const recoverableClaim = await findTurnInteractionResolutionClaim(env, row.command_id, payload.interaction_id);
+  if (claimDeliveryMayHaveReachedConnector(recoverableClaim)) {
+    const resolution = turnInteractionResolutionFromClaim(recoverableClaim, payload);
     if (!resolution) {
       throw new CommandTargetError("Turn interaction delivery recovery payload is unavailable", 409);
     }
@@ -4303,7 +4303,7 @@ async function claimTurnInteractionResolution(
     .run();
   if (result.meta?.changes === 0) {
     const claim = await findTurnInteractionResolutionClaim(env, commandId, interactionId);
-    if (claimDeliveredAt(claim)) {
+    if (claimDeliveryMayHaveReachedConnector(claim)) {
       const deliveredResolution = turnInteractionResolutionFromClaim(claim, request);
       if (!deliveredResolution) {
         throw new CommandTargetError("Turn interaction delivery recovery payload is unavailable", 409);
@@ -4362,6 +4362,18 @@ function claimDeliveredAt<T extends { delivered_at: string | null }>(
   claim: T | null | undefined
 ): claim is T & { delivered_at: string } {
   return typeof claim?.delivered_at === "string" && claim.delivered_at.trim().length > 0;
+}
+
+function claimDeliveryUncertainAt<T extends { delivery_uncertain_at: string | null }>(
+  claim: T | null | undefined
+): claim is T & { delivery_uncertain_at: string } {
+  return typeof claim?.delivery_uncertain_at === "string" && claim.delivery_uncertain_at.trim().length > 0;
+}
+
+function claimDeliveryMayHaveReachedConnector<T extends { delivered_at: string | null; delivery_uncertain_at: string | null }>(
+  claim: T | null | undefined
+): claim is T & ({ delivered_at: string } | { delivery_uncertain_at: string }) {
+  return claimDeliveredAt(claim) || claimDeliveryUncertainAt(claim);
 }
 
 function parseClaimedTurnInteractionResponse(responseJson: string | null): ResolveTurnInteractionRequest | undefined {

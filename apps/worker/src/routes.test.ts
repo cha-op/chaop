@@ -223,9 +223,9 @@ test("host session refresh requires D1 binding outside sample mode", async () =>
   }
 });
 
-test("turn interaction response keeps claim when connector delivery is ambiguous", async () => {
+test("turn interaction response records recovery event when connector delivery is ambiguous", async () => {
   const db = turnInteractionResolutionRouteDb();
-  let internalPath = "";
+  const internalPaths: string[] = [];
   const response = await handleRequest(
     new Request("https://api.example.com/api/thread-events/event-request-1/interaction", {
       method: "POST",
@@ -244,7 +244,13 @@ test("turn interaction response keeps claim when connector delivery is ambiguous
         idFromName: () => ({}) as DurableObjectId,
         get: () => ({
           fetch: async (input: RequestInfo | URL) => {
-            internalPath = new URL(String(input)).pathname;
+            const path = new URL(String(input)).pathname;
+            internalPaths.push(path);
+            if (path !== "/internal/resolve-turn-interaction") {
+              return new Response(JSON.stringify({ accepted: true }), {
+                headers: { "content-type": "application/json; charset=utf-8" }
+              });
+            }
             return new Response(JSON.stringify({
               error: "Connector timed out while receiving the turn interaction response",
               delivery_state: "sent_unknown"
@@ -257,15 +263,18 @@ test("turn interaction response keeps claim when connector delivery is ambiguous
       } as unknown as DurableObjectNamespace
     }
   );
-  const body = await response.json() as { error?: string };
+  const body = await response.json() as { accepted?: boolean; event?: { kind?: string; payload?: { status?: string } } };
 
-  assert.equal(response.status, 504);
-  assert.match(body.error ?? "", /timed out/);
-  assert.equal(internalPath, "/internal/resolve-turn-interaction");
+  assert.equal(response.status, 202);
+  assert.equal(body.accepted, true);
+  assert.equal(body.event?.kind, "approval.resolved");
+  assert.equal(body.event?.payload?.status, "accepted");
+  assert.deepEqual(internalPaths, ["/internal/resolve-turn-interaction", "/internal/broadcast-thread-events"]);
   assert.equal(db.claimInserts, 1);
   assert.equal(db.dispatchStartUpdates, 1);
   assert.equal(db.deliveryUncertainUpdates, 1);
-  assert.equal(db.claimDeletes, 0);
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.claimDeletes, 1);
 });
 
 test("turn interaction response releases claim when connector was not sent", async () => {
@@ -5064,6 +5073,7 @@ function turnInteractionResolutionRouteDb(): D1Database & {
   readonly claimInserts: number;
   readonly dispatchStartUpdates: number;
   readonly deliveryUncertainUpdates: number;
+  readonly eventInserts: number;
 } {
   const safetyDb = safetyPauseDb();
   const payload = JSON.stringify({
@@ -5085,6 +5095,8 @@ function turnInteractionResolutionRouteDb(): D1Database & {
     claimInserts: 0,
     dispatchStartUpdates: 0,
     deliveryUncertainUpdates: 0,
+    eventInserts: 0,
+    taskUpdates: 0,
     staleClaimDeletes: 0
   };
   const db = {
@@ -5104,6 +5116,28 @@ function turnInteractionResolutionRouteDb(): D1Database & {
                   created_at: "2026-06-24T10:00:00.000Z",
                   lease_owner_connector_id: "connector-online",
                   state: "running"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT e\.id, e\.workspace_id, e\.thread_id, e\.command_id, e\.kind, e\.payload_json,/.test(sql)) {
+        return {
+          bind(eventId: string) {
+            assert.equal(eventId, "event-request-1");
+            return {
+              async first() {
+                return {
+                  id: "event-request-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  command_id: "command-1",
+                  kind: "approval.requested",
+                  payload_json: payload,
+                  task_id: "task-1",
+                  lease_owner_connector_id: "connector-online"
                 };
               }
             };
@@ -5246,6 +5280,50 @@ function turnInteractionResolutionRouteDb(): D1Database & {
         };
       }
 
+      if (/UPDATE tasks\s+SET state = 'running'/.test(sql)) {
+        return {
+          bind(connectorId: string | null, assignedAgentConnectorId: string | null, updatedAt: string, taskId: string) {
+            assert.equal(connectorId, "connector-online");
+            assert.equal(assignedAgentConnectorId, "connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId, "task-1");
+            return {
+              async run() {
+                counters.taskUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads\s+SET last_seq = last_seq \+ 1/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 2 };
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
       try {
         return safetyDb.prepare(sql);
       } catch (error) {
@@ -5266,6 +5344,9 @@ function turnInteractionResolutionRouteDb(): D1Database & {
     },
     get deliveryUncertainUpdates() {
       return counters.deliveryUncertainUpdates;
+    },
+    get eventInserts() {
+      return counters.eventInserts;
     }
   };
 
@@ -5274,6 +5355,7 @@ function turnInteractionResolutionRouteDb(): D1Database & {
     readonly claimInserts: number;
     readonly dispatchStartUpdates: number;
     readonly deliveryUncertainUpdates: number;
+    readonly eventInserts: number;
   };
 }
 

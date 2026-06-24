@@ -52,6 +52,7 @@ superseded_by:
 - 最终合并准备复查发现 dispatch-started claim 还需要显式恢复路径。Worker 现在会在短期防重复窗口内保留模糊的 `sent_unknown` delivery，只对 `not_sent` 或 connector 明确拒绝的 response 释放 claim，并在更长超时后回收 stale dispatch-started claim，避免被中断的 response 永久卡住 approval 或 input request。
 - 后续复查发现模糊 delivery 需要独立的持久状态，不能只靠 dispatch-started timestamp。Worker 现在会给 `sent_unknown` claim 标记 `delivery_uncertain_at`，因此不会被 TTL 清理并重新派发；但真正从未发出的 dispatch-started claim 仍然可以在较长超时后恢复。浏览器提交 input 时也会保留原始 answer 文本；Worker 会拒绝 crafted request 中不属于给定 options 的 answer，除非该问题允许 `is_other`；connector 也会按 Worker delivery timeout 等待 app-server worker acknowledgement。
 - 最新恢复路径复查处理了 app-server 已消费浏览器响应、但 Worker 写入 resolution event 前命令已经结束的情况。现在 delivered claim 会先于 active-command 检查恢复；input 恢复只依赖已保存的安全 resolution summary，不需要再次提交 secret answer；WorkspaceDO 也不再为 connector acknowledgement 发送 connector 不消费的二次 ack。
+- Independent PR review 发现 `sent_unknown` claim 在 response 已离开 Worker、但没有观察到 connector acknowledgement 时仍可能 deadlock。Worker 现在把 uncertain delivery 当成不能重试派发的状态：能立即记录安全 resolution event 时就直接记录；后续显式 retry 也会从 claim 恢复，而不会再次把 response 发送给 app-server。
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。
@@ -60,6 +61,7 @@ superseded_by:
 - Response claim 也会保存 dispatch-started marker。这是在显式 operator response 路径上的一次额外有界写入，用来避免不确定的 app-server delivery 被自动清理后再次派发。
 - 模糊的 `sent_unknown` response 只会在显式 operator response 路径上额外写入一个有界 marker：`delivery_uncertain_at`。这里不增加后台 retry、poller 或 sweep；恢复需要后续显式 operator action，或未来的手动恢复 UI。
 - Delivered-claim recovery 仍然只在下一次显式 response attempt 中顺带发生。它不增加轮询或新的写入路径，也避免把 app-server 可能已经消费过的 response 再发送一次。
+- Uncertain-delivery recovery 使用和 delivered-claim recovery 相同的显式 response 路径。不增加后台 sweep、poller 或 connector inventory refresh，也避免 `sent_unknown` timeout 后重复向 app-server 发送 response。
 - Dispatch-started claim recovery 只会在更长超时后、下一次 operator response attempt 里顺带发生；不会新增后台任务、轮询或 sweep。
 - Stale claim recovery 只发生在 response dispatch 路径里，不增加后台扫描。
 - WebSocket delivery 继续作为首选 realtime path；现有 10 秒 fallback polling 不变。

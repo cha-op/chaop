@@ -983,30 +983,25 @@ test("prepareTurnInteractionResolutionInDb reclaims stale dispatch-started claim
   assert.equal(db.claimInserts, 1);
 });
 
-test("prepareTurnInteractionResolutionInDb does not reclaim uncertain delivery claims", async () => {
+test("prepareTurnInteractionResolutionInDb recovers uncertain delivery claims without redispatch", async () => {
   const db = turnInteractionResolutionDb({
     resolved: false,
     claimed: true,
-    staleClaim: true,
     dispatchStartedClaim: true,
     staleDispatchStartedClaim: true,
     deliveryUncertainClaim: true
   });
 
-  await assert.rejects(
-    () =>
-      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
-        kind: "approval",
-        decision: "accept"
-      }),
-    (error: unknown) =>
-      error instanceof CommandTargetError &&
-      error.status === 409 &&
-      /already being resolved/.test(error.message)
-  );
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
 
-  assert.equal(db.staleClaimDeletes, 1);
-  assert.equal(db.claimInserts, 1);
+  assert.equal(preparation.already_delivered, true);
+  assert.equal(preparation.resolution?.payload.type, "turn_interaction_resolution");
+  assert.equal(preparation.resolution?.payload.status, "accepted");
+  assert.equal(db.staleClaimDeletes, 0);
+  assert.equal(db.claimInserts, 0);
 });
 
 test("prepareTurnInteractionResolutionInDb rejects unavailable approval decisions", async () => {
