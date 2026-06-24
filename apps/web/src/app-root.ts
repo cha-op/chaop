@@ -88,6 +88,7 @@ const FALLBACK_POLL_MS = 10_000;
 const BUDGET_REFRESH_MS = 60_000;
 const HOST_SESSIONS_AUTO_REFRESH_MS = 60_000;
 const SOCKET_RECONNECT_MS = 3_000;
+const OTHER_ANSWER_VALUE = "__chaop_other__";
 const SHOW_CODEX_CLI_FALLBACK = import.meta.env.VITE_CHAOP_SHOW_CODEX_CLI_FALLBACK === "true";
 
 @customElement("chaop-app")
@@ -725,7 +726,7 @@ export class ChaopApp extends LitElement {
     const submitting = Boolean(this.interactionSubmitting[interaction.event_id]);
     if (payload.request_kind === "input") {
       const questions = payload.questions ?? [];
-      const complete = questions.every((question) => this.interactionAnswer(interaction.event_id, question.id).trim().length > 0);
+      const complete = questions.every((question) => this.resolvedInteractionAnswer(interaction.event_id, question.id).trim().length > 0);
       return html`
         <section class="interaction-card input">
           <header>
@@ -738,41 +739,7 @@ export class ChaopApp extends LitElement {
           ${payload.detail ? html`<p>${payload.detail}</p>` : nothing}
           <div class="interaction-questions">
             ${questions.map(
-              (question) => html`
-                <label>
-                  <span>${question.header}</span>
-                  <small>${question.question}</small>
-                  ${question.options && question.options.length > 0
-                    ? html`
-                        <select
-                          .value=${this.interactionAnswer(interaction.event_id, question.id)}
-                          @change=${(event: Event) =>
-                            this.setInteractionAnswer(
-                              interaction.event_id,
-                              question.id,
-                              (event.target as HTMLSelectElement).value
-                            )}
-                        >
-                          <option value="">Choose an answer</option>
-                          ${question.options.map(
-                            (option) => html`<option value=${option.label}>${option.label}</option>`
-                          )}
-                        </select>
-                      `
-                    : html`
-                        <input
-                          type=${question.is_secret ? "password" : "text"}
-                          .value=${this.interactionAnswer(interaction.event_id, question.id)}
-                          @input=${(event: InputEvent) =>
-                            this.setInteractionAnswer(
-                              interaction.event_id,
-                              question.id,
-                              (event.target as HTMLInputElement).value
-                            )}
-                        />
-                      `}
-                </label>
-              `
+              (question) => this.renderInputQuestion(interaction.event_id, question)
             )}
           </div>
           <div class="interaction-actions">
@@ -835,8 +802,76 @@ export class ChaopApp extends LitElement {
           >
             Decline
           </button>
+          <button
+            type="button"
+            title=${this.safetyButtonTitle("turn_interaction")}
+            ?disabled=${submitting || this.safetyBlocked("turn_interaction")}
+            @click=${() => void this.resolveApprovalInteraction(interaction, "cancel")}
+          >
+            Cancel turn
+          </button>
         </div>
       </section>
+    `;
+  }
+
+  private renderInputQuestion(
+    eventId: string,
+    question: NonNullable<PendingTurnInteraction["payload"]["questions"]>[number]
+  ) {
+    const answer = this.interactionAnswer(eventId, question.id);
+    const otherSelected = question.is_other && answer === OTHER_ANSWER_VALUE;
+    return html`
+      <label>
+        <span>${question.header}</span>
+        <small>${question.question}</small>
+        ${question.options && question.options.length > 0
+          ? html`
+              <select
+                .value=${answer}
+                @change=${(event: Event) =>
+                  this.setInteractionAnswer(
+                    eventId,
+                    question.id,
+                    (event.target as HTMLSelectElement).value
+                  )}
+              >
+                <option value="">Choose an answer</option>
+                ${question.options.map(
+                  (option) => html`<option value=${option.label}>${option.label}</option>`
+                )}
+                ${question.is_other ? html`<option value=${OTHER_ANSWER_VALUE}>Other</option>` : nothing}
+              </select>
+              ${otherSelected
+                ? html`
+                    <input
+                      class="interaction-other-input"
+                      type=${question.is_secret ? "password" : "text"}
+                      placeholder="Other answer"
+                      .value=${this.interactionOtherAnswer(eventId, question.id)}
+                      @input=${(event: InputEvent) =>
+                        this.setInteractionOtherAnswer(
+                          eventId,
+                          question.id,
+                          (event.target as HTMLInputElement).value
+                        )}
+                    />
+                  `
+                : nothing}
+            `
+          : html`
+              <input
+                type=${question.is_secret ? "password" : "text"}
+                .value=${answer}
+                @input=${(event: InputEvent) =>
+                  this.setInteractionAnswer(
+                    eventId,
+                    question.id,
+                    (event.target as HTMLInputElement).value
+                  )}
+              />
+            `}
+      </label>
     `;
   }
 
@@ -1318,6 +1353,15 @@ export class ChaopApp extends LitElement {
     return this.interactionDrafts[eventId]?.[questionId] ?? "";
   }
 
+  private interactionOtherAnswer(eventId: string, questionId: string): string {
+    return this.interactionDrafts[eventId]?.[this.interactionOtherKey(questionId)] ?? "";
+  }
+
+  private resolvedInteractionAnswer(eventId: string, questionId: string): string {
+    const answer = this.interactionAnswer(eventId, questionId);
+    return answer === OTHER_ANSWER_VALUE ? this.interactionOtherAnswer(eventId, questionId) : answer;
+  }
+
   private setInteractionAnswer(eventId: string, questionId: string, value: string): void {
     this.interactionDrafts = {
       ...this.interactionDrafts,
@@ -1326,6 +1370,14 @@ export class ChaopApp extends LitElement {
         [questionId]: value
       }
     };
+  }
+
+  private setInteractionOtherAnswer(eventId: string, questionId: string, value: string): void {
+    this.setInteractionAnswer(eventId, this.interactionOtherKey(questionId), value);
+  }
+
+  private interactionOtherKey(questionId: string): string {
+    return `${questionId}:other`;
   }
 
   private setInteractionSubmitting(eventId: string, submitting: boolean): void {
@@ -1365,7 +1417,7 @@ export class ChaopApp extends LitElement {
     if (!this.guardSafetyAction("turn_interaction")) return;
     const answers: Record<string, { answers: string[] }> = {};
     for (const question of interaction.payload.questions ?? []) {
-      const answer = this.interactionAnswer(interaction.event_id, question.id).trim();
+      const answer = this.resolvedInteractionAnswer(interaction.event_id, question.id).trim();
       if (answer.length > 0) {
         answers[question.id] = { answers: [answer] };
       }
@@ -1925,7 +1977,9 @@ export class ChaopApp extends LitElement {
 
     return commands.map((command) =>
       command.id === event.command_id
-        ? { ...command, state, updated_at: event.created_at }
+        ? isTerminalCommandState(command.state) && !isTerminalCommandState(state)
+          ? command
+          : { ...command, state, updated_at: event.created_at }
         : command
     );
   }
@@ -1946,7 +2000,11 @@ export class ChaopApp extends LitElement {
     if (!state) return tasks;
 
     return tasks.map((task) =>
-      task.id === command.task_id ? { ...task, state, updated_at: event.created_at } : task
+      task.id === command.task_id
+        ? isTerminalTaskState(task.state) && !isTerminalTaskState(state)
+          ? task
+          : { ...task, state, updated_at: event.created_at }
+        : task
     );
   }
 }
@@ -2296,7 +2354,6 @@ function cleanApiErrorMessage(message: string): string {
 
 function commandStateForEvent(kind: ThreadEvent["kind"]): CommandSummary["state"] | undefined {
   if (kind === "command.started") return "running";
-  if (kind === "approval.resolved" || kind === "input.received") return "running";
   if (kind === "command.finished") return "succeeded";
   if (kind === "command.failed") return "failed";
   return undefined;
@@ -2310,6 +2367,14 @@ function taskStateForEvent(kind: ThreadEvent["kind"]): TaskSummary["state"] | un
   if (kind === "command.finished") return "done";
   if (kind === "command.failed") return "failed";
   return undefined;
+}
+
+function isTerminalCommandState(state: CommandSummary["state"]): boolean {
+  return state === "succeeded" || state === "failed";
+}
+
+function isTerminalTaskState(state: TaskSummary["state"]): boolean {
+  return state === "done" || state === "failed";
 }
 
 function turnStatusLabel(status: ThreadTurnSummary["status"]): string {

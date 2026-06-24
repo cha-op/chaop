@@ -56,6 +56,7 @@ import {
   recordTurnInteractionResolutionInDb,
   recordHostSessionBackfillEvents,
   recordHostSessions,
+  releaseTurnInteractionResolutionClaimInDb,
   setDogfoodSafetyPauseInDb,
   unarchiveTaskInDb
 } from "./db.js";
@@ -386,7 +387,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (safetyResponse) return safetyResponse;
       const eventId = decodeURIComponent(turnInteractionMatch[1] ?? "");
       const dispatch = await prepareTurnInteractionResolutionInDb(env, eventId, payload.value);
-      await requestTurnInteractionResolution(env, dispatch);
+      try {
+        await requestTurnInteractionResolution(env, dispatch);
+      } catch (error) {
+        await releaseTurnInteractionResolutionClaimInDb(env, dispatch.interaction_id);
+        throw error;
+      }
       const event = await recordTurnInteractionResolutionInDb(env, eventId, payload.value);
       await broadcastThreadEvents(env, [event]);
       const response: ResolveTurnInteractionResponse = {

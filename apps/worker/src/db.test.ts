@@ -17,6 +17,7 @@ import {
   recordHostSessionBackfillEvents,
   recordHostSessions,
   recordTurnInteractionResolutionInDb,
+  releaseTurnInteractionResolutionClaimInDb,
   updateConnectorCapabilities
 } from "./db.js";
 import type { AgentAppServerInstance } from "@chaop/protocol";
@@ -741,6 +742,36 @@ test("prepareTurnInteractionResolutionInDb rejects already resolved interactions
   assert.equal(db.eventInserts, 0);
 });
 
+test("prepareTurnInteractionResolutionInDb claims pending interactions before dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false });
+
+  const dispatch = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+
+  assert.equal(dispatch.command_id, "command-1");
+  assert.equal(dispatch.interaction_id, "interaction-1");
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects claimed interactions before dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false, claimed: true });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) => error instanceof CommandTargetError && error.status === 409
+  );
+
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.claimInserts, 1);
+});
+
 test("recordTurnInteractionResolutionInDb rejects already resolved interactions before append", async () => {
   const db = turnInteractionResolutionDb({ resolved: true });
 
@@ -755,6 +786,14 @@ test("recordTurnInteractionResolutionInDb rejects already resolved interactions 
 
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.eventInserts, 0);
+});
+
+test("releaseTurnInteractionResolutionClaimInDb deletes pending claims", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false });
+
+  await releaseTurnInteractionResolutionClaimInDb({ DB: db } as Env, "interaction-1");
+
+  assert.equal(db.claimDeletes, 1);
 });
 
 test("markConnectorDisconnected fails active commands and marks connector offline", async () => {
@@ -1612,7 +1651,7 @@ test("chooseConnectorForLocalThread rejects connectors without app-server suppor
   );
 });
 
-function turnInteractionResolutionDb(options: { resolved: boolean }) {
+function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boolean }) {
   const payload = JSON.stringify({
     type: "turn_interaction",
     interaction_id: "interaction-1",
@@ -1628,7 +1667,9 @@ function turnInteractionResolutionDb(options: { resolved: boolean }) {
   });
   const counters = {
     eventInserts: 0,
-    resolutionChecks: 0
+    resolutionChecks: 0,
+    claimInserts: 0,
+    claimDeletes: 0
   };
   const db = {
     prepare(sql: string) {
@@ -1688,6 +1729,44 @@ function turnInteractionResolutionDb(options: { resolved: boolean }) {
         };
       }
 
+      if (/INSERT INTO turn_interaction_resolution_claims/.test(sql)) {
+        return {
+          bind(
+            interactionId: string,
+            eventId: string,
+            commandId: string,
+            responseKind: string,
+            createdAt: string
+          ) {
+            assert.equal(interactionId, "interaction-1");
+            assert.equal(eventId, "event-request-1");
+            assert.equal(commandId, "command-1");
+            assert.equal(responseKind, "approval");
+            assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            return {
+              async run() {
+                counters.claimInserts += 1;
+                return { meta: { changes: options.claimed ? 0 : 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/DELETE FROM turn_interaction_resolution_claims/.test(sql)) {
+        return {
+          bind(interactionId: string) {
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async run() {
+                counters.claimDeletes += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
       if (/INSERT INTO events/.test(sql)) {
         return {
           bind() {
@@ -1708,6 +1787,12 @@ function turnInteractionResolutionDb(options: { resolved: boolean }) {
     },
     get resolutionChecks() {
       return counters.resolutionChecks;
+    },
+    get claimInserts() {
+      return counters.claimInserts;
+    },
+    get claimDeletes() {
+      return counters.claimDeletes;
     }
   };
 

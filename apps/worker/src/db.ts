@@ -1661,6 +1661,7 @@ export async function prepareTurnInteractionResolutionInDb(
   if (await hasTurnInteractionResolution(env, row.command_id, payload.interaction_id)) {
     throw new CommandTargetError("Turn interaction has already been resolved", 409);
   }
+  await claimTurnInteractionResolution(env, row.id, row.command_id, payload.interaction_id, response.kind);
   return {
     command_id: row.command_id,
     interaction_id: payload.interaction_id,
@@ -1715,6 +1716,18 @@ export async function recordTurnInteractionResolutionInDb(
     throw new NotFoundError("Thread not found");
   }
   return event;
+}
+
+export async function releaseTurnInteractionResolutionClaimInDb(
+  env: Env,
+  interactionId: string
+): Promise<void> {
+  if (!env.DB) return;
+  await env.DB.prepare(
+    "DELETE FROM turn_interaction_resolution_claims WHERE interaction_id = ?"
+  )
+    .bind(interactionId)
+    .run();
 }
 
 export async function chooseConnectorForLocalThread(
@@ -3986,6 +3999,26 @@ async function hasTurnInteractionResolution(
     .bind(commandId, interactionId)
     .first<{ id: string }>();
   return Boolean(row);
+}
+
+async function claimTurnInteractionResolution(
+  env: Env,
+  eventId: string,
+  commandId: string,
+  interactionId: string,
+  responseKind: ResolveTurnInteractionRequest["kind"]
+): Promise<void> {
+  const result = await env.DB!.prepare(
+    `INSERT INTO turn_interaction_resolution_claims (
+       interaction_id, request_event_id, command_id, response_kind, created_at
+     ) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(interaction_id) DO NOTHING`
+  )
+    .bind(interactionId, eventId, commandId, responseKind, new Date().toISOString())
+    .run();
+  if (result.meta?.changes === 0) {
+    throw new CommandTargetError("Turn interaction has already been resolved", 409);
+  }
 }
 
 function isTurnInteractionRequestPayload(value: unknown): value is TurnInteractionRequestPayload {

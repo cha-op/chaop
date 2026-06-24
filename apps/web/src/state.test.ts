@@ -1088,6 +1088,28 @@ test("threadTurnsForDisplay clears resolved interactions", () => {
   assert.equal(turns[0]?.pending_interactions.length, 0);
 });
 
+test("threadTurnsForDisplay keeps terminal state after late interaction resolution", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [command("command-1", { state: "succeeded" })],
+    [
+      event("event-1", "command-1", 1, "command.started", "Connector started Codex app-server turn."),
+      event("event-2", "command-1", 2, "command.finished", "Command finished."),
+      event("event-3", "command-1", 3, "approval.resolved", "Approval accepted.", {
+        payload: {
+          type: "turn_interaction_resolution",
+          interaction_id: "interaction-1",
+          status: "accepted",
+          decision: "accept"
+        }
+      })
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "succeeded");
+});
+
 test("threadTurnsForDisplay renders commandless backfilled history turns", () => {
   const turns = threadTurnsForDisplay(
     "thread-1",

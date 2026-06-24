@@ -250,7 +250,17 @@ function buildThreadTurn(
 
 function threadTurnStatusFromEvents(events: ThreadEvent[]): ThreadTurnStatus | undefined {
   let status: ThreadTurnStatus | undefined;
+  let terminalStatus: ThreadTurnStatus | undefined;
   for (const event of events) {
+    if (event.kind === "command.finished") {
+      terminalStatus = "succeeded";
+      continue;
+    }
+    if (event.kind === "command.failed") {
+      terminalStatus = "failed";
+      continue;
+    }
+    if (terminalStatus) continue;
     if (event.kind === "command.accepted") status = "pending";
     if (
       event.kind === "command.started" ||
@@ -267,10 +277,8 @@ function threadTurnStatusFromEvents(events: ThreadEvent[]): ThreadTurnStatus | u
     ) {
       status = "waiting";
     }
-    if (event.kind === "command.finished") status = "succeeded";
-    if (event.kind === "command.failed") status = "failed";
   }
-  return status;
+  return terminalStatus ?? status;
 }
 
 function pendingTurnInteractions(events: ThreadEvent[]): PendingTurnInteraction[] {
