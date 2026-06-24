@@ -1058,6 +1058,24 @@ test("threadTurnsForDisplay attaches commandless tool history to the previous tu
   assert.equal(turns[0]?.event_count, 3);
 });
 
+test("threadTurnsForDisplay leaves leading commandless tool history in raw events only", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [],
+    [
+      event(
+        "event-1",
+        undefined,
+        1,
+        "command.output",
+        "2026-06-12 10:02 - Tool call: exec_command"
+      )
+    ]
+  );
+
+  assert.equal(turns.length, 0);
+});
+
 test("threadTurnsForDisplay keeps final assistant history on the same tool turn", () => {
   const turns = threadTurnsForDisplay(
     "thread-1",

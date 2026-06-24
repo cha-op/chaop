@@ -87,13 +87,7 @@ function buildHistoryTurns(threadId: string, events: ThreadEvent[]): ThreadTurnS
     if (target) {
       target.events.push(event);
       target.progress_summaries = appendProgressSummary(target.progress_summaries, event.summary);
-      return;
     }
-    drafts.push({
-      id: `history-${event.id}`,
-      events: [event],
-      progress_summaries: [event.summary]
-    });
   };
 
   for (const event of historyEvents) {
