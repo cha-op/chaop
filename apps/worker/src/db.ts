@@ -1678,8 +1678,10 @@ export async function recordTurnInteractionResolutionInDb(
     throw new Error("DB binding is required for turn interaction resolution");
   }
   const row = await env.DB.prepare(
-    `SELECT e.id, e.workspace_id, e.thread_id, e.command_id, e.kind, e.payload_json
+    `SELECT e.id, e.workspace_id, e.thread_id, e.command_id, e.kind, e.payload_json,
+            cmd.task_id, cmd.lease_owner_connector_id
      FROM events e
+     LEFT JOIN commands cmd ON cmd.id = e.command_id
      WHERE e.id = ?
      LIMIT 1`
   )
@@ -1691,6 +1693,8 @@ export async function recordTurnInteractionResolutionInDb(
       command_id: string | null;
       kind: ThreadEvent["kind"];
       payload_json: string | null;
+      task_id: string | null;
+      lease_owner_connector_id: string | null;
     }>();
   if (!row || !row.command_id) {
     throw new NotFoundError("Turn interaction event not found");
@@ -1715,18 +1719,32 @@ export async function recordTurnInteractionResolutionInDb(
   if (!event) {
     throw new NotFoundError("Thread not found");
   }
+  if (row.task_id) {
+    await env.DB.prepare(
+      `UPDATE tasks
+       SET state = 'running',
+           connector_id = COALESCE(?, connector_id),
+           assigned_agent = CASE WHEN ? IS NOT NULL THEN 'chaop-agent' ELSE assigned_agent END,
+           updated_at = ?
+       WHERE id = ?
+         AND state IN ('waiting_for_approval', 'waiting_for_input')`
+    )
+      .bind(row.lease_owner_connector_id, row.lease_owner_connector_id, event.created_at, row.task_id)
+      .run();
+  }
   return event;
 }
 
 export async function releaseTurnInteractionResolutionClaimInDb(
   env: Env,
+  commandId: string,
   interactionId: string
 ): Promise<void> {
   if (!env.DB) return;
   await env.DB.prepare(
-    "DELETE FROM turn_interaction_resolution_claims WHERE interaction_id = ?"
+    "DELETE FROM turn_interaction_resolution_claims WHERE command_id = ? AND interaction_id = ?"
   )
-    .bind(interactionId)
+    .bind(commandId, interactionId)
     .run();
 }
 
@@ -4012,7 +4030,7 @@ async function claimTurnInteractionResolution(
     `INSERT INTO turn_interaction_resolution_claims (
        interaction_id, request_event_id, command_id, response_kind, created_at
      ) VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(interaction_id) DO NOTHING`
+     ON CONFLICT(command_id, interaction_id) DO NOTHING`
   )
     .bind(interactionId, eventId, commandId, responseKind, new Date().toISOString())
     .run();

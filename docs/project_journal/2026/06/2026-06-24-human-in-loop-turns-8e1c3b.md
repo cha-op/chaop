@@ -5,7 +5,7 @@ status: active
 created: 2026-06-24
 updated: 2026-06-24
 branch: wip/human-in-loop-turns
-pr:
+pr: 21
 supersedes:
 superseded_by:
 ---
@@ -34,5 +34,6 @@ superseded_by:
 
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.
+- Resolution claims are scoped by command plus interaction so repeated app-server request IDs across turns do not strand later responses.
 - WebSocket delivery remains the preferred realtime path. The existing 10-second fallback polling remains unchanged.
 - The new `turn_interaction` safety action allows the hard-limit and pause controls to block operator responses before they create D1 writes.

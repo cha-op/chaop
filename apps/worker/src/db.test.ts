@@ -788,10 +788,23 @@ test("recordTurnInteractionResolutionInDb rejects already resolved interactions 
   assert.equal(db.eventInserts, 0);
 });
 
+test("recordTurnInteractionResolutionInDb resumes waiting tasks after append", async () => {
+  const db = turnInteractionResolutionDb({ resolved: false });
+
+  const event = await recordTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
+
+  assert.equal(event.kind, "approval.resolved");
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.taskUpdates, 1);
+});
+
 test("releaseTurnInteractionResolutionClaimInDb deletes pending claims", async () => {
   const db = turnInteractionResolutionDb({ resolved: false });
 
-  await releaseTurnInteractionResolutionClaimInDb({ DB: db } as Env, "interaction-1");
+  await releaseTurnInteractionResolutionClaimInDb({ DB: db } as Env, "command-1", "interaction-1");
 
   assert.equal(db.claimDeletes, 1);
 });
@@ -1669,7 +1682,8 @@ function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boo
     eventInserts: 0,
     resolutionChecks: 0,
     claimInserts: 0,
-    claimDeletes: 0
+    claimDeletes: 0,
+    taskUpdates: 0
   };
   const db = {
     prepare(sql: string) {
@@ -1694,7 +1708,7 @@ function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boo
         };
       }
 
-      if (/SELECT e\.id, e\.workspace_id, e\.thread_id, e\.command_id, e\.kind, e\.payload_json/.test(sql)) {
+      if (/SELECT e\.id, e\.workspace_id, e\.thread_id, e\.command_id, e\.kind, e\.payload_json,/.test(sql)) {
         return {
           bind(eventId: string) {
             assert.equal(eventId, "event-request-1");
@@ -1706,7 +1720,9 @@ function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boo
                   thread_id: "thread-1",
                   command_id: "command-1",
                   kind: "approval.requested",
-                  payload_json: payload
+                  payload_json: payload,
+                  task_id: "task-1",
+                  lease_owner_connector_id: "connector-online"
                 };
               }
             };
@@ -1755,12 +1771,44 @@ function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boo
 
       if (/DELETE FROM turn_interaction_resolution_claims/.test(sql)) {
         return {
-          bind(interactionId: string) {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
             assert.equal(interactionId, "interaction-1");
             return {
               async run() {
                 counters.claimDeletes += 1;
                 return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE tasks\s+SET state = 'running'/.test(sql)) {
+        return {
+          bind(connectorId: string | null, assignedAgentConnectorId: string | null, updatedAt: string, taskId: string) {
+            assert.equal(connectorId, "connector-online");
+            assert.equal(assignedAgentConnectorId, "connector-online");
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(taskId, "task-1");
+            return {
+              async run() {
+                counters.taskUpdates += 1;
+                return { meta: { changes: 1 } };
+              }
+            };
+          }
+        };
+      }
+
+      if (/UPDATE threads\s+SET last_seq = last_seq \+ 1/.test(sql)) {
+        return {
+          bind(updatedAt: string, threadId: string) {
+            assert.match(updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+            assert.equal(threadId, "thread-1");
+            return {
+              async first() {
+                return { last_seq: 2 };
               }
             };
           }
@@ -1793,6 +1841,9 @@ function turnInteractionResolutionDb(options: { resolved: boolean; claimed?: boo
     },
     get claimDeletes() {
       return counters.claimDeletes;
+    },
+    get taskUpdates() {
+      return counters.taskUpdates;
     }
   };
 

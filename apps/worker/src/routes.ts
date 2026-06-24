@@ -390,7 +390,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       try {
         await requestTurnInteractionResolution(env, dispatch);
       } catch (error) {
-        await releaseTurnInteractionResolutionClaimInDb(env, dispatch.interaction_id);
+        await releaseTurnInteractionResolutionClaimInDb(env, dispatch.command_id, dispatch.interaction_id);
         throw error;
       }
       const event = await recordTurnInteractionResolutionInDb(env, eventId, payload.value);

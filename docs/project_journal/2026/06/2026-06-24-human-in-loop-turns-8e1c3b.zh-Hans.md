@@ -5,7 +5,7 @@ status: active
 created: 2026-06-24
 updated: 2026-06-24
 branch: wip/human-in-loop-turns
-pr:
+pr: 21
 supersedes:
 superseded_by:
 ---
@@ -34,5 +34,6 @@ superseded_by:
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。
+- Resolution claim 按 command 和 interaction 共同限定，避免不同 turn 复用 app-server request ID 时让后续 response 被错误拦住。
 - WebSocket delivery 继续作为首选 realtime path；现有 10 秒 fallback polling 不变。
 - 新增的 `turn_interaction` safety action 让 hard limit 和 pause controls 可以在 operator response 产生 D1 写入前拦截。
