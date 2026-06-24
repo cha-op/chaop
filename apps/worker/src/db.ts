@@ -1658,6 +1658,9 @@ export async function prepareTurnInteractionResolutionInDb(
   if (response.kind === "input" && row.kind !== "input.requested") {
     throw new CommandTargetError("Turn interaction is not an input request", 400);
   }
+  if (await hasTurnInteractionResolution(env, row.command_id, payload.interaction_id)) {
+    throw new CommandTargetError("Turn interaction has already been resolved", 409);
+  }
   return {
     command_id: row.command_id,
     interaction_id: payload.interaction_id,
@@ -1694,6 +1697,9 @@ export async function recordTurnInteractionResolutionInDb(
   const payload = parseTurnInteractionRequestPayload(row.payload_json);
   if (!payload) {
     throw new CommandTargetError("Turn interaction payload is unavailable", 409);
+  }
+  if (await hasTurnInteractionResolution(env, row.command_id, payload.interaction_id)) {
+    throw new CommandTargetError("Turn interaction has already been resolved", 409);
   }
   const resolution = turnInteractionResolutionEvent(response, payload);
   const event = await appendEvent(env, {
@@ -3962,6 +3968,24 @@ function parseTurnInteractionRequestPayload(payloadJson: string | null): TurnInt
   } catch {
     return undefined;
   }
+}
+
+async function hasTurnInteractionResolution(
+  env: Env,
+  commandId: string,
+  interactionId: string
+): Promise<boolean> {
+  const row = await env.DB!.prepare(
+    `SELECT id
+     FROM events
+     WHERE command_id = ?
+       AND kind IN ('approval.resolved', 'input.received')
+       AND json_extract(payload_json, '$.interaction_id') = ?
+     LIMIT 1`
+  )
+    .bind(commandId, interactionId)
+    .first<{ id: string }>();
+  return Boolean(row);
 }
 
 function isTurnInteractionRequestPayload(value: unknown): value is TurnInteractionRequestPayload {

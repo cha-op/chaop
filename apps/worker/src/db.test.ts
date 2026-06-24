@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  CommandTargetError,
   LocalThreadTargetError,
   chooseConnectorForLocalThread,
   cleanupStaleExplicitAppServerCommandTargets,
@@ -10,10 +11,12 @@ import {
   markAppServerInstancesStoppedForConnector,
   markConnectorDisconnected,
   pendingCommandsForConnector,
+  prepareTurnInteractionResolutionInDb,
   recordAgentEvent,
   recordAppServerInstances,
   recordHostSessionBackfillEvents,
   recordHostSessions,
+  recordTurnInteractionResolutionInDb,
   updateConnectorCapabilities
 } from "./db.js";
 import type { AgentAppServerInstance } from "@chaop/protocol";
@@ -720,6 +723,38 @@ test("recordAgentEvent marks failed command tasks as failed", async () => {
   assert.equal(db.commandUpdates, 1);
   assert.equal(db.taskUpdates, 1);
   assert.equal(db.eventInserts, 1);
+});
+
+test("prepareTurnInteractionResolutionInDb rejects already resolved interactions before dispatch", async () => {
+  const db = turnInteractionResolutionDb({ resolved: true });
+
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) => error instanceof CommandTargetError && error.status === 409
+  );
+
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.eventInserts, 0);
+});
+
+test("recordTurnInteractionResolutionInDb rejects already resolved interactions before append", async () => {
+  const db = turnInteractionResolutionDb({ resolved: true });
+
+  await assert.rejects(
+    () =>
+      recordTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) => error instanceof CommandTargetError && error.status === 409
+  );
+
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.eventInserts, 0);
 });
 
 test("markConnectorDisconnected fails active commands and marks connector offline", async () => {
@@ -1576,6 +1611,108 @@ test("chooseConnectorForLocalThread rejects connectors without app-server suppor
     LocalThreadTargetError
   );
 });
+
+function turnInteractionResolutionDb(options: { resolved: boolean }) {
+  const payload = JSON.stringify({
+    type: "turn_interaction",
+    interaction_id: "interaction-1",
+    status: "pending",
+    method: "item/commandExecution/requestApproval",
+    request_kind: "approval",
+    subject: "command_execution",
+    app_server_thread_id: "thread-local-1",
+    app_server_turn_id: "turn-1",
+    title: "Approve command execution",
+    command: "cat config.json",
+    cwd: "/workspace"
+  });
+  const counters = {
+    eventInserts: 0,
+    resolutionChecks: 0
+  };
+  const db = {
+    prepare(sql: string) {
+      if (/SELECT e\.id, e\.thread_id, e\.command_id, e\.kind, e\.payload_json,/.test(sql)) {
+        return {
+          bind(eventId: string) {
+            assert.equal(eventId, "event-request-1");
+            return {
+              async first() {
+                return {
+                  id: "event-request-1",
+                  thread_id: "thread-1",
+                  command_id: "command-1",
+                  kind: "approval.requested",
+                  payload_json: payload,
+                  lease_owner_connector_id: "connector-online",
+                  state: "running"
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/SELECT e\.id, e\.workspace_id, e\.thread_id, e\.command_id, e\.kind, e\.payload_json/.test(sql)) {
+        return {
+          bind(eventId: string) {
+            assert.equal(eventId, "event-request-1");
+            return {
+              async first() {
+                return {
+                  id: "event-request-1",
+                  workspace_id: "workspace-api",
+                  thread_id: "thread-1",
+                  command_id: "command-1",
+                  kind: "approval.requested",
+                  payload_json: payload
+                };
+              }
+            };
+          }
+        };
+      }
+
+      if (/json_extract\(payload_json, '\$\.interaction_id'\)/.test(sql)) {
+        return {
+          bind(commandId: string, interactionId: string) {
+            assert.equal(commandId, "command-1");
+            assert.equal(interactionId, "interaction-1");
+            return {
+              async first() {
+                counters.resolutionChecks += 1;
+                return options.resolved ? { id: "event-resolution-1" } : null;
+              }
+            };
+          }
+        };
+      }
+
+      if (/INSERT INTO events/.test(sql)) {
+        return {
+          bind() {
+            return {
+              async run() {
+                counters.eventInserts += 1;
+                return { success: true };
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    },
+    get eventInserts() {
+      return counters.eventInserts;
+    },
+    get resolutionChecks() {
+      return counters.resolutionChecks;
+    }
+  };
+
+  return db as D1Database & typeof counters;
+}
 
 function agentEventGuardDb(command: {
   leaseOwnerConnectorId: string;
