@@ -1022,6 +1022,42 @@ test("threadTurnsForDisplay renders commandless backfilled history turns", () =>
   assert.equal(turns[0]?.event_count, 2);
 });
 
+test("threadTurnsForDisplay attaches commandless tool history to the previous turn", () => {
+  const turns = threadTurnsForDisplay(
+    "thread-1",
+    [],
+    [
+      event(
+        "event-1",
+        undefined,
+        1,
+        "command.output",
+        "2026-06-12 10:00 - User: Inspect the app-server attach failure."
+      ),
+      event(
+        "event-2",
+        undefined,
+        2,
+        "command.output",
+        "2026-06-12 10:01 - Assistant: I will inspect the failing path."
+      ),
+      event(
+        "event-3",
+        undefined,
+        3,
+        "command.output",
+        "2026-06-12 10:02 - Tool call: exec_command"
+      )
+    ]
+  );
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.status, "succeeded");
+  assert.equal(turns[0]?.assistant_summary, "I will inspect the failing path.");
+  assert.deepEqual(turns[0]?.progress_summaries, ["2026-06-12 10:02 - Tool call: exec_command"]);
+  assert.equal(turns[0]?.event_count, 3);
+});
+
 function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
   return {
     user: {

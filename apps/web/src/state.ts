@@ -75,13 +75,31 @@ function buildHistoryTurns(threadId: string, events: ThreadEvent[]): ThreadTurnS
       if (left.seq !== right.seq) return left.seq - right.seq;
       return left.created_at.localeCompare(right.created_at);
     });
-  const turns: ThreadTurnSummary[] = [];
+  const drafts: HistoryTurnDraft[] = [];
   let current: HistoryTurnDraft | undefined;
+  const finishCurrent = () => {
+    if (!current) return;
+    drafts.push(current);
+    current = undefined;
+  };
+  const appendProgress = (event: ThreadEvent) => {
+    const target = current ?? drafts.at(-1);
+    if (target) {
+      target.events.push(event);
+      target.progress_summaries = appendProgressSummary(target.progress_summaries, event.summary);
+      return;
+    }
+    drafts.push({
+      id: `history-${event.id}`,
+      events: [event],
+      progress_summaries: [event.summary]
+    });
+  };
 
   for (const event of historyEvents) {
     const message = parseBackfillMessage(event.summary);
     if (message?.role === "user") {
-      if (current) turns.push(historyTurnFromDraft(current));
+      finishCurrent();
       current = {
         id: `history-${event.id}`,
         prompt: message.text,
@@ -94,31 +112,29 @@ function buildHistoryTurns(threadId: string, events: ThreadEvent[]): ThreadTurnS
       if (current) {
         current.assistant = message.text;
         current.events.push(event);
-        turns.push(historyTurnFromDraft(current));
+        drafts.push(current);
         current = undefined;
       } else {
-        turns.push(historyTurnFromDraft({
+        drafts.push({
           id: `history-${event.id}`,
           assistant: message.text,
           events: [event]
-        }));
+        });
       }
       continue;
     }
 
-    if (current) {
-      turns.push(historyTurnFromDraft(current));
-      current = undefined;
-    }
-    turns.push(historyTurnFromDraft({
-      id: `history-${event.id}`,
-      events: [event],
-      progress_summaries: [event.summary]
-    }));
+    appendProgress(event);
   }
 
-  if (current) turns.push(historyTurnFromDraft(current));
-  return turns;
+  finishCurrent();
+  return drafts.map(historyTurnFromDraft);
+}
+
+function appendProgressSummary(current: string[] | undefined, summary: string): string[] {
+  if (!current) return [summary];
+  if (current.includes(summary)) return current;
+  return [...current, summary];
 }
 
 function historyTurnFromDraft(draft: HistoryTurnDraft): ThreadTurnSummary {
@@ -130,7 +146,7 @@ function historyTurnFromDraft(draft: HistoryTurnDraft): ThreadTurnSummary {
   return {
     command_id: draft.id,
     prompt: draft.prompt,
-    status: failed ? "failed" : draft.assistant ? "succeeded" : "pending",
+    status: failed ? "failed" : "succeeded",
     assistant_summary: draft.assistant,
     error_summary: [...sortedEvents].reverse().find((event) => event.kind === "command.failed")?.summary,
     progress_summaries: draft.progress_summaries ?? [],
