@@ -790,20 +790,45 @@ test("recordAgentEvent rolls back sequence allocation after raced duplicate reso
   assert.equal(db.usageWindowUpserts, 0);
 });
 
-test("prepareTurnInteractionResolutionInDb rejects already resolved interactions before dispatch", async () => {
+test("prepareTurnInteractionResolutionInDb returns existing resolutions before dispatch", async () => {
   const db = turnInteractionResolutionDb({ resolved: true });
 
-  await assert.rejects(
-    () =>
-      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
-        kind: "approval",
-        decision: "accept"
-      }),
-    (error: unknown) => error instanceof CommandTargetError && error.status === 409
-  );
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "approval",
+    decision: "accept"
+  });
 
+  assert.equal(preparation.dispatch.command_id, "command-1");
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, true);
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.eventInserts, 0);
+  assert.equal(db.claimInserts, 0);
+});
+
+test("prepareTurnInteractionResolutionInDb returns existing resolutions after input expiry", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: true,
+    requestKind: "input",
+    autoResolutionMs: 1,
+    createdAt: "2000-01-01T00:00:00.000Z"
+  });
+
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["Yes"]
+      }
+    }
+  });
+
+  assert.equal(preparation.dispatch.command_id, "command-1");
+  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
+  assert.equal(preparation.already_delivered, true);
+  assert.equal(db.resolutionChecks, 1);
+  assert.equal(db.staleClaimDeletes, 0);
+  assert.equal(db.claimInserts, 0);
 });
 
 test("prepareTurnInteractionResolutionInDb claims pending interactions before dispatch", async () => {
@@ -1300,7 +1325,11 @@ test("prepareTurnInteractionResolutionInDb rejects expired auto-resolving input 
     () =>
       prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
         kind: "input",
-        answers: {}
+        answers: {
+          "question-1": {
+            answers: ["Yes"]
+          }
+        }
       }),
     (error: unknown) =>
       error instanceof CommandTargetError &&
@@ -1308,7 +1337,7 @@ test("prepareTurnInteractionResolutionInDb rejects expired auto-resolving input 
       /auto-resolution deadline has expired/.test(error.message)
   );
 
-  assert.equal(db.resolutionChecks, 0);
+  assert.equal(db.resolutionChecks, 1);
   assert.equal(db.claimInserts, 0);
 });
 
@@ -2465,15 +2494,27 @@ function turnInteractionResolutionDb(options: {
                     thread_id: "thread-1",
                     command_id: "command-1",
                     seq: 3,
-                    kind: "approval.resolved",
+                    kind: requestKind === "approval" ? "approval.resolved" : "input.received",
                     priority: "P1",
-                    summary: "Approval accepted for command execution.",
-                    payload_json: JSON.stringify({
-                      type: "turn_interaction_resolution",
-                      interaction_id: "interaction-1",
-                      status: "accepted",
-                      decision: "accept"
-                    }),
+                    summary:
+                      requestKind === "approval"
+                        ? "Approval accepted for command execution."
+                        : "Input provided for Provide input.",
+                    payload_json: JSON.stringify(
+                      requestKind === "approval"
+                        ? {
+                            type: "turn_interaction_resolution",
+                            interaction_id: "interaction-1",
+                            status: "accepted",
+                            decision: "accept"
+                          }
+                        : {
+                            type: "turn_interaction_resolution",
+                            interaction_id: "interaction-1",
+                            status: "answered",
+                            answer_count: 1
+                          }
+                    ),
                     created_at: "2026-06-24T10:00:00.000Z"
                   }
                   : null;

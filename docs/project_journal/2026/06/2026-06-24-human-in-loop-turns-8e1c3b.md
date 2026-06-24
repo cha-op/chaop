@@ -55,6 +55,7 @@ superseded_by:
 - The independent PR review found that `sent_unknown` claims could still deadlock after the response left Worker but before a connector acknowledgement was observed. Worker now treats uncertain delivery as a non-retryable dispatch, records the safe resolution event immediately when possible, and lets later explicit retries recover from the claim without sending the response to app-server again.
 - GitHub Codex found that a failed `delivered_at` marker write after confirmed connector delivery could still abort before the durable resolution event was recorded. Worker now treats that marker as recoverable, best-effort marks the claim uncertain if the delivered marker fails, and continues to append the resolution event.
 - The latest independent review found three recovery and input-selection edge cases. Existing resolution recovery now also repairs the task state before releasing the claim, Worker derives auto-resolution expiry from its own event creation time rather than the agent host clock, and Thread Centre separates the Other selection state from actual input answer text.
+- A follow-up independent review found that ordinary existing-resolution retries could still be rejected after command completion or auto-resolution expiry. Worker now validates the browser response, checks for an existing durable resolution before active-state and deadline rejection, and lets the existing resolution path repair task state without re-sending the response to app-server.
 
 ## Cost Notes
 - Request and response persistence adds at most two event rows per human-in-the-loop pause.
@@ -66,6 +67,7 @@ superseded_by:
 - Uncertain-delivery recovery uses the same explicit response path as delivered-claim recovery. It adds no background sweep, poller, or connector inventory refresh, and it avoids duplicate app-server responses after a `sent_unknown` timeout.
 - Confirmed-delivery marker fallback is also limited to the explicit operator response path. It does not add a normal-case write; only marker failures attempt one bounded `delivery_uncertain_at` fallback before the existing resolution event append.
 - Existing-resolution task repair is an idempotent retry-path update only. It does not add a background process, and it runs only when an operator retries a resolution that already has a durable event.
+- Existing-resolution retry recovery adds at most one read on an explicit operator retry. It does not add polling, a background sweep, connector sync, or a new write path.
 - Worker-owned auto-resolution expiry and the frontend Other-selection change do not add D1 writes.
 - Dispatch-started claim recovery is opportunistic on the next operator response attempt after the longer timeout. It does not add a background job, poller, or sweep.
 - Stale claim recovery is bounded to the response-dispatch path and does not add a background sweep.

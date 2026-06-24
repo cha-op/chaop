@@ -1662,6 +1662,11 @@ export async function prepareTurnInteractionResolutionInDb(
   if (response.kind === "input" && row.kind !== "input.requested") {
     throw new CommandTargetError("Turn interaction is not an input request", 400);
   }
+  const dispatch = {
+    command_id: row.command_id,
+    interaction_id: payload.interaction_id,
+    response
+  };
   const recoverableClaim = await findTurnInteractionResolutionClaim(env, row.command_id, payload.interaction_id);
   if (claimDeliveryMayHaveReachedConnector(recoverableClaim)) {
     const resolution = turnInteractionResolutionFromClaim(recoverableClaim, payload);
@@ -1669,13 +1674,16 @@ export async function prepareTurnInteractionResolutionInDb(
       throw new CommandTargetError("Turn interaction delivery recovery payload is unavailable", 409);
     }
     return {
-      dispatch: {
-        command_id: row.command_id,
-        interaction_id: payload.interaction_id,
-        response
-      },
+      dispatch,
       already_delivered: true,
       resolution
+    };
+  }
+  validateTurnInteractionResponseForRequest(response, payload);
+  if (await hasTurnInteractionResolution(env, row.command_id, payload.interaction_id)) {
+    return {
+      dispatch,
+      already_delivered: true
     };
   }
   if (!row.lease_owner_connector_id || !row.state || !isActiveCommandState(row.state)) {
@@ -1684,17 +1692,9 @@ export async function prepareTurnInteractionResolutionInDb(
   if (turnInteractionAutoResolutionExpired(payload, row.created_at)) {
     throw new CommandTargetError("Turn interaction auto-resolution deadline has expired", 409);
   }
-  validateTurnInteractionResponseForRequest(response, payload);
-  if (await hasTurnInteractionResolution(env, row.command_id, payload.interaction_id)) {
-    throw new CommandTargetError("Turn interaction has already been resolved", 409);
-  }
   const claim = await claimTurnInteractionResolution(env, row.id, row.command_id, payload, response);
   return {
-    dispatch: {
-      command_id: row.command_id,
-      interaction_id: payload.interaction_id,
-      response
-    },
+    dispatch,
     already_delivered: claim.already_delivered,
     resolution: claim.resolution
   };

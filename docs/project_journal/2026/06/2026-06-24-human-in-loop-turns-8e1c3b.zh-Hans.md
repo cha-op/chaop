@@ -55,6 +55,7 @@ superseded_by:
 - Independent PR review 发现 `sent_unknown` claim 在 response 已离开 Worker、但没有观察到 connector acknowledgement 时仍可能 deadlock。Worker 现在把 uncertain delivery 当成不能重试派发的状态：能立即记录安全 resolution event 时就直接记录；后续显式 retry 也会从 claim 恢复，而不会再次把 response 发送给 app-server。
 - GitHub Codex 发现 confirmed connector delivery 后，如果 `delivered_at` marker 写失败，route 仍可能在记录 durable resolution event 之前 abort。Worker 现在把这个 marker 当成可恢复状态：delivered marker 失败时会 best-effort 标记 claim 为 uncertain，并继续 append resolution event。
 - 最新 independent review 又发现三个恢复和输入选择边界情况。已有 resolution 的恢复路径现在会先修复 task state，再释放 claim；Worker 会用自己记录的 event creation time 推导 auto-resolution expiry，不再信任 agent host clock；Thread Centre 也把 Other 选择状态和真实 input answer 文本分开保存。
+- 后续 independent review 发现，普通的已有 resolution retry 在 command 已完成或 auto-resolution deadline 已过后仍可能被拒绝。现在 Worker 会先校验浏览器 response，再在 active-state 和 deadline 拒绝前检查是否已经存在 durable resolution，并让已有 resolution 路径修复 task state，而不会再次把 response 发送给 app-server。
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。
@@ -66,6 +67,7 @@ superseded_by:
 - Uncertain-delivery recovery 使用和 delivered-claim recovery 相同的显式 response 路径。不增加后台 sweep、poller 或 connector inventory refresh，也避免 `sent_unknown` timeout 后重复向 app-server 发送 response。
 - Confirmed-delivery marker fallback 也只发生在显式 operator response 路径。正常路径不增加写入；只有 marker 失败时才会尝试一次有边界的 `delivery_uncertain_at` fallback，然后继续走既有 resolution event append。
 - 已有 resolution 的 task repair 是幂等的 retry-path update，不增加后台流程，只会在 operator retry 一个已经有 durable event 的 resolution 时运行。
+- 已有 resolution 的 retry recovery 只会在显式 operator retry 时最多增加一次读取；不增加 polling、后台 sweep、connector sync 或新的写入路径。
 - Worker-owned auto-resolution expiry 和前端 Other-selection 修改都不会增加 D1 写入。
 - Dispatch-started claim recovery 只会在更长超时后、下一次 operator response attempt 里顺带发生；不会新增后台任务、轮询或 sweep。
 - Stale claim recovery 只发生在 response dispatch 路径里，不增加后台扫描。
