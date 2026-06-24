@@ -1606,6 +1606,11 @@ function isTurnInteractionRequestPayloadForEvent(
       value.questions.length > 0 &&
       value.questions.every(isTurnInteractionInputQuestion);
   }
+  if (value.available_decisions !== undefined) {
+    return Array.isArray(value.available_decisions) &&
+      value.available_decisions.length > 0 &&
+      value.available_decisions.every(isTurnInteractionApprovalDecision);
+  }
   return true;
 }
 

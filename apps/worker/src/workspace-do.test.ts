@@ -2494,6 +2494,61 @@ test("input turn interaction requests without questions are rejected with a nega
   assert.equal(browserSent.length, 0);
 });
 
+test("approval turn interaction requests without valid decisions are rejected with a negative ack", async () => {
+  const sent: string[] = [];
+  const browserSent: string[] = [];
+  const agentSocket = mutableSocketWithAttachment({
+    socketType: "agent",
+    connectorId: "connector-online",
+    connectedAt: 300,
+    agentReady: true,
+    activeCommandIds: ["command-1"]
+  }, sent);
+  const browserSocket = mutableSocketWithAttachment({ socketType: "browser" }, browserSent);
+  const ctx = {
+    getWebSockets(tag?: string) {
+      if (tag === "browser") return [browserSocket];
+      if (tag === "agent:connector-online") return [agentSocket];
+      assert.fail(`unexpected websocket tag: ${tag}`);
+    }
+  } as unknown as DurableObjectState;
+  const workspace = new WorkspaceDO(ctx, { DB: {} } as Env);
+
+  await workspace.webSocketMessage(agentSocket, JSON.stringify({
+    kind: "agent.event",
+    payload: {
+      command_id: "command-1",
+      kind: "approval.requested",
+      priority: "P0",
+      summary: "Approval requested",
+      payload: {
+        type: "turn_interaction",
+        interaction_id: "interaction-1",
+        status: "pending",
+        method: "item/commandExecution/requestApproval",
+        request_kind: "approval",
+        app_server_thread_id: "thread-live-1",
+        app_server_turn_id: "turn-1",
+        title: "Approve command execution",
+        available_decisions: []
+      }
+    }
+  }));
+
+  assert.equal(sent.length, 1);
+  const ack = JSON.parse(sent[0] ?? "{}") as {
+    kind?: string;
+    payload?: { command_id?: string; kind?: string; accepted?: boolean; dropped?: boolean; reason?: string };
+  };
+  assert.equal(ack.kind, "server.ack");
+  assert.equal(ack.payload?.command_id, "command-1");
+  assert.equal(ack.payload?.kind, "approval.requested");
+  assert.equal(ack.payload?.accepted, false);
+  assert.equal(ack.payload?.dropped, true);
+  assert.match(ack.payload?.reason ?? "", /payload is invalid/);
+  assert.equal(browserSent.length, 0);
+});
+
 test("malformed turn interaction resolution events are rejected with a negative ack", async () => {
   const sent: string[] = [];
   const browserSent: string[] = [];

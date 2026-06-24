@@ -1668,27 +1668,34 @@ export async function prepareTurnInteractionResolutionInDb(
   if (await hasTurnInteractionResolution(env, row.command_id, payload.interaction_id)) {
     throw new CommandTargetError("Turn interaction has already been resolved", 409);
   }
-  const claim = await claimTurnInteractionResolution(env, row.id, row.command_id, payload.interaction_id, response);
+  const claim = await claimTurnInteractionResolution(env, row.id, row.command_id, payload, response);
   return {
     dispatch: {
       command_id: row.command_id,
       interaction_id: payload.interaction_id,
       response
     },
-    already_delivered: claim.already_delivered
+    already_delivered: claim.already_delivered,
+    resolution: claim.resolution
   };
 }
 
 type PreparedTurnInteractionResolution = {
   dispatch: TurnInteractionResponseDispatch;
   already_delivered: boolean;
+  resolution?: TurnInteractionRecordedResolution | undefined;
+};
+
+type TurnInteractionRecordedResolution = {
+  summary: string;
+  payload: NonNullable<ThreadEvent["payload"]>;
 };
 
 export async function recordTurnInteractionResolutionInDb(
   env: Env,
   eventId: string,
   response: ResolveTurnInteractionRequest,
-  options: { allowExisting?: boolean } = {}
+  options: { allowExisting?: boolean; resolution?: TurnInteractionRecordedResolution | undefined } = {}
 ): Promise<ThreadEvent> {
   if (!env.DB) {
     throw new Error("DB binding is required for turn interaction resolution");
@@ -1728,7 +1735,7 @@ export async function recordTurnInteractionResolutionInDb(
     }
     throw new CommandTargetError("Turn interaction has already been resolved", 409);
   }
-  const resolution = turnInteractionResolutionEvent(response, payload);
+  const resolution = options.resolution ?? turnInteractionResolutionEvent(response, payload);
   let event: ThreadEvent | undefined;
   try {
     event = await appendEvent(env, {
@@ -4146,6 +4153,10 @@ function jsonValueEquals(left: unknown, right: unknown): boolean {
   return false;
 }
 
+function isNonNegativeInteger(value: unknown, maxValue: number): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= maxValue;
+}
+
 function isResolveTurnInteractionRequestValue(value: unknown): value is ResolveTurnInteractionRequest {
   if (!isRecord(value)) return false;
   if (value.kind === "approval") {
@@ -4224,28 +4235,49 @@ async function claimTurnInteractionResolution(
   env: Env,
   eventId: string,
   commandId: string,
-  interactionId: string,
+  request: TurnInteractionRequestPayload,
   response: ResolveTurnInteractionRequest
-): Promise<{ already_delivered: boolean }> {
+): Promise<{ already_delivered: boolean; resolution?: TurnInteractionRecordedResolution | undefined }> {
+  const interactionId = request.interaction_id;
   await deleteStaleTurnInteractionResolutionClaim(env, commandId, interactionId);
-  const responseJson = JSON.stringify(response);
+  const responseJson = turnInteractionResponseJsonForClaim(response);
+  const resolution = turnInteractionResolutionEvent(response, request);
+  const resolutionPayloadJson = JSON.stringify(resolution.payload);
   const result = await env.DB!.prepare(
     `INSERT INTO turn_interaction_resolution_claims (
-       interaction_id, request_event_id, command_id, response_kind, response_json, created_at
-     ) VALUES (?, ?, ?, ?, ?, ?)
+       interaction_id, request_event_id, command_id, response_kind, response_json,
+       resolution_summary, resolution_payload_json, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(command_id, interaction_id) DO NOTHING`
   )
-    .bind(interactionId, eventId, commandId, response.kind, responseJson, new Date().toISOString())
+    .bind(
+      interactionId,
+      eventId,
+      commandId,
+      response.kind,
+      responseJson,
+      resolution.summary,
+      resolutionPayloadJson,
+      new Date().toISOString()
+    )
     .run();
   if (result.meta?.changes === 0) {
     const claim = await findTurnInteractionResolutionClaim(env, commandId, interactionId);
-    const claimedResponse = claim ? parseClaimedTurnInteractionResponse(claim.response_json) : undefined;
-    if (claimedResponse && jsonValueEquals(claimedResponse, response)) {
-      return { already_delivered: typeof claim?.delivered_at === "string" && claim.delivered_at.trim().length > 0 };
+    if (claim && typeof claim.delivered_at === "string" && claim.delivered_at.trim().length > 0) {
+      const deliveredResolution = turnInteractionResolutionFromClaim(claim, request);
+      if (!deliveredResolution) {
+        throw new CommandTargetError("Turn interaction delivery recovery payload is unavailable", 409);
+      }
+      return { already_delivered: true, resolution: deliveredResolution };
     }
     throw new CommandTargetError("Turn interaction is already being resolved", 409);
   }
   return { already_delivered: false };
+}
+
+function turnInteractionResponseJsonForClaim(response: ResolveTurnInteractionRequest): string | null {
+  if (response.kind === "input") return null;
+  return JSON.stringify(response);
 }
 
 async function findTurnInteractionResolutionClaim(
@@ -4257,10 +4289,13 @@ async function findTurnInteractionResolutionClaim(
   interaction_id: string;
   response_kind: ResolveTurnInteractionRequest["kind"];
   response_json: string | null;
+  resolution_summary: string | null;
+  resolution_payload_json: string | null;
   delivered_at: string | null;
 } | undefined> {
   const row = await env.DB!.prepare(
-    `SELECT command_id, interaction_id, response_kind, response_json, delivered_at
+    `SELECT command_id, interaction_id, response_kind, response_json,
+            resolution_summary, resolution_payload_json, delivered_at
      FROM turn_interaction_resolution_claims
      WHERE command_id = ?
        AND interaction_id = ?
@@ -4272,6 +4307,8 @@ async function findTurnInteractionResolutionClaim(
       interaction_id: string;
       response_kind: ResolveTurnInteractionRequest["kind"];
       response_json: string | null;
+      resolution_summary: string | null;
+      resolution_payload_json: string | null;
       delivered_at: string | null;
     }>();
   return row ?? undefined;
@@ -4285,6 +4322,69 @@ function parseClaimedTurnInteractionResponse(responseJson: string | null): Resol
   } catch {
     return undefined;
   }
+}
+
+function turnInteractionResolutionFromClaim(
+  claim: {
+    response_kind: ResolveTurnInteractionRequest["kind"];
+    response_json: string | null;
+    resolution_summary: string | null;
+    resolution_payload_json: string | null;
+  },
+  request: TurnInteractionRequestPayload
+): TurnInteractionRecordedResolution | undefined {
+  const payload = parseClaimedTurnInteractionResolutionPayload(claim.resolution_payload_json, claim.response_kind);
+  if (payload && claim.resolution_summary && claim.resolution_summary.trim().length > 0) {
+    return {
+      summary: claim.resolution_summary,
+      payload
+    };
+  }
+  const claimedResponse = parseClaimedTurnInteractionResponse(claim.response_json);
+  return claimedResponse ? turnInteractionResolutionEvent(claimedResponse, request) : undefined;
+}
+
+function parseClaimedTurnInteractionResolutionPayload(
+  payloadJson: string | null,
+  responseKind: ResolveTurnInteractionRequest["kind"]
+): NonNullable<ThreadEvent["payload"]> | undefined {
+  if (!payloadJson) return undefined;
+  try {
+    const payload = JSON.parse(payloadJson) as unknown;
+    return isTurnInteractionResolutionPayloadValue(payload, responseKind) ? payload : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isTurnInteractionResolutionPayloadValue(
+  value: unknown,
+  responseKind: ResolveTurnInteractionRequest["kind"]
+): value is NonNullable<ThreadEvent["payload"]> {
+  if (!isRecord(value)) return false;
+  if (
+    !(
+      value.type === "turn_interaction_resolution" &&
+      typeof value.interaction_id === "string" &&
+      value.interaction_id.trim().length > 0
+    )
+  ) {
+    return false;
+  }
+  if (responseKind === "input") {
+    return value.status === "answered" &&
+      (value.answer_count === undefined || isNonNegativeInteger(value.answer_count, 1000));
+  }
+  return (
+    (
+      value.status === "accepted" ||
+      value.status === "accepted_for_session" ||
+      value.status === "accepted_with_execpolicy_amendment" ||
+      value.status === "declined" ||
+      value.status === "cancelled"
+    ) &&
+    (value.decision === undefined || isTurnInteractionApprovalDecisionValue(value.decision))
+  );
 }
 
 export async function markTurnInteractionResolutionDeliveredInDb(
@@ -4313,6 +4413,7 @@ async function deleteStaleTurnInteractionResolutionClaim(
      WHERE command_id = ?
        AND interaction_id = ?
        AND created_at < ?
+       AND delivered_at IS NULL
        AND NOT EXISTS (
          SELECT 1
          FROM events
@@ -4352,6 +4453,11 @@ function isTurnInteractionRequestPayload(value: unknown): value is TurnInteracti
     return Array.isArray(value.questions) &&
       value.questions.length > 0 &&
       value.questions.every(isTurnInteractionInputQuestionValue);
+  }
+  if (value.available_decisions !== undefined) {
+    return Array.isArray(value.available_decisions) &&
+      value.available_decisions.length > 0 &&
+      value.available_decisions.every(isTurnInteractionApprovalDecisionValue);
   }
   return true;
 }

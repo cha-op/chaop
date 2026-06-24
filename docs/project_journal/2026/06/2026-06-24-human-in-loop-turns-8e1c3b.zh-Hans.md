@@ -47,11 +47,12 @@ superseded_by:
 - GitHub Codex 后续 review 修复移除了绝对 workspace 形态的 sample path，app-server auto-resolution deadline 改为 checked arithmetic，HITL response delivery ack 会等到 app-server response 写回成功后再确认，并且 connector 在等待 request event acknowledgement 时也会处理已经到达的 HITL response。
 - Independent PR review 又发现两个 fail-closed 缺口。WorkspaceDO 现在会在任何 DB 写入前用 negative ack 拒绝 malformed 的必要 `approval.requested` 和 `input.requested` events；app-server `availableDecisions` 里若全是无效 decision，也会保留空 `available_decisions` list，让浏览器和 API 不再回退到无限制默认 approval choices。
 - 后续 review 又发现三个 fail-closed 和 auditability 缺口。浏览器 response 现在会先持久化到 resolution claim，再投递给 connector；已经 delivered 的 claim 可以重试补 durable event，而不重复发送给 app-server；没有合法问题的 input request 会在变成 operator-visible 之前被拒绝；malformed resolution payload 也会在 DB 去重逻辑触发运行时异常前被拒绝或防御性忽略。
+- 最新 independent review 发现原始 input answer 不能留存在 D1 claim 里，而且已经 delivered 但尚未记录 event 的 claim 不能被短 TTL 清理。现在 resolution claim 只保存可恢复的安全 summary/payload，不保存 input answers；重复的 pending 提交会被拒绝而不是重新派发；当 app-server approval choices 没有任何有效 decision 时会 fail closed。
 
 ## 成本说明
 - 每次 human-in-the-loop pause 最多增加两条 event row：一条 request，一条 response。
 - Resolution claim 按 command 和 interaction 共同限定，避免不同 turn 复用 app-server request ID 时让后续 response 被错误拦住。
-- Response claim 现在也会保存浏览器提交的 response 和 delivered marker。它只在 operator resolve HITL request 的低频路径上增加有边界的写入，不增加后台 sweep 或 polling path。
+- Response claim 现在会保存 delivered marker 和可恢复的安全 resolution summary/payload。为兼容性可以保留 approval decision，但 input answers 不会存入 claim。它只在 operator resolve HITL request 的低频路径上增加有边界的写入，不增加后台 sweep 或 polling path。
 - Stale claim recovery 只发生在 response dispatch 路径里，不增加后台扫描。
 - WebSocket delivery 继续作为首选 realtime path；现有 10 秒 fallback polling 不变。
 - 新增的 `turn_interaction` safety action 让 hard limit 和 pause controls 可以在 operator response 产生 D1 写入前拦截。

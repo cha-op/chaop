@@ -837,7 +837,7 @@ test("prepareTurnInteractionResolutionInDb rejects claimed interactions before d
   assert.equal(db.claimInserts, 1);
 });
 
-test("prepareTurnInteractionResolutionInDb reuses matching pending claims", async () => {
+test("prepareTurnInteractionResolutionInDb rejects matching pending claims without redispatch", async () => {
   const db = turnInteractionResolutionDb({
     resolved: false,
     claimed: true,
@@ -847,14 +847,18 @@ test("prepareTurnInteractionResolutionInDb reuses matching pending claims", asyn
     }
   });
 
-  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
-    kind: "approval",
-    decision: "accept"
-  });
+  await assert.rejects(
+    () =>
+      prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+        kind: "approval",
+        decision: "accept"
+      }),
+    (error: unknown) =>
+      error instanceof CommandTargetError &&
+      error.status === 409 &&
+      /already being resolved/.test(error.message)
+  );
 
-  assert.equal(preparation.dispatch.command_id, "command-1");
-  assert.equal(preparation.dispatch.interaction_id, "interaction-1");
-  assert.equal(preparation.already_delivered, false);
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.claimInserts, 1);
 });
@@ -878,6 +882,8 @@ test("prepareTurnInteractionResolutionInDb recognises delivered matching claims"
   assert.equal(preparation.dispatch.command_id, "command-1");
   assert.equal(preparation.dispatch.interaction_id, "interaction-1");
   assert.equal(preparation.already_delivered, true);
+  assert.equal(preparation.resolution?.payload.type, "turn_interaction_resolution");
+  assert.equal(preparation.resolution?.payload.status, "accepted");
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.claimInserts, 1);
 });
@@ -943,8 +949,8 @@ test("prepareTurnInteractionResolutionInDb rejects approval decisions when avail
       }),
     (error: unknown) =>
       error instanceof CommandTargetError &&
-      error.status === 400 &&
-      /decision is not available/.test(error.message)
+      error.status === 409 &&
+      /payload is unavailable/.test(error.message)
   );
 
   assert.equal(db.resolutionChecks, 0);
@@ -975,6 +981,52 @@ test("prepareTurnInteractionResolutionInDb accepts available approval decision o
   assert.equal(preparation.already_delivered, false);
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.claimInserts, 1);
+});
+
+test("recordTurnInteractionResolutionInDb can recover a delivered input claim without stored answers", async () => {
+  const db = turnInteractionResolutionDb({
+    resolved: false,
+    requestKind: "input",
+    claimed: true,
+    deliveredClaim: true,
+    claimedResponse: null
+  });
+  const preparation = await prepareTurnInteractionResolutionInDb({ DB: db } as Env, "event-request-1", {
+    kind: "input",
+    answers: {
+      "question-1": {
+        answers: ["secret answer"]
+      }
+    }
+  });
+
+  const event = await recordTurnInteractionResolutionInDb(
+    { DB: db } as Env,
+    "event-request-1",
+    {
+      kind: "input",
+      answers: {
+        "question-1": {
+          answers: ["different retry answer"]
+        }
+      }
+    },
+    {
+      allowExisting: true,
+      resolution: preparation.resolution
+    }
+  );
+
+  assert.equal(preparation.already_delivered, true);
+  assert.equal(event.kind, "input.received");
+  assert.deepEqual(event.payload, {
+    type: "turn_interaction_resolution",
+    interaction_id: "interaction-1",
+    status: "answered",
+    answer_count: 1
+  });
+  assert.equal(db.eventInserts, 1);
+  assert.equal(db.claimDeletes, 1);
 });
 
 test("prepareTurnInteractionResolutionInDb rejects incomplete input answers", async () => {
@@ -1093,6 +1145,14 @@ test("prepareTurnInteractionResolutionInDb accepts input during explicit respons
   assert.equal(preparation.already_delivered, false);
   assert.equal(db.resolutionChecks, 1);
   assert.equal(db.claimInserts, 1);
+  assert.equal(db.claimResponseJson, null);
+  assert.equal(db.claimResolutionSummary, "Input provided for Provide input.");
+  assert.deepEqual(JSON.parse(db.claimResolutionPayloadJson ?? "{}"), {
+    type: "turn_interaction_resolution",
+    interaction_id: "interaction-1",
+    status: "answered",
+    answer_count: 1
+  });
 });
 
 test("recordTurnInteractionResolutionInDb rejects already resolved interactions before append", async () => {
@@ -2095,7 +2155,10 @@ function turnInteractionResolutionDb(options: {
     claimInserts: 0,
     claimDeletes: 0,
     staleClaimDeletes: 0,
-    taskUpdates: 0
+    taskUpdates: 0,
+    claimResponseJson: undefined as string | null | undefined,
+    claimResolutionSummary: undefined as string | undefined,
+    claimResolutionPayloadJson: undefined as string | undefined
   };
   const db = {
     prepare(sql: string) {
@@ -2179,6 +2242,7 @@ function turnInteractionResolutionDb(options: {
       }
 
       if (/DELETE FROM turn_interaction_resolution_claims[\s\S]*created_at </.test(sql)) {
+        assert.match(sql, /delivered_at IS NULL/);
         return {
           bind(
             commandId: string,
@@ -2209,15 +2273,29 @@ function turnInteractionResolutionDb(options: {
             eventId: string,
             commandId: string,
             responseKind: string,
-            responseJson: string,
+            responseJson: string | null,
+            resolutionSummary: string,
+            resolutionPayloadJson: string,
             createdAt: string
           ) {
             assert.equal(interactionId, "interaction-1");
             assert.equal(eventId, "event-request-1");
             assert.equal(commandId, "command-1");
             assert.equal(responseKind, requestKind);
-            assert.doesNotThrow(() => JSON.parse(responseJson));
+            if (requestKind === "input") {
+              assert.equal(responseJson, null);
+            } else {
+              if (typeof responseJson !== "string") {
+                assert.fail("approval claim response_json should be persisted");
+              }
+              assert.doesNotThrow(() => JSON.parse(responseJson));
+            }
+            assert.equal(typeof resolutionSummary, "string");
+            assert.doesNotThrow(() => JSON.parse(resolutionPayloadJson));
             assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/);
+            counters.claimResponseJson = responseJson;
+            counters.claimResolutionSummary = resolutionSummary;
+            counters.claimResolutionPayloadJson = resolutionPayloadJson;
             return {
               async run() {
                 counters.claimInserts += 1;
@@ -2228,7 +2306,7 @@ function turnInteractionResolutionDb(options: {
         };
       }
 
-      if (/SELECT command_id, interaction_id, response_kind, response_json, delivered_at/.test(sql)) {
+      if (/SELECT command_id, interaction_id, response_kind, response_json,[\s\S]*resolution_summary, resolution_payload_json, delivered_at/.test(sql)) {
         return {
           bind(commandId: string, interactionId: string) {
             assert.equal(commandId, "command-1");
@@ -2236,23 +2314,41 @@ function turnInteractionResolutionDb(options: {
             return {
               async first() {
                 if (!options.claimed || options.staleClaim) return null;
-                const response = options.claimedResponse ?? {
-                  kind: requestKind,
-                  ...(requestKind === "approval"
-                    ? { decision: "decline" }
-                    : {
-                      answers: {
-                        "question-1": {
-                          answers: ["Different"]
+                const response = Object.prototype.hasOwnProperty.call(options, "claimedResponse")
+                  ? options.claimedResponse
+                  : {
+                    kind: requestKind,
+                    ...(requestKind === "approval"
+                      ? { decision: "decline" }
+                      : {
+                        answers: {
+                          "question-1": {
+                            answers: ["Different"]
+                          }
                         }
-                      }
-                    })
-                };
+                      })
+                  };
                 return {
                   command_id: "command-1",
                   interaction_id: "interaction-1",
                   response_kind: requestKind,
-                  response_json: JSON.stringify(response),
+                  response_json: response === null ? null : JSON.stringify(response),
+                  resolution_summary: requestKind === "approval"
+                    ? "Approval accepted for Approve command execution."
+                    : "Input provided for Provide input.",
+                  resolution_payload_json: JSON.stringify(requestKind === "approval"
+                    ? {
+                      type: "turn_interaction_resolution",
+                      interaction_id: "interaction-1",
+                      status: "accepted",
+                      decision: "accept"
+                    }
+                    : {
+                      type: "turn_interaction_resolution",
+                      interaction_id: "interaction-1",
+                      status: "answered",
+                      answer_count: 1
+                    }),
                   delivered_at: options.deliveredClaim ? "2026-06-24T10:00:01.000Z" : null
                 };
               }
@@ -2339,6 +2435,15 @@ function turnInteractionResolutionDb(options: {
     },
     get taskUpdates() {
       return counters.taskUpdates;
+    },
+    get claimResponseJson() {
+      return counters.claimResponseJson;
+    },
+    get claimResolutionSummary() {
+      return counters.claimResolutionSummary;
+    },
+    get claimResolutionPayloadJson() {
+      return counters.claimResolutionPayloadJson;
     }
   };
 

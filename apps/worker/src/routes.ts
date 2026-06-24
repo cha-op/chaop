@@ -410,7 +410,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       let event: ThreadEvent;
       try {
         event = await recordTurnInteractionResolutionInDb(env, eventId, payload.value, {
-          allowExisting: true
+          allowExisting: true,
+          resolution: preparation.resolution
         });
       } catch (error) {
         if (!connectorDelivered) {
