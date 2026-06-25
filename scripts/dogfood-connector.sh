@@ -158,14 +158,53 @@ normalise_paths() {
   HOSTNAME_VALUE="${HOSTNAME_VALUE:-$(hostname)}"
 }
 
+state_file_path_key() {
+  local file_path="$1"
+  local parent_dir base_name resolved_parent
+  parent_dir="$(dirname "$file_path")"
+  base_name="$(basename "$file_path")"
+  resolved_parent="$(cd "$parent_dir" && pwd -P)"
+  printf '%s/%s\n' "$resolved_parent" "$base_name"
+}
+
+state_file_identity() {
+  local file_path="$1"
+  if stat -f '%d:%i' "$file_path" 2>/dev/null; then
+    return 0
+  fi
+  stat -c '%d:%i' "$file_path"
+}
+
+ensure_distinct_state_paths() {
+  local pid_path meta_path log_path
+  pid_path="$(state_file_path_key "$PID_FILE")"
+  meta_path="$(state_file_path_key "$PID_META_FILE")"
+  log_path="$(state_file_path_key "$LOG_FILE")"
+  if [[ "$pid_path" == "$meta_path" || "$pid_path" == "$log_path" || "$meta_path" == "$log_path" ]]; then
+    die "pid, pid metadata, and log files must be distinct paths"
+  fi
+}
+
+ensure_distinct_state_file_identities() {
+  local pid_id meta_id log_id
+  pid_id="$(state_file_identity "$PID_FILE")"
+  meta_id="$(state_file_identity "$PID_META_FILE")"
+  log_id="$(state_file_identity "$LOG_FILE")"
+  if [[ "$pid_id" == "$meta_id" || "$pid_id" == "$log_id" || "$meta_id" == "$log_id" ]]; then
+    die "pid, pid metadata, and log files must not point to the same file"
+  fi
+}
+
 ensure_state_dirs() {
   mkdir -p "$STATE_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")" "$(dirname "$PID_META_FILE")" "$(dirname "$LOG_FILE")"
   chmod 700 "$STATE_DIR" 2>/dev/null || true
+  ensure_distinct_state_paths
   touch "$LOG_FILE"
 }
 
 preflight_launch_files() {
   touch "$LOG_FILE" "$PID_FILE" "$PID_META_FILE"
+  ensure_distinct_state_file_identities
   rm -f "$PID_FILE" "$PID_META_FILE"
 }
 
@@ -226,6 +265,28 @@ process_started_at() {
   ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
 }
 
+wait_for_process_started_at() {
+  local pid="$1"
+  local started_at=""
+  for _ in {1..10}; do
+    started_at="$(process_started_at "$pid")"
+    if [[ -n "$started_at" ]]; then
+      printf '%s\n' "$started_at"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+new_run_token() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+    return 0
+  fi
+  printf '%s-%s-%s\n' "$$" "$(date -u '+%Y%m%dT%H%M%SZ')" "$RANDOM"
+}
+
 metadata_field() {
   local key="$1"
   [[ -f "$PID_META_FILE" ]] || return 1
@@ -235,10 +296,12 @@ metadata_field() {
 write_pid_metadata() {
   local pid="$1"
   local agent_bin="$2"
+  local run_token="$3"
   local started_at
-  started_at="$(process_started_at "$pid")"
+  started_at="$(wait_for_process_started_at "$pid" || true)"
   {
     printf 'pid=%s\n' "$pid"
+    printf 'run_token=%s\n' "$run_token"
     printf 'started_at=%s\n' "$started_at"
     printf 'agent_bin=%s\n' "$agent_bin"
     printf 'config=%s\n' "$CONFIG_PATH"
@@ -247,20 +310,25 @@ write_pid_metadata() {
 
 pid_matches_metadata() {
   local pid="$1"
-  local recorded_pid recorded_started_at current_started_at
+  local recorded_pid recorded_run_token recorded_started_at current_started_at
   recorded_pid="$(metadata_field pid)" || return 1
+  recorded_run_token="$(metadata_field run_token)" || return 1
   recorded_started_at="$(metadata_field started_at)" || return 1
   [[ "$recorded_pid" == "$pid" ]] || return 1
+  [[ -n "$recorded_run_token" ]] || return 1
   [[ -n "$recorded_started_at" ]] || return 0
   current_started_at="$(process_started_at "$pid")"
+  [[ -n "$current_started_at" ]] || return 0
   [[ "$current_started_at" == "$recorded_started_at" ]]
 }
 
 pid_matches_connector() {
   local pid="$1"
-  if pid_matches_metadata "$pid"; then
-    return 0
-  fi
+  pid_matches_metadata "$pid"
+}
+
+pid_matches_connector_hint() {
+  local pid="$1"
   local command_line
   command_line="$(process_command "$pid")"
   [[ "$command_line" == *"--connect"* ]] || return 1
@@ -299,7 +367,11 @@ print_status() {
     printf 'pid=%s\n' "$pid"
     printf 'process=%s\n' "$(process_command "$pid")"
   elif pid="$(pid_from_file)" && is_pid_running "$pid"; then
-    printf 'status=pid-file-points-to-other-process\n'
+    if pid_matches_connector_hint "$pid"; then
+      printf 'status=pid-file-points-to-unmanaged-connector-like-process\n'
+    else
+      printf 'status=pid-file-points-to-other-process\n'
+    fi
     printf 'pid=%s\n' "$pid"
     printf 'process=%s\n' "$(process_command "$pid")"
   else
@@ -331,10 +403,12 @@ start_connector() {
     printf 'config=%s\n' "$CONFIG_PATH"
   } >> "$LOG_FILE"
 
-  nohup "$agent_bin" --config "$CONFIG_PATH" --connect >> "$LOG_FILE" 2>&1 &
+  local run_token
+  run_token="$(new_run_token)"
+  CHAOP_DOGFOOD_RUN_TOKEN="$run_token" nohup "$agent_bin" --config "$CONFIG_PATH" --connect >> "$LOG_FILE" 2>&1 &
   pid="$!"
   printf '%s\n' "$pid" > "$PID_FILE"
-  write_pid_metadata "$pid" "$agent_bin"
+  write_pid_metadata "$pid" "$agent_bin" "$run_token"
   sleep 1
   if ! is_pid_running "$pid"; then
     printf 'connector exited during startup; recent log follows:\n' >&2
@@ -350,7 +424,7 @@ stop_connector() {
   normalise_paths
   local pid
   if pid="$(pid_from_file)" && is_pid_running "$pid" && ! pid_matches_connector "$pid"; then
-    die "pid file points to a different running process; refusing to stop pid $pid"
+    die "pid file points to an unmanaged running process; refusing to stop pid $pid"
   fi
   if ! pid="$(current_pid)"; then
     remove_stale_pid_file
