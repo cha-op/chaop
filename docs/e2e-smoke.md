@@ -102,7 +102,7 @@ curl -fsS \
 Expected checks:
 
 - `/api/health` returns `200` JSON with `ok: true` and `service: "chaop-api"`.
-- `/api/bootstrap` returns `200` JSON when sent with an allowed `Origin` header for the GUI domain.
+- `/api/bootstrap` returns `200` JSON with a `workspaces` array when sent with an allowed `Origin` header for the GUI domain. This shape is required even when `--skip-browser` is used.
 - `/api/usage-summary` returns `200` JSON with sampled Cloudflare telemetry-backed constraints when telemetry is configured. The top-level `source` can remain `d1_usage_windows` when local usage windows also exist.
 - The GUI index returns `200`.
 - Every same-origin JavaScript and CSS asset referenced by the index returns `200`, the expected JavaScript or CSS content type, and a non-zero body. Off-origin assets are not fetched with Cloudflare Access service-token headers, and direct smoke requests disable automatic redirects so a same-origin asset cannot redirect those headers to another origin. HTML SPA fallback responses are rejected for asset URLs.
@@ -126,7 +126,7 @@ Expected browser checks:
 - the body contains `Budget Board`;
 - the body contains `Host Sessions`;
 - `/api/bootstrap` on the configured API origin returns `200` JSON within the configured timeout;
-- no GUI HTML, static asset, or API response returns `4xx` or `5xx`.
+- no GUI HTML, static asset, or API response returns `4xx` or `5xx`. Browser-owned optional `/favicon.ico` failures are ignored because the app does not depend on that request.
 
 ## Budget Smoke
 

@@ -102,7 +102,7 @@ curl -fsS \
 预期检查项：
 
 - `/api/health` 返回 `200` JSON，并包含 `ok: true` 和 `service: "chaop-api"`。
-- `/api/bootstrap` 在带允许的 GUI domain `Origin` header 时返回 `200` JSON。
+- `/api/bootstrap` 在带允许的 GUI domain `Origin` header 时返回包含 `workspaces` 数组的 `200` JSON。即使使用 `--skip-browser`，也必须校验这个结构。
 - `/api/usage-summary` 在 telemetry 已配置时返回 `200` JSON，并包含 sampled Cloudflare telemetry-backed constraints。若本地 usage windows 同时存在，顶层 `source` 可以仍然是 `d1_usage_windows`。
 - GUI index 返回 `200`。
 - index 引用的每个同源 JavaScript 和 CSS asset 都返回 `200`、符合预期的 JavaScript 或 CSS content type，并且 body 非空。off-origin assets 不会带 Cloudflare Access service-token headers 请求；direct smoke requests 会禁用自动重定向，所以同源 asset 不能通过重定向把这些 headers 带到其他 origin。asset URL 返回 HTML SPA fallback 会被拒绝。
@@ -126,7 +126,7 @@ curl -fsS \
 - body 包含 `Budget Board`；
 - body 包含 `Host Sessions`；
 - 配置的 API origin 上的 `/api/bootstrap` 在配置的 timeout 内返回 `200` JSON；
-- GUI HTML、静态 asset 和 API response 都没有返回 `4xx` 或 `5xx`。
+- GUI HTML、静态 asset 和 API response 都没有返回 `4xx` 或 `5xx`。浏览器自动触发且应用不依赖的可选 `/favicon.ico` 失败会被忽略。
 
 ## Budget Smoke
 

@@ -19,7 +19,7 @@ Use this repo-local skill when verifying a deployed Chaop slice, especially afte
    Confirm the configured GUI and API origins are HTTPS before sending Cloudflare Access service-token headers.
 2. Run the low-cost API and asset smoke:
    - `/api/health`;
-   - `/api/bootstrap` with the allowed GUI Origin;
+   - `/api/bootstrap` with the allowed GUI Origin, rejecting payloads without a `workspaces` array even when browser automation is skipped;
    - `/api/usage-summary`, which can refresh Cloudflare telemetry and write a bounded telemetry cache row;
    - stop immediately on a failing Budget Board gate before requesting GUI assets or running browser automation;
    - GUI index;
@@ -30,6 +30,7 @@ Use this repo-local skill when verifying a deployed Chaop slice, especially afte
    - do not inject service-token headers into the page context;
    - assert the app shell renders `Operations Map`, `Budget Board`, and `Host Sessions`;
    - assert `/api/bootstrap` on the configured API origin returns `200` JSON before the configured timeout.
+   - fail on deployed `4xx`/`5xx` responses observed by the browser, except for optional browser-owned `/favicon.ico` requests that the app does not depend on.
 4. For Budget Board checks, summarise `/api/usage-summary`:
    - `source`, `state`, and `generated_at`;
    - bottleneck constraint;

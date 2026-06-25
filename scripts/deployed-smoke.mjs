@@ -204,6 +204,7 @@ async function runDirectApiSmoke({ config, fetchImpl }) {
     headers: apiHeaders,
   }, config.browserTimeoutMs);
   assertStatus("API bootstrap", bootstrap.status, 200);
+  assertBootstrapPayload("API bootstrap", bootstrap.body);
 
   const usage = await fetchJson(fetchImpl, `${config.apiBaseUrl}/api/usage-summary`, {
     headers: apiHeaders,
@@ -214,7 +215,7 @@ async function runDirectApiSmoke({ config, fetchImpl }) {
     health: health.status,
     bootstrap: bootstrap.status,
     usage: usage.status,
-    workspace_count: arrayLength(bootstrap.body?.workspaces),
+    workspace_count: bootstrap.body.workspaces.length,
     usagePayload: usage.body,
   };
 }
@@ -286,8 +287,9 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
     const page = await context.newPage();
     page.on("response", (response) => {
       const status = response.status();
-      if (status >= 400) {
-        failedResponses.push({ status, url: redactOrigin(response.url()) });
+      const url = response.url();
+      if (status >= 400 && !isOptionalBrowserFailure(url)) {
+        failedResponses.push({ status, url: redactOrigin(url) });
       }
     });
     await page.goto(config.guiUrl, {
@@ -509,8 +511,19 @@ function assertEqual(label, actual, expected) {
   }
 }
 
-function arrayLength(value) {
-  return Array.isArray(value) ? value.length : 0;
+function assertBootstrapPayload(label, body) {
+  if (!Array.isArray(body?.workspaces)) {
+    throw new SmokeError(`${label} did not return the expected API JSON.`);
+  }
+}
+
+function isOptionalBrowserFailure(value) {
+  try {
+    const url = new URL(value);
+    return url.pathname === "/favicon.ico";
+  } catch {
+    return false;
+  }
 }
 
 export function analyseBudget(payload, options = {}) {

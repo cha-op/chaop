@@ -176,6 +176,37 @@ describe("deployed smoke assets and cookies", () => {
     assert.deepEqual(requested, ["https://api.example.com/api/health"]);
   });
 
+  it("rejects malformed bootstrap JSON in skip-browser smoke", async () => {
+    const config = readConfig(smokeEnv());
+    const requested = [];
+    const fetchImpl = async (url) => {
+      requested.push(url);
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse(healthBody());
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: {} });
+      }
+      throw new Error(`Unexpected request after bootstrap failure: ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        runDeployedSmoke({
+          config,
+          fetchImpl,
+          options: {
+            skipBrowser: true,
+            allowMissingTelemetry: false,
+            maxBottleneckUsedPct: 90,
+            maxD1RowsWrittenUsedPct: 80,
+          },
+        }),
+      /API bootstrap did not return the expected API JSON/,
+    );
+    assert.deepEqual(requested, ["https://api.example.com/api/health", "https://api.example.com/api/bootstrap"]);
+  });
+
   it("does not automatically follow asset redirects with Access headers", async () => {
     const config = readConfig(smokeEnv());
     const requested = [];
@@ -414,6 +445,101 @@ describe("deployed smoke assets and cookies", () => {
           "browser bootstrap response body did not time out",
         ),
       /Browser bootstrap request timed out/,
+    );
+  });
+
+  it("ignores optional browser favicon failures", async () => {
+    const config = readConfig(smokeEnv());
+    const fetchImpl = async (url, init = {}) => {
+      if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
+        throw new Error("Access header fetch did not disable automatic redirects");
+      }
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse(healthBody(), { headers: { "set-cookie": "CF_Authorization=api-token; Path=/" } });
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: [] });
+      }
+      if (url === "https://api.example.com/api/usage-summary") {
+        return jsonResponse(healthyBudget());
+      }
+      if (url === "https://app.example.com") {
+        return textResponse('<script type="module" src="/assets/index.js"></script>', {
+          headers: { "set-cookie": "CF_Authorization=gui-token; Path=/" },
+        });
+      }
+      if (url === "https://app.example.com/assets/index.js") {
+        return textResponse("console.log('ok');", { headers: { "content-type": "text/javascript" } });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    const result = await runDeployedSmoke({
+      config,
+      fetchImpl,
+      browserLauncher: fakeBrowserLauncher({
+        evaluate: async () => ({ status: 200, contentType: "application/json", hasWorkspaces: true, timedOut: false }),
+        responses: [{ status: 404, url: "https://app.example.com/favicon.ico" }],
+      }),
+      options: {
+        skipBrowser: false,
+        allowMissingTelemetry: false,
+        maxBottleneckUsedPct: 90,
+        maxD1RowsWrittenUsedPct: 80,
+      },
+    });
+
+    assert.deepEqual(result.browser.failedResponses, []);
+  });
+
+  it("fails on deployed browser responses other than optional favicon requests", async () => {
+    const config = readConfig(smokeEnv());
+    const fetchImpl = async (url, init = {}) => {
+      if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
+        throw new Error("Access header fetch did not disable automatic redirects");
+      }
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse(healthBody(), { headers: { "set-cookie": "CF_Authorization=api-token; Path=/" } });
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: [] });
+      }
+      if (url === "https://api.example.com/api/usage-summary") {
+        return jsonResponse(healthyBudget());
+      }
+      if (url === "https://app.example.com") {
+        return textResponse('<script type="module" src="/assets/index.js"></script>', {
+          headers: { "set-cookie": "CF_Authorization=gui-token; Path=/" },
+        });
+      }
+      if (url === "https://app.example.com/assets/index.js") {
+        return textResponse("console.log('ok');", { headers: { "content-type": "text/javascript" } });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        runDeployedSmoke({
+          config,
+          fetchImpl,
+          browserLauncher: fakeBrowserLauncher({
+            evaluate: async () => ({
+              status: 200,
+              contentType: "application/json",
+              hasWorkspaces: true,
+              timedOut: false,
+            }),
+            responses: [{ status: 404, url: "https://app.example.com/assets/missing.js" }],
+          }),
+          options: {
+            skipBrowser: false,
+            allowMissingTelemetry: false,
+            maxBottleneckUsedPct: 90,
+            maxD1RowsWrittenUsedPct: 80,
+          },
+        }),
+      /Browser observed failed deployed responses/,
     );
   });
 });
@@ -663,7 +789,7 @@ function textResponse(body, init = {}) {
   });
 }
 
-function fakeBrowserLauncher({ evaluate }) {
+function fakeBrowserLauncher({ evaluate, responses = [] }) {
   return {
     async launch() {
       return {
@@ -672,7 +798,15 @@ function fakeBrowserLauncher({ evaluate }) {
             async addCookies() {},
             async newPage() {
               return {
-                on() {},
+                on(event, handler) {
+                  if (event !== "response") return;
+                  for (const response of responses) {
+                    handler({
+                      status: () => response.status,
+                      url: () => response.url,
+                    });
+                  }
+                },
                 async goto() {},
                 async waitForFunction() {},
                 async title() {
