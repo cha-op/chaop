@@ -273,6 +273,11 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
   const launcher = browserLauncher ?? (await loadPlaywrightChromium());
   const cookies = await accessCookies({ config, fetchImpl });
   const failedResponses = [];
+  const appBootstrapUrls = [];
+  let resolveAppBootstrapResponse = () => {};
+  const appBootstrapResponse = new Promise((resolve) => {
+    resolveAppBootstrapResponse = resolve;
+  });
   let browser;
   try {
     browser = await launcher.launch({ headless: true });
@@ -288,14 +293,24 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
     page.on("response", (response) => {
       const status = response.status();
       const url = response.url();
+      if (isBootstrapApiUrl(url)) {
+        appBootstrapUrls.push(url);
+        resolveAppBootstrapResponse();
+      }
       if (status >= 400 && !isOptionalBrowserFailure(url)) {
         failedResponses.push({ status, url: redactOrigin(url) });
       }
     });
-    await page.goto(config.guiUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: config.browserTimeoutMs,
-    });
+    try {
+      await page.goto(config.guiUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: config.browserTimeoutMs,
+      });
+    } catch (error) {
+      throw new SmokeError("Browser navigation failed for the GUI origin.", {
+        cause: error instanceof Error ? error.name : "navigation error",
+      });
+    }
     await page.waitForFunction(
       () => {
         const text = document.body?.innerText ?? "";
@@ -312,6 +327,8 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
     if (title !== "Chaop Control Plane") {
       throw new SmokeError(`Unexpected browser title: ${title}`);
     }
+    await waitForBrowserAppBootstrap(appBootstrapUrls, appBootstrapResponse, config.browserTimeoutMs);
+    const observedAppBootstrapUrls = [...appBootstrapUrls];
     const bootstrap = await page.evaluate(async ({ apiBaseUrl, timeoutMs }) => {
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -358,6 +375,7 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
     if (!bootstrap.contentType.includes("application/json") || !bootstrap.hasWorkspaces) {
       throw new SmokeError("Browser bootstrap request did not return the expected API JSON.");
     }
+    assertBrowserAppBootstrapOrigin(observedAppBootstrapUrls, config.apiBaseUrl);
     if (failedResponses.length > 0) {
       throw new SmokeError("Browser observed failed deployed responses.", { failedResponses });
     }
@@ -523,6 +541,48 @@ function isOptionalBrowserFailure(value) {
     return url.pathname === "/favicon.ico";
   } catch {
     return false;
+  }
+}
+
+function isBootstrapApiUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.pathname === "/api/bootstrap";
+  } catch {
+    return false;
+  }
+}
+
+function assertBrowserAppBootstrapOrigin(urls, expectedApiBaseUrl) {
+  const expectedOrigin = new URL(expectedApiBaseUrl).origin;
+  if (urls.length === 0) {
+    throw new SmokeError("Browser app did not request bootstrap before the browser smoke timeout.");
+  }
+  if (!urls.every((value) => new URL(value).origin === expectedOrigin)) {
+    throw new SmokeError("Browser app bootstrap used an unexpected API origin.", {
+      expected: redactOrigin(`${expectedApiBaseUrl}/api/bootstrap`),
+      observed: urls.map(redactOrigin),
+    });
+  }
+}
+
+async function waitForBrowserAppBootstrap(urls, appBootstrapResponse, timeoutMs) {
+  if (urls.length > 0) return;
+  let timeout;
+  try {
+    const observed = await Promise.race([
+      appBootstrapResponse.then(() => true),
+      new Promise((resolve) => {
+        timeout = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+    if (!observed && urls.length === 0) {
+      throw new SmokeError("Browser app did not request bootstrap before the browser smoke timeout.", {
+        timeout_ms: timeoutMs,
+      });
+    }
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

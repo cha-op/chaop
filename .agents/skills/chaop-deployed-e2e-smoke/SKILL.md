@@ -29,8 +29,10 @@ Use this repo-local skill when verifying a deployed Chaop slice, especially afte
    - add those cookies to the browser context;
    - do not inject service-token headers into the page context;
    - assert the app shell renders `Operations Map`, `Budget Board`, and `Host Sessions`;
+   - assert the app shell's own `/api/bootstrap` request uses the configured API origin, catching stale `VITE_CHAOP_API_BASE_URL` bundles;
    - assert `/api/bootstrap` on the configured API origin returns `200` JSON before the configured timeout.
    - fail on deployed `4xx`/`5xx` responses observed by the browser, except for optional browser-owned `/favicon.ico` requests that the app does not depend on.
+   - report browser navigation failures without printing private deployment origins.
 4. For Budget Board checks, summarise `/api/usage-summary`:
    - `source`, `state`, and `generated_at`;
    - bottleneck constraint;

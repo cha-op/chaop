@@ -125,8 +125,11 @@ curl -fsS \
 - body 包含 `Operations Map`；
 - body 包含 `Budget Board`；
 - body 包含 `Host Sessions`；
+- app shell 自己发起的 `/api/bootstrap` request 使用配置的 API origin，用于发现 stale `VITE_CHAOP_API_BASE_URL` bundle；
 - 配置的 API origin 上的 `/api/bootstrap` 在配置的 timeout 内返回 `200` JSON；
 - GUI HTML、静态 asset 和 API response 都没有返回 `4xx` 或 `5xx`。浏览器自动触发且应用不依赖的可选 `/favicon.ico` 失败会被忽略。
+
+Navigation failures 会在不打印私有 GUI origin 的情况下报告。
 
 ## Budget Smoke
 

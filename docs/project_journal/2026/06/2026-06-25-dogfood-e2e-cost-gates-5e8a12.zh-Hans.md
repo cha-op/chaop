@@ -29,6 +29,8 @@ superseded_by:
 - API health checks 会同时校验 `ok: true` 和 `service: "chaop-api"`，避免路由到错误 Worker 的部署误判通过。
 - direct bootstrap checks 会校验响应包含 `workspaces` 数组，避免 `--skip-browser` 在 malformed bootstrap JSON 上误判通过。
 - browser response checks 会忽略可选的 `/favicon.ico` 失败，但仍然会在真实 GUI asset 或 API `4xx`/`5xx` responses 上失败。
+- browser navigation failures 会被包装成已隐藏 origin 的 `SmokeError` messages，避免打印私有 GUI origin。
+- browser smoke 会比较 app shell 自己发起的 `/api/bootstrap` request origin 和配置的 API origin，用于发现 stale `VITE_CHAOP_API_BASE_URL` bundle。
 - app-server request deadline errors 现在会保留正在等待的 method name，避免 agent tests 在 suite load 下出现不稳定的 timeout 分类。
 - asset checks 会校验 JavaScript/CSS content types，避免 Cloudflare Assets 的 SPA fallback HTML 让缺失 asset 误判通过。
 - asset summaries 和 asset failure messages 会隐藏部署 origin，只报告路径。
@@ -41,6 +43,6 @@ superseded_by:
 - API/Web deploy 或 connector cost-control 变更后，继续使用 deployed smoke。
 
 ## 证据
-- 本地 Node tests 覆盖 argument parsing、HTTPS origin validation、API health service validation、bootstrap shape validation、optional favicon filtering、asset 和 cookie parsing，以及 budget gate 的 pass/fail 行为。
+- 本地 Node tests 覆盖 argument parsing、HTTPS origin validation、API health service validation、bootstrap shape validation、browser navigation redaction、app API-origin validation、optional favicon filtering、asset 和 cookie parsing，以及 budget gate 的 pass/fail 行为。
 - 现有 Rust agent test 会覆盖 app-server resume deadline regression：不匹配的 resume response 应按 method timeout 收口。
 - 完整本地和 deployed validation 应在 merge 前记录到 PR readiness report。
