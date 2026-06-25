@@ -18,6 +18,7 @@ HOSTNAME_VALUE="${CHAOP_HOSTNAME:-}"
 LOG_LINES="${CHAOP_DOGFOOD_LOG_LINES:-80}"
 STOP_TIMEOUT_SECONDS="${CHAOP_DOGFOOD_STOP_TIMEOUT_SECONDS:-15}"
 LOCK_TIMEOUT_SECONDS="${CHAOP_DOGFOOD_LOCK_TIMEOUT_SECONDS:-15}"
+START_FAILURE_STOP_TIMEOUT_SECONDS="${CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS:-5}"
 NO_BUILD=0
 FOLLOW_LOGS=0
 FORCE_STOP=0
@@ -62,6 +63,7 @@ Environment:
   CHAOP_DOGFOOD_PID_META_FILE
   CHAOP_DOGFOOD_LOCK_DIR
   CHAOP_DOGFOOD_LOCK_TIMEOUT_SECONDS
+  CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS
   CHAOP_DOGFOOD_UPGRADE_MARKER_FILE
 USAGE
 }
@@ -237,6 +239,23 @@ ensure_private_dir() {
   fi
 }
 
+ensure_state_subpath() {
+  local path_value="$1"
+  case "$path_value" in
+    "$STATE_DIR"|"$STATE_DIR"/*)
+      ;;
+    *)
+      die "state paths must stay under --state-dir: $path_value"
+      ;;
+  esac
+}
+
+ensure_private_state_dir() {
+  local dir_path="$1"
+  ensure_state_subpath "$dir_path"
+  ensure_private_dir "$dir_path"
+}
+
 ensure_state_file_not_symlink() {
   local file_path="$1"
   [[ ! -L "$file_path" ]] || die "state file must not be a symlink: $file_path"
@@ -250,10 +269,10 @@ ensure_no_state_file_symlinks() {
 
 ensure_state_safety() {
   ensure_private_dir "$STATE_DIR"
-  ensure_private_dir "$LOG_DIR"
-  ensure_private_dir "$(dirname "$PID_FILE")"
-  ensure_private_dir "$(dirname "$PID_META_FILE")"
-  ensure_private_dir "$(dirname "$LOG_FILE")"
+  ensure_private_state_dir "$LOG_DIR"
+  ensure_private_state_dir "$(dirname "$PID_FILE")"
+  ensure_private_state_dir "$(dirname "$PID_META_FILE")"
+  ensure_private_state_dir "$(dirname "$LOG_FILE")"
   ensure_distinct_state_paths
   ensure_no_state_file_symlinks
 }
@@ -274,21 +293,52 @@ preflight_launch_files() {
 
 acquire_state_lock() {
   ensure_private_dir "$STATE_DIR"
-  ensure_private_dir "$(dirname "$LOCK_DIR")"
+  ensure_private_state_dir "$(dirname "$LOCK_DIR")"
   local waited=0
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+  while true; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      if printf '%s\n' "$$" > "$LOCK_DIR/owner.pid"; then
+        LOCK_ACQUIRED=1
+        chmod 700 "$LOCK_DIR" 2>/dev/null || true
+        return 0
+      fi
+      rm -f "$LOCK_DIR/owner.pid"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+    if [[ "$waited" -gt 0 ]]; then
+      remove_stale_lock_dir 1
+    else
+      remove_stale_lock_dir 0
+    fi
     if [[ "$waited" -ge "$LOCK_TIMEOUT_SECONDS" ]]; then
       die "could not acquire connector state lock: $LOCK_DIR"
     fi
     sleep 1
     waited=$((waited + 1))
   done
-  LOCK_ACQUIRED=1
-  chmod 700 "$LOCK_DIR" 2>/dev/null || true
+}
+
+remove_stale_lock_dir() {
+  local remove_ownerless="${1:-0}"
+  local owner_file="$LOCK_DIR/owner.pid"
+  local owner_pid=""
+  if [[ -f "$owner_file" ]]; then
+    owner_pid="$(tr -d '[:space:]' < "$owner_file")"
+    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$owner_file"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    return 0
+  fi
+  if [[ "$remove_ownerless" -eq 1 ]]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
 }
 
 release_state_lock() {
   if [[ "$LOCK_ACQUIRED" -eq 1 ]]; then
+    rm -f "$LOCK_DIR/owner.pid"
     rmdir "$LOCK_DIR" 2>/dev/null || true
     LOCK_ACQUIRED=0
   fi
@@ -449,9 +499,22 @@ pid_matches_metadata() {
   fi
   [[ "$argv_status" -eq 2 ]] || return 1
   command_line="$(process_command "$pid")"
-  [[ "$command_line" == "$recorded_agent_bin --config $recorded_config --connect"* ]] || return 1
-  [[ "$command_line" == *"--config"* ]] || return 1
-  [[ "$command_line" == *"--connect"* ]]
+  [[ "$command_line" == "$recorded_agent_bin --config $recorded_config --connect" ]]
+}
+
+stop_start_failure_child() {
+  local pid="$1"
+  local waited=0
+  kill -TERM "$pid" 2>/dev/null || true
+  while is_pid_running "$pid"; do
+    if [[ "$waited" -ge "$START_FAILURE_STOP_TIMEOUT_SECONDS" ]]; then
+      kill -KILL "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null || true
 }
 
 pid_matches_connector() {
@@ -545,8 +608,7 @@ start_connector() {
   printf '%s\n' "$pid" > "$PID_FILE"
   if ! write_pid_metadata "$pid" "$agent_bin" "$run_token"; then
     printf 'could not write connector metadata for pid %s; stopping child\n' "$pid" >&2
-    kill -TERM "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    stop_start_failure_child "$pid"
     rm -f "$PID_FILE" "$PID_META_FILE"
     exit 1
   fi

@@ -8,9 +8,9 @@ CONFIG_FILE="$WORK_DIR/config/connector.toml"
 FAKE_AGENT="$WORK_DIR/bin/fake-chaop-agent"
 FAKE_PS="$WORK_DIR/bin/ps"
 STATE_DIR="$WORK_DIR/state"
-PID_FILE="$WORK_DIR/nested/pids/connector.pid"
-PID_META_FILE="$WORK_DIR/nested/pids/connector.pid.meta"
-LOG_FILE="$WORK_DIR/nested/logs/connector.log"
+PID_FILE="$STATE_DIR/pids/connector.pid"
+PID_META_FILE="$STATE_DIR/pids/connector.pid.meta"
+LOG_FILE="$STATE_DIR/logs/connector.log"
 FAKE_AGENT_STARTED_FILE="$WORK_DIR/agent-started.log"
 FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
 FAKE_PS_COMMAND=""
@@ -44,6 +44,18 @@ resolve_test_path() {
   printf '%s/%s\n' "$resolved_parent" "$base_name"
 }
 
+mode_test_path() {
+  local path_value="$1"
+  case "$(uname -s)" in
+    Darwin|FreeBSD|OpenBSD|NetBSD)
+      stat -f '%Lp' "$path_value"
+      ;;
+    *)
+      stat -c '%a' "$path_value"
+      ;;
+  esac
+}
+
 mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$FAKE_AGENT")"
 cat > "$CONFIG_FILE" <<'CONFIG'
 control_plane_url = "https://example.invalid"
@@ -61,7 +73,11 @@ if [[ "$*" != *"--connect"* ]]; then
 fi
 
 printf '%s %s\n' "$$" "$*" >> "${FAKE_AGENT_STARTED_FILE:?}"
-trap 'exit 0' TERM INT
+if [[ "${FAKE_AGENT_IGNORE_TERM:-0}" == "1" ]]; then
+  trap ':' TERM INT
+else
+  trap 'exit 0' TERM INT
+fi
 while true; do
   sleep 5 &
   wait "$!"
@@ -95,8 +111,10 @@ RECORDED_FAKE_AGENT="$(resolve_test_path "$FAKE_AGENT")"
 RECORDED_CONFIG_FILE="$(resolve_test_path "$CONFIG_FILE")"
 FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
 export FAKE_AGENT_STARTED_FILE
+export FAKE_AGENT_IGNORE_TERM=0
 export FAKE_PS_LSTART
 export FAKE_PS_COMMAND
+export CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS=1
 export PATH="$WORK_DIR/bin:$PATH"
 
 connector() {
@@ -131,6 +149,23 @@ if kill -0 "$first_pid" 2>/dev/null; then
   exit 1
 fi
 
+mkdir -p "$STATE_DIR/connector.lock"
+printf '999999\n' > "$STATE_DIR/connector.lock/owner.pid"
+started_count_before_stale_lock="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+connector recover
+started_count_after_stale_lock="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_stale_lock" != "$((started_count_before_stale_lock + 1))" ]]; then
+  printf 'expected recover to remove a stale lock and start one connector\n' >&2
+  exit 1
+fi
+stale_lock_recovery_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+connector stop
+if kill -0 "$stale_lock_recovery_pid" 2>/dev/null; then
+  printf 'expected stale-lock-recovery pid %s to stop\n' "$stale_lock_recovery_pid" >&2
+  exit 1
+fi
+
+started_count_before_concurrent="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
 connector start >"$WORK_DIR/concurrent-start-a.out" &
 start_a_pid="$!"
 connector start >"$WORK_DIR/concurrent-start-b.out" &
@@ -139,7 +174,7 @@ wait "$start_a_pid"
 wait "$start_b_pid"
 concurrent_pid="$(tr -d '[:space:]' < "$PID_FILE")"
 concurrent_started_count="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
-if [[ "$concurrent_started_count" != "2" ]]; then
+if [[ "$concurrent_started_count" != "$((started_count_before_concurrent + 1))" ]]; then
   printf 'expected concurrent start to launch one additional connector, got %s total starts\n' "$concurrent_started_count" >&2
   exit 1
 fi
@@ -243,6 +278,60 @@ FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
 export FAKE_PS_COMMAND
 rm -f "$PID_FILE" "$PID_META_FILE"
 
+sleep 30 &
+FOREIGN_PID="$!"
+printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
+{
+  printf 'pid=%s\n' "$FOREIGN_PID"
+  printf 'run_token=fake-token\n'
+  printf 'started_at=%s\n' "$FAKE_PS_LSTART"
+  printf 'agent_bin=%s\n' "$RECORDED_FAKE_AGENT"
+  printf 'config=%s\n' "$RECORDED_CONFIG_FILE"
+} > "$PID_META_FILE"
+FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect --spoofed"
+export FAKE_PS_COMMAND
+if connector stop >/dev/null 2>"$WORK_DIR/suffix-command-stop.err"; then
+  printf 'expected stop to reject connector-looking argv with extra suffix\n' >&2
+  exit 1
+fi
+if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
+  printf 'expected suffix-command pid %s to remain running\n' "$FOREIGN_PID" >&2
+  exit 1
+fi
+kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=""
+FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
+export FAKE_PS_COMMAND
+rm -f "$PID_FILE" "$PID_META_FILE"
+
+external_log_dir="$WORK_DIR/external-logs"
+mkdir -p "$external_log_dir"
+chmod 755 "$external_log_dir"
+started_count_before_external_path="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if "$REPO_ROOT/scripts/dogfood-connector.sh" \
+  --config "$CONFIG_FILE" \
+  --agent-bin "$FAKE_AGENT" \
+  --state-dir "$STATE_DIR" \
+  --pid-file "$PID_FILE" \
+  --pid-meta-file "$PID_META_FILE" \
+  --log-file "$external_log_dir/connector.log" \
+  start >/dev/null 2>"$WORK_DIR/external-log-path.err"; then
+  printf 'expected start to reject state files outside state-dir\n' >&2
+  exit 1
+fi
+external_mode="$(mode_test_path "$external_log_dir")"
+if [[ "$external_mode" != "755" ]]; then
+  printf 'expected external log directory mode to remain 755, got %s\n' "$external_mode" >&2
+  exit 1
+fi
+started_count_after_external_path="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_external_path" != "$started_count_before_external_path" ]]; then
+  printf 'expected external path rejection to avoid starting another connector\n' >&2
+  exit 1
+fi
+
+started_count_before_collision="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
 if "$REPO_ROOT/scripts/dogfood-connector.sh" \
   --config "$CONFIG_FILE" \
   --agent-bin "$FAKE_AGENT" \
@@ -256,11 +345,12 @@ if "$REPO_ROOT/scripts/dogfood-connector.sh" \
 fi
 
 started_count_after_collision="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
-if [[ "$started_count_after_collision" != "4" ]]; then
+if [[ "$started_count_after_collision" != "$started_count_before_collision" ]]; then
   printf 'expected path collision to avoid starting another connector\n' >&2
   exit 1
 fi
 
+started_count_before_symlink="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
 rm -f "$LOG_FILE"
 ln -s "$WORK_DIR/symlink-target.log" "$LOG_FILE"
 if connector start >/dev/null 2>"$WORK_DIR/symlink-log.err"; then
@@ -269,7 +359,7 @@ if connector start >/dev/null 2>"$WORK_DIR/symlink-log.err"; then
 fi
 rm -f "$LOG_FILE"
 started_count_after_symlink="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
-if [[ "$started_count_after_symlink" != "4" ]]; then
+if [[ "$started_count_after_symlink" != "$started_count_before_symlink" ]]; then
   printf 'expected symlink state file rejection to avoid starting another connector\n' >&2
   exit 1
 fi
@@ -291,7 +381,9 @@ rm -f "$LOG_FILE"
 
 started_count_before_metadata_failure="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
 FAKE_PS_LSTART=""
+FAKE_AGENT_IGNORE_TERM=1
 export FAKE_PS_LSTART
+export FAKE_AGENT_IGNORE_TERM
 if connector start >/dev/null 2>"$WORK_DIR/metadata-failure-start.err"; then
   printf 'expected start to fail when process start time cannot be read\n' >&2
   exit 1
@@ -311,6 +403,8 @@ if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
   exit 1
 fi
 FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
+FAKE_AGENT_IGNORE_TERM=0
 export FAKE_PS_LSTART
+export FAKE_AGENT_IGNORE_TERM
 
 printf 'dogfood connector script smoke passed\n'
