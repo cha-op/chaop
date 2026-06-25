@@ -164,6 +164,15 @@ normalise_paths() {
   HOSTNAME_VALUE="${HOSTNAME_VALUE:-$(hostname)}"
 }
 
+resolve_existing_path() {
+  local path_value="$1"
+  local parent_dir base_name resolved_parent
+  parent_dir="$(dirname "$path_value")"
+  base_name="$(basename "$path_value")"
+  resolved_parent="$(cd "$parent_dir" && pwd -P)"
+  printf '%s/%s\n' "$resolved_parent" "$base_name"
+}
+
 state_mode() {
   local file_path="$1"
   case "$(uname -s)" in
@@ -239,7 +248,7 @@ ensure_no_state_file_symlinks() {
   ensure_state_file_not_symlink "$LOG_FILE"
 }
 
-ensure_state_dirs() {
+ensure_state_safety() {
   ensure_private_dir "$STATE_DIR"
   ensure_private_dir "$LOG_DIR"
   ensure_private_dir "$(dirname "$PID_FILE")"
@@ -247,6 +256,10 @@ ensure_state_dirs() {
   ensure_private_dir "$(dirname "$LOG_FILE")"
   ensure_distinct_state_paths
   ensure_no_state_file_symlinks
+}
+
+ensure_state_dirs() {
+  ensure_state_safety
   touch "$LOG_FILE"
   ensure_no_state_file_symlinks
 }
@@ -295,11 +308,13 @@ with_state_lock() {
 ensure_config() {
   [[ -n "$CONFIG_PATH" ]] || die "set --config or CHAOP_AGENT_CONFIG"
   [[ -r "$CONFIG_PATH" ]] || die "connector config is not readable: $CONFIG_PATH"
+  CONFIG_PATH="$(resolve_existing_path "$CONFIG_PATH")"
 }
 
 ensure_agent_bin() {
   if [[ -n "$AGENT_BIN" ]]; then
     [[ -x "$AGENT_BIN" ]] || die "chaop-agent binary is not executable: $AGENT_BIN"
+    AGENT_BIN="$(resolve_existing_path "$AGENT_BIN")"
     printf '%s\n' "$AGENT_BIN"
     return
   fi
@@ -344,6 +359,21 @@ process_command() {
   ps -p "$pid" -o command= 2>/dev/null || true
 }
 
+process_argv_matches() {
+  local pid="$1"
+  local recorded_agent_bin="$2"
+  local recorded_config="$3"
+  if [[ ! -r "/proc/$pid/cmdline" ]]; then
+    return 2
+  fi
+  local -a argv
+  mapfile -t argv < <(tr '\0' '\n' < "/proc/$pid/cmdline")
+  [[ "${argv[0]:-}" == "$recorded_agent_bin" ]] || return 1
+  [[ "${argv[1]:-}" == "--config" ]] || return 1
+  [[ "${argv[2]:-}" == "$recorded_config" ]] || return 1
+  [[ "${argv[3]:-}" == "--connect" ]] || return 1
+}
+
 process_started_at() {
   local pid="$1"
   ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
@@ -382,15 +412,17 @@ write_pid_metadata() {
   local agent_bin="$2"
   local run_token="$3"
   local started_at
-  started_at="$(wait_for_process_started_at "$pid")" || die "could not read connector process start time for pid $pid"
+  started_at="$(wait_for_process_started_at "$pid")" || return 1
   ensure_no_state_file_symlinks
-  {
+  if ! {
     printf 'pid=%s\n' "$pid"
     printf 'run_token=%s\n' "$run_token"
     printf 'started_at=%s\n' "$started_at"
     printf 'agent_bin=%s\n' "$agent_bin"
     printf 'config=%s\n' "$CONFIG_PATH"
-  } > "$PID_META_FILE"
+  } > "$PID_META_FILE"; then
+    return 1
+  fi
 }
 
 pid_matches_metadata() {
@@ -409,10 +441,16 @@ pid_matches_metadata() {
   current_started_at="$(process_started_at "$pid")"
   [[ -n "$current_started_at" ]] || return 1
   [[ "$current_started_at" == "$recorded_started_at" ]] || return 1
+  local argv_status=0
+  if process_argv_matches "$pid" "$recorded_agent_bin" "$recorded_config"; then
+    return 0
+  else
+    argv_status=$?
+  fi
+  [[ "$argv_status" -eq 2 ]] || return 1
   command_line="$(process_command "$pid")"
-  [[ "$command_line" == *"$recorded_agent_bin"* ]] || return 1
+  [[ "$command_line" == "$recorded_agent_bin --config $recorded_config --connect"* ]] || return 1
   [[ "$command_line" == *"--config"* ]] || return 1
-  [[ "$command_line" == *"$recorded_config"* ]] || return 1
   [[ "$command_line" == *"--connect"* ]]
 }
 
@@ -448,6 +486,7 @@ remove_stale_pid_file() {
 
 print_status() {
   normalise_paths
+  ensure_state_safety
   local pid
   printf 'state_dir=%s\n' "$STATE_DIR"
   printf 'pid_file=%s\n' "$PID_FILE"
@@ -504,7 +543,13 @@ start_connector() {
   pid="$!"
   ensure_no_state_file_symlinks
   printf '%s\n' "$pid" > "$PID_FILE"
-  write_pid_metadata "$pid" "$agent_bin" "$run_token"
+  if ! write_pid_metadata "$pid" "$agent_bin" "$run_token"; then
+    printf 'could not write connector metadata for pid %s; stopping child\n' "$pid" >&2
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$PID_FILE" "$PID_META_FILE"
+    exit 1
+  fi
   sleep 1
   if ! is_pid_running "$pid"; then
     printf 'connector exited during startup; recent log follows:\n' >&2
@@ -518,6 +563,7 @@ start_connector() {
 
 stop_connector() {
   normalise_paths
+  ensure_state_safety
   local pid
   if pid="$(pid_from_file)" && is_pid_running "$pid" && ! pid_matches_connector "$pid"; then
     die "pid file points to an unmanaged running process; refusing to stop pid $pid"
@@ -549,6 +595,7 @@ stop_connector() {
 
 recover_connector() {
   normalise_paths
+  ensure_state_safety
   if current_pid >/dev/null; then
     print_status
     return 0
@@ -564,6 +611,7 @@ restart_connector() {
 
 show_logs() {
   normalise_paths
+  ensure_state_safety
   [[ -f "$LOG_FILE" ]] || die "log file does not exist: $LOG_FILE"
   if [[ "$FOLLOW_LOGS" -eq 1 ]]; then
     tail -n "$LOG_LINES" -f "$LOG_FILE"

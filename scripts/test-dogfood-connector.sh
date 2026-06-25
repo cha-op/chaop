@@ -13,7 +13,9 @@ PID_META_FILE="$WORK_DIR/nested/pids/connector.pid.meta"
 LOG_FILE="$WORK_DIR/nested/logs/connector.log"
 FAKE_AGENT_STARTED_FILE="$WORK_DIR/agent-started.log"
 FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
-FAKE_PS_COMMAND="$FAKE_AGENT --config $CONFIG_FILE --connect"
+FAKE_PS_COMMAND=""
+RECORDED_FAKE_AGENT=""
+RECORDED_CONFIG_FILE=""
 FOREIGN_PID=""
 
 cleanup() {
@@ -32,6 +34,15 @@ cleanup() {
   rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
+
+resolve_test_path() {
+  local path_value="$1"
+  local parent_dir base_name resolved_parent
+  parent_dir="$(dirname "$path_value")"
+  base_name="$(basename "$path_value")"
+  resolved_parent="$(cd "$parent_dir" && pwd -P)"
+  printf '%s/%s\n' "$resolved_parent" "$base_name"
+}
 
 mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$FAKE_AGENT")"
 cat > "$CONFIG_FILE" <<'CONFIG'
@@ -80,6 +91,9 @@ PS
 chmod +x "$FAKE_AGENT"
 chmod +x "$FAKE_PS"
 touch "$FAKE_AGENT_STARTED_FILE"
+RECORDED_FAKE_AGENT="$(resolve_test_path "$FAKE_AGENT")"
+RECORDED_CONFIG_FILE="$(resolve_test_path "$CONFIG_FILE")"
+FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
 export FAKE_AGENT_STARTED_FILE
 export FAKE_PS_LSTART
 export FAKE_PS_COMMAND
@@ -159,8 +173,8 @@ printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
   printf 'pid=%s\n' "$FOREIGN_PID"
   printf 'run_token=fake-token\n'
   printf 'started_at=\n'
-  printf 'agent_bin=%s\n' "$FAKE_AGENT"
-  printf 'config=%s\n' "$CONFIG_FILE"
+  printf 'agent_bin=%s\n' "$RECORDED_FAKE_AGENT"
+  printf 'config=%s\n' "$RECORDED_CONFIG_FILE"
 } > "$PID_META_FILE"
 if connector stop >/dev/null 2>"$WORK_DIR/empty-started-at-stop.err"; then
   printf 'expected stop to reject metadata without a process start time\n' >&2
@@ -182,8 +196,8 @@ printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
   printf 'pid=%s\n' "$FOREIGN_PID"
   printf 'run_token=fake-token\n'
   printf 'started_at=%s\n' "$FAKE_PS_LSTART"
-  printf 'agent_bin=%s\n' "$FAKE_AGENT"
-  printf 'config=%s\n' "$CONFIG_FILE"
+  printf 'agent_bin=%s\n' "$RECORDED_FAKE_AGENT"
+  printf 'config=%s\n' "$RECORDED_CONFIG_FILE"
 } > "$PID_META_FILE"
 FAKE_PS_COMMAND="sleep 30"
 export FAKE_PS_COMMAND
@@ -198,7 +212,34 @@ fi
 kill "$FOREIGN_PID" 2>/dev/null || true
 wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=""
-FAKE_PS_COMMAND="$FAKE_AGENT --config $CONFIG_FILE --connect"
+FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
+export FAKE_PS_COMMAND
+rm -f "$PID_FILE" "$PID_META_FILE"
+
+sleep 30 &
+FOREIGN_PID="$!"
+printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
+{
+  printf 'pid=%s\n' "$FOREIGN_PID"
+  printf 'run_token=fake-token\n'
+  printf 'started_at=%s\n' "$FAKE_PS_LSTART"
+  printf 'agent_bin=%s\n' "$RECORDED_FAKE_AGENT"
+  printf 'config=%s\n' "$RECORDED_CONFIG_FILE"
+} > "$PID_META_FILE"
+FAKE_PS_COMMAND="bash -c loop $RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
+export FAKE_PS_COMMAND
+if connector stop >/dev/null 2>"$WORK_DIR/spoofed-command-stop.err"; then
+  printf 'expected stop to reject metadata when a non-connector process spoofs connector argv\n' >&2
+  exit 1
+fi
+if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
+  printf 'expected spoofed-command pid %s to remain running\n' "$FOREIGN_PID" >&2
+  exit 1
+fi
+kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=""
+FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
 export FAKE_PS_COMMAND
 rm -f "$PID_FILE" "$PID_META_FILE"
 
@@ -232,5 +273,44 @@ if [[ "$started_count_after_symlink" != "4" ]]; then
   printf 'expected symlink state file rejection to avoid starting another connector\n' >&2
   exit 1
 fi
+
+ln -s "$WORK_DIR/symlink-target.log" "$LOG_FILE"
+if connector logs >/dev/null 2>"$WORK_DIR/symlink-logs.err"; then
+  printf 'expected logs to reject symlinked log file\n' >&2
+  exit 1
+fi
+if connector status >/dev/null 2>"$WORK_DIR/symlink-status.err"; then
+  printf 'expected status to reject symlinked log file\n' >&2
+  exit 1
+fi
+if connector stop >/dev/null 2>"$WORK_DIR/symlink-stop.err"; then
+  printf 'expected stop to reject symlinked log file\n' >&2
+  exit 1
+fi
+rm -f "$LOG_FILE"
+
+started_count_before_metadata_failure="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+FAKE_PS_LSTART=""
+export FAKE_PS_LSTART
+if connector start >/dev/null 2>"$WORK_DIR/metadata-failure-start.err"; then
+  printf 'expected start to fail when process start time cannot be read\n' >&2
+  exit 1
+fi
+started_count_after_metadata_failure="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_metadata_failure" != "$((started_count_before_metadata_failure + 1))" ]]; then
+  printf 'expected metadata failure test to start exactly one child before cleanup\n' >&2
+  exit 1
+fi
+metadata_failure_pid="$(tail -n 1 "$FAKE_AGENT_STARTED_FILE" | awk '{print $1}')"
+if kill -0 "$metadata_failure_pid" 2>/dev/null; then
+  printf 'expected metadata-failure child pid %s to be stopped\n' "$metadata_failure_pid" >&2
+  exit 1
+fi
+if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
+  printf 'expected metadata failure to clean pid state files\n' >&2
+  exit 1
+fi
+FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
+export FAKE_PS_LSTART
 
 printf 'dogfood connector script smoke passed\n'
