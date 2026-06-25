@@ -23,6 +23,7 @@ import {
   commandModeLabel,
   commandTypeForMode,
   defaultCommandMode,
+  dogfoodReadinessPreflight,
   historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
@@ -387,6 +388,88 @@ test("safety helpers expose blocked action reasons only for guarded actions", ()
   assert.equal(safetyActionReason(data, "host_session_refresh"), "Refresh is paused while cost posture is conservative.");
   assert.equal(safetyActionBlocked(data, "command_create"), false);
   assert.equal(safetyActionReason(data, "command_create"), undefined);
+});
+
+test("dogfoodReadinessPreflight reports a ready managed path without refreshing inventory", () => {
+  const data = payload({
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")]
+  });
+
+  const readiness = dogfoodReadinessPreflight(data);
+
+  assert.equal(readiness.state, "ready");
+  assert.equal(readiness.next_action.href, "#thread-centre");
+  assert.equal(readiness.checks.find((check) => check.id === "inventory")?.state, "ready");
+  assert.match(
+    readiness.checks.find((check) => check.id === "inventory")?.detail ?? "",
+    /existing state only/
+  );
+});
+
+test("dogfoodReadinessPreflight blocks on cost posture before connector state", () => {
+  const baseSafety = safety();
+  const data = payload({
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")],
+    safety: {
+      ...baseSafety,
+      state: "hard_limited",
+      summary: "D1 rows written hard limit is active.",
+      actions: baseSafety.actions.map((guard) =>
+        guard.action === "command_create"
+          ? {
+            ...guard,
+            state: "blocked",
+            reason: "D1 rows written hard limit is active.",
+            budget_state: "hard_limited"
+          }
+          : guard
+      )
+    }
+  });
+
+  const readiness = dogfoodReadinessPreflight(data);
+
+  assert.equal(readiness.state, "blocked");
+  assert.equal(readiness.next_action.href, "#budget-board");
+  assert.equal(readiness.summary, "D1 rows written hard limit is active.");
+});
+
+test("dogfoodReadinessPreflight calls out split app-server connector capabilities", () => {
+  const data = payload({
+    connectors: [
+      connector("connector-a", ["app_server_threads"]),
+      connector("connector-b", ["codex_app_server_exec"])
+    ],
+    app_server_instances: [appServerInstance("app-server-b", "healthy", "2026-06-12T10:01:00.000Z", "connector-b")]
+  });
+
+  const readiness = dogfoodReadinessPreflight(data);
+
+  assert.equal(readiness.state, "attention");
+  assert.equal(readiness.next_action.href, "#host-sessions");
+  assert.match(readiness.checks.find((check) => check.id === "connector")?.detail ?? "", /same connector/);
+});
+
+test("dogfoodReadinessPreflight distinguishes busy and missing app-server reports", () => {
+  const busy = dogfoodReadinessPreflight(payload({
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [
+      {
+        ...appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a"),
+        active_turn_count: 2
+      }
+    ]
+  }));
+  const missing = dogfoodReadinessPreflight(payload({
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])]
+  }));
+
+  assert.equal(busy.state, "attention");
+  assert.equal(busy.checks.find((check) => check.id === "app_server")?.detail, "1 healthy app-server instance with 2 active turns.");
+  assert.equal(missing.state, "blocked");
+  assert.equal(missing.checks.find((check) => check.id === "app_server")?.detail, "No healthy app-server instance is reported by an online connector.");
 });
 
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {

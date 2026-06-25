@@ -31,6 +31,6 @@
 - [done] PR D：增加 persistent connector dogfood runbook 和用于 start、stop、observation、recovery 的 operational scripts。
 - [done] PR E：强化 dogfood E2E 和 cost telemetry gates；只有再次出现无法解释的写入增长时，才加入精确 D1 write attribution。
 - [done] PR F：收尾已完成的 dogfood usability roadmap，并记录下一阶段 daily dogfood readiness 计划。
-- [planned] PR G：在日常 dogfood 开始前，增加低成本 connector 和 Budget Board preflight。
+- [done] PR G：在日常 dogfood 开始前，增加低成本 connector 和 Budget Board preflight。
 - [planned] PR H：为真实 conversation path 增加显式 opt-in 的 managed app-server thread E2E smoke。
 - [planned] PR I：围绕日常对话重点打磨 Thread Centre，同时不增加高频 polling。

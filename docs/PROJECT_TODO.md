@@ -31,6 +31,6 @@
 - [done] PR D: Add the persistent connector dogfood runbook and operational scripts for start, stop, observation, and recovery.
 - [done] PR E: Harden dogfood E2E and cost telemetry gates, adding exact D1 write attribution only if unexplained write growth reappears.
 - [done] PR F: Close out the completed dogfood usability roadmap and record the next daily dogfood readiness plan.
-- [planned] PR G: Add a low-cost connector and Budget Board preflight before daily dogfood work starts.
+- [done] PR G: Add a low-cost connector and Budget Board preflight before daily dogfood work starts.
 - [planned] PR H: Add an explicit opt-in managed app-server thread E2E smoke for the real conversation path.
 - [planned] PR I: Polish Thread Centre for daily conversation focus without adding high-frequency polling.

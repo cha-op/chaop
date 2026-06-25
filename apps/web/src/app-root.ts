@@ -55,6 +55,7 @@ import {
   commandModeLabel,
   commandTypeForMode,
   defaultCommandMode,
+  dogfoodReadinessPreflight,
   historyBackfillNotice,
   localThreadConnectorId,
   localThreadConnectors,
@@ -76,6 +77,7 @@ import {
   type CommandExecutionMode,
   type PendingTurnInteraction,
   type PendingTurnInteractionQuestion,
+  type ReadinessPreflight,
   type ThreadTurnSummary
 } from "./state.js";
 
@@ -1136,7 +1138,9 @@ export class ChaopApp extends LitElement {
     const generatedAt = budget.generated_at ?? this.data!.server_time;
     const windowSampleCount = budget.window_sample_count ?? windows.length;
     const constraintSampleCount = budget.constraint_sample_count ?? constraints.filter((constraint) => constraint.sampled).length;
+    const readiness = dogfoodReadinessPreflight(this.data);
     return html`
+      ${this.renderDogfoodReadiness(readiness)}
       <section class="page-grid budget-grid">
         <section class="panel primary">
           <div class="section-heading">
@@ -1244,6 +1248,37 @@ export class ChaopApp extends LitElement {
           </dl>
           ${budgetD1ActivitySignals(budget)}
         </aside>
+      </section>
+    `;
+  }
+
+  private renderDogfoodReadiness(readiness: ReadinessPreflight) {
+    return html`
+      <section class=${`readiness-panel ${readiness.state}`} aria-label="Dogfood readiness">
+        <div class="readiness-summary">
+          <div>
+            <span>Dogfood readiness</span>
+            <strong>${readiness.title}</strong>
+          </div>
+          <p>${readiness.summary}</p>
+        </div>
+        <div class="readiness-checks">
+          ${readiness.checks.map(
+            (check) => html`
+              <article class=${check.state}>
+                <span class=${`chip ${check.state === "ready" ? "normal" : check.state === "attention" ? "conservative" : "hard_limited"}`}>
+                  ${check.state}
+                </span>
+                <strong>${check.label}</strong>
+                <small>${check.detail}</small>
+              </article>
+            `
+          )}
+        </div>
+        <div class="readiness-action">
+          <a class="primary-action" href=${readiness.next_action.href}>${readiness.next_action.label}</a>
+          <span>${readiness.next_action.detail}</span>
+        </div>
       </section>
     `;
   }

@@ -25,6 +25,10 @@ superseded_by:
 - PR H, Opt-In Managed Thread E2E: add an explicit operator-triggered smoke for the managed app-server conversation path: budget gate, create or select a small test thread, submit one bounded prompt, observe the final assistant answer, and clean up or archive.
 - PR I, Thread Centre Daily Polish: tighten the default conversation surface around one thing: current turn status, final answer, pending input/approval, and actionable error messages. Avoid new high-frequency polling.
 
+## Completed Slices
+- PR F closed out the completed dogfood usability roadmap and recorded this next plan.
+- PR G adds the passive connector and Budget Board preflight described in [Connector And Budget Preflight](2026-06-25-dogfood-readiness-preflight-7b4c2d.md).
+
 ## Cost Rules
 - Passive readiness checks can read budget, connector, and app-server state, but must not refresh broad Host Session inventory unless the user explicitly opts in.
 - Write-path smoke must be explicit, bounded, and guarded by Budget Board posture before and after the run.
@@ -32,7 +36,7 @@ superseded_by:
 - R2 remains deferred until artefact retention, budget alerts, and product value are clear.
 
 ## Next Steps
-- Implement PR G next.
+- Implement PR H next.
 - Keep PR H behind an explicit operator flag because it intentionally exercises a real app-server turn.
 - Continue running the tracked deployed smoke after any API, Web, Access, connector, app-server, or cost-posture change.
 

@@ -43,6 +43,27 @@ export type PendingTurnInteraction = {
 
 export type PendingTurnInteractionQuestion = NonNullable<TurnInteractionRequestPayload["questions"]>[number];
 
+export type ReadinessPreflightState = "ready" | "attention" | "blocked";
+
+export type ReadinessPreflightCheck = {
+  id: "cost" | "connector" | "app_server" | "inventory";
+  label: string;
+  state: ReadinessPreflightState;
+  detail: string;
+};
+
+export type ReadinessPreflight = {
+  state: ReadinessPreflightState;
+  title: string;
+  summary: string;
+  next_action: {
+    label: string;
+    href: "#budget-board" | "#host-sessions" | "#thread-centre";
+    detail: string;
+  };
+  checks: ReadinessPreflightCheck[];
+};
+
 export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
 export const TURN_INTERACTION_OTHER_SELECT_VALUE = "other";
 
@@ -705,6 +726,235 @@ export function managedAppServerCommandAvailable(
   if (!data || !session) return false;
   const connector = data.connectors.find((item) => item.id === session.connector_id);
   return Boolean(connector && connectorCanRunManagedAppServer(connector));
+}
+
+export function dogfoodReadinessPreflight(data: BootstrapPayload | undefined): ReadinessPreflight {
+  const checks = [
+    readinessCostCheck(data),
+    readinessConnectorCheck(data),
+    readinessAppServerCheck(data),
+    readinessInventoryCheck(data)
+  ];
+  const state = checks.some((check) => check.state === "blocked")
+    ? "blocked"
+    : checks.some((check) => check.state === "attention")
+      ? "attention"
+      : "ready";
+  const nextAction = readinessNextAction(state, checks);
+  return {
+    state,
+    title: readinessTitle(state),
+    summary: readinessSummary(state, checks),
+    next_action: nextAction,
+    checks
+  };
+}
+
+function readinessCostCheck(data: BootstrapPayload | undefined): ReadinessPreflightCheck {
+  if (!data) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "blocked",
+      detail: "Bootstrap data has not loaded yet."
+    };
+  }
+
+  const safety = data.safety;
+  const blockedReason =
+    safetyActionReason(data, "command_create") ??
+    safetyActionReason(data, "local_thread_create") ??
+    safetyActionReason(data, "host_session_attach");
+  if (safety.paused) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "blocked",
+      detail: safety.paused_reason ?? safety.summary
+    };
+  }
+  if (
+    safety.state === "hard_limited" ||
+    safety.state === "throttled" ||
+    data.budget.state === "hard_limited" ||
+    data.budget.state === "throttled" ||
+    blockedReason
+  ) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "blocked",
+      detail: blockedReason ?? safety.summary
+    };
+  }
+  if (
+    safety.state === "conservative" ||
+    safety.state === "recovery" ||
+    data.budget.state === "conservative" ||
+    data.budget.state === "recovery"
+  ) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "attention",
+      detail: safety.summary
+    };
+  }
+  return {
+    id: "cost",
+    label: "Cost posture",
+    state: "ready",
+    detail: safety.summary
+  };
+}
+
+function readinessConnectorCheck(data: BootstrapPayload | undefined): ReadinessPreflightCheck {
+  const online = (data?.connectors ?? []).filter((connector) => connector.status === "online");
+  const full = online.filter((connector) =>
+    connector.capabilities.includes("app_server_threads") &&
+    connector.capabilities.includes("codex_app_server_exec")
+  );
+  if (full.length > 0) {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "ready",
+      detail: `${full.length} online connector${full.length === 1 ? "" : "s"} can create and run managed app-server threads.`
+    };
+  }
+  if (online.length === 0) {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "No online connector is reporting managed app-server capabilities."
+    };
+  }
+  const canCreate = online.some((connector) => connector.capabilities.includes("app_server_threads"));
+  const canRun = online.some((connector) => connector.capabilities.includes("codex_app_server_exec"));
+  if (!canCreate && !canRun) {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: `${online.length} connector${online.length === 1 ? "" : "s"} online, but none reports managed app-server capabilities.`
+    };
+  }
+  return {
+    id: "connector",
+    label: "Connector",
+    state: "attention",
+    detail: canCreate
+      ? "An online connector can create app-server threads, but execution capability is not reported on the same connector."
+      : "An online connector can run app-server turns, but local thread creation is not reported on the same connector."
+  };
+}
+
+function readinessAppServerCheck(data: BootstrapPayload | undefined): ReadinessPreflightCheck {
+  const onlineConnectorIds = new Set(
+    (data?.connectors ?? []).filter((connector) => connector.status === "online").map((connector) => connector.id)
+  );
+  const instances = (data?.app_server_instances ?? []).filter((instance) => onlineConnectorIds.has(instance.connector_id));
+  const healthy = instances.filter((instance) => instance.state === "healthy");
+  const activeTurns = healthy.reduce((total, instance) => total + instance.active_turn_count, 0);
+  if (healthy.length > 0 && activeTurns === 0) {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "ready",
+      detail: `${healthy.length} healthy app-server instance${healthy.length === 1 ? "" : "s"} idle.`
+    };
+  }
+  if (healthy.length > 0) {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "attention",
+      detail: `${healthy.length} healthy app-server instance${healthy.length === 1 ? "" : "s"} with ${activeTurns} active turn${activeTurns === 1 ? "" : "s"}.`
+    };
+  }
+  const edge = instances
+    .filter((instance) => instance.state !== "stopped")
+    .sort(compareAppServerInstancesForDisplay)[0];
+  if (edge) {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "blocked",
+      detail: edge.last_error ?? edge.status_summary ?? `App-server is ${edge.state}.`
+    };
+  }
+  return {
+    id: "app_server",
+    label: "App-server",
+    state: "blocked",
+    detail: "No healthy app-server instance is reported by an online connector."
+  };
+}
+
+function readinessInventoryCheck(data: BootstrapPayload | undefined): ReadinessPreflightCheck {
+  const reason = safetyActionReason(data, "host_session_refresh");
+  if (reason) {
+    return {
+      id: "inventory",
+      label: "Inventory sync",
+      state: "attention",
+      detail: `Broad Host Session refresh is blocked: ${reason}`
+    };
+  }
+  return {
+    id: "inventory",
+    label: "Inventory sync",
+    state: "ready",
+    detail: "Passive preflight uses existing state only; broad Host Session refresh remains opt-in."
+  };
+}
+
+function readinessNextAction(
+  state: ReadinessPreflightState,
+  checks: ReadinessPreflightCheck[]
+): ReadinessPreflight["next_action"] {
+  const blocked = checks.find((check) => check.state === "blocked");
+  if (blocked?.id === "cost") {
+    return {
+      label: "Review Budget Board",
+      href: "#budget-board",
+      detail: "Clear the cost posture before starting a managed turn."
+    };
+  }
+  if (blocked?.id === "connector" || blocked?.id === "app_server") {
+    return {
+      label: "Open Host Sessions",
+      href: "#host-sessions",
+      detail: "Confirm connector and app-server state before attaching or creating a thread."
+    };
+  }
+  if (state === "attention") {
+    return {
+      label: "Open Host Sessions",
+      href: "#host-sessions",
+      detail: "Confirm the warning state before starting daily dogfood work."
+    };
+  }
+  return {
+    label: "Open Thread Centre",
+    href: "#thread-centre",
+    detail: "Create or select a managed thread and send a bounded prompt."
+  };
+}
+
+function readinessTitle(state: ReadinessPreflightState): string {
+  if (state === "ready") return "Ready for managed dogfood";
+  if (state === "attention") return "Ready with operator attention";
+  return "Not ready for managed dogfood";
+}
+
+function readinessSummary(state: ReadinessPreflightState, checks: ReadinessPreflightCheck[]): string {
+  if (state === "ready") {
+    return "Cost, connector, and app-server state are aligned for a low-cost managed thread.";
+  }
+  const first = checks.find((check) => check.state === state) ?? checks.find((check) => check.state !== "ready");
+  return first?.detail ?? "Readiness state needs attention.";
 }
 
 export function codexCliFallbackAvailable(
