@@ -7,6 +7,8 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/chaop-dogfood-connector-test.XXXXXX")"
 CONFIG_FILE="$WORK_DIR/config/connector.toml"
 FAKE_AGENT="$WORK_DIR/bin/fake-chaop-agent"
 FAKE_AGENT_SRC="$WORK_DIR/bin/fake-chaop-agent.c"
+FAKE_CARGO="$WORK_DIR/bin/cargo"
+FAKE_CARGO_TARGET_DIR="$WORK_DIR/custom-target"
 FAKE_PS="$WORK_DIR/bin/ps"
 STATE_DIR="$WORK_DIR/state"
 PID_FILE="$STATE_DIR/pids/connector.pid"
@@ -113,6 +115,25 @@ int main(int argc, char **argv) {
 }
 AGENT
 cc "$FAKE_AGENT_SRC" -o "$FAKE_AGENT"
+mkdir -p "$FAKE_CARGO_TARGET_DIR/debug"
+cp "$FAKE_AGENT" "$FAKE_CARGO_TARGET_DIR/debug/chaop-agent"
+cat > "$FAKE_CARGO" <<'CARGO'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  metadata)
+    printf '{"target_directory":"%s"}\n' "${FAKE_CARGO_TARGET_DIR:?}"
+    ;;
+  build)
+    ;;
+  *)
+    printf 'unexpected fake cargo command: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+CARGO
+chmod +x "$FAKE_CARGO"
 cat > "$FAKE_PS" <<'PS'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -153,6 +174,7 @@ export FAKE_AGENT_STARTED_FILE
 export FAKE_AGENT_IGNORE_TERM=0
 export FAKE_PS_LSTART
 export FAKE_PS_COMMAND
+export FAKE_CARGO_TARGET_DIR
 export CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS=1
 export PATH="$WORK_DIR/bin:$PATH"
 
@@ -166,6 +188,25 @@ connector() {
     --log-file "$LOG_FILE" \
     "$@"
 }
+
+custom_target_output="$WORK_DIR/custom-target-doctor.out"
+if ! "$REPO_ROOT/scripts/dogfood-connector.sh" \
+  --config "$CONFIG_FILE" \
+  --state-dir "$STATE_DIR" \
+  --pid-file "$PID_FILE" \
+  --pid-meta-file "$PID_META_FILE" \
+  --log-file "$LOG_FILE" \
+  --no-build \
+  --build-profile debug \
+  doctor > "$custom_target_output"; then
+  printf 'expected doctor to use Cargo metadata target_directory when --agent-bin is omitted\n' >&2
+  exit 1
+fi
+if ! grep -q 'doctor ok' "$custom_target_output"; then
+  printf 'expected custom target-dir doctor output, got:\n' >&2
+  cat "$custom_target_output" >&2
+  exit 1
+fi
 
 connector start
 first_pid="$(tr -d '[:space:]' < "$PID_FILE")"
@@ -450,6 +491,31 @@ if [[ "$started_count_after_lock_traversal" != "$started_count_before_lock_trave
   exit 1
 fi
 
+printf '999999\n' > "$WORK_DIR/owner.pid"
+started_count_before_lock_parent="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if CHAOP_DOGFOOD_LOCK_DIR="$STATE_DIR/.." \
+  "$REPO_ROOT/scripts/dogfood-connector.sh" \
+    --config "$CONFIG_FILE" \
+    --agent-bin "$FAKE_AGENT" \
+    --state-dir "$STATE_DIR" \
+    --pid-file "$PID_FILE" \
+    --pid-meta-file "$PID_META_FILE" \
+    --log-file "$LOG_FILE" \
+    start >/dev/null 2>"$WORK_DIR/parent-lock-path.err"; then
+  printf 'expected start to reject lock paths ending with parent traversal\n' >&2
+  exit 1
+fi
+if [[ ! -e "$WORK_DIR/owner.pid" ]]; then
+  printf 'expected parent lock path rejection to preserve owner.pid outside state dir\n' >&2
+  exit 1
+fi
+started_count_after_lock_parent="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_lock_parent" != "$started_count_before_lock_parent" ]]; then
+  printf 'expected parent lock path rejection to avoid starting another connector\n' >&2
+  exit 1
+fi
+rm -f "$WORK_DIR/owner.pid"
+
 lock_symlink_target_dir="$WORK_DIR/lock-symlink-target"
 mkdir -p "$lock_symlink_target_dir"
 printf '999999\n' > "$lock_symlink_target_dir/owner.pid"
@@ -517,6 +583,65 @@ if connector stop >/dev/null 2>"$WORK_DIR/symlink-stop.err"; then
   exit 1
 fi
 rm -f "$LOG_FILE"
+
+for unsafe_state_file in "$PID_FILE" "$PID_META_FILE" "$LOG_FILE"; do
+  rm -f "$unsafe_state_file"
+  mkfifo "$unsafe_state_file"
+  if connector status >/dev/null 2>"$WORK_DIR/non-regular-state-file.err"; then
+    printf 'expected status to reject non-regular state file: %s\n' "$unsafe_state_file" >&2
+    exit 1
+  fi
+  rm -f "$unsafe_state_file"
+done
+
+started_count_before_signal="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+FAKE_PS_LSTART=""
+FAKE_AGENT_IGNORE_TERM=1
+export FAKE_PS_LSTART
+export FAKE_AGENT_IGNORE_TERM
+"$REPO_ROOT/scripts/dogfood-connector.sh" \
+  --config "$CONFIG_FILE" \
+  --agent-bin "$FAKE_AGENT" \
+  --state-dir "$STATE_DIR" \
+  --pid-file "$PID_FILE" \
+  --pid-meta-file "$PID_META_FILE" \
+  --log-file "$LOG_FILE" \
+  start >"$WORK_DIR/signalled-start.out" 2>"$WORK_DIR/signalled-start.err" &
+signalled_start_pid="$!"
+for _ in {1..20}; do
+  started_count_after_signal_start="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+  if [[ "$started_count_after_signal_start" == "$((started_count_before_signal + 1))" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+kill -TERM "$signalled_start_pid" 2>/dev/null || true
+set +e
+wait "$signalled_start_pid"
+signalled_start_status="$?"
+set -e
+if [[ "$signalled_start_status" -ne 143 ]]; then
+  printf 'expected signalled start to exit 143, got %s\n' "$signalled_start_status" >&2
+  exit 1
+fi
+started_count_after_signal="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_signal" != "$((started_count_before_signal + 1))" ]]; then
+  printf 'expected signalled start to launch exactly one child before cleanup\n' >&2
+  exit 1
+fi
+signalled_child_pid="$(tail -n 1 "$FAKE_AGENT_STARTED_FILE" | awk '{print $1}')"
+if kill -0 "$signalled_child_pid" 2>/dev/null; then
+  printf 'expected signal handler to stop child pid %s\n' "$signalled_child_pid" >&2
+  exit 1
+fi
+if [[ -e "$STATE_DIR/connector.lock" || -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
+  printf 'expected signal handler to release lock and clean pid state\n' >&2
+  exit 1
+fi
+FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
+FAKE_AGENT_IGNORE_TERM=0
+export FAKE_PS_LSTART
+export FAKE_AGENT_IGNORE_TERM
 
 started_count_before_metadata_failure="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
 FAKE_PS_LSTART=""

@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 COMMAND=""
 CONFIG_PATH="${CHAOP_AGENT_CONFIG:-${CHAOP_CONNECTOR_CONFIG:-}}"
 STATE_DIR="${CHAOP_DOGFOOD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/chaop/dogfood}"
@@ -23,6 +20,7 @@ NO_BUILD=0
 FOLLOW_LOGS=0
 FORCE_STOP=0
 LOCK_ACQUIRED=0
+STARTED_CHILD_PID=""
 
 usage() {
   cat <<'USAGE'
@@ -328,26 +326,27 @@ ensure_private_state_dir() {
   ensure_physical_dir_under_state "$dir_path" "$state_root"
 }
 
-state_file_not_symlink() {
+state_file_is_safe() {
   local file_path="$1"
-  [[ ! -L "$file_path" ]]
+  [[ ! -L "$file_path" ]] || return 1
+  [[ ! -e "$file_path" || -f "$file_path" ]]
 }
 
-ensure_state_file_not_symlink() {
+ensure_state_file_is_safe() {
   local file_path="$1"
-  state_file_not_symlink "$file_path" || die "state file must not be a symlink: $file_path"
+  state_file_is_safe "$file_path" || die "state file must be a regular file or absent: $file_path"
 }
 
-state_files_not_symlinks() {
-  state_file_not_symlink "$PID_FILE" || return 1
-  state_file_not_symlink "$PID_META_FILE" || return 1
-  state_file_not_symlink "$LOG_FILE" || return 1
+state_files_are_safe() {
+  state_file_is_safe "$PID_FILE" || return 1
+  state_file_is_safe "$PID_META_FILE" || return 1
+  state_file_is_safe "$LOG_FILE" || return 1
 }
 
-ensure_no_state_file_symlinks() {
-  ensure_state_file_not_symlink "$PID_FILE"
-  ensure_state_file_not_symlink "$PID_META_FILE"
-  ensure_state_file_not_symlink "$LOG_FILE"
+ensure_safe_state_files() {
+  ensure_state_file_is_safe "$PID_FILE"
+  ensure_state_file_is_safe "$PID_META_FILE"
+  ensure_state_file_is_safe "$LOG_FILE"
 }
 
 ensure_lock_dir_not_symlink() {
@@ -362,19 +361,19 @@ ensure_state_safety() {
   ensure_private_state_dir "$(dirname "$PID_META_FILE")" "$state_root"
   ensure_private_state_dir "$(dirname "$LOG_FILE")" "$state_root"
   ensure_distinct_state_paths
-  ensure_no_state_file_symlinks
+  ensure_safe_state_files
 }
 
 ensure_state_dirs() {
   ensure_state_safety
   touch "$LOG_FILE"
-  ensure_no_state_file_symlinks
+  ensure_safe_state_files
 }
 
 preflight_launch_files() {
-  ensure_no_state_file_symlinks
+  ensure_safe_state_files
   touch "$LOG_FILE" "$PID_FILE" "$PID_META_FILE"
-  ensure_no_state_file_symlinks
+  ensure_safe_state_files
   ensure_distinct_state_file_identities
   rm -f "$PID_FILE" "$PID_META_FILE"
 }
@@ -382,6 +381,7 @@ preflight_launch_files() {
 acquire_state_lock() {
   local state_root
   state_root="$(ensure_state_root)"
+  ensure_physical_state_subpath "$LOCK_DIR" "$state_root"
   ensure_private_state_dir "$(dirname "$LOCK_DIR")" "$state_root"
   local waited=0
   while true; do
@@ -435,12 +435,28 @@ release_state_lock() {
   fi
 }
 
+handle_lock_signal() {
+  local signal_name="$1"
+  local exit_status=143
+  [[ "$signal_name" == "INT" ]] && exit_status=130
+  if [[ -n "$STARTED_CHILD_PID" ]]; then
+    stop_start_failure_child "$STARTED_CHILD_PID"
+    rm -f "$PID_FILE" "$PID_META_FILE"
+    STARTED_CHILD_PID=""
+  fi
+  release_state_lock
+  trap - EXIT INT TERM
+  exit "$exit_status"
+}
+
 with_state_lock() {
   normalise_paths
   acquire_state_lock
-  trap release_state_lock EXIT INT TERM
-  "$@"
-  local status=$?
+  trap release_state_lock EXIT
+  trap 'handle_lock_signal INT' INT
+  trap 'handle_lock_signal TERM' TERM
+  local status=0
+  "$@" || status=$?
   release_state_lock
   trap - EXIT INT TERM
   return "$status"
@@ -452,6 +468,18 @@ ensure_config() {
   CONFIG_PATH="$(resolve_existing_path "$CONFIG_PATH")"
 }
 
+cargo_target_dir() {
+  local metadata target_dir
+  metadata="$(cargo metadata --format-version 1 --no-deps 2>/dev/null)" || die "could not inspect Cargo target directory"
+  if command -v node >/dev/null 2>&1; then
+    target_dir="$(printf '%s' "$metadata" | node -e 'const fs = require("fs"); const input = fs.readFileSync(0, "utf8"); const metadata = JSON.parse(input); if (typeof metadata.target_directory !== "string" || metadata.target_directory.length === 0) process.exit(1); process.stdout.write(metadata.target_directory);')" || true
+  else
+    target_dir="$(printf '%s\n' "$metadata" | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+  fi
+  [[ -n "$target_dir" ]] || die "could not parse Cargo target directory"
+  printf '%s\n' "$target_dir"
+}
+
 ensure_agent_bin() {
   if [[ -n "$AGENT_BIN" ]]; then
     [[ -x "$AGENT_BIN" ]] || die "chaop-agent binary is not executable: $AGENT_BIN"
@@ -460,15 +488,17 @@ ensure_agent_bin() {
     return
   fi
 
+  local target_dir
+  target_dir="$(cargo_target_dir)"
   case "$BUILD_PROFILE" in
     release)
-      AGENT_BIN="$REPO_ROOT/target/release/chaop-agent"
+      AGENT_BIN="$target_dir/release/chaop-agent"
       if [[ "$NO_BUILD" -eq 0 ]]; then
         cargo build -p chaop-agent --release
       fi
       ;;
     debug)
-      AGENT_BIN="$REPO_ROOT/target/debug/chaop-agent"
+      AGENT_BIN="$target_dir/debug/chaop-agent"
       if [[ "$NO_BUILD" -eq 0 ]]; then
         cargo build -p chaop-agent
       fi
@@ -562,7 +592,7 @@ write_pid_metadata() {
   local run_token="$3"
   local started_at
   started_at="$(wait_for_process_started_at "$pid")" || return 1
-  state_files_not_symlinks || return 1
+  state_files_are_safe || return 1
   if ! {
     printf 'pid=%s\n' "$pid"
     printf 'run_token=%s\n' "$run_token"
@@ -578,7 +608,7 @@ write_started_child_state() {
   local pid="$1"
   local agent_bin="$2"
   local run_token="$3"
-  state_files_not_symlinks || return 1
+  state_files_are_safe || return 1
   printf '%s\n' "$pid" > "$PID_FILE" || return 1
   write_pid_metadata "$pid" "$agent_bin" "$run_token"
 }
@@ -709,15 +739,18 @@ start_connector() {
 
   local run_token
   run_token="$(new_run_token)"
-  ensure_no_state_file_symlinks
+  ensure_safe_state_files
   CHAOP_DOGFOOD_RUN_TOKEN="$run_token" nohup "$agent_bin" --config "$CONFIG_PATH" --connect >> "$LOG_FILE" 2>&1 &
   pid="$!"
+  STARTED_CHILD_PID="$pid"
   if ! write_started_child_state "$pid" "$agent_bin" "$run_token"; then
     printf 'could not write connector state for pid %s; stopping child\n' "$pid" >&2
     stop_start_failure_child "$pid"
     rm -f "$PID_FILE" "$PID_META_FILE"
+    STARTED_CHILD_PID=""
     exit 1
   fi
+  STARTED_CHILD_PID=""
   sleep 1
   if ! is_pid_running "$pid"; then
     printf 'connector exited during startup; recent log follows:\n' >&2
