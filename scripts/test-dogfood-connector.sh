@@ -27,6 +27,7 @@ cleanup() {
     stop --force >/dev/null 2>&1 || true
   if [[ -n "$FOREIGN_PID" ]] && kill -0 "$FOREIGN_PID" 2>/dev/null; then
     kill "$FOREIGN_PID" 2>/dev/null || true
+    wait "$FOREIGN_PID" 2>/dev/null || true
   fi
   rm -rf "$WORK_DIR"
 }
@@ -116,6 +117,24 @@ if kill -0 "$first_pid" 2>/dev/null; then
   exit 1
 fi
 
+connector start >"$WORK_DIR/concurrent-start-a.out" &
+start_a_pid="$!"
+connector start >"$WORK_DIR/concurrent-start-b.out" &
+start_b_pid="$!"
+wait "$start_a_pid"
+wait "$start_b_pid"
+concurrent_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+concurrent_started_count="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$concurrent_started_count" != "2" ]]; then
+  printf 'expected concurrent start to launch one additional connector, got %s total starts\n' "$concurrent_started_count" >&2
+  exit 1
+fi
+connector stop
+if kill -0 "$concurrent_pid" 2>/dev/null; then
+  printf 'expected concurrent-managed pid %s to stop\n' "$concurrent_pid" >&2
+  exit 1
+fi
+
 "$FAKE_AGENT" --config "$CONFIG_FILE" --connect &
 FOREIGN_PID="$!"
 printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
@@ -129,6 +148,7 @@ if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
   exit 1
 fi
 kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=""
 rm -f "$PID_FILE" "$PID_META_FILE"
 
@@ -151,7 +171,35 @@ if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
   exit 1
 fi
 kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=""
+rm -f "$PID_FILE" "$PID_META_FILE"
+
+sleep 30 &
+FOREIGN_PID="$!"
+printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
+{
+  printf 'pid=%s\n' "$FOREIGN_PID"
+  printf 'run_token=fake-token\n'
+  printf 'started_at=%s\n' "$FAKE_PS_LSTART"
+  printf 'agent_bin=%s\n' "$FAKE_AGENT"
+  printf 'config=%s\n' "$CONFIG_FILE"
+} > "$PID_META_FILE"
+FAKE_PS_COMMAND="sleep 30"
+export FAKE_PS_COMMAND
+if connector stop >/dev/null 2>"$WORK_DIR/wrong-command-stop.err"; then
+  printf 'expected stop to reject metadata when the process command does not match the connector\n' >&2
+  exit 1
+fi
+if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
+  printf 'expected wrong-command pid %s to remain running\n' "$FOREIGN_PID" >&2
+  exit 1
+fi
+kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=""
+FAKE_PS_COMMAND="$FAKE_AGENT --config $CONFIG_FILE --connect"
+export FAKE_PS_COMMAND
 rm -f "$PID_FILE" "$PID_META_FILE"
 
 if "$REPO_ROOT/scripts/dogfood-connector.sh" \
@@ -167,8 +215,21 @@ if "$REPO_ROOT/scripts/dogfood-connector.sh" \
 fi
 
 started_count_after_collision="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
-if [[ "$started_count_after_collision" != "3" ]]; then
+if [[ "$started_count_after_collision" != "4" ]]; then
   printf 'expected path collision to avoid starting another connector\n' >&2
+  exit 1
+fi
+
+rm -f "$LOG_FILE"
+ln -s "$WORK_DIR/symlink-target.log" "$LOG_FILE"
+if connector start >/dev/null 2>"$WORK_DIR/symlink-log.err"; then
+  printf 'expected start to reject symlinked log file\n' >&2
+  exit 1
+fi
+rm -f "$LOG_FILE"
+started_count_after_symlink="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_symlink" != "4" ]]; then
+  printf 'expected symlink state file rejection to avoid starting another connector\n' >&2
   exit 1
 fi
 

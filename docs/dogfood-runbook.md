@@ -72,6 +72,8 @@ export CHAOP_DOGFOOD_UPGRADE_MARKER_FILE="/path/to/private/app-server-upgrade.ma
 
 The script writes a PID file and connector log under the state directory. It does not store Cloudflare API tokens, Access service-token secrets, connector bootstrap secrets, or connector tokens.
 
+The PID, metadata, log, and lock paths must live in private state directories. The wrapper refuses symlinked state files so a shared temporary directory cannot redirect PID or log writes.
+
 ## Commands
 
 Start or recover the connector:

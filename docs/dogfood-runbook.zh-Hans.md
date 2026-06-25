@@ -72,6 +72,8 @@ export CHAOP_DOGFOOD_UPGRADE_MARKER_FILE="/path/to/private/app-server-upgrade.ma
 
 脚本会在状态目录下写 PID file 和 connector log。它不会保存 Cloudflare API token、Access service-token secret、connector bootstrap secret 或 connector token。
 
+PID、metadata、日志和 lock 路径必须位于私有状态目录中。wrapper 会拒绝 symlink 形式的状态文件，避免共享临时目录把 PID 或日志写入重定向到其他位置。
+
 ## 命令
 
 启动或恢复 connector：

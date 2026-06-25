@@ -11,14 +11,17 @@ LOG_DIR="${CHAOP_DOGFOOD_LOG_DIR:-}"
 PID_FILE="${CHAOP_DOGFOOD_PID_FILE:-}"
 PID_META_FILE="${CHAOP_DOGFOOD_PID_META_FILE:-}"
 LOG_FILE="${CHAOP_DOGFOOD_LOG_FILE:-}"
+LOCK_DIR="${CHAOP_DOGFOOD_LOCK_DIR:-}"
 AGENT_BIN="${CHAOP_AGENT_BIN:-}"
 BUILD_PROFILE="${CHAOP_AGENT_BUILD_PROFILE:-release}"
 HOSTNAME_VALUE="${CHAOP_HOSTNAME:-}"
 LOG_LINES="${CHAOP_DOGFOOD_LOG_LINES:-80}"
 STOP_TIMEOUT_SECONDS="${CHAOP_DOGFOOD_STOP_TIMEOUT_SECONDS:-15}"
+LOCK_TIMEOUT_SECONDS="${CHAOP_DOGFOOD_LOCK_TIMEOUT_SECONDS:-15}"
 NO_BUILD=0
 FOLLOW_LOGS=0
 FORCE_STOP=0
+LOCK_ACQUIRED=0
 
 usage() {
   cat <<'USAGE'
@@ -57,6 +60,8 @@ Environment:
   CHAOP_DOGFOOD_LOG_FILE
   CHAOP_DOGFOOD_PID_FILE
   CHAOP_DOGFOOD_PID_META_FILE
+  CHAOP_DOGFOOD_LOCK_DIR
+  CHAOP_DOGFOOD_LOCK_TIMEOUT_SECONDS
   CHAOP_DOGFOOD_UPGRADE_MARKER_FILE
 USAGE
 }
@@ -155,7 +160,20 @@ normalise_paths() {
   PID_FILE="${PID_FILE:-$STATE_DIR/connector.pid}"
   PID_META_FILE="${PID_META_FILE:-$PID_FILE.meta}"
   LOG_FILE="${LOG_FILE:-$LOG_DIR/connector.log}"
+  LOCK_DIR="${LOCK_DIR:-$STATE_DIR/connector.lock}"
   HOSTNAME_VALUE="${HOSTNAME_VALUE:-$(hostname)}"
+}
+
+state_mode() {
+  local file_path="$1"
+  case "$(uname -s)" in
+    Darwin|FreeBSD|OpenBSD|NetBSD)
+      stat -f '%Lp' "$file_path"
+      ;;
+    *)
+      stat -c '%a' "$file_path"
+      ;;
+  esac
 }
 
 state_file_path_key() {
@@ -199,17 +217,79 @@ ensure_distinct_state_file_identities() {
   fi
 }
 
+ensure_private_dir() {
+  local dir_path="$1"
+  local mode
+  mkdir -p "$dir_path"
+  chmod 700 "$dir_path" 2>/dev/null || true
+  mode="$(state_mode "$dir_path")" || die "could not inspect directory permissions: $dir_path"
+  if (( (8#$mode & 077) != 0 )); then
+    die "state directory must not be group/other accessible: $dir_path"
+  fi
+}
+
+ensure_state_file_not_symlink() {
+  local file_path="$1"
+  [[ ! -L "$file_path" ]] || die "state file must not be a symlink: $file_path"
+}
+
+ensure_no_state_file_symlinks() {
+  ensure_state_file_not_symlink "$PID_FILE"
+  ensure_state_file_not_symlink "$PID_META_FILE"
+  ensure_state_file_not_symlink "$LOG_FILE"
+}
+
 ensure_state_dirs() {
-  mkdir -p "$STATE_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")" "$(dirname "$PID_META_FILE")" "$(dirname "$LOG_FILE")"
-  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  ensure_private_dir "$STATE_DIR"
+  ensure_private_dir "$LOG_DIR"
+  ensure_private_dir "$(dirname "$PID_FILE")"
+  ensure_private_dir "$(dirname "$PID_META_FILE")"
+  ensure_private_dir "$(dirname "$LOG_FILE")"
   ensure_distinct_state_paths
+  ensure_no_state_file_symlinks
   touch "$LOG_FILE"
+  ensure_no_state_file_symlinks
 }
 
 preflight_launch_files() {
+  ensure_no_state_file_symlinks
   touch "$LOG_FILE" "$PID_FILE" "$PID_META_FILE"
+  ensure_no_state_file_symlinks
   ensure_distinct_state_file_identities
   rm -f "$PID_FILE" "$PID_META_FILE"
+}
+
+acquire_state_lock() {
+  ensure_private_dir "$STATE_DIR"
+  ensure_private_dir "$(dirname "$LOCK_DIR")"
+  local waited=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    if [[ "$waited" -ge "$LOCK_TIMEOUT_SECONDS" ]]; then
+      die "could not acquire connector state lock: $LOCK_DIR"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  LOCK_ACQUIRED=1
+  chmod 700 "$LOCK_DIR" 2>/dev/null || true
+}
+
+release_state_lock() {
+  if [[ "$LOCK_ACQUIRED" -eq 1 ]]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_ACQUIRED=0
+  fi
+}
+
+with_state_lock() {
+  normalise_paths
+  acquire_state_lock
+  trap release_state_lock EXIT INT TERM
+  "$@"
+  local status=$?
+  release_state_lock
+  trap - EXIT INT TERM
+  return "$status"
 }
 
 ensure_config() {
@@ -303,6 +383,7 @@ write_pid_metadata() {
   local run_token="$3"
   local started_at
   started_at="$(wait_for_process_started_at "$pid")" || die "could not read connector process start time for pid $pid"
+  ensure_no_state_file_symlinks
   {
     printf 'pid=%s\n' "$pid"
     printf 'run_token=%s\n' "$run_token"
@@ -314,16 +395,25 @@ write_pid_metadata() {
 
 pid_matches_metadata() {
   local pid="$1"
-  local recorded_pid recorded_run_token recorded_started_at current_started_at
+  local recorded_pid recorded_run_token recorded_started_at recorded_agent_bin recorded_config current_started_at command_line
   recorded_pid="$(metadata_field pid)" || return 1
   recorded_run_token="$(metadata_field run_token)" || return 1
   recorded_started_at="$(metadata_field started_at)" || return 1
+  recorded_agent_bin="$(metadata_field agent_bin)" || return 1
+  recorded_config="$(metadata_field config)" || return 1
   [[ "$recorded_pid" == "$pid" ]] || return 1
   [[ -n "$recorded_run_token" ]] || return 1
   [[ -n "$recorded_started_at" ]] || return 1
+  [[ -n "$recorded_agent_bin" ]] || return 1
+  [[ -n "$recorded_config" ]] || return 1
   current_started_at="$(process_started_at "$pid")"
   [[ -n "$current_started_at" ]] || return 1
-  [[ "$current_started_at" == "$recorded_started_at" ]]
+  [[ "$current_started_at" == "$recorded_started_at" ]] || return 1
+  command_line="$(process_command "$pid")"
+  [[ "$command_line" == *"$recorded_agent_bin"* ]] || return 1
+  [[ "$command_line" == *"--config"* ]] || return 1
+  [[ "$command_line" == *"$recorded_config"* ]] || return 1
+  [[ "$command_line" == *"--connect"* ]]
 }
 
 pid_matches_connector() {
@@ -409,8 +499,10 @@ start_connector() {
 
   local run_token
   run_token="$(new_run_token)"
+  ensure_no_state_file_symlinks
   CHAOP_DOGFOOD_RUN_TOKEN="$run_token" nohup "$agent_bin" --config "$CONFIG_PATH" --connect >> "$LOG_FILE" 2>&1 &
   pid="$!"
+  ensure_no_state_file_symlinks
   printf '%s\n' "$pid" > "$PID_FILE"
   write_pid_metadata "$pid" "$agent_bin" "$run_token"
   sleep 1
@@ -465,6 +557,11 @@ recover_connector() {
   start_connector
 }
 
+restart_connector() {
+  stop_connector
+  start_connector
+}
+
 show_logs() {
   normalise_paths
   [[ -f "$LOG_FILE" ]] || die "log file does not exist: $LOG_FILE"
@@ -504,17 +601,16 @@ normalise_paths
 
 case "$COMMAND" in
   start)
-    start_connector
+    with_state_lock start_connector
     ;;
   stop)
-    stop_connector
+    with_state_lock stop_connector
     ;;
   restart)
-    stop_connector
-    start_connector
+    with_state_lock restart_connector
     ;;
   recover)
-    recover_connector
+    with_state_lock recover_connector
     ;;
   status)
     print_status
