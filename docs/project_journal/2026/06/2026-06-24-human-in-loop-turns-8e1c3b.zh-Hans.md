@@ -1,9 +1,9 @@
 ---
 id: 20260624-8e1c3b-zh-Hans
 title: 人工介入回合
-status: active
+status: completed
 created: 2026-06-24
-updated: 2026-06-24
+updated: 2026-06-25
 branch: wip/human-in-loop-turns
 pr: 21
 supersedes:
@@ -73,3 +73,7 @@ superseded_by:
 - Stale claim recovery 只发生在 response dispatch 路径里，不增加后台扫描。
 - WebSocket delivery 继续作为首选 realtime path；现有 10 秒 fallback polling 不变。
 - 新增的 `turn_interaction` safety action 让 hard limit 和 pause controls 可以在 operator response 产生 D1 写入前拦截。
+
+## 交接
+- 这一片已通过 [PR #21](https://github.com/cha-op/chaop/pull/21) 合入。
+- 后续 dogfood 工作已通过完成的 [Dogfood 可用性路线图](2026-06-23-dogfood-usability-roadmap-3f8a91.zh-Hans.md) 继续推进，并交接到 [日常 Dogfood 就绪路线图](2026-06-25-dogfood-readiness-roadmap-2d6f8b.zh-Hans.md)。

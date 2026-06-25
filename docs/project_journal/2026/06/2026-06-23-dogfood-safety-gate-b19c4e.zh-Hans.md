@@ -1,9 +1,9 @@
 ---
 id: 20260623-b19c4e-zh-Hans
 title: 试用安全闸门
-status: active
+status: completed
 created: 2026-06-23
-updated: 2026-06-24
+updated: 2026-06-25
 branch: wip/dogfood-safety-gate
 pr: 19
 supersedes:
@@ -85,5 +85,6 @@ superseded_by:
 - `project-journal validate --repo .`
 - `git diff --check`
 
-## 下一步
-- 重新运行三路 review，并在 merge 前 resolve 所有 GitHub conversations。
+## 交接
+- 这一片已通过 [PR #19](https://github.com/cha-op/chaop/pull/19) 合入。
+- 后续 dogfood 工作已通过完成的 [Dogfood 可用性路线图](2026-06-23-dogfood-usability-roadmap-3f8a91.zh-Hans.md) 继续推进，并交接到 [日常 Dogfood 就绪路线图](2026-06-25-dogfood-readiness-roadmap-2d6f8b.zh-Hans.md)。
