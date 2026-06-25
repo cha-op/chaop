@@ -9,10 +9,10 @@ Current slice:
 - Lit/Vite browser GUI with Operations Map, Operations Task Board, Thread Command Centre, and Budget Reliability Board views.
 - Cloudflare Worker route skeleton with Cloudflare Access JWT validation, connector bootstrap tokens, browser Origin checks, Durable Object binding, D1 binding, and R2 binding.
 - Shared TypeScript protocol package for connector, thread, task, command, and budget data.
-- Rust connector crate that can connect to the Worker, receive command dispatches, run placeholder execution by default, and opt in to local `codex exec` execution through private configuration.
+- Rust connector crate that can connect to the Worker, receive command dispatches, run placeholder execution by default, and opt in to managed Codex app-server or private local `codex exec` execution through private configuration.
 - Initial D1 schema migration set under `migrations/d1/`.
 
-This slice now persists command lifecycle rows in D1, relays pending commands through the Durable Object, closes the loop with the Rust connector, attaches local Codex sessions, and can create new local Codex app-server threads through a connector with `session_inventory.app_server_url` configured. Local Codex CLI execution is opt-in per connector with `execution.mode = "codex_exec"`; R2 artefact capture remains a later slice.
+This slice now persists command lifecycle rows in D1, relays pending commands through the Durable Object, closes the loop with the Rust connector, attaches local Codex sessions, can create new local Codex app-server threads, and can run managed app-server turns through a dogfood connector. Local Codex CLI execution is opt-in per connector with `execution.mode = "codex_exec"`; R2 artefact capture remains a later slice.
 
 Start locally:
 
@@ -27,6 +27,7 @@ The committed Worker config is production-safe. The local `dev:worker` script bu
 Documentation entrypoints use British English at the canonical paths. Simplified Chinese counterparts use the same basename with a `.zh-Hans.md` suffix.
 
 - `docs/deployment-guide.md`
+- `docs/dogfood-runbook.md`
 - `docs/e2e-smoke.md`
 - `docs/cost-aware.md`
 - `docs/ux-visual-directions.md`
