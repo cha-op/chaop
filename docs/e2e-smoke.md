@@ -99,7 +99,7 @@ Expected checks:
 - `/api/bootstrap` returns `200` JSON when sent with an allowed `Origin` header for the GUI domain.
 - `/api/usage-summary` returns `200` JSON with sampled Cloudflare telemetry-backed constraints when telemetry is configured. The top-level `source` can remain `d1_usage_windows` when local usage windows also exist.
 - The GUI index returns `200`.
-- Every same-origin JavaScript and CSS asset referenced by the index returns `200` and a non-zero body. Off-origin assets are not fetched with Cloudflare Access service-token headers.
+- Every same-origin JavaScript and CSS asset referenced by the index returns `200` and a non-zero body. Off-origin assets are not fetched with Cloudflare Access service-token headers, and direct smoke requests disable automatic redirects so a same-origin asset cannot redirect those headers to another origin.
 
 ## Browser Smoke
 

@@ -22,6 +22,7 @@ superseded_by:
 ## 当前状态
 - `scripts/deployed-smoke.mjs` 是 `pnpm smoke:deployed` 背后的 operator entrypoint。
 - 浏览器路径使用 Cloudflare Access cookie exchange，而不是把 service-token headers 注入跨域 browser requests。
+- direct service-token fetches 会禁用自动重定向，避免同源 asset check 把 Access headers 泄露给 off-origin redirect target。
 - budget gate 会把 `hard_limited`、`throttled`、sampled hard constraints 缺失、telemetry 缺失、D1 rows-written activity 缺失，以及 bottleneck/D1 write usage 过高视为失败。
 - `--allow-missing-telemetry` 只用于已知 telemetry outage 或非 dogfood 环境。
 

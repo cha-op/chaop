@@ -7,6 +7,7 @@ import {
   extractAssetUrls,
   parseArgs,
   readConfig,
+  runDeployedSmoke,
   runCli,
   SmokeError,
   splitCombinedSetCookie,
@@ -95,6 +96,52 @@ describe("deployed smoke assets and cookies", () => {
       secure: true,
       sameSite: "None",
     });
+  });
+
+  it("does not automatically follow asset redirects with Access headers", async () => {
+    const config = readConfig(smokeEnv());
+    const requested = [];
+    const fetchImpl = async (url, init = {}) => {
+      requested.push(url);
+      if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
+        throw new Error("Access header fetch did not disable automatic redirects");
+      }
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse({ ok: true });
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: [] });
+      }
+      if (url === "https://api.example.com/api/usage-summary") {
+        return jsonResponse(healthyBudget());
+      }
+      if (url === "https://app.example.com") {
+        return textResponse('<script type="module" src="/assets/index.js"></script>');
+      }
+      if (url === "https://app.example.com/assets/index.js") {
+        return textResponse("", { status: 302, headers: { location: "https://cdn.example.com/assets/index.js" } });
+      }
+      if (url === "https://cdn.example.com/assets/index.js") {
+        throw new Error("Off-origin asset redirect was followed");
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        runDeployedSmoke({
+          config,
+          fetchImpl,
+          options: {
+            skipBrowser: true,
+            allowMissingTelemetry: false,
+            maxBottleneckUsedPct: 90,
+            maxD1RowsWrittenUsedPct: 80,
+          },
+        }),
+      /Request failed/,
+    );
+    assert.equal(requested.includes("https://cdn.example.com/assets/index.js"), false);
   });
 });
 
@@ -247,6 +294,20 @@ function smokeEnv() {
     CF_ACCESS_CLIENT_ID: "client-id",
     CF_ACCESS_CLIENT_SECRET: "client-secret",
   };
+}
+
+function jsonResponse(body, init = {}) {
+  return new Response(JSON.stringify(body), {
+    status: init.status ?? 200,
+    headers: { "content-type": "application/json", ...(init.headers ?? {}) },
+  });
+}
+
+function textResponse(body, init = {}) {
+  return new Response(body, {
+    status: init.status ?? 200,
+    headers: init.headers,
+  });
 }
 
 function healthyBudget() {

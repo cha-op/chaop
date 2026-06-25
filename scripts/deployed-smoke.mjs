@@ -340,7 +340,7 @@ async function accessCookies({ config, fetchImpl }) {
 }
 
 async function exchangeAccessCookie(fetchImpl, url, headers) {
-  const response = await fetchImpl(url, { headers });
+  const response = await fetchImpl(url, noRedirect({ headers }));
   if (response.status < 200 || response.status >= 400) {
     throw new SmokeError(`Access cookie exchange failed for ${redactOrigin(url)}.`, {
       status: response.status,
@@ -386,7 +386,7 @@ export function splitCombinedSetCookie(value) {
 }
 
 async function fetchJson(fetchImpl, url, init) {
-  const response = await fetchImpl(url, init);
+  const response = await fetchImpl(url, noRedirect(init));
   const text = await response.text();
   let body;
   try {
@@ -404,12 +404,16 @@ async function fetchJson(fetchImpl, url, init) {
 }
 
 async function fetchText(fetchImpl, url, init) {
-  const response = await fetchImpl(url, init);
+  const response = await fetchImpl(url, noRedirect(init));
   const body = await response.text();
   if (response.status < 200 || response.status >= 300) {
     throw new SmokeError(`Request failed: ${redactOrigin(url)}`, { status: response.status });
   }
   return { status: response.status, body };
+}
+
+function noRedirect(init = {}) {
+  return { ...init, redirect: "manual" };
 }
 
 function assertStatus(label, actual, expected) {
