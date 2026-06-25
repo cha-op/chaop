@@ -97,9 +97,13 @@ cat > "$FAKE_AGENT_SRC" <<'AGENT'
 
 int main(int argc, char **argv) {
   int has_connect = 0;
+  int run_once = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--connect") == 0) {
       has_connect = 1;
+    }
+    if (strcmp(argv[i], "--run-once") == 0) {
+      run_once = 1;
     }
   }
 
@@ -130,6 +134,10 @@ int main(int argc, char **argv) {
   }
   fputc('\n', file);
   fclose(file);
+
+  if (run_once) {
+    return 0;
+  }
 
   for (;;) {
     sleep(5);
@@ -244,6 +252,33 @@ export FAKE_PS_KILL_ON_LSTART_PID
 export FAKE_CARGO_TARGET_DIR
 export CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS=1
 export PATH="$WORK_DIR/bin:$PATH"
+
+if ! env -u HOME -u XDG_STATE_HOME "$REPO_ROOT/scripts/dogfood-connector.sh" --help >/dev/null; then
+  printf 'expected --help to work when HOME and XDG_STATE_HOME are unset\n' >&2
+  exit 1
+fi
+
+if env -u HOME -u XDG_STATE_HOME "$REPO_ROOT/scripts/dogfood-connector.sh" status >/dev/null 2>"$WORK_DIR/no-home-state.err"; then
+  printf 'expected status without HOME, XDG_STATE_HOME, or --state-dir to fail\n' >&2
+  exit 1
+fi
+
+shared_state_dir="$WORK_DIR/shared-state"
+mkdir -p "$shared_state_dir"
+chmod 755 "$shared_state_dir"
+if "$REPO_ROOT/scripts/dogfood-connector.sh" \
+  --config "$CONFIG_FILE" \
+  --agent-bin "$FAKE_AGENT" \
+  --state-dir "$shared_state_dir" \
+  status >/dev/null 2>"$WORK_DIR/shared-state.err"; then
+  printf 'expected existing shared state root to be rejected\n' >&2
+  exit 1
+fi
+shared_state_mode="$(mode_test_path "$shared_state_dir")"
+if [[ "$shared_state_mode" != "755" ]]; then
+  printf 'expected shared state root mode to remain 755, got %s\n' "$shared_state_mode" >&2
+  exit 1
+fi
 
 connector() {
   "$REPO_ROOT/scripts/dogfood-connector.sh" \

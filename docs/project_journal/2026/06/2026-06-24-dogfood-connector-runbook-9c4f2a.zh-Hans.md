@@ -15,9 +15,9 @@ superseded_by:
 # Dogfood Connector 运行手册
 
 ## 摘要
-- PR D 把 ad-hoc connector launch path 固化为 persistent dogfood operating path。
-- 新脚本会在 durable user state directory 中管理 connector PID 和 log，启动并停止已有的 `chaop-agent --connect` loop，支持 one-shot smoke run，也可以 touch managed app-server upgrade marker。
-- 配套 runbook 记录 cost-safe start、stop、observation、recovery 和 upgrade scheduling，同时不提交任何 deployment-instance values。
+- PR D 把临时 connector 启动方式固化为持久化的 dogfood 运行方式。
+- 新脚本会在用户持久化状态目录中管理 connector PID 和日志，启动并停止已有的 `chaop-agent --connect` 循环，支持一次性 smoke 运行，也可以触发 managed app-server 升级标记。
+- 配套运行手册记录控制成本的启动、停止、观察、恢复和升级安排，同时不提交任何部署实例值。
 
 ## 当前状态
 - `scripts/dogfood-connector.sh` 提供 `start`、`stop`、`restart`、`recover`、`status`、`logs`、`doctor`、`once` 和 `schedule-upgrade`。

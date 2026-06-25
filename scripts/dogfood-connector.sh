@@ -3,7 +3,7 @@ set -euo pipefail
 
 COMMAND=""
 CONFIG_PATH="${CHAOP_AGENT_CONFIG:-${CHAOP_CONNECTOR_CONFIG:-}}"
-STATE_DIR="${CHAOP_DOGFOOD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/chaop/dogfood}"
+STATE_DIR="${CHAOP_DOGFOOD_STATE_DIR:-}"
 LOG_DIR="${CHAOP_DOGFOOD_LOG_DIR:-}"
 PID_FILE="${CHAOP_DOGFOOD_PID_FILE:-}"
 PID_META_FILE="${CHAOP_DOGFOOD_PID_META_FILE:-}"
@@ -156,12 +156,27 @@ parse_args() {
 }
 
 normalise_paths() {
+  if [[ -z "$STATE_DIR" ]]; then
+    STATE_DIR="$(default_state_dir)"
+  fi
   LOG_DIR="${LOG_DIR:-$STATE_DIR/logs}"
   PID_FILE="${PID_FILE:-$STATE_DIR/connector.pid}"
   PID_META_FILE="${PID_META_FILE:-$PID_FILE.meta}"
   LOG_FILE="${LOG_FILE:-$LOG_DIR/connector.log}"
   LOCK_DIR="${LOCK_DIR:-$STATE_DIR/connector.lock}"
   HOSTNAME_VALUE="${HOSTNAME_VALUE:-$(hostname)}"
+}
+
+default_state_dir() {
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    printf '%s/chaop/dogfood\n' "$XDG_STATE_HOME"
+    return 0
+  fi
+  if [[ -n "${HOME:-}" ]]; then
+    printf '%s/.local/state/chaop/dogfood\n' "$HOME"
+    return 0
+  fi
+  die "set --state-dir or CHAOP_DOGFOOD_STATE_DIR when HOME and XDG_STATE_HOME are unset"
 }
 
 resolve_existing_path() {
@@ -297,9 +312,12 @@ ensure_distinct_state_file_identities() {
 
 ensure_private_dir() {
   local dir_path="$1"
-  local mode
+  local mode existed=0
+  [[ -e "$dir_path" ]] && existed=1
   mkdir -p "$dir_path"
-  chmod 700 "$dir_path" 2>/dev/null || true
+  if [[ "$existed" -eq 0 ]]; then
+    chmod 700 "$dir_path" 2>/dev/null || true
+  fi
   mode="$(state_mode "$dir_path")" || die "could not inspect directory permissions: $dir_path"
   if (( (8#$mode & 077) != 0 )); then
     die "state directory must not be group/other accessible: $dir_path"
@@ -314,11 +332,14 @@ ensure_state_root() {
 ensure_private_state_dir() {
   local dir_path="$1"
   local state_root="$2"
-  local mode
+  local mode existed=0
   ensure_physical_state_subpath "$dir_path" "$state_root"
+  [[ -e "$dir_path" ]] && existed=1
   mkdir -p "$dir_path"
   ensure_physical_dir_under_state "$dir_path" "$state_root"
-  chmod 700 "$dir_path" 2>/dev/null || true
+  if [[ "$existed" -eq 0 ]]; then
+    chmod 700 "$dir_path" 2>/dev/null || true
+  fi
   mode="$(state_mode "$dir_path")" || die "could not inspect directory permissions: $dir_path"
   if (( (8#$mode & 077) != 0 )); then
     die "state directory must not be group/other accessible: $dir_path"
