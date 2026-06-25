@@ -69,7 +69,7 @@ The runner fails the smoke when:
 
 - API health, bootstrap, usage summary, GUI index, or referenced assets fail;
 - browser rendering fails or the browser observes deployed `4xx` or `5xx` responses;
-- Budget Board state is `hard_limited`;
+- Budget Board state is `hard_limited` or `throttled`;
 - the sampled hard budget bottleneck is missing;
 - sampled Cloudflare telemetry-backed hard constraints are missing;
 - measured current-day D1 rows-written activity is missing;

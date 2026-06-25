@@ -21,7 +21,7 @@
 - Attaching an unused local Codex session through a connector with `host_session_app_server_ensure` now resumes it through app-server before creating the Chaop task/thread attachment, so Thread Centre can use the managed app-server command path immediately.
 - The nine-PR app-server lifecycle roadmap is implemented through the Budget Board real-metrics slice.
 - Deployed E2E smoke now has a documented Access-cookie browser path and a repo-local skill for repeatable low-cost API, Web, browser, and Budget Board validation.
-- Deployed E2E smoke now also has a tracked read-only runner, `scripts/deployed-smoke.mjs`, with Budget Board gates for Cloudflare telemetry, sampled hard constraints, measured D1 rows-written activity, hard-limit posture, and high usage thresholds.
+- Deployed E2E smoke now also has a tracked low-cost runner, `scripts/deployed-smoke.mjs`, with Budget Board gates for Cloudflare telemetry, sampled hard constraints, measured D1 rows-written activity, hard-limit/throttled posture, and high usage thresholds.
 - The next dogfood usability roadmap is recorded and prioritises cost safety first, then a managed app-server Thread Centre chat MVP, human-in-the-loop turns, and persistent connector operations.
 - Local D1 rows-written guardrails now use the larger of Cloudflare telemetry and the local conservative estimate, with no-telemetry fallback budgeted at 26 rows per event.
 - Completed workstream state lives in `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.md`.

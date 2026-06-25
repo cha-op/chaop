@@ -16,18 +16,18 @@ Use this repo-local skill when verifying a deployed Chaop slice, especially afte
 ## Default Workflow
 
 1. Source the private deployment env and Access smoke env without echoing values.
-2. Run the read-only API and asset smoke:
+2. Run the low-cost API and asset smoke:
    - `/api/health`;
    - `/api/bootstrap` with the allowed GUI Origin;
-   - `/api/usage-summary`;
+   - `/api/usage-summary`, which can refresh Cloudflare telemetry and write a bounded telemetry cache row;
    - GUI index;
-   - referenced JavaScript and CSS assets.
+   - referenced same-origin JavaScript and CSS assets.
 3. Run browser smoke through Access cookies:
    - exchange the service token for `CF_Authorization` cookies on the GUI and API hosts;
    - add those cookies to the browser context;
    - do not inject service-token headers into the page context;
    - assert the app shell renders `Operations Map`, `Budget Board`, and `Host Sessions`;
-   - assert `/api/bootstrap` returns `200`.
+   - assert `/api/bootstrap` on the configured API origin returns `200` JSON.
 4. For Budget Board checks, summarise `/api/usage-summary`:
    - `source`, `state`, and `generated_at`;
    - bottleneck constraint;
@@ -39,7 +39,7 @@ Use this repo-local skill when verifying a deployed Chaop slice, especially afte
 
 ## Cost Guardrails
 
-Default to read-only checks. Do not call these endpoints unless the user asks for a write-path or connector test:
+Default to low-cost checks that avoid product write actions. Do not call these endpoints unless the user asks for a write-path or connector test:
 
 - `POST /api/commands`;
 - `POST /api/host-sessions/refresh`;

@@ -7,6 +7,8 @@ import {
   extractAssetUrls,
   parseArgs,
   readConfig,
+  runCli,
+  SmokeError,
   splitCombinedSetCookie,
 } from "../scripts/deployed-smoke.mjs";
 
@@ -147,6 +149,27 @@ describe("deployed smoke budget gate", () => {
     assert.match(budget.failures.join("\n"), /No sampled hard budget constraints/);
   });
 
+  it("still fails without sampled hard constraints when missing telemetry is allowed", () => {
+    const budget = analyseBudget(
+      {
+        ...healthyBudget(),
+        source: "d1_usage_windows",
+        constraints: [],
+        bottleneck_constraint: undefined,
+        d1_activity: undefined,
+      },
+      {
+        allowMissingTelemetry: true,
+        maxBottleneckUsedPct: 90,
+        maxD1RowsWrittenUsedPct: 80,
+      },
+    );
+
+    assert.equal(budget.ok, false);
+    assert.match(budget.failures.join("\n"), /No sampled hard budget constraints/);
+    assert.match(budget.warnings.join("\n"), /Cloudflare telemetry/);
+  });
+
   it("fails on hard limits and high D1 rows written", () => {
     const budget = healthyBudget();
     budget.state = "hard_limited";
@@ -161,7 +184,70 @@ describe("deployed smoke budget gate", () => {
     assert.match(result.failures.join("\n"), /hard_limited/);
     assert.match(result.failures.join("\n"), /D1 rows written \/ day is at 90%/);
   });
+
+  it("fails on throttled posture", () => {
+    const budget = {
+      ...healthyBudget(),
+      state: "throttled",
+    };
+    const result = analyseBudget(budget, {
+      allowMissingTelemetry: false,
+      maxBottleneckUsedPct: 90,
+      maxD1RowsWrittenUsedPct: 80,
+    });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join("\n"), /throttled/);
+  });
 });
+
+describe("deployed smoke CLI", () => {
+  it("keeps JSON output machine-readable on smoke failures", async () => {
+    const stdout = writableBuffer();
+    const stderr = writableBuffer();
+    const code = await runCli({
+      argv: ["--json"],
+      env: smokeEnv(),
+      stdout,
+      stderr,
+      runSmoke: async () => {
+        throw new SmokeError("Budget gate failed.", {
+          ok: false,
+          budget: { failures: ["Budget posture is throttled."] },
+        });
+      },
+    });
+
+    assert.equal(code, 1);
+    assert.equal(stderr.text, "");
+    assert.deepEqual(JSON.parse(stdout.text), {
+      ok: false,
+      error: "Budget gate failed.",
+      details: {
+        ok: false,
+        budget: { failures: ["Budget posture is throttled."] },
+      },
+    });
+  });
+});
+
+function writableBuffer() {
+  return {
+    text: "",
+    write(value) {
+      this.text += value;
+    },
+  };
+}
+
+function smokeEnv() {
+  return {
+    CHAOP_GUI_DOMAIN: "app.example.com",
+    VITE_CHAOP_API_BASE_URL: "https://api.example.com/",
+    CF_ACCESS_CLIENT_ID: "client-id",
+    CF_ACCESS_CLIENT_SECRET: "client-secret",
+  };
+}
 
 function healthyBudget() {
   return {

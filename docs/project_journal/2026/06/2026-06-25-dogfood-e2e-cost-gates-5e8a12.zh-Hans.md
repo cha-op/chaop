@@ -15,14 +15,14 @@ superseded_by:
 # Dogfood E2E Cost Gates
 
 ## 摘要
-- PR E 把 deployed smoke workflow 从临时 runner 固化为已跟踪的只读脚本。
-- runner 会验证通过 Access authentication 的 API、bootstrap、usage summary、GUI assets、browser rendering 和 Budget Board posture，不调用写路径 endpoints。
+- PR E 把 deployed smoke workflow 从临时 runner 固化为已跟踪的低成本脚本。
+- runner 会验证通过 Access authentication 的 API、bootstrap、usage summary、GUI assets、browser rendering 和 Budget Board posture，不调用产品写路径 endpoints。`/api/usage-summary` 仍可能刷新并缓存一条有界 Cloudflare telemetry sample。
 - Budget gate 默认会在 Cloudflare telemetry 或当前日 D1 rows-written 实测 activity 缺失时失败。
 
 ## 当前状态
 - `scripts/deployed-smoke.mjs` 是 `pnpm smoke:deployed` 背后的 operator entrypoint。
 - 浏览器路径使用 Cloudflare Access cookie exchange，而不是把 service-token headers 注入跨域 browser requests。
-- budget gate 会把 `hard_limited`、sampled hard constraints 缺失、telemetry 缺失、D1 rows-written activity 缺失，以及 bottleneck/D1 write usage 过高视为失败。
+- budget gate 会把 `hard_limited`、`throttled`、sampled hard constraints 缺失、telemetry 缺失、D1 rows-written activity 缺失，以及 bottleneck/D1 write usage 过高视为失败。
 - `--allow-missing-telemetry` 只用于已知 telemetry outage 或非 dogfood 环境。
 
 ## 下一步

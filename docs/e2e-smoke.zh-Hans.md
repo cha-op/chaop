@@ -69,7 +69,7 @@ runner 在这些情况下会让 smoke 失败：
 
 - API health、bootstrap、usage summary、GUI index 或被引用的 assets 失败；
 - 浏览器渲染失败，或浏览器观察到线上 `4xx` 或 `5xx` response；
-- Budget Board state 是 `hard_limited`；
+- Budget Board state 是 `hard_limited` 或 `throttled`；
 - sampled hard budget bottleneck 缺失；
 - sampled Cloudflare telemetry-backed hard constraints 缺失；
 - 当前日 D1 rows-written 实测 activity 缺失；

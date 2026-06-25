@@ -7,7 +7,7 @@ const DEFAULT_BROWSER_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_BOTTLENECK_USED_PCT = 90;
 const DEFAULT_MAX_D1_ROWS_WRITTEN_USED_PCT = 80;
 
-class SmokeError extends Error {
+export class SmokeError extends Error {
   constructor(message, details = undefined) {
     super(message);
     this.name = "SmokeError";
@@ -449,24 +449,31 @@ export function analyseBudget(payload, options = {}) {
   if (budget?.state === "hard_limited") {
     failures.push("Budget posture is hard_limited.");
   } else if (budget?.state === "throttled") {
-    warnings.push("Budget posture is throttled.");
+    failures.push("Budget posture is throttled.");
   }
 
-  if (!options.allowMissingTelemetry) {
-    if (sampledCloudflareConstraints.length === 0) {
-      failures.push("No sampled Cloudflare telemetry hard budget constraints are available.");
+  if (sampledHardConstraints.length === 0) {
+    failures.push("No sampled hard budget constraints are available.");
+  }
+  if (!bottleneck || !bottleneck.sampled || bottleneck.state === "missing") {
+    failures.push("No sampled hard budget bottleneck is available.");
+  }
+
+  if (sampledCloudflareConstraints.length === 0) {
+    const message = "No sampled Cloudflare telemetry hard budget constraints are available.";
+    if (options.allowMissingTelemetry) {
+      warnings.push(message);
+    } else {
+      failures.push(message);
     }
-    if (sampledHardConstraints.length === 0) {
-      failures.push("No sampled hard budget constraints are available.");
+  }
+  if (!measuredD1RowsWritten) {
+    const message = "Measured current-day D1 rows-written activity is missing.";
+    if (options.allowMissingTelemetry) {
+      warnings.push(message);
+    } else {
+      failures.push(message);
     }
-    if (!bottleneck || !bottleneck.sampled || bottleneck.state === "missing") {
-      failures.push("No sampled hard budget bottleneck is available.");
-    }
-    if (!measuredD1RowsWritten) {
-      failures.push("Measured current-day D1 rows-written activity is missing.");
-    }
-  } else if (sampledCloudflareConstraints.length === 0) {
-    warnings.push("No sampled Cloudflare telemetry hard budget constraints are available.");
   }
 
   if (typeof budget?.d1_write_model?.budgeted_rows_written_per_event !== "number") {
@@ -593,15 +600,17 @@ export async function runCli({
   env = process.env,
   stdout = process.stdout,
   stderr = process.stderr,
+  runSmoke = runDeployedSmoke,
 } = {}) {
+  let options;
   try {
-    const options = parseArgs(argv);
+    options = parseArgs(argv);
     if (options.help) {
       stdout.write(usage());
       return 0;
     }
     const config = readConfig(env);
-    const result = await runDeployedSmoke({ config, options });
+    const result = await runSmoke({ config, options });
     if (options.json) {
       stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } else {
@@ -614,6 +623,20 @@ export async function runCli({
       return 2;
     }
     const details = error instanceof SmokeError ? error.details : undefined;
+    if (options?.json) {
+      stdout.write(
+        `${JSON.stringify(
+          {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+            details,
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      return 1;
+    }
     stderr.write(`${error.message ?? String(error)}\n`);
     if (details) {
       stderr.write(`${JSON.stringify(details, null, 2)}\n`);
