@@ -167,6 +167,37 @@ describe("deployed smoke assets and cookies", () => {
     );
   });
 
+  it("times out stalled direct response bodies", async () => {
+    const config = readConfig({ ...smokeEnv(), CHAOP_SMOKE_BROWSER_TIMEOUT_MS: "5" });
+    const fetchImpl = async (_url, init = {}) => ({
+      status: 200,
+      headers: new Headers({ "content-type": "application/json" }),
+      text: async () =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new Error("body aborted")));
+        }),
+    });
+
+    await assert.rejects(
+      () =>
+        rejectAfter(
+          runDeployedSmoke({
+            config,
+            fetchImpl,
+            options: {
+              skipBrowser: true,
+              allowMissingTelemetry: false,
+              maxBottleneckUsedPct: 90,
+              maxD1RowsWrittenUsedPct: 80,
+            },
+          }),
+          100,
+          "direct response body did not time out",
+        ),
+      /Request timed out/,
+    );
+  });
+
   it("fails when the browser bootstrap request times out", async () => {
     const config = readConfig(smokeEnv());
     const fetchImpl = async (url, init = {}) => {
@@ -208,6 +239,55 @@ describe("deployed smoke assets and cookies", () => {
             maxD1RowsWrittenUsedPct: 80,
           },
         }),
+      /Browser bootstrap request timed out/,
+    );
+  });
+
+  it("fails when the browser bootstrap response body times out", async () => {
+    const config = readConfig({ ...smokeEnv(), CHAOP_SMOKE_BROWSER_TIMEOUT_MS: "5" });
+    const fetchImpl = async (url, init = {}) => {
+      if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
+        throw new Error("Access header fetch did not disable automatic redirects");
+      }
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse({ ok: true }, { headers: { "set-cookie": "CF_Authorization=api-token; Path=/" } });
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: [] });
+      }
+      if (url === "https://api.example.com/api/usage-summary") {
+        return jsonResponse(healthyBudget());
+      }
+      if (url === "https://app.example.com") {
+        return textResponse('<script type="module" src="/assets/index.js"></script>', {
+          headers: { "set-cookie": "CF_Authorization=gui-token; Path=/" },
+        });
+      }
+      if (url === "https://app.example.com/assets/index.js") {
+        return textResponse("console.log('ok');");
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        rejectAfter(
+          runDeployedSmoke({
+            config,
+            fetchImpl,
+            browserLauncher: fakeBrowserLauncher({
+              evaluate: async (callback, argument) => withBrowserGlobals(() => callback(argument)),
+            }),
+            options: {
+              skipBrowser: false,
+              allowMissingTelemetry: false,
+              maxBottleneckUsedPct: 90,
+              maxD1RowsWrittenUsedPct: 80,
+            },
+          }),
+          100,
+          "browser bootstrap response body did not time out",
+        ),
       /Browser bootstrap request timed out/,
     );
   });
@@ -403,6 +483,44 @@ function fakeBrowserLauncher({ evaluate }) {
       };
     },
   };
+}
+
+async function withBrowserGlobals(callback) {
+  const originalFetch = globalThis.fetch;
+  const originalWindow = globalThis.window;
+  globalThis.window = { setTimeout, clearTimeout };
+  globalThis.fetch = async (_url, init = {}) => ({
+    status: 200,
+    headers: new Headers({ "content-type": "application/json" }),
+    json: async () =>
+      new Promise((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => reject(new Error("body aborted")));
+      }),
+  });
+  try {
+    return await callback();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = originalWindow;
+    }
+  }
+}
+
+async function rejectAfter(promise, timeoutMs, message) {
+  let timeout;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function healthyBudget() {

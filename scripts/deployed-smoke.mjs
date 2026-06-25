@@ -290,11 +290,24 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
       let response;
+      let contentType = "";
+      let body;
       try {
         response = await fetch(`${apiBaseUrl}/api/bootstrap`, {
           credentials: "include",
           signal: controller.signal,
         });
+        contentType = response.headers.get("content-type") ?? "";
+        if (contentType.includes("application/json")) {
+          try {
+            body = await response.json();
+          } catch {
+            if (controller.signal.aborted) {
+              return { status: 0, contentType: "", hasWorkspaces: false, timedOut: true };
+            }
+            body = undefined;
+          }
+        }
       } catch (error) {
         if (controller.signal.aborted) {
           return { status: 0, contentType: "", hasWorkspaces: false, timedOut: true };
@@ -302,15 +315,6 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
         throw error;
       } finally {
         window.clearTimeout(timeout);
-      }
-      const contentType = response.headers.get("content-type") ?? "";
-      let body;
-      if (contentType.includes("application/json")) {
-        try {
-          body = await response.json();
-        } catch {
-          body = undefined;
-        }
       }
       return {
         status: response.status,
@@ -359,7 +363,7 @@ async function accessCookies({ config, fetchImpl }) {
 }
 
 async function exchangeAccessCookie(fetchImpl, url, headers, timeoutMs) {
-  const response = await fetchWithTimeout(fetchImpl, url, { headers }, timeoutMs);
+  const response = await fetchWithinTimeout(fetchImpl, url, { headers }, timeoutMs, async (incoming) => incoming);
   if (response.status < 200 || response.status >= 400) {
     throw new SmokeError(`Access cookie exchange failed for ${redactOrigin(url)}.`, {
       status: response.status,
@@ -405,8 +409,10 @@ export function splitCombinedSetCookie(value) {
 }
 
 async function fetchJson(fetchImpl, url, init, timeoutMs) {
-  const response = await fetchWithTimeout(fetchImpl, url, init, timeoutMs);
-  const text = await response.text();
+  const { response, text } = await fetchWithinTimeout(fetchImpl, url, init, timeoutMs, async (incoming) => ({
+    response: incoming,
+    text: await incoming.text(),
+  }));
   let body;
   try {
     body = text ? JSON.parse(text) : undefined;
@@ -423,19 +429,22 @@ async function fetchJson(fetchImpl, url, init, timeoutMs) {
 }
 
 async function fetchText(fetchImpl, url, init, timeoutMs) {
-  const response = await fetchWithTimeout(fetchImpl, url, init, timeoutMs);
-  const body = await response.text();
+  const { response, body } = await fetchWithinTimeout(fetchImpl, url, init, timeoutMs, async (incoming) => ({
+    response: incoming,
+    body: await incoming.text(),
+  }));
   if (response.status < 200 || response.status >= 300) {
     throw new SmokeError(`Request failed: ${redactOrigin(url)}`, { status: response.status });
   }
   return { status: response.status, body };
 }
 
-async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
+async function fetchWithinTimeout(fetchImpl, url, init, timeoutMs, readResponse) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetchImpl(url, { ...noRedirect(init), signal: controller.signal });
+    const response = await fetchImpl(url, { ...noRedirect(init), signal: controller.signal });
+    return await readResponse(response);
   } catch (error) {
     if (controller.signal.aborted) {
       throw new SmokeError(`Request timed out: ${redactOrigin(url)}`, { timeout_ms: timeoutMs });
