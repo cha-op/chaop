@@ -9,6 +9,7 @@ CONFIG_PATH="${CHAOP_AGENT_CONFIG:-${CHAOP_CONNECTOR_CONFIG:-}}"
 STATE_DIR="${CHAOP_DOGFOOD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/chaop/dogfood}"
 LOG_DIR="${CHAOP_DOGFOOD_LOG_DIR:-}"
 PID_FILE="${CHAOP_DOGFOOD_PID_FILE:-}"
+PID_META_FILE="${CHAOP_DOGFOOD_PID_META_FILE:-}"
 LOG_FILE="${CHAOP_DOGFOOD_LOG_FILE:-}"
 AGENT_BIN="${CHAOP_AGENT_BIN:-}"
 BUILD_PROFILE="${CHAOP_AGENT_BUILD_PROFILE:-release}"
@@ -38,6 +39,7 @@ Options:
   --config <path>       Connector TOML config. Defaults to CHAOP_AGENT_CONFIG.
   --state-dir <path>    Persistent dogfood state dir.
   --pid-file <path>     Pid file path.
+  --pid-meta-file <p>   Pid metadata path. Default: <pid-file>.meta.
   --log-file <path>     Connector log path.
   --agent-bin <path>    Prebuilt chaop-agent binary.
   --build-profile <p>   release or debug. Default: release.
@@ -54,6 +56,7 @@ Environment:
   CHAOP_DOGFOOD_STATE_DIR
   CHAOP_DOGFOOD_LOG_FILE
   CHAOP_DOGFOOD_PID_FILE
+  CHAOP_DOGFOOD_PID_META_FILE
   CHAOP_DOGFOOD_UPGRADE_MARKER_FILE
 USAGE
 }
@@ -79,6 +82,11 @@ parse_args() {
       --pid-file)
         PID_FILE="${2:-}"
         [[ -n "$PID_FILE" ]] || die "--pid-file requires a path"
+        shift 2
+        ;;
+      --pid-meta-file)
+        PID_META_FILE="${2:-}"
+        [[ -n "$PID_META_FILE" ]] || die "--pid-meta-file requires a path"
         shift 2
         ;;
       --log-file)
@@ -145,13 +153,16 @@ parse_args() {
 normalise_paths() {
   LOG_DIR="${LOG_DIR:-$STATE_DIR/logs}"
   PID_FILE="${PID_FILE:-$STATE_DIR/connector.pid}"
+  PID_META_FILE="${PID_META_FILE:-$PID_FILE.meta}"
   LOG_FILE="${LOG_FILE:-$LOG_DIR/connector.log}"
   HOSTNAME_VALUE="${HOSTNAME_VALUE:-$(hostname)}"
 }
 
 ensure_state_dirs() {
-  mkdir -p "$STATE_DIR" "$LOG_DIR"
+  mkdir -p "$STATE_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")" "$(dirname "$PID_META_FILE")" "$(dirname "$LOG_FILE")"
   chmod 700 "$STATE_DIR" 2>/dev/null || true
+  touch "$LOG_FILE" "$PID_FILE" "$PID_META_FILE"
+  rm -f "$PID_FILE" "$PID_META_FILE"
 }
 
 ensure_config() {
@@ -206,8 +217,46 @@ process_command() {
   ps -p "$pid" -o command= 2>/dev/null || true
 }
 
+process_started_at() {
+  local pid="$1"
+  ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
+}
+
+metadata_field() {
+  local key="$1"
+  [[ -f "$PID_META_FILE" ]] || return 1
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; found = 1 } END { exit found ? 0 : 1 }' "$PID_META_FILE"
+}
+
+write_pid_metadata() {
+  local pid="$1"
+  local agent_bin="$2"
+  local started_at
+  started_at="$(process_started_at "$pid")"
+  {
+    printf 'pid=%s\n' "$pid"
+    printf 'started_at=%s\n' "$started_at"
+    printf 'agent_bin=%s\n' "$agent_bin"
+    printf 'config=%s\n' "$CONFIG_PATH"
+  } > "$PID_META_FILE"
+}
+
+pid_matches_metadata() {
+  local pid="$1"
+  local recorded_pid recorded_started_at current_started_at
+  recorded_pid="$(metadata_field pid)" || return 1
+  recorded_started_at="$(metadata_field started_at)" || return 1
+  [[ "$recorded_pid" == "$pid" ]] || return 1
+  [[ -n "$recorded_started_at" ]] || return 0
+  current_started_at="$(process_started_at "$pid")"
+  [[ "$current_started_at" == "$recorded_started_at" ]]
+}
+
 pid_matches_connector() {
   local pid="$1"
+  if pid_matches_metadata "$pid"; then
+    return 0
+  fi
   local command_line
   command_line="$(process_command "$pid")"
   [[ "$command_line" == *"--connect"* ]] || return 1
@@ -227,7 +276,7 @@ current_pid() {
 remove_stale_pid_file() {
   local pid
   if pid="$(pid_from_file)" && ! is_pid_running "$pid"; then
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$PID_META_FILE"
   fi
 }
 
@@ -236,6 +285,7 @@ print_status() {
   local pid
   printf 'state_dir=%s\n' "$STATE_DIR"
   printf 'pid_file=%s\n' "$PID_FILE"
+  printf 'pid_meta_file=%s\n' "$PID_META_FILE"
   printf 'log_file=%s\n' "$LOG_FILE"
   if [[ -n "$CONFIG_PATH" ]]; then
     printf 'config=%s\n' "$CONFIG_PATH"
@@ -276,11 +326,12 @@ start_connector() {
   nohup "$agent_bin" --config "$CONFIG_PATH" --connect >> "$LOG_FILE" 2>&1 &
   pid="$!"
   printf '%s\n' "$pid" > "$PID_FILE"
+  write_pid_metadata "$pid" "$agent_bin"
   sleep 1
   if ! is_pid_running "$pid"; then
     printf 'connector exited during startup; recent log follows:\n' >&2
     tail -n "$LOG_LINES" "$LOG_FILE" >&2 || true
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$PID_META_FILE"
     exit 1
   fi
   printf 'connector started with pid %s\n' "$pid"
@@ -314,7 +365,7 @@ stop_connector() {
     sleep 1
     waited=$((waited + 1))
   done
-  rm -f "$PID_FILE"
+  rm -f "$PID_FILE" "$PID_META_FILE"
   printf 'connector stopped\n'
 }
 
