@@ -776,7 +776,14 @@ stop_connector() {
   fi
 
   printf 'stopping connector pid %s\n' "$pid"
-  kill -TERM "$pid"
+  if ! kill -TERM "$pid" 2>/dev/null; then
+    if ! is_pid_running "$pid"; then
+      rm -f "$PID_FILE" "$PID_META_FILE"
+      printf 'connector stopped\n'
+      return 0
+    fi
+    die "could not signal connector pid $pid"
+  fi
   local waited=0
   while is_pid_running "$pid"; do
     if [[ "$waited" -ge "$STOP_TIMEOUT_SECONDS" ]]; then

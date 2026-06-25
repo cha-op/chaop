@@ -17,6 +17,7 @@ LOG_FILE="$STATE_DIR/logs/connector.log"
 FAKE_AGENT_STARTED_FILE="$WORK_DIR/agent-started.log"
 FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
 FAKE_PS_COMMAND=""
+FAKE_PS_KILL_ON_COMMAND=0
 RECORDED_FAKE_AGENT=""
 RECORDED_CONFIG_FILE=""
 FOREIGN_PID=""
@@ -155,6 +156,10 @@ if [[ "${1:-}" == "-p" && "${3:-}" == "-o" ]]; then
       else
         printf '%.40s\n' "${FAKE_PS_COMMAND:?}"
       fi
+      if [[ "${FAKE_PS_KILL_ON_COMMAND:-0}" == "1" ]]; then
+        kill -KILL "${2:?}" 2>/dev/null || true
+        sleep 0.2
+      fi
       ;;
     *)
       exit 1
@@ -174,6 +179,7 @@ export FAKE_AGENT_STARTED_FILE
 export FAKE_AGENT_IGNORE_TERM=0
 export FAKE_PS_LSTART
 export FAKE_PS_COMMAND
+export FAKE_PS_KILL_ON_COMMAND
 export FAKE_CARGO_TARGET_DIR
 export CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS=1
 export PATH="$WORK_DIR/bin:$PATH"
@@ -261,6 +267,31 @@ fi
 connector stop
 if kill -0 "$concurrent_pid" 2>/dev/null; then
   printf 'expected concurrent-managed pid %s to stop\n' "$concurrent_pid" >&2
+  exit 1
+fi
+
+connector start
+kill_race_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+FAKE_PS_KILL_ON_COMMAND=1
+export FAKE_PS_KILL_ON_COMMAND
+if ! connector stop >"$WORK_DIR/kill-race-stop.out" 2>"$WORK_DIR/kill-race-stop.err"; then
+  printf 'expected stop to tolerate a connector exiting before TERM\n' >&2
+  exit 1
+fi
+FAKE_PS_KILL_ON_COMMAND=0
+export FAKE_PS_KILL_ON_COMMAND
+if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
+  printf 'expected stop race cleanup to remove pid state\n' >&2
+  exit 1
+fi
+for _ in {1..20}; do
+  if ! kill -0 "$kill_race_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if kill -0 "$kill_race_pid" 2>/dev/null; then
+  printf 'expected kill-race pid %s to be gone\n' "$kill_race_pid" >&2
   exit 1
 fi
 
