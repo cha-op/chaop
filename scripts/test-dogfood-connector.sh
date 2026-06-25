@@ -117,13 +117,23 @@ cat > "$FAKE_PS" <<'PS'
 #!/usr/bin/env bash
 set -euo pipefail
 
+wide_output=0
+if [[ "${1:-}" == "-ww" ]]; then
+  wide_output=1
+  shift
+fi
+
 if [[ "${1:-}" == "-p" && "${3:-}" == "-o" ]]; then
   case "${4:-}" in
     lstart=)
       printf '%s\n' "${FAKE_PS_LSTART:?}"
       ;;
     command=)
-      printf '%s\n' "${FAKE_PS_COMMAND:?}"
+      if [[ "$wide_output" -eq 1 ]]; then
+        printf '%s\n' "${FAKE_PS_COMMAND:?}"
+      else
+        printf '%.40s\n' "${FAKE_PS_COMMAND:?}"
+      fi
       ;;
     *)
       exit 1

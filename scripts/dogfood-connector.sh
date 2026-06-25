@@ -497,7 +497,14 @@ is_pid_running() {
 
 process_command() {
   local pid="$1"
-  ps -p "$pid" -o command= 2>/dev/null || true
+  case "$(uname -s)" in
+    Darwin|FreeBSD|OpenBSD|NetBSD)
+      ps -ww -p "$pid" -o command= 2>/dev/null || true
+      ;;
+    *)
+      ps -p "$pid" -o command= 2>/dev/null || true
+      ;;
+  esac
 }
 
 process_argv_matches() {
