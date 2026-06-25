@@ -281,12 +281,11 @@ export class ChaopApp extends LitElement {
     }
     this.view = nextView;
     const nextThreadId = threadIdFromHash();
-    const threadChanged = nextThreadId !== this.selectedThreadId;
-    if (threadChanged) {
+    if (nextThreadId !== undefined && nextThreadId !== this.selectedThreadId) {
       this.commandModeExplicit = false;
       this.resetThreadCommandState();
+      this.selectedThreadId = nextThreadId;
     }
-    this.selectedThreadId = nextThreadId;
     this.ensureSelectedThread();
     void this.loadSelectedThreadEvents().catch((error) => {
       this.actionError = actionErrorMessage("Thread events refresh failed", error);
@@ -1138,7 +1137,7 @@ export class ChaopApp extends LitElement {
     const generatedAt = budget.generated_at ?? this.data!.server_time;
     const windowSampleCount = budget.window_sample_count ?? windows.length;
     const constraintSampleCount = budget.constraint_sample_count ?? constraints.filter((constraint) => constraint.sampled).length;
-    const readiness = dogfoodReadinessPreflight(this.data, this.selectedThreadId);
+    const readiness = dogfoodReadinessPreflight(this.data, this.selectedThread()?.id);
     return html`
       ${this.renderDogfoodReadiness(readiness)}
       <section class="page-grid budget-grid">

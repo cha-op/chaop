@@ -18,7 +18,7 @@ superseded_by:
 - PR G 在 Budget Board 顶部增加一个被动 readiness preflight，让 operator 在开始日常 dogfood 前可以先检查 cost posture、connector capability、目标 workspace 的 app-server availability，以及下一步安全操作。
 - 这个 preflight 完全从现有 bootstrap payload 推导：`safety`、`budget`、`connectors` 和 `app_server_instances`。
 - 它不新增 Worker route、D1 write path、connector report、Host Session refresh，也不新增后台 poll。
-- Review follow-up 现在会把 readiness 限定到所选 Thread Centre workspace；没有选中 thread 时使用默认 workspace，因此其它 workspace ready 不会让当前 dogfood path 被误判为 ready。
+- Review follow-up 现在会把 readiness 限定到 Thread Centre 实际会打开的 thread，并且在跨视图导航时保留所选 thread 目标；只有没有任何可打开 thread 时才回退到默认 workspace，因此其它 workspace ready 不会让当前 dogfood path 被误判为 ready。
 - 如果 connector 明确报告 app-server thread 和 execution capabilities，外部 service manager 管理的 app-server listener 仍然可以算作 ready；preflight 检查的是 execution path，不是 service-manager ownership model。
 
 ## 范围

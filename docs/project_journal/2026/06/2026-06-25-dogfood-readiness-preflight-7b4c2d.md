@@ -18,7 +18,7 @@ superseded_by:
 - PR G adds a passive readiness preflight to the Budget Board so an operator can check cost posture, connector capability, app-server availability for the target workspace, and the next safe action before daily dogfood work starts.
 - The preflight derives its decision entirely from the existing bootstrap payload: `safety`, `budget`, `connectors`, and `app_server_instances`.
 - It does not add a Worker route, D1 write path, connector report, Host Session refresh, or background poll.
-- Review follow-up scopes readiness to the selected Thread Centre workspace, or the default workspace when no thread is selected, so another workspace cannot make the current dogfood path look ready.
+- Review follow-up scopes readiness to the thread that Thread Centre will actually open, preserves the selected thread target across view navigation, and falls back to the default workspace only when no thread is available, so another workspace cannot make the current dogfood path look ready.
 - Externally managed app-server listeners still count as ready when the connector reports the app-server thread and execution capabilities; the preflight tests the execution path, not the service-manager ownership model.
 
 ## Scope
