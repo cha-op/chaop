@@ -5,16 +5,18 @@
   "scripts": {
     "build": "pnpm --filter @chaop/protocol build && pnpm --filter @chaop/worker build && pnpm --filter @chaop/web build && cargo build --workspace",
     "test": "pnpm run test:scripts && pnpm --filter @chaop/protocol test && pnpm --filter @chaop/web test && pnpm --filter @chaop/worker test && cargo test --workspace",
-    "test:scripts": "bash -n scripts/dogfood-connector.sh && bash -n scripts/test-dogfood-connector.sh && bash scripts/test-dogfood-connector.sh",
+    "test:scripts": "node --test test/*.node-test.mjs && bash -n scripts/dogfood-connector.sh && bash -n scripts/test-dogfood-connector.sh && bash scripts/test-dogfood-connector.sh",
     "typecheck": "pnpm --filter @chaop/protocol build && pnpm --filter @chaop/worker typecheck && pnpm --filter @chaop/web typecheck",
     "dev:web": "pnpm --filter @chaop/web dev",
     "dev:worker": "pnpm --filter @chaop/worker dev",
     "dogfood:connector": "bash scripts/dogfood-connector.sh",
     "deploy:web": "node scripts/deploy-web.mjs",
-    "deploy:api": "node scripts/deploy-api.mjs"
+    "deploy:api": "node scripts/deploy-api.mjs",
+    "smoke:deployed": "node scripts/deployed-smoke.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "playwright": "^1.61.1",
     "typescript": "^5.8.3"
   }
 }

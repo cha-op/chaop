@@ -29,4 +29,4 @@
 - [done] PR B: Add the Thread Centre chat MVP for managed app-server threads, prompt submission, live progress, and assistant final-answer rendering.
 - [done] PR C: Add human-in-the-loop approval/input handling for Codex app-server turns.
 - [done] PR D: Add the persistent connector dogfood runbook and operational scripts for start, stop, observation, and recovery.
-- [planned] PR E: Harden dogfood E2E and cost telemetry gates, adding exact D1 write attribution only if unexplained write growth reappears.
+- [done] PR E: Harden dogfood E2E and cost telemetry gates, adding exact D1 write attribution only if unexplained write growth reappears.

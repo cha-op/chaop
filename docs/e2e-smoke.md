@@ -35,6 +35,46 @@ CF_ACCESS_CLIENT_SECRET
 
 Never print the service-token secret. When summarising results, print status codes and selected response fields only.
 
+## Tracked Runner
+
+Use the tracked read-only runner for ordinary deployment checks:
+
+```bash
+pnpm install
+pnpm exec playwright install chromium
+
+set -a
+. path/to/deployment.env
+. path/to/cloudflare-access-smoke.env
+set +a
+
+pnpm smoke:deployed
+```
+
+For machine-readable output:
+
+```bash
+pnpm smoke:deployed -- --json
+```
+
+For API, asset, and Budget Board checks without browser automation:
+
+```bash
+pnpm smoke:deployed -- --skip-browser
+```
+
+The runner fails the smoke when:
+
+- API health, bootstrap, usage summary, GUI index, or referenced assets fail;
+- browser rendering fails or the browser observes deployed `4xx` or `5xx` responses;
+- Budget Board state is `hard_limited`;
+- the sampled hard budget bottleneck is missing;
+- Cloudflare telemetry is missing;
+- measured current-day D1 rows-written activity is missing;
+- the bottleneck or daily D1 rows-written percentage exceeds the configured threshold.
+
+Use `--allow-missing-telemetry` only for a known telemetry outage or a non-dogfood environment. The default dogfood gate should require Cloudflare telemetry so cost posture regressions are caught before broader testing.
+
 ## API And Asset Smoke
 
 Use Cloudflare Access service-token headers for direct API and static asset requests:

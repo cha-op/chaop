@@ -35,6 +35,46 @@ CF_ACCESS_CLIENT_SECRET
 
 不要打印 service-token secret。总结结果时只输出 status code 和经过挑选的响应字段。
 
+## 已跟踪的 Runner
+
+普通部署验证使用已提交到仓库的只读 runner：
+
+```bash
+pnpm install
+pnpm exec playwright install chromium
+
+set -a
+. path/to/deployment.env
+. path/to/cloudflare-access-smoke.env
+set +a
+
+pnpm smoke:deployed
+```
+
+如需 machine-readable output：
+
+```bash
+pnpm smoke:deployed -- --json
+```
+
+如果只做 API、asset 和 Budget Board 检查，不跑浏览器自动化：
+
+```bash
+pnpm smoke:deployed -- --skip-browser
+```
+
+runner 在这些情况下会让 smoke 失败：
+
+- API health、bootstrap、usage summary、GUI index 或被引用的 assets 失败；
+- 浏览器渲染失败，或浏览器观察到线上 `4xx` 或 `5xx` response；
+- Budget Board state 是 `hard_limited`；
+- sampled hard budget bottleneck 缺失；
+- Cloudflare telemetry 缺失；
+- 当前日 D1 rows-written 实测 activity 缺失；
+- bottleneck 或 daily D1 rows-written percentage 超过配置阈值。
+
+只有在已知 telemetry outage 或非 dogfood 环境里才使用 `--allow-missing-telemetry`。默认 dogfood gate 应要求 Cloudflare telemetry 可用，这样在更宽的测试前就能发现 cost posture regression。
+
 ## API 和 Asset Smoke
 
 直接请求 API 和静态资产时，使用 Cloudflare Access service-token headers：
