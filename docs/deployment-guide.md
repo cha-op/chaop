@@ -537,16 +537,26 @@ unset CHAOP_BOOTSTRAP_SECRET
 
 Store the returned connector token at the `token_file` path in the connector config. The Worker stores only the token hash in D1. If you need to inspect the bootstrap response for `connector_id` or `control_url`, run the same command without the final `node` extraction and redirect the response to a local private file outside the repository.
 
-Run the connector loop with:
+For daily dogfooding, run the persistent connector through the checked-in operator script documented in the [Dogfood Connector Runbook](dogfood-runbook.md):
+
+```bash
+export CHAOP_AGENT_CONFIG="/path/to/agent.toml"
+pnpm dogfood:connector -- start
+pnpm dogfood:connector -- status
+```
+
+The script keeps PID and log state in `${XDG_STATE_HOME:-$HOME/.local/state}/chaop/dogfood/` by default, not in `/tmp`.
+
+For a narrow one-command smoke test, use:
+
+```bash
+pnpm dogfood:connector -- once
+```
+
+For ad-hoc development without the persistent wrapper, the raw connector command is still:
 
 ```bash
 cargo run -p chaop-agent -- --config /path/to/agent.toml --connect
-```
-
-For a one-command smoke test, use:
-
-```bash
-cargo run -p chaop-agent -- --config /path/to/agent.toml --connect --run-once
 ```
 
 ### What I need from you

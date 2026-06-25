@@ -4,7 +4,7 @@ title: Dogfood Usability Roadmap
 status: active
 created: 2026-06-23
 updated: 2026-06-24
-branch: wip/dogfood-safety-gate
+branch: wip/dogfood-runbook
 pr:
 supersedes:
 superseded_by:
@@ -43,4 +43,6 @@ superseded_by:
 ## Current Next Step
 - PR A landed through [PR #19](https://github.com/cha-op/chaop/pull/19).
 - PR B landed through [PR #20](https://github.com/cha-op/chaop/pull/20).
-- PR C is being implemented on `wip/human-in-loop-turns`: human-in-the-loop approval and input handling for Codex app-server turns.
+- PR C landed through [PR #21](https://github.com/cha-op/chaop/pull/21).
+- PR D adds the persistent connector dogfood runbook and operator script for starting, stopping, observing, recovering, and scheduling managed app-server upgrades.
+- PR E remains the next planned slice: dogfood E2E and cost telemetry hardening, adding exact D1 write attribution only if unexplained growth reappears.

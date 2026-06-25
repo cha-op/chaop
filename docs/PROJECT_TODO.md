@@ -27,6 +27,6 @@
 - [done] Close and merge the app-server attach/resume PR after the full test gate, three review lanes, and resolved GitHub conversations.
 - [done] PR A: Add a dogfood safety gate with visible cost posture, guarded write/refresh actions, and an emergency pause or stop path.
 - [done] PR B: Add the Thread Centre chat MVP for managed app-server threads, prompt submission, live progress, and assistant final-answer rendering.
-- [in_progress] PR C: Add human-in-the-loop approval/input handling for Codex app-server turns.
-- [planned] PR D: Add the persistent connector dogfood runbook and operational scripts for start, stop, observation, and recovery.
+- [done] PR C: Add human-in-the-loop approval/input handling for Codex app-server turns.
+- [done] PR D: Add the persistent connector dogfood runbook and operational scripts for start, stop, observation, and recovery.
 - [planned] PR E: Harden dogfood E2E and cost telemetry gates, adding exact D1 write attribution only if unexplained write growth reappears.
