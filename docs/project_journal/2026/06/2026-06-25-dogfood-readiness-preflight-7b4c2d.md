@@ -33,6 +33,6 @@ superseded_by:
 - `pnpm --filter @chaop/web test` passed with readiness helper coverage.
 - `pnpm test` passed.
 - `pnpm build` passed.
-- Local Playwright visual smoke passed for desktop and mobile Budget Board rendering, with no horizontal overflow.
-- API and Web deployments were refreshed after the change.
-- `pnpm smoke:deployed` passed: direct API health/bootstrap/usage checks returned 200, browser bootstrap returned 200, Budget Board state was `normal`, source was `cloudflare_analytics`, and the bottleneck was D1 rows read / day at 10.7%.
+- Local Playwright visual smoke passed for desktop, narrow desktop, breakpoint-edge, and mobile Budget Board rendering, with no horizontal overflow.
+- API and Web deployments were refreshed after the initial change; Web was refreshed again after review fixes.
+- `pnpm smoke:deployed` passed after the final Web refresh: direct API health/bootstrap/usage checks returned 200, browser bootstrap returned 200, Budget Board state was `normal`, source was `cloudflare_analytics`, and the bottleneck was D1 rows read / day at 10.8%.

@@ -33,6 +33,6 @@ superseded_by:
 - `pnpm --filter @chaop/web test` 已通过，覆盖 readiness helper。
 - `pnpm test` 已通过。
 - `pnpm build` 已通过。
-- 本地 Playwright 视觉 smoke 已通过，桌面和移动端 Budget Board 渲染正常，没有横向溢出。
-- 修改后已刷新 API 和 Web 部署。
-- `pnpm smoke:deployed` 已通过：direct API health/bootstrap/usage 检查均返回 200，browser bootstrap 返回 200，Budget Board 状态为 `normal`，source 为 `cloudflare_analytics`，bottleneck 为 D1 rows read / day，使用率 10.7%。
+- 本地 Playwright 视觉 smoke 已通过，桌面、窄桌面、断点边缘和移动端 Budget Board 渲染正常，没有横向溢出。
+- 初始修改后已刷新 API 和 Web 部署；review fix 后再次刷新了 Web 部署。
+- `pnpm smoke:deployed` 在最终 Web 刷新后已通过：direct API health/bootstrap/usage 检查均返回 200，browser bootstrap 返回 200，Budget Board 状态为 `normal`，source 为 `cloudflare_analytics`，bottleneck 为 D1 rows read / day，使用率 10.8%。

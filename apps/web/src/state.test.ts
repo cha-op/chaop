@@ -392,6 +392,7 @@ test("safety helpers expose blocked action reasons only for guarded actions", ()
 
 test("dogfoodReadinessPreflight reports a ready managed path without refreshing inventory", () => {
   const data = payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
     connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
     app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")]
   });
@@ -410,6 +411,7 @@ test("dogfoodReadinessPreflight reports a ready managed path without refreshing 
 test("dogfoodReadinessPreflight blocks on cost posture before connector state", () => {
   const baseSafety = safety();
   const data = payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
     connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
     app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")],
     safety: {
@@ -438,6 +440,7 @@ test("dogfoodReadinessPreflight blocks on cost posture before connector state", 
 
 test("dogfoodReadinessPreflight calls out split app-server connector capabilities", () => {
   const data = payload({
+    workspaces: [workspace("workspace-api", ["connector-a", "connector-b"])],
     connectors: [
       connector("connector-a", ["app_server_threads"]),
       connector("connector-b", ["codex_app_server_exec"])
@@ -447,13 +450,15 @@ test("dogfoodReadinessPreflight calls out split app-server connector capabilitie
 
   const readiness = dogfoodReadinessPreflight(data);
 
-  assert.equal(readiness.state, "attention");
+  assert.equal(readiness.state, "blocked");
   assert.equal(readiness.next_action.href, "#host-sessions");
+  assert.equal(readiness.checks.find((check) => check.id === "connector")?.state, "attention");
   assert.match(readiness.checks.find((check) => check.id === "connector")?.detail ?? "", /same connector/);
 });
 
 test("dogfoodReadinessPreflight distinguishes busy and missing app-server reports", () => {
   const busy = dogfoodReadinessPreflight(payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
     connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
     app_server_instances: [
       {
@@ -463,13 +468,40 @@ test("dogfoodReadinessPreflight distinguishes busy and missing app-server report
     ]
   }));
   const missing = dogfoodReadinessPreflight(payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
     connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])]
   }));
 
   assert.equal(busy.state, "attention");
   assert.equal(busy.checks.find((check) => check.id === "app_server")?.detail, "1 healthy app-server instance with 2 active turns.");
   assert.equal(missing.state, "blocked");
-  assert.equal(missing.checks.find((check) => check.id === "app_server")?.detail, "No healthy app-server instance is reported by an online connector.");
+  assert.equal(missing.checks.find((check) => check.id === "app_server")?.detail, "No healthy app-server instance is reported by a workspace-linked managed connector.");
+});
+
+test("dogfoodReadinessPreflight requires a workspace-linked managed connector", () => {
+  const readiness = dogfoodReadinessPreflight(payload({
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")]
+  }));
+
+  assert.equal(readiness.state, "blocked");
+  assert.equal(readiness.next_action.href, "#host-sessions");
+  assert.equal(readiness.checks.find((check) => check.id === "connector")?.detail, "No online connector is linked to a workspace for managed dogfood.");
+});
+
+test("dogfoodReadinessPreflight does not borrow app-server health from an unrelated connector", () => {
+  const readiness = dogfoodReadinessPreflight(payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    connectors: [
+      connector("connector-a", ["app_server_threads", "codex_app_server_exec"]),
+      connector("connector-b", ["app_server_threads", "codex_app_server_exec"])
+    ],
+    app_server_instances: [appServerInstance("app-server-b", "healthy", "2026-06-12T10:01:00.000Z", "connector-b")]
+  }));
+
+  assert.equal(readiness.state, "blocked");
+  assert.equal(readiness.checks.find((check) => check.id === "connector")?.state, "ready");
+  assert.equal(readiness.checks.find((check) => check.id === "app_server")?.detail, "No healthy app-server instance is reported by a workspace-linked managed connector.");
 });
 
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {

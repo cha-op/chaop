@@ -64,6 +64,11 @@ export type ReadinessPreflight = {
   checks: ReadinessPreflightCheck[];
 };
 
+type ReadinessConnectorScope = {
+  connector: ConnectorSummary;
+  workspaceIds: Set<string>;
+};
+
 export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
 export const TURN_INTERACTION_OTHER_SELECT_VALUE = "other";
 
@@ -809,17 +814,16 @@ function readinessCostCheck(data: BootstrapPayload | undefined): ReadinessPrefli
 }
 
 function readinessConnectorCheck(data: BootstrapPayload | undefined): ReadinessPreflightCheck {
-  const online = (data?.connectors ?? []).filter((connector) => connector.status === "online");
-  const full = online.filter((connector) =>
-    connector.capabilities.includes("app_server_threads") &&
-    connector.capabilities.includes("codex_app_server_exec")
-  );
+  const online = readinessConnectorScopes(data).filter((scope) => scope.connector.status === "online");
+  const workspaceLinked = online.filter((scope) => scope.workspaceIds.size > 0);
+  const full = readinessEligibleConnectorScopes(data);
   if (full.length > 0) {
+    const workspaceCount = new Set(full.flatMap((scope) => [...scope.workspaceIds])).size;
     return {
       id: "connector",
       label: "Connector",
       state: "ready",
-      detail: `${full.length} online connector${full.length === 1 ? "" : "s"} can create and run managed app-server threads.`
+      detail: `${full.length} workspace connector${full.length === 1 ? "" : "s"} can create and run managed app-server threads across ${workspaceCount} workspace${workspaceCount === 1 ? "" : "s"}.`
     };
   }
   if (online.length === 0) {
@@ -830,14 +834,22 @@ function readinessConnectorCheck(data: BootstrapPayload | undefined): ReadinessP
       detail: "No online connector is reporting managed app-server capabilities."
     };
   }
-  const canCreate = online.some((connector) => connector.capabilities.includes("app_server_threads"));
-  const canRun = online.some((connector) => connector.capabilities.includes("codex_app_server_exec"));
+  if (workspaceLinked.length === 0) {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "No online connector is linked to a workspace for managed dogfood."
+    };
+  }
+  const canCreate = workspaceLinked.some((scope) => scope.connector.capabilities.includes("app_server_threads"));
+  const canRun = workspaceLinked.some((scope) => scope.connector.capabilities.includes("codex_app_server_exec"));
   if (!canCreate && !canRun) {
     return {
       id: "connector",
       label: "Connector",
       state: "blocked",
-      detail: `${online.length} connector${online.length === 1 ? "" : "s"} online, but none reports managed app-server capabilities.`
+      detail: `${workspaceLinked.length} workspace connector${workspaceLinked.length === 1 ? "" : "s"} online, but none reports managed app-server capabilities.`
     };
   }
   return {
@@ -851,10 +863,10 @@ function readinessConnectorCheck(data: BootstrapPayload | undefined): ReadinessP
 }
 
 function readinessAppServerCheck(data: BootstrapPayload | undefined): ReadinessPreflightCheck {
-  const onlineConnectorIds = new Set(
-    (data?.connectors ?? []).filter((connector) => connector.status === "online").map((connector) => connector.id)
+  const eligibleConnectorScopes = readinessEligibleConnectorScopes(data);
+  const instances = (data?.app_server_instances ?? []).filter((instance) =>
+    readinessInstanceMatchesEligibleConnector(data, instance, eligibleConnectorScopes)
   );
-  const instances = (data?.app_server_instances ?? []).filter((instance) => onlineConnectorIds.has(instance.connector_id));
   const healthy = instances.filter((instance) => instance.state === "healthy");
   const activeTurns = healthy.reduce((total, instance) => total + instance.active_turn_count, 0);
   if (healthy.length > 0 && activeTurns === 0) {
@@ -888,8 +900,47 @@ function readinessAppServerCheck(data: BootstrapPayload | undefined): ReadinessP
     id: "app_server",
     label: "App-server",
     state: "blocked",
-    detail: "No healthy app-server instance is reported by an online connector."
+    detail: "No healthy app-server instance is reported by a workspace-linked managed connector."
   };
+}
+
+function readinessConnectorScopes(data: BootstrapPayload | undefined): ReadinessConnectorScope[] {
+  if (!data) return [];
+  const workspaceIdsByConnector = new Map<string, Set<string>>();
+  for (const workspace of data.workspaces) {
+    for (const connectorId of workspace.connector_ids) {
+      const workspaceIds = workspaceIdsByConnector.get(connectorId) ?? new Set<string>();
+      workspaceIds.add(workspace.id);
+      workspaceIdsByConnector.set(connectorId, workspaceIds);
+    }
+  }
+  return data.connectors.map((connector) => ({
+    connector,
+    workspaceIds: workspaceIdsByConnector.get(connector.id) ?? new Set<string>()
+  }));
+}
+
+function readinessEligibleConnectorScopes(data: BootstrapPayload | undefined): ReadinessConnectorScope[] {
+  return readinessConnectorScopes(data).filter(
+    (scope) =>
+      scope.workspaceIds.size > 0 &&
+      scope.connector.status === "online" &&
+      scope.connector.capabilities.includes("app_server_threads") &&
+      scope.connector.capabilities.includes("codex_app_server_exec")
+  );
+}
+
+function readinessInstanceMatchesEligibleConnector(
+  data: BootstrapPayload | undefined,
+  instance: AppServerInstanceSummary,
+  eligibleConnectorScopes: ReadinessConnectorScope[]
+): boolean {
+  const scope = eligibleConnectorScopes.find((item) => item.connector.id === instance.connector_id);
+  if (!scope) return false;
+  if (instance.scope === "connector") return true;
+  if (instance.scope === "workspace") return Boolean(instance.workspace_id && scope.workspaceIds.has(instance.workspace_id));
+  const thread = data?.threads.find((item) => item.id === instance.thread_id);
+  return Boolean(thread && scope.workspaceIds.has(thread.workspace_id));
 }
 
 function readinessInventoryCheck(data: BootstrapPayload | undefined): ReadinessPreflightCheck {
