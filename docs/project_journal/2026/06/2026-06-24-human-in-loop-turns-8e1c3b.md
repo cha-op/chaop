@@ -1,9 +1,9 @@
 ---
 id: 20260624-8e1c3b
 title: Human-In-The-Loop Turns
-status: active
+status: completed
 created: 2026-06-24
-updated: 2026-06-24
+updated: 2026-06-25
 branch: wip/human-in-loop-turns
 pr: 21
 supersedes:
@@ -73,3 +73,7 @@ superseded_by:
 - Stale claim recovery is bounded to the response-dispatch path and does not add a background sweep.
 - WebSocket delivery remains the preferred realtime path. The existing 10-second fallback polling remains unchanged.
 - The new `turn_interaction` safety action allows the hard-limit and pause controls to block operator responses before they create D1 writes.
+
+## Handoff
+- This slice landed through [PR #21](https://github.com/cha-op/chaop/pull/21).
+- Follow-up dogfood work continued through the completed [Dogfood Usability Roadmap](2026-06-23-dogfood-usability-roadmap-3f8a91.md), then into the [Daily Dogfood Readiness Roadmap](2026-06-25-dogfood-readiness-roadmap-2d6f8b.md).

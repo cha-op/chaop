@@ -22,7 +22,7 @@
 - 九个 PR 的 app-server lifecycle roadmap 已实现到 Budget Board real-metrics 切片。
 - Deployed E2E smoke 现在有已记录的 Access-cookie browser path，以及 repo-local skill，用于重复执行低成本 API、Web、browser 和 Budget Board 验证。
 - Deployed E2E smoke 现在也有已跟踪的低成本 runner：`scripts/deployed-smoke.mjs`，并带有 Budget Board gates，检查 Cloudflare telemetry、sampled hard constraints、D1 rows-written 实测 activity、hard-limit/throttled posture 和高 usage thresholds。
-- 下一轮 dogfood usability roadmap 已记录，会先保证成本安全，再推进 managed app-server Thread Centre chat MVP、human-in-the-loop turns 和 persistent connector operations。
+- dogfood usability roadmap 已完成到 PR E。下一条 daily dogfood readiness roadmap 继续把成本安全放在第一位，然后聚焦 connector/app-server preflight、opt-in managed-thread E2E，以及 Thread Centre 日常对话打磨。
 - 本地 D1 rows-written guardrails 现在使用 Cloudflare telemetry 和本地保守 estimate 中较大的一个；no-telemetry fallback 按每 event 26 行预算。
 - 已完成的工作流状态记录在 `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.zh-Hans.md`。
 
@@ -44,6 +44,7 @@
 - Deployed E2E smoke 和成本检查 journal：`docs/project_journal/2026/06/2026-06-23-deployed-e2e-smoke-cost-check-7c9d1e.zh-Hans.md`
 - Dogfood E2E cost gates journal：`docs/project_journal/2026/06/2026-06-25-dogfood-e2e-cost-gates-5e8a12.zh-Hans.md`
 - Dogfood usability roadmap：`docs/project_journal/2026/06/2026-06-23-dogfood-usability-roadmap-3f8a91.zh-Hans.md`
+- Daily dogfood readiness roadmap：`docs/project_journal/2026/06/2026-06-25-dogfood-readiness-roadmap-2d6f8b.zh-Hans.md`
 - Conservative D1 write guardrail：`docs/project_journal/2026/06/2026-06-23-conservative-d1-write-guardrail-6a4b8d.zh-Hans.md`
 - 本地索引：可生成 `docs/project_journal/INDEX.md`，但不要提交。
 

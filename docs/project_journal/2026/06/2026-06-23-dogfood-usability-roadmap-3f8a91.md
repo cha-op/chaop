@@ -1,9 +1,9 @@
 ---
 id: 20260623-3f8a91
 title: Dogfood Usability Roadmap
-status: active
+status: completed
 created: 2026-06-23
-updated: 2026-06-24
+updated: 2026-06-25
 branch: wip/dogfood-runbook
 pr:
 supersedes:
@@ -40,9 +40,13 @@ superseded_by:
 - Run the deployed E2E smoke when a slice changes production-facing API, Web, Access, connector, app-server, or cost-posture behaviour.
 - Run three review lanes before merge, then resolve or explicitly close every GitHub conversation.
 
-## Current Next Step
+## Completed Slices
 - PR A landed through [PR #19](https://github.com/cha-op/chaop/pull/19).
 - PR B landed through [PR #20](https://github.com/cha-op/chaop/pull/20).
 - PR C landed through [PR #21](https://github.com/cha-op/chaop/pull/21).
-- PR D adds the persistent connector dogfood runbook and operator script for starting, stopping, observing, recovering, and scheduling managed app-server upgrades.
-- PR E remains the next planned slice: dogfood E2E and cost telemetry hardening, adding exact D1 write attribution only if unexplained growth reappears.
+- PR D landed through [PR #22](https://github.com/cha-op/chaop/pull/22), adding the persistent connector dogfood runbook and operator script for starting, stopping, observing, recovering, and scheduling managed app-server upgrades.
+- PR E landed through [PR #23](https://github.com/cha-op/chaop/pull/23), adding the tracked deployed smoke runner and cost telemetry gates.
+
+## Handoff
+- This roadmap is complete through PR E.
+- The next dogfood workstream is [Daily Dogfood Readiness Roadmap](2026-06-25-dogfood-readiness-roadmap-2d6f8b.md), which keeps cost safety first and then tightens the daily Browser-to-app-server conversation loop.

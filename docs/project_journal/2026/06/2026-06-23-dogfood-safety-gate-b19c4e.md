@@ -1,9 +1,9 @@
 ---
 id: 20260623-b19c4e
 title: Dogfood Safety Gate
-status: active
+status: completed
 created: 2026-06-23
-updated: 2026-06-24
+updated: 2026-06-25
 branch: wip/dogfood-safety-gate
 pr: 19
 supersedes:
@@ -85,5 +85,6 @@ superseded_by:
 - `project-journal validate --repo .`
 - `git diff --check`
 
-## Next Steps
-- Rerun the three review lanes and resolve every GitHub conversation before merge.
+## Handoff
+- This slice landed through [PR #19](https://github.com/cha-op/chaop/pull/19).
+- Follow-up dogfood work continued through the completed [Dogfood Usability Roadmap](2026-06-23-dogfood-usability-roadmap-3f8a91.md), then into the [Daily Dogfood Readiness Roadmap](2026-06-25-dogfood-readiness-roadmap-2d6f8b.md).

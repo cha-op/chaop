@@ -1,9 +1,9 @@
 ---
 id: 20260623-3f8a91-zh-Hans
-title: Dogfood Usability Roadmap
-status: active
+title: Dogfood 可用性路线图
+status: completed
 created: 2026-06-23
-updated: 2026-06-24
+updated: 2026-06-25
 branch: wip/dogfood-runbook
 pr:
 supersedes:
@@ -12,7 +12,7 @@ superseded_by:
 
 [ [British English](2026-06-23-dogfood-usability-roadmap-3f8a91.md) | 简体中文 ]
 
-# Dogfood Usability Roadmap
+# Dogfood 可用性路线图
 
 ## 摘要
 - 下一轮产品目标是：先保证 Chaop 不超成本，再让它足够可用，能从 Browser 里支撑日常 dogfood。
@@ -40,9 +40,13 @@ superseded_by:
 - 如果切片改变 production-facing API、Web、Access、connector、app-server 或 cost-posture 行为，就运行 deployed E2E smoke。
 - merge 前运行三路 review，然后 resolve 或明确关闭每个 GitHub conversation。
 
-## 当前下一步
+## 已完成切片
 - PR A 已通过 [PR #19](https://github.com/cha-op/chaop/pull/19) 合入。
 - PR B 已通过 [PR #20](https://github.com/cha-op/chaop/pull/20) 合入。
 - PR C 已通过 [PR #21](https://github.com/cha-op/chaop/pull/21) 合入。
-- PR D 增加 persistent connector dogfood runbook 和 operator script，用于 start、stop、observation、recovery，以及安排 managed app-server upgrade restart。
-- PR E 仍是下一片计划：dogfood E2E 和 cost telemetry hardening；只有再次出现无法解释的增长时，才加入精确 D1 write attribution。
+- PR D 已通过 [PR #22](https://github.com/cha-op/chaop/pull/22) 合入，增加 persistent connector dogfood runbook 和 operator script，用于 start、stop、observation、recovery，以及安排 managed app-server upgrade restart。
+- PR E 已通过 [PR #23](https://github.com/cha-op/chaop/pull/23) 合入，增加已跟踪的 deployed smoke runner 和 cost telemetry gates。
+
+## 交接
+- 这个 roadmap 已完成到 PR E。
+- 下一条 dogfood workstream 是 [Daily Dogfood Readiness Roadmap](2026-06-25-dogfood-readiness-roadmap-2d6f8b.zh-Hans.md)，继续把成本安全放在第一位，然后收紧日常 Browser 到 app-server 对话闭环。
