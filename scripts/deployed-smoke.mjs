@@ -184,21 +184,21 @@ async function runDirectSmoke({ config, fetchImpl }) {
 
   const health = await fetchJson(fetchImpl, `${config.apiBaseUrl}/api/health`, {
     headers: authHeaders,
-  });
+  }, config.browserTimeoutMs);
   assertStatus("API health", health.status, 200);
   assertEqual("API health ok", health.body?.ok, true);
 
   const bootstrap = await fetchJson(fetchImpl, `${config.apiBaseUrl}/api/bootstrap`, {
     headers: apiHeaders,
-  });
+  }, config.browserTimeoutMs);
   assertStatus("API bootstrap", bootstrap.status, 200);
 
   const usage = await fetchJson(fetchImpl, `${config.apiBaseUrl}/api/usage-summary`, {
     headers: apiHeaders,
-  });
+  }, config.browserTimeoutMs);
   assertStatus("API usage summary", usage.status, 200);
 
-  const index = await fetchText(fetchImpl, config.guiUrl, { headers: authHeaders });
+  const index = await fetchText(fetchImpl, config.guiUrl, { headers: authHeaders }, config.browserTimeoutMs);
   assertStatus("GUI index", index.status, 200);
   if (index.body.length === 0) {
     throw new SmokeError("GUI index returned an empty body.");
@@ -210,7 +210,7 @@ async function runDirectSmoke({ config, fetchImpl }) {
   }
   const assets = [];
   for (const url of assetUrls) {
-    const asset = await fetchText(fetchImpl, url, { headers: authHeaders });
+    const asset = await fetchText(fetchImpl, url, { headers: authHeaders }, config.browserTimeoutMs);
     if (asset.status < 200 || asset.status >= 300) {
       throw new SmokeError(`Asset request failed: ${url}`, { status: asset.status });
     }
@@ -286,8 +286,23 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
     if (title !== "Chaop Control Plane") {
       throw new SmokeError(`Unexpected browser title: ${title}`);
     }
-    const bootstrap = await page.evaluate(async (apiBaseUrl) => {
-      const response = await fetch(`${apiBaseUrl}/api/bootstrap`, { credentials: "include" });
+    const bootstrap = await page.evaluate(async ({ apiBaseUrl, timeoutMs }) => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+      let response;
+      try {
+        response = await fetch(`${apiBaseUrl}/api/bootstrap`, {
+          credentials: "include",
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          return { status: 0, contentType: "", hasWorkspaces: false, timedOut: true };
+        }
+        throw error;
+      } finally {
+        window.clearTimeout(timeout);
+      }
       const contentType = response.headers.get("content-type") ?? "";
       let body;
       if (contentType.includes("application/json")) {
@@ -301,8 +316,12 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
         status: response.status,
         contentType,
         hasWorkspaces: Array.isArray(body?.workspaces),
+        timedOut: false,
       };
-    }, config.apiBaseUrl);
+    }, { apiBaseUrl: config.apiBaseUrl, timeoutMs: config.browserTimeoutMs });
+    if (bootstrap.timedOut) {
+      throw new SmokeError("Browser bootstrap request timed out.", { timeout_ms: config.browserTimeoutMs });
+    }
     if (bootstrap.status !== 200) {
       throw new SmokeError(`Browser bootstrap request returned ${bootstrap.status}.`);
     }
@@ -333,14 +352,14 @@ async function loadPlaywrightChromium() {
 
 async function accessCookies({ config, fetchImpl }) {
   const [guiCookie, apiCookie] = await Promise.all([
-    exchangeAccessCookie(fetchImpl, config.guiUrl, config.accessHeaders),
-    exchangeAccessCookie(fetchImpl, `${config.apiBaseUrl}/api/health`, config.accessHeaders),
+    exchangeAccessCookie(fetchImpl, config.guiUrl, config.accessHeaders, config.browserTimeoutMs),
+    exchangeAccessCookie(fetchImpl, `${config.apiBaseUrl}/api/health`, config.accessHeaders, config.browserTimeoutMs),
   ]);
   return [guiCookie, apiCookie];
 }
 
-async function exchangeAccessCookie(fetchImpl, url, headers) {
-  const response = await fetchImpl(url, noRedirect({ headers }));
+async function exchangeAccessCookie(fetchImpl, url, headers, timeoutMs) {
+  const response = await fetchWithTimeout(fetchImpl, url, { headers }, timeoutMs);
   if (response.status < 200 || response.status >= 400) {
     throw new SmokeError(`Access cookie exchange failed for ${redactOrigin(url)}.`, {
       status: response.status,
@@ -385,8 +404,8 @@ export function splitCombinedSetCookie(value) {
   return value.split(/,(?=\s*[^;,=\s]+=[^;,]+)/).map((part) => part.trim());
 }
 
-async function fetchJson(fetchImpl, url, init) {
-  const response = await fetchImpl(url, noRedirect(init));
+async function fetchJson(fetchImpl, url, init, timeoutMs) {
+  const response = await fetchWithTimeout(fetchImpl, url, init, timeoutMs);
   const text = await response.text();
   let body;
   try {
@@ -403,13 +422,28 @@ async function fetchJson(fetchImpl, url, init) {
   return { status: response.status, body };
 }
 
-async function fetchText(fetchImpl, url, init) {
-  const response = await fetchImpl(url, noRedirect(init));
+async function fetchText(fetchImpl, url, init, timeoutMs) {
+  const response = await fetchWithTimeout(fetchImpl, url, init, timeoutMs);
   const body = await response.text();
   if (response.status < 200 || response.status >= 300) {
     throw new SmokeError(`Request failed: ${redactOrigin(url)}`, { status: response.status });
   }
   return { status: response.status, body };
+}
+
+async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...noRedirect(init), signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new SmokeError(`Request timed out: ${redactOrigin(url)}`, { timeout_ms: timeoutMs });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function noRedirect(init = {}) {

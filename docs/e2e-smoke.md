@@ -77,6 +77,8 @@ The runner fails the smoke when:
 
 Use `--allow-missing-telemetry` only for a known telemetry outage or a non-dogfood environment. The default dogfood gate should require Cloudflare telemetry so cost posture regressions are caught before broader testing.
 
+`CHAOP_SMOKE_BROWSER_TIMEOUT_MS` controls both browser waits and direct deployed requests. Direct API, index, asset, and Access cookie-exchange fetches disable automatic redirects and time out instead of waiting for an outer CI timeout.
+
 ## API And Asset Smoke
 
 Use Cloudflare Access service-token headers for direct API and static asset requests:
@@ -119,7 +121,7 @@ Expected browser checks:
 - the body contains `Operations Map`;
 - the body contains `Budget Board`;
 - the body contains `Host Sessions`;
-- `/api/bootstrap` on the configured API origin returns `200` JSON;
+- `/api/bootstrap` on the configured API origin returns `200` JSON within the configured timeout;
 - no GUI HTML, static asset, or API response returns `4xx` or `5xx`.
 
 ## Budget Smoke

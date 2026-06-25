@@ -21,13 +21,13 @@ Use this repo-local skill when verifying a deployed Chaop slice, especially afte
    - `/api/bootstrap` with the allowed GUI Origin;
    - `/api/usage-summary`, which can refresh Cloudflare telemetry and write a bounded telemetry cache row;
    - GUI index;
-   - referenced same-origin JavaScript and CSS assets, with automatic redirects disabled for service-token requests.
+   - referenced same-origin JavaScript and CSS assets, with automatic redirects disabled and request timeouts applied for service-token requests.
 3. Run browser smoke through Access cookies:
    - exchange the service token for `CF_Authorization` cookies on the GUI and API hosts;
    - add those cookies to the browser context;
    - do not inject service-token headers into the page context;
    - assert the app shell renders `Operations Map`, `Budget Board`, and `Host Sessions`;
-   - assert `/api/bootstrap` on the configured API origin returns `200` JSON.
+   - assert `/api/bootstrap` on the configured API origin returns `200` JSON before the configured timeout.
 4. For Budget Board checks, summarise `/api/usage-summary`:
    - `source`, `state`, and `generated_at`;
    - bottleneck constraint;

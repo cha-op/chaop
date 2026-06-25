@@ -77,6 +77,8 @@ runner 在这些情况下会让 smoke 失败：
 
 只有在已知 telemetry outage 或非 dogfood 环境里才使用 `--allow-missing-telemetry`。默认 dogfood gate 应要求 Cloudflare telemetry 可用，这样在更宽的测试前就能发现 cost posture regression。
 
+`CHAOP_SMOKE_BROWSER_TIMEOUT_MS` 同时控制 browser waits 和 direct deployed requests。direct API、index、asset 以及 Access cookie-exchange fetches 会禁用自动重定向并按 timeout 失败，而不是一直等到外层 CI timeout。
+
 ## API 和 Asset Smoke
 
 直接请求 API 和静态资产时，使用 Cloudflare Access service-token headers：
@@ -119,7 +121,7 @@ curl -fsS \
 - body 包含 `Operations Map`；
 - body 包含 `Budget Board`；
 - body 包含 `Host Sessions`；
-- 配置的 API origin 上的 `/api/bootstrap` 返回 `200` JSON；
+- 配置的 API origin 上的 `/api/bootstrap` 在配置的 timeout 内返回 `200` JSON；
 - GUI HTML、静态 asset 和 API response 都没有返回 `4xx` 或 `5xx`。
 
 ## Budget Smoke

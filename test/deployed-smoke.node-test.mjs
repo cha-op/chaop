@@ -143,6 +143,74 @@ describe("deployed smoke assets and cookies", () => {
     );
     assert.equal(requested.includes("https://cdn.example.com/assets/index.js"), false);
   });
+
+  it("times out stalled direct requests", async () => {
+    const config = readConfig({ ...smokeEnv(), CHAOP_SMOKE_BROWSER_TIMEOUT_MS: "5" });
+    const fetchImpl = async (_url, init = {}) =>
+      new Promise((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+
+    await assert.rejects(
+      () =>
+        runDeployedSmoke({
+          config,
+          fetchImpl,
+          options: {
+            skipBrowser: true,
+            allowMissingTelemetry: false,
+            maxBottleneckUsedPct: 90,
+            maxD1RowsWrittenUsedPct: 80,
+          },
+        }),
+      /Request timed out/,
+    );
+  });
+
+  it("fails when the browser bootstrap request times out", async () => {
+    const config = readConfig(smokeEnv());
+    const fetchImpl = async (url, init = {}) => {
+      if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
+        throw new Error("Access header fetch did not disable automatic redirects");
+      }
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse({ ok: true }, { headers: { "set-cookie": "CF_Authorization=api-token; Path=/" } });
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: [] });
+      }
+      if (url === "https://api.example.com/api/usage-summary") {
+        return jsonResponse(healthyBudget());
+      }
+      if (url === "https://app.example.com") {
+        return textResponse('<script type="module" src="/assets/index.js"></script>', {
+          headers: { "set-cookie": "CF_Authorization=gui-token; Path=/" },
+        });
+      }
+      if (url === "https://app.example.com/assets/index.js") {
+        return textResponse("console.log('ok');");
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        runDeployedSmoke({
+          config,
+          fetchImpl,
+          browserLauncher: fakeBrowserLauncher({
+            evaluate: async () => ({ status: 0, contentType: "", hasWorkspaces: false, timedOut: true }),
+          }),
+          options: {
+            skipBrowser: false,
+            allowMissingTelemetry: false,
+            maxBottleneckUsedPct: 90,
+            maxD1RowsWrittenUsedPct: 80,
+          },
+        }),
+      /Browser bootstrap request timed out/,
+    );
+  });
 });
 
 describe("deployed smoke budget gate", () => {
@@ -308,6 +376,33 @@ function textResponse(body, init = {}) {
     status: init.status ?? 200,
     headers: init.headers,
   });
+}
+
+function fakeBrowserLauncher({ evaluate }) {
+  return {
+    async launch() {
+      return {
+        async newContext() {
+          return {
+            async addCookies() {},
+            async newPage() {
+              return {
+                on() {},
+                async goto() {},
+                async waitForFunction() {},
+                async title() {
+                  return "Chaop Control Plane";
+                },
+                evaluate,
+              };
+            },
+            async close() {},
+          };
+        },
+        async close() {},
+      };
+    },
+  };
 }
 
 function healthyBudget() {
