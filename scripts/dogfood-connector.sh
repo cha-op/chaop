@@ -175,6 +175,11 @@ resolve_existing_path() {
   printf '%s/%s\n' "$resolved_parent" "$base_name"
 }
 
+resolve_existing_dir_path() {
+  local path_value="$1"
+  cd "$path_value" && pwd -P
+}
+
 state_mode() {
   local file_path="$1"
   case "$(uname -s)" in
@@ -204,6 +209,70 @@ state_file_identity() {
       ;;
     *)
       stat -c '%d:%i' "$file_path"
+      ;;
+  esac
+}
+
+path_has_parent_reference() {
+  local path_value="$1"
+  local IFS='/'
+  local -a parts
+  read -r -a parts <<< "$path_value"
+  local part
+  for part in "${parts[@]}"; do
+    [[ "$part" == ".." ]] && return 0
+  done
+  return 1
+}
+
+ensure_physical_state_subpath() {
+  local path_value="$1"
+  local state_root="$2"
+  local parent_dir nearest_parent nearest_real path_real
+  path_has_parent_reference "$path_value" && die "state paths must not contain ..: $path_value"
+
+  if [[ -e "$path_value" ]]; then
+    if [[ -d "$path_value" ]]; then
+      path_real="$(resolve_existing_dir_path "$path_value")"
+    else
+      path_real="$(resolve_existing_path "$path_value")"
+    fi
+    case "$path_real" in
+      "$state_root"|"$state_root"/*)
+        return 0
+        ;;
+    esac
+    die "state paths must stay under --state-dir: $path_value"
+  fi
+
+  parent_dir="$(dirname "$path_value")"
+  nearest_parent="$parent_dir"
+  while [[ ! -e "$nearest_parent" ]]; do
+    local next_parent
+    next_parent="$(dirname "$nearest_parent")"
+    [[ "$next_parent" != "$nearest_parent" ]] || break
+    nearest_parent="$next_parent"
+  done
+  nearest_real="$(cd "$nearest_parent" && pwd -P)" || die "could not inspect state path parent: $path_value"
+  case "$nearest_real" in
+    "$state_root"|"$state_root"/*)
+      ;;
+    *)
+      die "state paths must stay under --state-dir: $path_value"
+      ;;
+  esac
+}
+
+ensure_physical_dir_under_state() {
+  local dir_path="$1"
+  local state_root="$2"
+  local dir_real
+  dir_real="$(resolve_existing_dir_path "$dir_path")"
+  case "$dir_real" in
+    "$state_root"|"$state_root"/*)
+      ;;
+    *)
+      die "state directory resolved outside --state-dir: $dir_path"
       ;;
   esac
 }
@@ -239,26 +308,40 @@ ensure_private_dir() {
   fi
 }
 
-ensure_state_subpath() {
-  local path_value="$1"
-  case "$path_value" in
-    "$STATE_DIR"|"$STATE_DIR"/*)
-      ;;
-    *)
-      die "state paths must stay under --state-dir: $path_value"
-      ;;
-  esac
+ensure_state_root() {
+  ensure_private_dir "$STATE_DIR"
+  resolve_existing_dir_path "$STATE_DIR"
 }
 
 ensure_private_state_dir() {
   local dir_path="$1"
-  ensure_state_subpath "$dir_path"
-  ensure_private_dir "$dir_path"
+  local state_root="$2"
+  local mode
+  ensure_physical_state_subpath "$dir_path" "$state_root"
+  mkdir -p "$dir_path"
+  ensure_physical_dir_under_state "$dir_path" "$state_root"
+  chmod 700 "$dir_path" 2>/dev/null || true
+  mode="$(state_mode "$dir_path")" || die "could not inspect directory permissions: $dir_path"
+  if (( (8#$mode & 077) != 0 )); then
+    die "state directory must not be group/other accessible: $dir_path"
+  fi
+  ensure_physical_dir_under_state "$dir_path" "$state_root"
+}
+
+state_file_not_symlink() {
+  local file_path="$1"
+  [[ ! -L "$file_path" ]]
 }
 
 ensure_state_file_not_symlink() {
   local file_path="$1"
-  [[ ! -L "$file_path" ]] || die "state file must not be a symlink: $file_path"
+  state_file_not_symlink "$file_path" || die "state file must not be a symlink: $file_path"
+}
+
+state_files_not_symlinks() {
+  state_file_not_symlink "$PID_FILE" || return 1
+  state_file_not_symlink "$PID_META_FILE" || return 1
+  state_file_not_symlink "$LOG_FILE" || return 1
 }
 
 ensure_no_state_file_symlinks() {
@@ -268,11 +351,12 @@ ensure_no_state_file_symlinks() {
 }
 
 ensure_state_safety() {
-  ensure_private_dir "$STATE_DIR"
-  ensure_private_state_dir "$LOG_DIR"
-  ensure_private_state_dir "$(dirname "$PID_FILE")"
-  ensure_private_state_dir "$(dirname "$PID_META_FILE")"
-  ensure_private_state_dir "$(dirname "$LOG_FILE")"
+  local state_root
+  state_root="$(ensure_state_root)"
+  ensure_private_state_dir "$LOG_DIR" "$state_root"
+  ensure_private_state_dir "$(dirname "$PID_FILE")" "$state_root"
+  ensure_private_state_dir "$(dirname "$PID_META_FILE")" "$state_root"
+  ensure_private_state_dir "$(dirname "$LOG_FILE")" "$state_root"
   ensure_distinct_state_paths
   ensure_no_state_file_symlinks
 }
@@ -292,8 +376,9 @@ preflight_launch_files() {
 }
 
 acquire_state_lock() {
-  ensure_private_dir "$STATE_DIR"
-  ensure_private_state_dir "$(dirname "$LOCK_DIR")"
+  local state_root
+  state_root="$(ensure_state_root)"
+  ensure_private_state_dir "$(dirname "$LOCK_DIR")" "$state_root"
   local waited=0
   while true; do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -422,6 +507,7 @@ process_argv_matches() {
   [[ "${argv[1]:-}" == "--config" ]] || return 1
   [[ "${argv[2]:-}" == "$recorded_config" ]] || return 1
   [[ "${argv[3]:-}" == "--connect" ]] || return 1
+  [[ "${#argv[@]}" -eq 4 ]] || return 1
 }
 
 process_started_at() {
@@ -463,7 +549,7 @@ write_pid_metadata() {
   local run_token="$3"
   local started_at
   started_at="$(wait_for_process_started_at "$pid")" || return 1
-  ensure_no_state_file_symlinks
+  state_files_not_symlinks || return 1
   if ! {
     printf 'pid=%s\n' "$pid"
     printf 'run_token=%s\n' "$run_token"
@@ -473,6 +559,15 @@ write_pid_metadata() {
   } > "$PID_META_FILE"; then
     return 1
   fi
+}
+
+write_started_child_state() {
+  local pid="$1"
+  local agent_bin="$2"
+  local run_token="$3"
+  state_files_not_symlinks || return 1
+  printf '%s\n' "$pid" > "$PID_FILE" || return 1
+  write_pid_metadata "$pid" "$agent_bin" "$run_token"
 }
 
 pid_matches_metadata() {
@@ -604,10 +699,8 @@ start_connector() {
   ensure_no_state_file_symlinks
   CHAOP_DOGFOOD_RUN_TOKEN="$run_token" nohup "$agent_bin" --config "$CONFIG_PATH" --connect >> "$LOG_FILE" 2>&1 &
   pid="$!"
-  ensure_no_state_file_symlinks
-  printf '%s\n' "$pid" > "$PID_FILE"
-  if ! write_pid_metadata "$pid" "$agent_bin" "$run_token"; then
-    printf 'could not write connector metadata for pid %s; stopping child\n' "$pid" >&2
+  if ! write_started_child_state "$pid" "$agent_bin" "$run_token"; then
+    printf 'could not write connector state for pid %s; stopping child\n' "$pid" >&2
     stop_start_failure_child "$pid"
     rm -f "$PID_FILE" "$PID_META_FILE"
     exit 1

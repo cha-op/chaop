@@ -6,6 +6,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/chaop-dogfood-connector-test.XXXXXX")"
 CONFIG_FILE="$WORK_DIR/config/connector.toml"
 FAKE_AGENT="$WORK_DIR/bin/fake-chaop-agent"
+FAKE_AGENT_SRC="$WORK_DIR/bin/fake-chaop-agent.c"
 FAKE_PS="$WORK_DIR/bin/ps"
 STATE_DIR="$WORK_DIR/state"
 PID_FILE="$STATE_DIR/pids/connector.pid"
@@ -63,26 +64,55 @@ workspace_id = "workspace-test"
 connector_token = "connector-test"
 hostname = "host-test"
 CONFIG
-cat > "$FAKE_AGENT" <<'AGENT'
-#!/usr/bin/env bash
-set -euo pipefail
+cat > "$FAKE_AGENT_SRC" <<'AGENT'
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-if [[ "$*" != *"--connect"* ]]; then
-  printf 'doctor ok\n'
-  exit 0
-fi
+int main(int argc, char **argv) {
+  int has_connect = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--connect") == 0) {
+      has_connect = 1;
+    }
+  }
 
-printf '%s %s\n' "$$" "$*" >> "${FAKE_AGENT_STARTED_FILE:?}"
-if [[ "${FAKE_AGENT_IGNORE_TERM:-0}" == "1" ]]; then
-  trap ':' TERM INT
-else
-  trap 'exit 0' TERM INT
-fi
-while true; do
-  sleep 5 &
-  wait "$!"
-done
+  if (!has_connect) {
+    puts("doctor ok");
+    return 0;
+  }
+
+  if (strcmp(getenv("FAKE_AGENT_IGNORE_TERM") ? getenv("FAKE_AGENT_IGNORE_TERM") : "0", "1") == 0) {
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+  }
+
+  const char *started_file = getenv("FAKE_AGENT_STARTED_FILE");
+  if (started_file == NULL || started_file[0] == '\0') {
+    fputs("FAKE_AGENT_STARTED_FILE is not set\n", stderr);
+    return 1;
+  }
+
+  FILE *file = fopen(started_file, "a");
+  if (file == NULL) {
+    perror("fopen");
+    return 1;
+  }
+  fprintf(file, "%ld", (long)getpid());
+  for (int i = 1; i < argc; i++) {
+    fprintf(file, " %s", argv[i]);
+  }
+  fputc('\n', file);
+  fclose(file);
+
+  for (;;) {
+    sleep(5);
+  }
+}
 AGENT
+cc "$FAKE_AGENT_SRC" -o "$FAKE_AGENT"
 cat > "$FAKE_PS" <<'PS'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -104,7 +134,6 @@ fi
 
 exit 1
 PS
-chmod +x "$FAKE_AGENT"
 chmod +x "$FAKE_PS"
 touch "$FAKE_AGENT_STARTED_FILE"
 RECORDED_FAKE_AGENT="$(resolve_test_path "$FAKE_AGENT")"
@@ -328,6 +357,86 @@ fi
 started_count_after_external_path="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
 if [[ "$started_count_after_external_path" != "$started_count_before_external_path" ]]; then
   printf 'expected external path rejection to avoid starting another connector\n' >&2
+  exit 1
+fi
+
+traversal_log_dir="$WORK_DIR/traversal-logs"
+mkdir -p "$traversal_log_dir"
+chmod 755 "$traversal_log_dir"
+started_count_before_traversal_path="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if "$REPO_ROOT/scripts/dogfood-connector.sh" \
+  --config "$CONFIG_FILE" \
+  --agent-bin "$FAKE_AGENT" \
+  --state-dir "$STATE_DIR" \
+  --pid-file "$PID_FILE" \
+  --pid-meta-file "$PID_META_FILE" \
+  --log-file "$STATE_DIR/../traversal-logs/connector.log" \
+  start >/dev/null 2>"$WORK_DIR/traversal-log-path.err"; then
+  printf 'expected start to reject state paths with parent traversal\n' >&2
+  exit 1
+fi
+traversal_mode="$(mode_test_path "$traversal_log_dir")"
+if [[ "$traversal_mode" != "755" ]]; then
+  printf 'expected traversal log directory mode to remain 755, got %s\n' "$traversal_mode" >&2
+  exit 1
+fi
+started_count_after_traversal_path="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_traversal_path" != "$started_count_before_traversal_path" ]]; then
+  printf 'expected traversal path rejection to avoid starting another connector\n' >&2
+  exit 1
+fi
+
+symlink_target_dir="$WORK_DIR/symlink-target-dir"
+mkdir -p "$symlink_target_dir"
+chmod 755 "$symlink_target_dir"
+ln -s "$symlink_target_dir" "$STATE_DIR/link-out"
+started_count_before_symlink_parent="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if "$REPO_ROOT/scripts/dogfood-connector.sh" \
+  --config "$CONFIG_FILE" \
+  --agent-bin "$FAKE_AGENT" \
+  --state-dir "$STATE_DIR" \
+  --pid-file "$PID_FILE" \
+  --pid-meta-file "$PID_META_FILE" \
+  --log-file "$STATE_DIR/link-out/connector.log" \
+  start >/dev/null 2>"$WORK_DIR/symlink-parent-log-path.err"; then
+  printf 'expected start to reject state paths through symlinked parents\n' >&2
+  exit 1
+fi
+symlink_target_mode="$(mode_test_path "$symlink_target_dir")"
+if [[ "$symlink_target_mode" != "755" ]]; then
+  printf 'expected symlink target directory mode to remain 755, got %s\n' "$symlink_target_mode" >&2
+  exit 1
+fi
+started_count_after_symlink_parent="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_symlink_parent" != "$started_count_before_symlink_parent" ]]; then
+  printf 'expected symlink parent rejection to avoid starting another connector\n' >&2
+  exit 1
+fi
+
+lock_traversal_dir="$WORK_DIR/traversal-locks"
+mkdir -p "$lock_traversal_dir"
+chmod 755 "$lock_traversal_dir"
+started_count_before_lock_traversal="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if CHAOP_DOGFOOD_LOCK_DIR="$STATE_DIR/../traversal-locks/connector.lock" \
+  "$REPO_ROOT/scripts/dogfood-connector.sh" \
+    --config "$CONFIG_FILE" \
+    --agent-bin "$FAKE_AGENT" \
+    --state-dir "$STATE_DIR" \
+    --pid-file "$PID_FILE" \
+    --pid-meta-file "$PID_META_FILE" \
+    --log-file "$LOG_FILE" \
+    start >/dev/null 2>"$WORK_DIR/traversal-lock-path.err"; then
+  printf 'expected start to reject lock paths with parent traversal\n' >&2
+  exit 1
+fi
+lock_traversal_mode="$(mode_test_path "$lock_traversal_dir")"
+if [[ "$lock_traversal_mode" != "755" ]]; then
+  printf 'expected traversal lock directory mode to remain 755, got %s\n' "$lock_traversal_mode" >&2
+  exit 1
+fi
+started_count_after_lock_traversal="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_lock_traversal" != "$started_count_before_lock_traversal" ]]; then
+  printf 'expected lock traversal rejection to avoid starting another connector\n' >&2
   exit 1
 fi
 
