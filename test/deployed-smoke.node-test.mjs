@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import {
   analyseBudget,
+  cfAccessCookies,
   cfAuthorizationCookie,
   extractAssetUrls,
   parseArgs,
@@ -99,6 +100,34 @@ describe("deployed smoke assets and cookies", () => {
     });
   });
 
+  it("preserves Cloudflare Access binding cookies for browser smoke", () => {
+    const headers = new Headers({
+      "set-cookie":
+        "CF_Authorization=token-value; Path=/; Secure; HttpOnly, CF_Binding=binding-value; Path=/; Secure; HttpOnly",
+    });
+
+    assert.deepEqual(cfAccessCookies(headers, "app.example.com"), [
+      {
+        name: "CF_Authorization",
+        value: "token-value",
+        domain: "app.example.com",
+        path: "/",
+        httpOnly: true,
+        secure: true,
+        sameSite: "None",
+      },
+      {
+        name: "CF_Binding",
+        value: "binding-value",
+        domain: "app.example.com",
+        path: "/",
+        httpOnly: true,
+        secure: true,
+        sameSite: "None",
+      },
+    ]);
+  });
+
   it("does not automatically follow asset redirects with Access headers", async () => {
     const config = readConfig(smokeEnv());
     const requested = [];
@@ -183,7 +212,12 @@ describe("deployed smoke assets and cookies", () => {
             maxD1RowsWrittenUsedPct: 80,
           },
         }),
-      /unexpected content type/,
+      (error) => {
+        assert.match(error.message, /unexpected content type/);
+        assert.match(error.message, /\/assets\/missing\.js/);
+        assert.doesNotMatch(error.message, /https:\/\/app\.example\.com/);
+        return true;
+      },
     );
   });
 

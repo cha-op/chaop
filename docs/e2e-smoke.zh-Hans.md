@@ -36,6 +36,7 @@ CF_ACCESS_CLIENT_SECRET
 ```
 
 不要打印 service-token secret。总结结果时只输出 status code 和经过挑选的响应字段。
+已跟踪的 runner 会从 asset summary 和 asset failure messages 中隐藏部署 origin，只保留路径。
 
 ## 已跟踪的 Runner
 
@@ -111,10 +112,10 @@ curl -fsS \
 
 改用这个流程：
 
-1. 带 service-token headers 请求 GUI domain，并捕获它返回的 `CF_Authorization` cookie。
-2. 带 service-token headers 请求 API domain，并捕获它返回的 `CF_Authorization` cookie。
+1. 带 service-token headers 请求 GUI domain，并捕获它返回的 `CF_Authorization` cookie 以及任何 Access binding cookie。
+2. 带 service-token headers 请求 API domain，并捕获它返回的 `CF_Authorization` cookie 以及任何 Access binding cookie。
 3. 启动不带 service-token headers 的 browser context。
-4. 把两个 `CF_Authorization` cookies 加到 browser context。
+4. 把这些 Access cookies 加到 browser context。
 5. 打开 GUI URL，并等待 app shell 渲染。
 
 预期 browser 检查项：

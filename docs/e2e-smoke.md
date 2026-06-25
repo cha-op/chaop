@@ -36,6 +36,7 @@ CF_ACCESS_CLIENT_SECRET
 ```
 
 Never print the service-token secret. When summarising results, print status codes and selected response fields only.
+The tracked runner redacts deployment origins from asset summaries and asset failure messages.
 
 ## Tracked Runner
 
@@ -111,10 +112,10 @@ Do not inject `CF-Access-Client-Id` and `CF-Access-Client-Secret` as browser ext
 
 Use this shape instead:
 
-1. Request the GUI domain with service-token headers and capture its `CF_Authorization` cookie.
-2. Request the API domain with service-token headers and capture its `CF_Authorization` cookie.
+1. Request the GUI domain with service-token headers and capture its `CF_Authorization` cookie plus any Access binding cookie.
+2. Request the API domain with service-token headers and capture its `CF_Authorization` cookie plus any Access binding cookie.
 3. Start a browser context without service-token headers.
-4. Add the two `CF_Authorization` cookies to the browser context.
+4. Add those Access cookies to the browser context.
 5. Open the GUI URL and wait for the app shell to render.
 
 Expected browser checks:

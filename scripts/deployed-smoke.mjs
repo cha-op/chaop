@@ -230,18 +230,19 @@ async function runDirectAssetSmoke({ config, fetchImpl }) {
   const assets = [];
   for (const url of assetUrls) {
     const asset = await fetchText(fetchImpl, url, { headers: authHeaders }, config.browserTimeoutMs);
+    const assetPath = redactOrigin(url);
     if (asset.status < 200 || asset.status >= 300) {
-      throw new SmokeError(`Asset request failed: ${url}`, { status: asset.status });
+      throw new SmokeError(`Asset request failed: ${assetPath}`, { status: asset.status });
     }
     if (!assetContentTypeMatches(url, asset.contentType)) {
-      throw new SmokeError(`Asset returned an unexpected content type: ${url}`, {
+      throw new SmokeError(`Asset returned an unexpected content type: ${assetPath}`, {
         content_type: asset.contentType || "missing",
       });
     }
     if (asset.body.length === 0) {
-      throw new SmokeError(`Asset returned an empty body: ${url}`);
+      throw new SmokeError(`Asset returned an empty body: ${assetPath}`);
     }
-    assets.push({ url: redactOrigin(url), status: asset.status, bytes: asset.body.length, content_type: asset.contentType });
+    assets.push({ url: assetPath, status: asset.status, bytes: asset.body.length, content_type: asset.contentType });
   }
 
   return {
@@ -374,49 +375,54 @@ async function loadPlaywrightChromium() {
 }
 
 async function accessCookies({ config, fetchImpl }) {
-  const [guiCookie, apiCookie] = await Promise.all([
-    exchangeAccessCookie(fetchImpl, config.guiUrl, config.accessHeaders, config.browserTimeoutMs),
-    exchangeAccessCookie(fetchImpl, `${config.apiBaseUrl}/api/health`, config.accessHeaders, config.browserTimeoutMs),
+  const [guiCookies, apiCookies] = await Promise.all([
+    exchangeAccessCookies(fetchImpl, config.guiUrl, config.accessHeaders, config.browserTimeoutMs),
+    exchangeAccessCookies(fetchImpl, `${config.apiBaseUrl}/api/health`, config.accessHeaders, config.browserTimeoutMs),
   ]);
-  return [guiCookie, apiCookie];
+  return [...guiCookies, ...apiCookies];
 }
 
-async function exchangeAccessCookie(fetchImpl, url, headers, timeoutMs) {
+async function exchangeAccessCookies(fetchImpl, url, headers, timeoutMs) {
   const response = await fetchWithinTimeout(fetchImpl, url, { headers }, timeoutMs, async (incoming) => incoming);
   if (response.status < 200 || response.status >= 400) {
     throw new SmokeError(`Access cookie exchange failed for ${redactOrigin(url)}.`, {
       status: response.status,
     });
   }
-  const cookie = cfAuthorizationCookie(response.headers, new URL(url).hostname);
-  if (!cookie) {
+  const cookies = cfAccessCookies(response.headers, new URL(url).hostname);
+  if (!cookies.some((cookie) => cookie.name === "CF_Authorization")) {
     throw new SmokeError(`Access cookie exchange did not return CF_Authorization for ${redactOrigin(url)}.`);
   }
-  return cookie;
+  return cookies;
 }
 
 export function cfAuthorizationCookie(headers, hostname) {
+  return cfAccessCookies(headers, hostname).find((cookie) => cookie.name === "CF_Authorization");
+}
+
+export function cfAccessCookies(headers, hostname) {
   const setCookies = getSetCookieHeaders(headers);
+  const cookies = [];
   for (const header of setCookies) {
-    const match = /^CF_Authorization=([^;]+)/.exec(header);
+    const match = /^(CF_Authorization|CF_Binding)=([^;]+)/.exec(header);
     if (match) {
-      return {
-        name: "CF_Authorization",
-        value: match[1],
+      cookies.push({
+        name: match[1],
+        value: match[2],
         domain: hostname,
         path: "/",
         httpOnly: true,
         secure: true,
         sameSite: "None",
-      };
+      });
     }
   }
-  return undefined;
+  return cookies;
 }
 
 function getSetCookieHeaders(headers) {
   if (typeof headers.getSetCookie === "function") {
-    return headers.getSetCookie();
+    return headers.getSetCookie().flatMap(splitCombinedSetCookie);
   }
   const value = headers.get?.("set-cookie");
   if (!value) return [];
