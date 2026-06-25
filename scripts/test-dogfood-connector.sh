@@ -278,6 +278,16 @@ if [[ "$started_count" != "1" ]]; then
   exit 1
 fi
 
+if connector once >/dev/null 2>"$WORK_DIR/once-while-running.err"; then
+  printf 'expected once to reject while the persistent connector is already running\n' >&2
+  exit 1
+fi
+started_count_after_rejected_once="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_rejected_once" != "$started_count" ]]; then
+  printf 'expected rejected once to avoid starting another connector, got %s starts\n' "$started_count_after_rejected_once" >&2
+  exit 1
+fi
+
 connector stop
 if kill -0 "$first_pid" 2>/dev/null; then
   printf 'expected managed pid %s to stop\n' "$first_pid" >&2

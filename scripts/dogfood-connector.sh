@@ -921,6 +921,10 @@ doctor() {
 run_once() {
   normalise_paths
   ensure_config
+  ensure_state_dirs
+  if current_pid >/dev/null; then
+    die "connector already running; stop it or use an isolated smoke config before running once"
+  fi
   local agent_bin
   agent_bin="$(ensure_agent_bin)"
   "$agent_bin" --config "$CONFIG_PATH" --connect --run-once
@@ -960,7 +964,7 @@ case "$COMMAND" in
     doctor
     ;;
   once)
-    run_once
+    with_state_lock run_once
     ;;
   schedule-upgrade)
     schedule_upgrade
