@@ -792,6 +792,12 @@ stop_connector() {
   fi
   local waited=0
   while is_pid_running "$pid"; do
+    if ! pid_matches_connector "$pid"; then
+      if ! is_pid_running "$pid"; then
+        break
+      fi
+      die "connector pid no longer matches metadata; refusing to signal pid $pid"
+    fi
     if [[ "$waited" -ge "$STOP_TIMEOUT_SECONDS" ]]; then
       if [[ "$FORCE_STOP" -eq 1 ]]; then
         printf 'force killing connector pid %s after %s seconds\n' "$pid" "$STOP_TIMEOUT_SECONDS"
