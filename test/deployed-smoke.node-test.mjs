@@ -55,6 +55,7 @@ describe("deployed smoke assets and cookies", () => {
       `
       <link rel="stylesheet" href="/assets/index.css">
       <script type="module" src="/assets/index.js"></script>
+      <script type="module" src="https://cdn.example.com/assets/external.js"></script>
       <img src="/assets/logo.png">
       `,
       "https://app.example.com",
@@ -109,6 +110,22 @@ describe("deployed smoke budget gate", () => {
     assert.equal(budget.d1_rows_written_activity.rows_written_daily, 123);
   });
 
+  it("passes with D1 usage window source when Cloudflare telemetry constraints are sampled", () => {
+    const payload = {
+      ...healthyBudget(),
+      source: "d1_usage_windows",
+      window_sample_count: 1,
+    };
+    const budget = analyseBudget(payload, {
+      allowMissingTelemetry: false,
+      maxBottleneckUsedPct: 90,
+      maxD1RowsWrittenUsedPct: 80,
+    });
+
+    assert.equal(budget.ok, true);
+    assert.equal(budget.source, "d1_usage_windows");
+  });
+
   it("fails when telemetry is missing by default", () => {
     const budget = analyseBudget(
       {
@@ -126,7 +143,7 @@ describe("deployed smoke budget gate", () => {
     );
 
     assert.equal(budget.ok, false);
-    assert.match(budget.failures.join("\n"), /cloudflare_analytics/);
+    assert.match(budget.failures.join("\n"), /Cloudflare telemetry/);
     assert.match(budget.failures.join("\n"), /No sampled hard budget constraints/);
   });
 

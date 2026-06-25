@@ -6,13 +6,15 @@
 
 ## 范围
 
-默认 smoke 是只读验证：
+默认 smoke 会避免产品写操作：
 
 - 确认 Cloudflare Access service-token authentication 可用；
 - 确认 API Worker 对 `/api/health`、`/api/bootstrap` 和 `/api/usage-summary` 返回 JSON；
-- 确认 Web Worker 可以返回已部署的 HTML、JavaScript 和 CSS assets；
+- 确认 Web Worker 可以返回已部署的 HTML 和同源 JavaScript、CSS assets；
 - 确认真正的浏览器可以通过 Cloudflare Access cookies 打开生产 GUI；
 - 查看 Budget Board posture，但不创建 command、不刷新 Host Session inventory，也不 bootstrap usage windows。
+
+`/api/usage-summary` 检查仍可能触发 Worker 刷新 Cloudflare telemetry，并以 best-effort 方式写入一条 `budget_telemetry_samples` cache row。应把它视为低成本 smoke，而不是零写入 smoke。
 
 除非用户明确要求测试写路径，默认 smoke 不要执行这些动作：
 
@@ -37,7 +39,7 @@ CF_ACCESS_CLIENT_SECRET
 
 ## 已跟踪的 Runner
 
-普通部署验证使用已提交到仓库的只读 runner：
+普通部署验证使用已提交到仓库的低成本 runner：
 
 ```bash
 pnpm install
@@ -69,7 +71,7 @@ runner 在这些情况下会让 smoke 失败：
 - 浏览器渲染失败，或浏览器观察到线上 `4xx` 或 `5xx` response；
 - Budget Board state 是 `hard_limited`；
 - sampled hard budget bottleneck 缺失；
-- Cloudflare telemetry 缺失；
+- sampled Cloudflare telemetry-backed hard constraints 缺失；
 - 当前日 D1 rows-written 实测 activity 缺失；
 - bottleneck 或 daily D1 rows-written percentage 超过配置阈值。
 
@@ -95,9 +97,9 @@ curl -fsS \
 
 - `/api/health` 返回 `200` JSON，并包含 `ok: true` 和 `service: "chaop-api"`。
 - `/api/bootstrap` 在带允许的 GUI domain `Origin` header 时返回 `200` JSON。
-- `/api/usage-summary` 在 telemetry 已配置时返回 `200` JSON，并包含 `source: "cloudflare_analytics"`。
+- `/api/usage-summary` 在 telemetry 已配置时返回 `200` JSON，并包含 sampled Cloudflare telemetry-backed constraints。若本地 usage windows 同时存在，顶层 `source` 可以仍然是 `d1_usage_windows`。
 - GUI index 返回 `200`。
-- index 引用的每个 JavaScript 和 CSS asset 都返回 `200`，并且 body 非空。
+- index 引用的每个同源 JavaScript 和 CSS asset 都返回 `200`，并且 body 非空。off-origin assets 不会带 Cloudflare Access service-token headers 请求。
 
 ## Browser Smoke
 
@@ -117,7 +119,7 @@ curl -fsS \
 - body 包含 `Operations Map`；
 - body 包含 `Budget Board`；
 - body 包含 `Host Sessions`；
-- `/api/bootstrap` 返回 `200`；
+- 配置的 API origin 上的 `/api/bootstrap` 返回 `200` JSON；
 - GUI HTML、静态 asset 和 API response 都没有返回 `4xx` 或 `5xx`。
 
 ## Budget Smoke

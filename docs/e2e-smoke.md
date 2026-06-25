@@ -6,13 +6,15 @@ This guide records the low-cost deployed smoke test for Chaop. It assumes deploy
 
 ## Scope
 
-The default smoke is read-only:
+The default smoke avoids product write actions:
 
 - confirm Cloudflare Access service-token authentication;
 - confirm the API Worker returns JSON for `/api/health`, `/api/bootstrap`, and `/api/usage-summary`;
-- confirm the Web Worker serves the deployed HTML, JavaScript, and CSS assets;
+- confirm the Web Worker serves the deployed HTML and same-origin JavaScript and CSS assets;
 - confirm a real browser can load the production GUI through Cloudflare Access cookies;
 - inspect Budget Board posture without creating commands, refreshing Host Session inventory, or bootstrapping usage windows.
+
+The `/api/usage-summary` check can still trigger the Worker to refresh Cloudflare telemetry and persist a best-effort `budget_telemetry_samples` cache row. Treat it as a low-cost smoke, not a zero-write smoke.
 
 Avoid these actions during the default smoke unless the user explicitly asks for a write-path test:
 
@@ -37,7 +39,7 @@ Never print the service-token secret. When summarising results, print status cod
 
 ## Tracked Runner
 
-Use the tracked read-only runner for ordinary deployment checks:
+Use the tracked low-cost runner for ordinary deployment checks:
 
 ```bash
 pnpm install
@@ -69,7 +71,7 @@ The runner fails the smoke when:
 - browser rendering fails or the browser observes deployed `4xx` or `5xx` responses;
 - Budget Board state is `hard_limited`;
 - the sampled hard budget bottleneck is missing;
-- Cloudflare telemetry is missing;
+- sampled Cloudflare telemetry-backed hard constraints are missing;
 - measured current-day D1 rows-written activity is missing;
 - the bottleneck or daily D1 rows-written percentage exceeds the configured threshold.
 
@@ -95,9 +97,9 @@ Expected checks:
 
 - `/api/health` returns `200` JSON with `ok: true` and `service: "chaop-api"`.
 - `/api/bootstrap` returns `200` JSON when sent with an allowed `Origin` header for the GUI domain.
-- `/api/usage-summary` returns `200` JSON with `source: "cloudflare_analytics"` when telemetry is configured.
+- `/api/usage-summary` returns `200` JSON with sampled Cloudflare telemetry-backed constraints when telemetry is configured. The top-level `source` can remain `d1_usage_windows` when local usage windows also exist.
 - The GUI index returns `200`.
-- Every JavaScript and CSS asset referenced by the index returns `200` and a non-zero body.
+- Every same-origin JavaScript and CSS asset referenced by the index returns `200` and a non-zero body. Off-origin assets are not fetched with Cloudflare Access service-token headers.
 
 ## Browser Smoke
 
@@ -117,7 +119,7 @@ Expected browser checks:
 - the body contains `Operations Map`;
 - the body contains `Budget Board`;
 - the body contains `Host Sessions`;
-- `/api/bootstrap` returns `200`;
+- `/api/bootstrap` on the configured API origin returns `200` JSON;
 - no GUI HTML, static asset, or API response returns `4xx` or `5xx`.
 
 ## Budget Smoke

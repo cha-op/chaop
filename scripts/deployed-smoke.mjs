@@ -233,10 +233,12 @@ async function runDirectSmoke({ config, fetchImpl }) {
 
 export function extractAssetUrls(html, baseUrl) {
   const urls = new Set();
+  const base = new URL(baseUrl);
   const pattern = /\b(?:src|href)=["']([^"']+\.(?:js|css)(?:\?[^"']*)?)["']/gi;
   let match;
   while ((match = pattern.exec(html)) !== null) {
     const url = new URL(match[1], baseUrl);
+    if (url.origin !== base.origin) continue;
     urls.add(url.toString());
   }
   return [...urls];
@@ -284,18 +286,34 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
     if (title !== "Chaop Control Plane") {
       throw new SmokeError(`Unexpected browser title: ${title}`);
     }
-    const bootstrapStatus = await page.evaluate(async () => {
-      const response = await fetch("/api/bootstrap");
-      return response.status;
-    });
-    if (bootstrapStatus !== 200) {
-      throw new SmokeError(`Browser bootstrap request returned ${bootstrapStatus}.`);
+    const bootstrap = await page.evaluate(async (apiBaseUrl) => {
+      const response = await fetch(`${apiBaseUrl}/api/bootstrap`, { credentials: "include" });
+      const contentType = response.headers.get("content-type") ?? "";
+      let body;
+      if (contentType.includes("application/json")) {
+        try {
+          body = await response.json();
+        } catch {
+          body = undefined;
+        }
+      }
+      return {
+        status: response.status,
+        contentType,
+        hasWorkspaces: Array.isArray(body?.workspaces),
+      };
+    }, config.apiBaseUrl);
+    if (bootstrap.status !== 200) {
+      throw new SmokeError(`Browser bootstrap request returned ${bootstrap.status}.`);
+    }
+    if (!bootstrap.contentType.includes("application/json") || !bootstrap.hasWorkspaces) {
+      throw new SmokeError("Browser bootstrap request did not return the expected API JSON.");
     }
     if (failedResponses.length > 0) {
       throw new SmokeError("Browser observed failed deployed responses.", { failedResponses });
     }
     await context.close();
-    return { title, bootstrapStatus, failedResponses };
+    return { title, bootstrapStatus: bootstrap.status, failedResponses };
   } finally {
     await browser.close();
   }
@@ -418,6 +436,9 @@ export function analyseBudget(payload, options = {}) {
   const sampledHardConstraints = constraints.filter(
     (constraint) => constraint.hard && constraint.sampled && constraint.state !== "missing",
   );
+  const sampledCloudflareConstraints = sampledHardConstraints.filter(
+    (constraint) => constraint.source === "cloudflare_analytics",
+  );
   const bottleneck = budget?.bottleneck_constraint ?? chooseBottleneck(sampledHardConstraints);
   const measuredD1RowsWritten = findMeasuredD1RowsWrittenSignal(budget);
   const dailyD1RowsWritten = findDailyD1RowsWrittenConstraint(constraints);
@@ -432,8 +453,8 @@ export function analyseBudget(payload, options = {}) {
   }
 
   if (!options.allowMissingTelemetry) {
-    if (budget?.source !== "cloudflare_analytics") {
-      failures.push("Budget source is not cloudflare_analytics.");
+    if (sampledCloudflareConstraints.length === 0) {
+      failures.push("No sampled Cloudflare telemetry hard budget constraints are available.");
     }
     if (sampledHardConstraints.length === 0) {
       failures.push("No sampled hard budget constraints are available.");
@@ -444,8 +465,8 @@ export function analyseBudget(payload, options = {}) {
     if (!measuredD1RowsWritten) {
       failures.push("Measured current-day D1 rows-written activity is missing.");
     }
-  } else if (budget?.source !== "cloudflare_analytics") {
-    warnings.push("Budget source is not cloudflare_analytics.");
+  } else if (sampledCloudflareConstraints.length === 0) {
+    warnings.push("No sampled Cloudflare telemetry hard budget constraints are available.");
   }
 
   if (typeof budget?.d1_write_model?.budgeted_rows_written_per_event !== "number") {
