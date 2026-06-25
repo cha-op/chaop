@@ -75,6 +75,8 @@ The runner fails the smoke when:
 - measured current-day D1 rows-written activity is missing;
 - the bottleneck or daily D1 rows-written percentage exceeds the configured threshold.
 
+The Budget Board gate is evaluated immediately after `/api/usage-summary`. When it fails, the runner stops before requesting the GUI index, JavaScript/CSS assets, or browser automation, so a hard limit or throttle does not spend additional deployed requests.
+
 Use `--allow-missing-telemetry` only for a known telemetry outage or a non-dogfood environment. The default dogfood gate should require Cloudflare telemetry so cost posture regressions are caught before broader testing.
 
 `CHAOP_SMOKE_BROWSER_TIMEOUT_MS` controls both browser waits and direct deployed requests. Direct API, index, asset, and Access cookie-exchange fetches disable automatic redirects and time out instead of waiting for an outer CI timeout.

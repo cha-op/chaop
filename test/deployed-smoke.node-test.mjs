@@ -11,6 +11,7 @@ import {
   runCli,
   SmokeError,
   splitCombinedSetCookie,
+  usage,
 } from "../scripts/deployed-smoke.mjs";
 
 describe("deployed smoke argument parsing", () => {
@@ -336,6 +337,56 @@ describe("deployed smoke assets and cookies", () => {
 });
 
 describe("deployed smoke budget gate", () => {
+  it("short-circuits assets and browser checks when the budget gate fails", async () => {
+    const config = readConfig(smokeEnv());
+    const requested = [];
+    const hardLimitedBudget = {
+      ...healthyBudget(),
+      state: "hard_limited",
+    };
+    const fetchImpl = async (url, init = {}) => {
+      requested.push(url);
+      if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
+        throw new Error("Access header fetch did not disable automatic redirects");
+      }
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse({ ok: true });
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: [] });
+      }
+      if (url === "https://api.example.com/api/usage-summary") {
+        return jsonResponse(hardLimitedBudget);
+      }
+      throw new Error(`Unexpected request after budget failure: ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        runDeployedSmoke({
+          config,
+          fetchImpl,
+          browserLauncher: {
+            async launch() {
+              throw new Error("Browser should not launch after a budget failure");
+            },
+          },
+          options: {
+            skipBrowser: false,
+            allowMissingTelemetry: false,
+            maxBottleneckUsedPct: 90,
+            maxD1RowsWrittenUsedPct: 80,
+          },
+        }),
+      /Budget gate failed/,
+    );
+    assert.deepEqual(requested, [
+      "https://api.example.com/api/health",
+      "https://api.example.com/api/bootstrap",
+      "https://api.example.com/api/usage-summary",
+    ]);
+  });
+
   it("passes a healthy telemetry-backed budget", () => {
     const budget = analyseBudget(healthyBudget(), {
       allowMissingTelemetry: false,
@@ -439,6 +490,29 @@ describe("deployed smoke budget gate", () => {
 });
 
 describe("deployed smoke CLI", () => {
+  it("keeps JSON output machine-readable on usage failures", async () => {
+    const stdout = writableBuffer();
+    const stderr = writableBuffer();
+    const code = await runCli({
+      argv: ["--json"],
+      env: {
+        CHAOP_GUI_DOMAIN: "app.example.com",
+        VITE_CHAOP_API_BASE_URL: "https://api.example.com/",
+        CF_ACCESS_CLIENT_ID: "client-id",
+      },
+      stdout,
+      stderr,
+    });
+
+    assert.equal(code, 2);
+    assert.equal(stderr.text, "");
+    assert.deepEqual(JSON.parse(stdout.text), {
+      ok: false,
+      error: "CF_ACCESS_CLIENT_SECRET is required.",
+      usage: usage(),
+    });
+  });
+
   it("keeps JSON output machine-readable on smoke failures", async () => {
     const stdout = writableBuffer();
     const stderr = writableBuffer();

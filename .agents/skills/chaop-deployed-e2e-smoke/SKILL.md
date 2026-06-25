@@ -20,6 +20,7 @@ Use this repo-local skill when verifying a deployed Chaop slice, especially afte
    - `/api/health`;
    - `/api/bootstrap` with the allowed GUI Origin;
    - `/api/usage-summary`, which can refresh Cloudflare telemetry and write a bounded telemetry cache row;
+   - stop immediately on a failing Budget Board gate before requesting GUI assets or running browser automation;
    - GUI index;
    - referenced same-origin JavaScript and CSS assets, with automatic redirects disabled, request timeouts applied, and HTML SPA fallback rejected for service-token requests.
 3. Run browser smoke through Access cookies:

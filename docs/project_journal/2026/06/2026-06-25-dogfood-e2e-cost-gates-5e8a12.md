@@ -25,6 +25,7 @@ superseded_by:
 - Direct service-token fetches disable automatic redirects so same-origin asset checks cannot leak Access headers to an off-origin redirect target.
 - Direct API, asset, Access cookie-exchange, and browser bootstrap fetches have smoke-level timeouts to avoid stalled deployment checks.
 - Asset checks validate JavaScript/CSS content types so Cloudflare Assets SPA fallback HTML cannot make a missing asset pass.
+- The deployed smoke runner evaluates the budget gate immediately after `/api/usage-summary` and stops before GUI asset or browser checks when the gate fails.
 - The budget gate treats `hard_limited`, `throttled`, missing sampled hard constraints, missing telemetry, missing D1 rows-written activity, and high bottleneck/D1-write usage as failures.
 - `--allow-missing-telemetry` is available only for known telemetry outages or non-dogfood environments.
 

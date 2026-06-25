@@ -155,9 +155,20 @@ export async function runDeployedSmoke({
     throw new SmokeError("global fetch is unavailable; use Node 18 or newer.");
   }
   const startedAt = new Date().toISOString();
-  const directResult = await runDirectSmoke({ config, fetchImpl });
-  const { usagePayload, ...direct } = directResult;
+  const directApiResult = await runDirectApiSmoke({ config, fetchImpl });
+  const { usagePayload, ...directApi } = directApiResult;
   const budget = analyseBudget(usagePayload, options);
+  if (!budget.ok) {
+    throw new SmokeError("Budget gate failed.", {
+      ok: false,
+      started_at: startedAt,
+      completed_at: new Date().toISOString(),
+      direct: directApi,
+      budget,
+    });
+  }
+  const directAssets = await runDirectAssetSmoke({ config, fetchImpl });
+  const direct = { ...directApi, ...directAssets };
   let browser = undefined;
   if (!options.skipBrowser) {
     browser = await runBrowserSmoke({ config, fetchImpl, browserLauncher });
@@ -171,13 +182,10 @@ export async function runDeployedSmoke({
     browser,
     budget,
   };
-  if (!budget.ok) {
-    throw new SmokeError("Budget gate failed.", result);
-  }
   return result;
 }
 
-async function runDirectSmoke({ config, fetchImpl }) {
+async function runDirectApiSmoke({ config, fetchImpl }) {
   const origin = config.guiUrl;
   const authHeaders = config.accessHeaders;
   const apiHeaders = { ...authHeaders, Origin: origin };
@@ -198,6 +206,17 @@ async function runDirectSmoke({ config, fetchImpl }) {
   }, config.browserTimeoutMs);
   assertStatus("API usage summary", usage.status, 200);
 
+  return {
+    health: health.status,
+    bootstrap: bootstrap.status,
+    usage: usage.status,
+    workspace_count: arrayLength(bootstrap.body?.workspaces),
+    usagePayload: usage.body,
+  };
+}
+
+async function runDirectAssetSmoke({ config, fetchImpl }) {
+  const authHeaders = config.accessHeaders;
   const index = await fetchText(fetchImpl, config.guiUrl, { headers: authHeaders }, config.browserTimeoutMs);
   assertStatus("GUI index", index.status, 200);
   if (index.body.length === 0) {
@@ -226,13 +245,8 @@ async function runDirectSmoke({ config, fetchImpl }) {
   }
 
   return {
-    health: health.status,
-    bootstrap: bootstrap.status,
-    usage: usage.status,
-    workspace_count: arrayLength(bootstrap.body?.workspaces),
     asset_count: assets.length,
     assets,
-    usagePayload: usage.body,
   };
 }
 
@@ -664,6 +678,7 @@ export async function runCli({
   runSmoke = runDeployedSmoke,
 } = {}) {
   let options;
+  const requestedJson = argv.includes("--json");
   try {
     options = parseArgs(argv);
     if (options.help) {
@@ -680,6 +695,20 @@ export async function runCli({
     return 0;
   } catch (error) {
     if (error instanceof UsageError) {
+      if (requestedJson || options?.json) {
+        stdout.write(
+          `${JSON.stringify(
+            {
+              ok: false,
+              error: error.message,
+              usage: usage(),
+            },
+            null,
+            2,
+          )}\n`,
+        );
+        return 2;
+      }
       stderr.write(`${error.message}\n\n${usage()}`);
       return 2;
     }

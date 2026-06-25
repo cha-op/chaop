@@ -75,6 +75,8 @@ runner 在这些情况下会让 smoke 失败：
 - 当前日 D1 rows-written 实测 activity 缺失；
 - bottleneck 或 daily D1 rows-written percentage 超过配置阈值。
 
+Budget Board gate 会在 `/api/usage-summary` 之后立即评估。若 gate 失败，runner 会在请求 GUI index、JavaScript/CSS assets 或启动 browser automation 之前停止，避免 hard limit 或 throttle 状态继续消耗额外部署请求。
+
 只有在已知 telemetry outage 或非 dogfood 环境里才使用 `--allow-missing-telemetry`。默认 dogfood gate 应要求 Cloudflare telemetry 可用，这样在更宽的测试前就能发现 cost posture regression。
 
 `CHAOP_SMOKE_BROWSER_TIMEOUT_MS` 同时控制 browser waits 和 direct deployed requests。direct API、index、asset 以及 Access cookie-exchange fetches 会禁用自动重定向并按 timeout 失败，而不是一直等到外层 CI timeout。
