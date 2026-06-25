@@ -922,8 +922,13 @@ run_once() {
   normalise_paths
   ensure_config
   ensure_state_dirs
+  remove_stale_pid_file
   if current_pid >/dev/null; then
     die "connector already running; stop it or use an isolated smoke config before running once"
+  fi
+  local pid
+  if pid="$(pid_from_file)" && is_pid_running "$pid"; then
+    die "pid file points to a running process; refusing to start one-shot connector"
   fi
   local agent_bin
   agent_bin="$(ensure_agent_bin)"

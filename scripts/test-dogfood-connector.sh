@@ -69,6 +69,18 @@ mode_test_path() {
   esac
 }
 
+pid_is_live_non_zombie() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [[ -r "/proc/$pid/stat" ]]; then
+    local stat_line stat_tail
+    stat_line="$(< "/proc/$pid/stat")" || return 1
+    stat_tail="${stat_line##*) }"
+    [[ "${stat_tail%% *}" != "Z" ]] || return 1
+  fi
+  return 0
+}
+
 mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$FAKE_AGENT")"
 cat > "$CONFIG_FILE" <<'CONFIG'
 control_plane_url = "https://example.invalid"
@@ -289,10 +301,33 @@ if [[ "$started_count_after_rejected_once" != "$started_count" ]]; then
 fi
 
 connector stop
-if kill -0 "$first_pid" 2>/dev/null; then
+if pid_is_live_non_zombie "$first_pid"; then
   printf 'expected managed pid %s to stop\n' "$first_pid" >&2
   exit 1
 fi
+
+"$FAKE_AGENT" --config "$CONFIG_FILE" --connect &
+FOREIGN_PID="$!"
+printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
+rm -f "$PID_META_FILE"
+started_count_before_rejected_once_corrupt_meta="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if connector once >/dev/null 2>"$WORK_DIR/once-corrupt-meta.err"; then
+  printf 'expected once to reject a live connector-like pid with corrupt metadata\n' >&2
+  exit 1
+fi
+started_count_after_rejected_once_corrupt_meta="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_rejected_once_corrupt_meta" != "$started_count_before_rejected_once_corrupt_meta" ]]; then
+  printf 'expected rejected corrupt-metadata once to avoid starting another connector, got %s starts\n' "$started_count_after_rejected_once_corrupt_meta" >&2
+  exit 1
+fi
+if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
+  printf 'expected corrupt-metadata once pid %s to remain running\n' "$FOREIGN_PID" >&2
+  exit 1
+fi
+kill -KILL "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=""
+rm -f "$PID_FILE" "$PID_META_FILE"
 
 sleep 30 &
 FOREIGN_PID="$!"
@@ -324,7 +359,7 @@ FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
 export FAKE_PS_COMMAND
 reused_pid_connector_pid="$(tr -d '[:space:]' < "$PID_FILE")"
 connector stop
-if kill -0 "$reused_pid_connector_pid" 2>/dev/null; then
+if pid_is_live_non_zombie "$reused_pid_connector_pid"; then
   printf 'expected reused-pid recovery connector pid %s to stop\n' "$reused_pid_connector_pid" >&2
   exit 1
 fi
@@ -376,7 +411,7 @@ if [[ -d "/proc" ]]; then
   fi
   zombie_recovery_connector_pid="$(tr -d '[:space:]' < "$PID_FILE")"
   connector stop
-  if kill -0 "$zombie_recovery_connector_pid" 2>/dev/null; then
+  if pid_is_live_non_zombie "$zombie_recovery_connector_pid"; then
     printf 'expected zombie-pid recovery connector pid %s to stop\n' "$zombie_recovery_connector_pid" >&2
     exit 1
   fi
@@ -396,7 +431,7 @@ if [[ "$started_count_after_stale_lock" != "$((started_count_before_stale_lock +
 fi
 stale_lock_recovery_pid="$(tr -d '[:space:]' < "$PID_FILE")"
 connector stop
-if kill -0 "$stale_lock_recovery_pid" 2>/dev/null; then
+if pid_is_live_non_zombie "$stale_lock_recovery_pid"; then
   printf 'expected stale-lock-recovery pid %s to stop\n' "$stale_lock_recovery_pid" >&2
   exit 1
 fi
@@ -422,7 +457,7 @@ wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=""
 reused_lock_owner_pid="$(tr -d '[:space:]' < "$PID_FILE")"
 connector stop
-if kill -0 "$reused_lock_owner_pid" 2>/dev/null; then
+if pid_is_live_non_zombie "$reused_lock_owner_pid"; then
   printf 'expected reused-lock-owner recovery pid %s to stop\n' "$reused_lock_owner_pid" >&2
   exit 1
 fi
@@ -441,7 +476,7 @@ if [[ "$concurrent_started_count" != "$((started_count_before_concurrent + 1))" 
   exit 1
 fi
 connector stop
-if kill -0 "$concurrent_pid" 2>/dev/null; then
+if pid_is_live_non_zombie "$concurrent_pid"; then
   printf 'expected concurrent-managed pid %s to stop\n' "$concurrent_pid" >&2
   exit 1
 fi
@@ -451,7 +486,7 @@ export FAKE_AGENT_IGNORE_TERM
 connector start
 force_stop_pid="$(tr -d '[:space:]' < "$PID_FILE")"
 CHAOP_DOGFOOD_STOP_TIMEOUT_SECONDS=0 connector stop --force
-if kill -0 "$force_stop_pid" 2>/dev/null; then
+if pid_is_live_non_zombie "$force_stop_pid"; then
   printf 'expected force-stopped pid %s to stop\n' "$force_stop_pid" >&2
   exit 1
 fi
@@ -481,12 +516,12 @@ if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
   exit 1
 fi
 for _ in {1..20}; do
-  if ! kill -0 "$kill_race_pid" 2>/dev/null; then
+  if ! pid_is_live_non_zombie "$kill_race_pid"; then
     break
   fi
   sleep 0.05
 done
-if kill -0 "$kill_race_pid" 2>/dev/null; then
+if pid_is_live_non_zombie "$kill_race_pid"; then
   printf 'expected kill-race pid %s to be gone\n' "$kill_race_pid" >&2
   exit 1
 fi
@@ -886,7 +921,7 @@ if [[ "$started_count_after_signal" != "$((started_count_before_signal + 1))" ]]
   exit 1
 fi
 signalled_child_pid="$(tail -n 1 "$FAKE_AGENT_STARTED_FILE" | awk '{print $1}')"
-if kill -0 "$signalled_child_pid" 2>/dev/null; then
+if pid_is_live_non_zombie "$signalled_child_pid"; then
   printf 'expected signal handler to stop child pid %s\n' "$signalled_child_pid" >&2
   exit 1
 fi
@@ -914,7 +949,7 @@ if [[ "$started_count_after_metadata_failure" != "$((started_count_before_metada
   exit 1
 fi
 metadata_failure_pid="$(tail -n 1 "$FAKE_AGENT_STARTED_FILE" | awk '{print $1}')"
-if kill -0 "$metadata_failure_pid" 2>/dev/null; then
+if pid_is_live_non_zombie "$metadata_failure_pid"; then
   printf 'expected metadata-failure child pid %s to be stopped\n' "$metadata_failure_pid" >&2
   exit 1
 fi
