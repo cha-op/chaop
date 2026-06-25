@@ -743,23 +743,37 @@ child_pids_of() {
   ps -o pid= --ppid "$parent_pid" 2>/dev/null | awk '{ print $1 }' || true
 }
 
+process_group_pids() {
+  local group_id="$1"
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -g "$group_id" 2>/dev/null || true
+    return 0
+  fi
+  ps -o pid= -g "$group_id" 2>/dev/null | awk '{ print $1 }' || true
+}
+
 signal_child_pid_list() {
   local child_pids="$1"
   local signal_name="$2"
   local child_pid
   while IFS= read -r child_pid; do
     [[ "$child_pid" =~ ^[0-9]+$ ]] || continue
+    kill "-$signal_name" "-$child_pid" 2>/dev/null || true
     if is_pid_running "$child_pid"; then
-      kill "-$signal_name" "-$child_pid" 2>/dev/null || kill "-$signal_name" "$child_pid" 2>/dev/null || true
+      kill "-$signal_name" "$child_pid" 2>/dev/null || true
     fi
   done <<< "$child_pids"
 }
 
 child_pid_list_has_running() {
   local child_pids="$1"
-  local child_pid
+  local child_pid group_pid
   while IFS= read -r child_pid; do
     [[ "$child_pid" =~ ^[0-9]+$ ]] || continue
+    while IFS= read -r group_pid; do
+      [[ "$group_pid" =~ ^[0-9]+$ ]] || continue
+      is_pid_running "$group_pid" && return 0
+    done < <(process_group_pids "$child_pid")
     is_pid_running "$child_pid" && return 0
   done <<< "$child_pids"
   return 1

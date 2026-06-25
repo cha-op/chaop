@@ -18,6 +18,7 @@ PID_META_FILE="$STATE_DIR/pids/connector.pid.meta"
 LOG_FILE="$STATE_DIR/logs/connector.log"
 FAKE_AGENT_STARTED_FILE="$WORK_DIR/agent-started.log"
 FAKE_AGENT_CHILD_PID_FILE="$WORK_DIR/agent-child.pid"
+FAKE_AGENT_DESCENDANT_PID_FILE="$WORK_DIR/agent-descendant.pid"
 FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
 FAKE_PS_COMMAND=""
 FAKE_PS_KILL_ON_COMMAND=0
@@ -51,6 +52,14 @@ cleanup() {
     if [[ "$child_pid" =~ ^[0-9]+$ ]] && kill -0 "$child_pid" 2>/dev/null; then
       kill -KILL "$child_pid" 2>/dev/null || true
       wait "$child_pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -f "$FAKE_AGENT_DESCENDANT_PID_FILE" ]]; then
+    local descendant_pid
+    descendant_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_DESCENDANT_PID_FILE")"
+    if [[ "$descendant_pid" =~ ^[0-9]+$ ]] && kill -0 "$descendant_pid" 2>/dev/null; then
+      kill -KILL "$descendant_pid" 2>/dev/null || true
+      wait "$descendant_pid" 2>/dev/null || true
     fi
   fi
   rm -rf "$WORK_DIR"
@@ -138,9 +147,39 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (child == 0) {
+      if (strcmp(getenv("FAKE_AGENT_CHILD_OWN_PROCESS_GROUP") ? getenv("FAKE_AGENT_CHILD_OWN_PROCESS_GROUP") : "0", "1") == 0) {
+        if (setpgid(0, 0) != 0) {
+          perror("setpgid");
+          return 1;
+        }
+      }
       if (strcmp(getenv("FAKE_AGENT_CHILD_IGNORE_TERM") ? getenv("FAKE_AGENT_CHILD_IGNORE_TERM") : "0", "1") == 0) {
         signal(SIGTERM, SIG_IGN);
         signal(SIGINT, SIG_IGN);
+      }
+      const char *descendant_pid_file = getenv("FAKE_AGENT_DESCENDANT_PID_FILE");
+      if (descendant_pid_file != NULL && descendant_pid_file[0] != '\0') {
+        pid_t descendant = fork();
+        if (descendant < 0) {
+          perror("fork descendant");
+          return 1;
+        }
+        if (descendant == 0) {
+          if (strcmp(getenv("FAKE_AGENT_DESCENDANT_IGNORE_TERM") ? getenv("FAKE_AGENT_DESCENDANT_IGNORE_TERM") : "0", "1") == 0) {
+            signal(SIGTERM, SIG_IGN);
+            signal(SIGINT, SIG_IGN);
+          }
+          for (;;) {
+            sleep(5);
+          }
+        }
+        FILE *descendant_file = fopen(descendant_pid_file, "w");
+        if (descendant_file == NULL) {
+          perror("fopen descendant pid");
+          return 1;
+        }
+        fprintf(descendant_file, "%ld\n", (long)descendant);
+        fclose(descendant_file);
       }
       for (;;) {
         sleep(5);
@@ -294,6 +333,9 @@ FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
 export FAKE_AGENT_STARTED_FILE
 export FAKE_AGENT_CHILD_PID_FILE=""
 export FAKE_AGENT_CHILD_IGNORE_TERM=0
+export FAKE_AGENT_CHILD_OWN_PROCESS_GROUP=0
+export FAKE_AGENT_DESCENDANT_PID_FILE=""
+export FAKE_AGENT_DESCENDANT_IGNORE_TERM=0
 export FAKE_AGENT_IGNORE_TERM=0
 export FAKE_PS_LSTART
 export FAKE_PS_COMMAND
@@ -586,14 +628,21 @@ fi
 
 FAKE_AGENT_IGNORE_TERM=1
 FAKE_AGENT_CHILD_PID_FILE="$WORK_DIR/force-stop-child.pid"
-FAKE_AGENT_CHILD_IGNORE_TERM=1
-rm -f "$FAKE_AGENT_CHILD_PID_FILE"
+FAKE_AGENT_CHILD_IGNORE_TERM=0
+FAKE_AGENT_CHILD_OWN_PROCESS_GROUP=1
+FAKE_AGENT_DESCENDANT_PID_FILE="$WORK_DIR/force-stop-descendant.pid"
+FAKE_AGENT_DESCENDANT_IGNORE_TERM=1
+rm -f "$FAKE_AGENT_CHILD_PID_FILE" "$FAKE_AGENT_DESCENDANT_PID_FILE"
 export FAKE_AGENT_IGNORE_TERM
 export FAKE_AGENT_CHILD_PID_FILE
 export FAKE_AGENT_CHILD_IGNORE_TERM
+export FAKE_AGENT_CHILD_OWN_PROCESS_GROUP
+export FAKE_AGENT_DESCENDANT_PID_FILE
+export FAKE_AGENT_DESCENDANT_IGNORE_TERM
 connector start
 force_stop_pid="$(tr -d '[:space:]' < "$PID_FILE")"
 force_stop_child_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_CHILD_PID_FILE")"
+force_stop_descendant_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_DESCENDANT_PID_FILE")"
 CHAOP_DOGFOOD_STOP_TIMEOUT_SECONDS=0 connector stop --force
 if pid_is_live_non_zombie "$force_stop_pid"; then
   printf 'expected force-stopped pid %s to stop\n' "$force_stop_pid" >&2
@@ -603,6 +652,10 @@ if pid_is_live_non_zombie "$force_stop_child_pid"; then
   printf 'expected force-stopped child pid %s to stop\n' "$force_stop_child_pid" >&2
   exit 1
 fi
+if pid_is_live_non_zombie "$force_stop_descendant_pid"; then
+  printf 'expected force-stopped descendant pid %s to stop\n' "$force_stop_descendant_pid" >&2
+  exit 1
+fi
 if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
   printf 'expected force stop to remove pid state only after the pid exits\n' >&2
   exit 1
@@ -610,9 +663,15 @@ fi
 FAKE_AGENT_IGNORE_TERM=0
 FAKE_AGENT_CHILD_PID_FILE=""
 FAKE_AGENT_CHILD_IGNORE_TERM=0
+FAKE_AGENT_CHILD_OWN_PROCESS_GROUP=0
+FAKE_AGENT_DESCENDANT_PID_FILE=""
+FAKE_AGENT_DESCENDANT_IGNORE_TERM=0
 export FAKE_AGENT_IGNORE_TERM
 export FAKE_AGENT_CHILD_PID_FILE
 export FAKE_AGENT_CHILD_IGNORE_TERM
+export FAKE_AGENT_CHILD_OWN_PROCESS_GROUP
+export FAKE_AGENT_DESCENDANT_PID_FILE
+export FAKE_AGENT_DESCENDANT_IGNORE_TERM
 
 connector start
 kill_race_pid="$(tr -d '[:space:]' < "$PID_FILE")"
