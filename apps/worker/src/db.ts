@@ -1873,7 +1873,7 @@ export async function chooseConnectorForLocalThread(
     : await findBestLocalThreadConnector(env, request.workspace_id);
 
   if (!connector) {
-    throw new LocalThreadTargetError("No managed app-server connector with thread support is online");
+    throw new LocalThreadTargetError("No managed app-server connector with thread and execution support is online");
   }
 
   return connector.id;
@@ -4709,6 +4709,7 @@ async function findBestLocalThreadConnector(
      INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
      WHERE wc.workspace_id = ? AND wc.can_execute = 1 AND c.status = 'online'
        AND c.capabilities_json LIKE '%"app_server_threads"%'
+       AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
      ORDER BY c.last_seen_at DESC, c.updated_at DESC
      LIMIT 1`
   )
@@ -4728,6 +4729,7 @@ async function findLocalThreadConnector(
      INNER JOIN workspace_connectors wc ON wc.connector_id = c.id
      WHERE c.id = ? AND wc.workspace_id = ? AND wc.can_execute = 1 AND c.status = 'online'
        AND c.capabilities_json LIKE '%"app_server_threads"%'
+       AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
      LIMIT 1`
   )
     .bind(connectorId, workspaceId)

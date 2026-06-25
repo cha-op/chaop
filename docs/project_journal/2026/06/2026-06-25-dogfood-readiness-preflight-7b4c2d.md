@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-25
 updated: 2026-06-25
 branch: wip/dogfood-readiness-preflight
-pr:
+pr: 25
 supersedes:
 superseded_by:
 ---
@@ -21,6 +21,8 @@ superseded_by:
 - Review follow-up scopes readiness to the thread that Thread Centre will actually open, preserves the selected thread target across view navigation, and falls back to the default workspace only when no thread is available, so another workspace cannot make the current dogfood path look ready.
 - Thread-scoped app-server instances now require an exact target-thread match before they can satisfy the readiness check, so a dedicated instance for another thread in the same workspace cannot create a false ready state.
 - Externally managed app-server listeners still count as ready when the connector reports the app-server thread and execution capabilities; the preflight tests the execution path, not the service-manager ownership model.
+- Final review follow-up routes missing sampled budget constraints to Budget Board instead of marking the path ready, treats any idle healthy app-server instance as sufficient even when another instance is busy, and allows selected existing attached app-server threads to run on exec-only connectors.
+- The Thread Centre empty state now exposes the local app-server thread creation form, and local thread connector selection is aligned end-to-end: Web readiness, the create form, and Worker auto-selection all require create-and-exec capability on the same workspace connector.
 
 ## Scope
 - Add a tested Web state helper that returns a compact `ready`, `attention`, or `blocked` preflight decision.
@@ -31,11 +33,12 @@ superseded_by:
 - Passive preflight reads only data already loaded by bootstrap or realtime updates.
 - Broad Host Session inventory remains explicit and opt-in.
 - Multiple Browser clients do not increase connector reporting frequency through this preflight.
+- Missing live or persisted budget samples are intentionally shown as requiring attention, so first-run operators must bootstrap or inspect Budget Board before relying on readiness.
 
 ## Validation Evidence
-- `pnpm --filter @chaop/web test` passed with readiness helper coverage, including exact matching for thread-scoped app-server instances.
+- `pnpm --filter @chaop/web test` passed with readiness helper coverage, including exact matching for thread-scoped app-server instances, missing sampled budgets, mixed busy/idle app-server instances, and selected existing attached app-server threads.
 - `pnpm test` passed.
 - `pnpm build` passed.
 - Local Playwright visual smoke passed for desktop, narrow desktop, breakpoint-edge, and mobile Budget Board rendering, with no horizontal overflow.
-- API and Web deployments were refreshed after the initial change; Web was refreshed again after review fixes.
-- `pnpm smoke:deployed` passed after the final Web refresh: direct API health/bootstrap/usage checks returned 200, browser bootstrap returned 200, Budget Board state was `normal`, source was `cloudflare_analytics`, and the bottleneck was D1 rows read / day at 11%.
+- API and Web deployments were refreshed after the final review fixes.
+- `pnpm smoke:deployed` passed after the final deployment refresh: direct API health/bootstrap/usage checks returned 200, browser bootstrap returned 200, Budget Board state was `normal`, source was `cloudflare_analytics`, and the bottleneck was D1 rows read / day at 11.7%.

@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-25
 updated: 2026-06-25
 branch: wip/dogfood-readiness-preflight
-pr:
+pr: 25
 supersedes:
 superseded_by:
 ---
@@ -21,6 +21,8 @@ superseded_by:
 - Review follow-up 现在会把 readiness 限定到 Thread Centre 实际会打开的 thread，并且在跨视图导航时保留所选 thread 目标；只有没有任何可打开 thread 时才回退到默认 workspace，因此其它 workspace ready 不会让当前 dogfood path 被误判为 ready。
 - Thread-scoped app-server instance 现在必须精确匹配目标 thread 才能满足 readiness check，因此同一 workspace 中另一条 thread 的 dedicated instance 不会造成 false ready。
 - 如果 connector 明确报告 app-server thread 和 execution capabilities，外部 service manager 管理的 app-server listener 仍然可以算作 ready；preflight 检查的是 execution path，不是 service-manager ownership model。
+- 最终 review follow-up 会把缺少真实预算采样的状态导向 Budget Board，而不是显示 ready；只要存在一个健康且空闲的 app-server instance，即使另一个 instance 正忙也可以算 ready；对于已经 attach 的现有 app-server thread，也允许只具备 execution capability 的 connector 继续运行。
+- Thread Centre 空状态现在直接显示本机 app-server thread 创建表单；本机 thread 的 connector 选择已端到端对齐：Web readiness、创建表单和 Worker 自动选择都要求同一 workspace connector 同时具备 create 和 exec capability。
 
 ## 范围
 - 增加一个有测试覆盖的 Web state helper，返回简洁的 `ready`、`attention` 或 `blocked` preflight decision。
@@ -31,11 +33,12 @@ superseded_by:
 - 被动 preflight 只读取 bootstrap 或 realtime updates 已经加载的数据。
 - Broad Host Session inventory 继续保持显式 opt-in。
 - 多个 Browser clients 不会因为这个 preflight 增加 connector report 频率。
+- 缺少 live 或 persisted budget samples 时会明确显示需要关注，因此首次使用的 operator 需要先 bootstrap 或检查 Budget Board，再依赖 readiness。
 
 ## 验证证据
-- `pnpm --filter @chaop/web test` 已通过，覆盖 readiness helper，并包含 thread-scoped app-server instance 的精确匹配回归测试。
+- `pnpm --filter @chaop/web test` 已通过，覆盖 readiness helper，并包含 thread-scoped app-server instance 精确匹配、缺少真实预算采样、busy/idle app-server 混合状态，以及已选现有 attached app-server thread 的回归测试。
 - `pnpm test` 已通过。
 - `pnpm build` 已通过。
 - 本地 Playwright 视觉 smoke 已通过，桌面、窄桌面、断点边缘和移动端 Budget Board 渲染正常，没有横向溢出。
-- 初始修改后已刷新 API 和 Web 部署；review fix 后再次刷新了 Web 部署。
-- `pnpm smoke:deployed` 在最终 Web 刷新后已通过：direct API health/bootstrap/usage 检查均返回 200，browser bootstrap 返回 200，Budget Board 状态为 `normal`，source 为 `cloudflare_analytics`，bottleneck 为 D1 rows read / day，使用率 11%。
+- 最终 review fixes 后已刷新 API 和 Web 部署。
+- `pnpm smoke:deployed` 在最终部署刷新后已通过：direct API health/bootstrap/usage 检查均返回 200，browser bootstrap 返回 200，Budget Board 状态为 `normal`，source 为 `cloudflare_analytics`，bottleneck 为 D1 rows read / day，使用率 11.7%。

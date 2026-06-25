@@ -1,6 +1,7 @@
 import type {
   AppServerInstanceSummary,
   BootstrapPayload,
+  BudgetConstraint,
   BudgetSummary,
   CommandSummary,
   CreateCommandRequest,
@@ -682,7 +683,8 @@ export function localThreadConnectors(
     (connector) =>
       connectorIds.has(connector.id) &&
       connector.status === "online" &&
-      connector.capabilities.includes("app_server_threads")
+      connector.capabilities.includes("app_server_threads") &&
+      connector.capabilities.includes("codex_app_server_exec")
   );
 }
 
@@ -738,10 +740,11 @@ export function dogfoodReadinessPreflight(
   selectedThreadId?: string
 ): ReadinessPreflight {
   const workspaceId = localThreadWorkspaceId(data, selectedThreadId);
+  const selectedThreadCanRun = managedAppServerCommandAvailable(data, selectedThreadId);
   const checks = [
     readinessCostCheck(data),
-    readinessConnectorCheck(data, workspaceId),
-    readinessAppServerCheck(data, workspaceId, selectedThreadId),
+    readinessConnectorCheck(data, workspaceId, selectedThreadCanRun),
+    readinessAppServerCheck(data, workspaceId, selectedThreadId, selectedThreadCanRun),
     readinessInventoryCheck(data)
   ];
   const state = checks.some((check) => check.state === "blocked")
@@ -809,6 +812,14 @@ function readinessCostCheck(data: BootstrapPayload | undefined): ReadinessPrefli
       detail: safety.summary
     };
   }
+  if (!budgetHasSampledHardConstraint(data.budget)) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "attention",
+      detail: "No sampled hard budget constraint is available yet."
+    };
+  }
   return {
     id: "cost",
     label: "Cost posture",
@@ -819,18 +830,21 @@ function readinessCostCheck(data: BootstrapPayload | undefined): ReadinessPrefli
 
 function readinessConnectorCheck(
   data: BootstrapPayload | undefined,
-  workspaceId: string | undefined
+  workspaceId: string | undefined,
+  selectedThreadCanRun: boolean
 ): ReadinessPreflightCheck {
   const online = readinessConnectorScopes(data, workspaceId).filter((scope) => scope.connector.status === "online");
   const workspaceLinked = online.filter((scope) => scope.workspaceIds.size > 0);
-  const full = readinessEligibleConnectorScopes(data, workspaceId);
+  const full = readinessEligibleConnectorScopes(data, workspaceId, selectedThreadCanRun);
   const workspaceLabel = readinessWorkspaceLabel(data, workspaceId);
   if (full.length > 0) {
     return {
       id: "connector",
       label: "Connector",
       state: "ready",
-      detail: `${full.length} workspace connector${full.length === 1 ? "" : "s"} can create and run app-server threads for ${workspaceLabel}.`
+      detail: selectedThreadCanRun
+        ? `${full.length} workspace connector${full.length === 1 ? "" : "s"} can run the selected app-server thread for ${workspaceLabel}.`
+        : `${full.length} workspace connector${full.length === 1 ? "" : "s"} can create and run app-server threads for ${workspaceLabel}.`
     };
   }
   if (online.length === 0) {
@@ -872,20 +886,22 @@ function readinessConnectorCheck(
 function readinessAppServerCheck(
   data: BootstrapPayload | undefined,
   workspaceId: string | undefined,
-  selectedThreadId: string | undefined
+  selectedThreadId: string | undefined,
+  selectedThreadCanRun: boolean
 ): ReadinessPreflightCheck {
-  const eligibleConnectorScopes = readinessEligibleConnectorScopes(data, workspaceId);
+  const eligibleConnectorScopes = readinessEligibleConnectorScopes(data, workspaceId, selectedThreadCanRun);
   const instances = (data?.app_server_instances ?? []).filter((instance) =>
     readinessInstanceMatchesEligibleConnector(data, instance, eligibleConnectorScopes, selectedThreadId)
   );
   const healthy = instances.filter((instance) => instance.state === "healthy");
+  const idle = healthy.filter((instance) => instance.active_turn_count === 0);
   const activeTurns = healthy.reduce((total, instance) => total + instance.active_turn_count, 0);
-  if (healthy.length > 0 && activeTurns === 0) {
+  if (idle.length > 0) {
     return {
       id: "app_server",
       label: "App-server",
       state: "ready",
-      detail: `${healthy.length} healthy app-server instance${healthy.length === 1 ? "" : "s"} idle.`
+      detail: `${idle.length} healthy app-server instance${idle.length === 1 ? "" : "s"} idle.`
     };
   }
   if (healthy.length > 0) {
@@ -939,14 +955,15 @@ function readinessConnectorScopes(
 
 function readinessEligibleConnectorScopes(
   data: BootstrapPayload | undefined,
-  workspaceId: string | undefined
+  workspaceId: string | undefined,
+  selectedThreadCanRun = false
 ): ReadinessConnectorScope[] {
   return readinessConnectorScopes(data, workspaceId).filter(
     (scope) =>
       scope.workspaceIds.size > 0 &&
       scope.connector.status === "online" &&
-      scope.connector.capabilities.includes("app_server_threads") &&
-      scope.connector.capabilities.includes("codex_app_server_exec")
+      scope.connector.capabilities.includes("codex_app_server_exec") &&
+      (selectedThreadCanRun || scope.connector.capabilities.includes("app_server_threads"))
   );
 }
 
@@ -1009,6 +1026,14 @@ function readinessNextAction(
     };
   }
   if (state === "attention") {
+    const attention = checks.find((check) => check.state === "attention");
+    if (attention?.id === "cost") {
+      return {
+        label: "Review Budget Board",
+        href: "#budget-board",
+        detail: "Confirm the cost warning before starting daily dogfood work."
+      };
+    }
     return {
       label: "Open Host Sessions",
       href: "#host-sessions",
@@ -1034,6 +1059,19 @@ function readinessSummary(state: ReadinessPreflightState, checks: ReadinessPrefl
   }
   const first = checks.find((check) => check.state === state) ?? checks.find((check) => check.state !== "ready");
   return first?.detail ?? "Readiness state needs attention.";
+}
+
+function budgetHasSampledHardConstraint(budget: BudgetSummary): boolean {
+  if (budget.bottleneck_constraint && isSampledHardBudgetConstraint(budget.bottleneck_constraint)) return true;
+  if (budget.constraints?.some(isSampledHardBudgetConstraint)) return true;
+  if (budget.constraints || budget.constraint_sample_count !== undefined || budget.source === "empty") return false;
+  return [budget.daily_used_pct, budget.four_hour_used_pct, budget.burst_used_pct].some(
+    (value) => typeof value === "number" && Number.isFinite(value)
+  );
+}
+
+function isSampledHardBudgetConstraint(constraint: BudgetConstraint): boolean {
+  return constraint.hard && constraint.sampled && constraint.state !== "missing";
 }
 
 export function codexCliFallbackAvailable(

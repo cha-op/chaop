@@ -951,7 +951,8 @@ export class ChaopApp extends LitElement {
             <h2>No thread selected</h2>
             <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
           </div>
-          <p>Waiting for connector activity.</p>
+          <p>Create a local app-server thread or choose an existing task from the Task Board.</p>
+          ${this.renderCreateThreadForm("stacked")}
         </section>
         <aside class="panel">
           <div class="section-heading">

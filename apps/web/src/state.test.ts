@@ -3,6 +3,7 @@ import test from "node:test";
 import type {
   AppServerInstanceSummary,
   BootstrapPayload,
+  BudgetConstraint,
   CommandSummary,
   HostSessionSummary,
   TaskArchiveResponse,
@@ -438,6 +439,30 @@ test("dogfoodReadinessPreflight blocks on cost posture before connector state", 
   assert.equal(readiness.summary, "D1 rows written hard limit is active.");
 });
 
+test("dogfoodReadinessPreflight sends missing sampled cost posture to the Budget Board", () => {
+  const data = payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")],
+    budget: {
+      ...payload().budget,
+      source: "empty",
+      constraints: [sampledBudgetConstraint("d1-daily", { sampled: false, state: "missing", used_pct: null })],
+      bottleneck_constraint: sampledBudgetConstraint("d1-daily", { sampled: false, state: "missing", used_pct: null }),
+      constraint_sample_count: 0
+    }
+  });
+
+  const readiness = dogfoodReadinessPreflight(data);
+
+  assert.equal(readiness.state, "attention");
+  assert.equal(readiness.next_action.href, "#budget-board");
+  assert.equal(
+    readiness.checks.find((check) => check.id === "cost")?.detail,
+    "No sampled hard budget constraint is available yet."
+  );
+});
+
 test("dogfoodReadinessPreflight calls out split app-server connector capabilities", () => {
   const data = payload({
     workspaces: [workspace("workspace-api", ["connector-a", "connector-b"])],
@@ -454,6 +479,23 @@ test("dogfoodReadinessPreflight calls out split app-server connector capabilitie
   assert.equal(readiness.next_action.href, "#host-sessions");
   assert.equal(readiness.checks.find((check) => check.id === "connector")?.state, "attention");
   assert.match(readiness.checks.find((check) => check.id === "connector")?.detail ?? "", /same connector/);
+});
+
+test("dogfoodReadinessPreflight treats any idle healthy app-server instance as ready", () => {
+  const readiness = dogfoodReadinessPreflight(payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [
+      {
+        ...appServerInstance("app-server-busy", "healthy", "2026-06-12T10:01:00.000Z", "connector-a"),
+        active_turn_count: 2
+      },
+      appServerInstance("app-server-idle", "healthy", "2026-06-12T10:02:00.000Z", "connector-a")
+    ]
+  }));
+
+  assert.equal(readiness.state, "ready");
+  assert.equal(readiness.checks.find((check) => check.id === "app_server")?.detail, "1 healthy app-server instance idle.");
 });
 
 test("dogfoodReadinessPreflight distinguishes busy and missing app-server reports", () => {
@@ -476,6 +518,28 @@ test("dogfoodReadinessPreflight distinguishes busy and missing app-server report
   assert.equal(busy.checks.find((check) => check.id === "app_server")?.detail, "1 healthy app-server instance with 2 active turns.");
   assert.equal(missing.state, "blocked");
   assert.equal(missing.checks.find((check) => check.id === "app_server")?.detail, "No healthy app-server instance is reported by a connector linked to workspace-api.");
+});
+
+test("dogfoodReadinessPreflight accepts exec-only connectors for selected attached app-server threads", () => {
+  const data = payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    threads: [thread("thread-api", "workspace-api")],
+    host_sessions: [
+      hostSession("session-api", {
+        connector_id: "connector-a",
+        workspace_id: "workspace-api",
+        attached_thread_id: "thread-api",
+        app_server_present: true
+      })
+    ],
+    connectors: [connector("connector-a", ["codex_app_server_exec"])],
+    app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")]
+  });
+
+  const readiness = dogfoodReadinessPreflight(data, "thread-api");
+
+  assert.equal(readiness.state, "ready");
+  assert.match(readiness.checks.find((check) => check.id === "connector")?.detail ?? "", /can run the selected app-server thread/);
 });
 
 test("dogfoodReadinessPreflight requires a workspace-linked managed connector", () => {
@@ -745,8 +809,8 @@ test("localThreadWorkspaceId falls back to the first workspace", () => {
 test("localThreadConnectors filters connectors by workspace", () => {
   const data = payload({
     connectors: [
-      connector("connector-a", ["app_server_threads"]),
-      connector("connector-b", ["app_server_threads"])
+      connector("connector-a", ["app_server_threads", "codex_app_server_exec"]),
+      connector("connector-b", ["app_server_threads", "codex_app_server_exec"])
     ],
     workspaces: [
       workspace("workspace-api", ["connector-a"]),
@@ -828,28 +892,30 @@ test("mergeBootstrapPayload removes connectors omitted from bootstrap snapshot",
   assert.deepEqual(merged.connectors.map((item) => item.id), ["connector-a"]);
 });
 
-test("localThreadConnectors only includes app-server capable connectors", () => {
+test("localThreadConnectors only includes create-and-exec app-server capable connectors", () => {
   const data = payload({
     connectors: [
       connector("connector-a", ["placeholder_commands"]),
-      connector("connector-b", ["app_server_threads"])
+      connector("connector-b", ["app_server_threads"]),
+      connector("connector-c", ["codex_app_server_exec"]),
+      connector("connector-d", ["app_server_threads", "codex_app_server_exec"])
     ],
     workspaces: [
-      workspace("workspace-api", ["connector-a", "connector-b"])
+      workspace("workspace-api", ["connector-a", "connector-b", "connector-c", "connector-d"])
     ]
   });
 
   assert.deepEqual(
     localThreadConnectors(data, "workspace-api").map((item) => item.id),
-    ["connector-b"]
+    ["connector-d"]
   );
 });
 
 test("localThreadConnectors skips unavailable app-server connectors", () => {
   const data = payload({
     connectors: [
-      connector("connector-a", ["app_server_threads"], "offline"),
-      connector("connector-b", ["app_server_threads"], "degraded")
+      connector("connector-a", ["app_server_threads", "codex_app_server_exec"], "offline"),
+      connector("connector-b", ["app_server_threads", "codex_app_server_exec"], "degraded")
     ],
     workspaces: [
       workspace("workspace-api", ["connector-a", "connector-b"])
@@ -865,8 +931,8 @@ test("localThreadConnectors skips unavailable app-server connectors", () => {
 test("localThreadConnectorId drops stale connector selections", () => {
   const data = payload({
     connectors: [
-      connector("connector-a", ["app_server_threads"]),
-      connector("connector-b", ["app_server_threads"])
+      connector("connector-a", ["app_server_threads", "codex_app_server_exec"]),
+      connector("connector-b", ["app_server_threads", "codex_app_server_exec"])
     ],
     workspaces: [
       workspace("workspace-api", ["connector-a"]),
@@ -1597,10 +1663,35 @@ function payload(overrides: Partial<BootstrapPayload> = {}): BootstrapPayload {
       source: "empty",
       generated_at: "2026-06-12T10:00:00.000Z",
       window_sample_count: 0,
+      constraint_sample_count: 1,
+      constraints: [sampledBudgetConstraint("d1-daily")],
+      bottleneck_constraint: sampledBudgetConstraint("d1-daily"),
       windows: []
     },
     safety: safety(),
     server_time: "2026-06-12T10:00:00.000Z",
+    ...overrides
+  };
+}
+
+function sampledBudgetConstraint(id: string, overrides: Partial<BudgetConstraint> = {}): BudgetConstraint {
+  return {
+    id,
+    label: "D1 rows written / day",
+    detail: "Cloudflare D1 daily write budget.",
+    window_type: "daily",
+    unit: "d1_row",
+    hard: true,
+    sampled: true,
+    state: "normal",
+    source: "cloudflare_analytics",
+    limit_units: 100000,
+    used_units: 1000,
+    used_pct: 1,
+    remaining_units: 99000,
+    remaining_ratio: 0.99,
+    per_event_units: 12,
+    remaining_event_capacity: 8250,
     ...overrides
   };
 }
