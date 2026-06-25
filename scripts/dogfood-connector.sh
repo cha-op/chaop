@@ -768,6 +768,11 @@ stop_connector() {
   ensure_state_safety
   local pid
   if pid="$(pid_from_file)" && is_pid_running "$pid" && ! pid_matches_connector "$pid"; then
+    if ! is_pid_running "$pid"; then
+      rm -f "$PID_FILE" "$PID_META_FILE"
+      printf 'connector is not running\n'
+      return 0
+    fi
     die "pid file points to an unmanaged running process; refusing to stop pid $pid"
   fi
   if ! pid="$(current_pid)"; then
