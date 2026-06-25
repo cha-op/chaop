@@ -19,6 +19,7 @@ superseded_by:
 - The preflight derives its decision entirely from the existing bootstrap payload: `safety`, `budget`, `connectors`, and `app_server_instances`.
 - It does not add a Worker route, D1 write path, connector report, Host Session refresh, or background poll.
 - Review follow-up scopes readiness to the thread that Thread Centre will actually open, preserves the selected thread target across view navigation, and falls back to the default workspace only when no thread is available, so another workspace cannot make the current dogfood path look ready.
+- Thread-scoped app-server instances now require an exact target-thread match before they can satisfy the readiness check, so a dedicated instance for another thread in the same workspace cannot create a false ready state.
 - Externally managed app-server listeners still count as ready when the connector reports the app-server thread and execution capabilities; the preflight tests the execution path, not the service-manager ownership model.
 
 ## Scope
@@ -32,7 +33,7 @@ superseded_by:
 - Multiple Browser clients do not increase connector reporting frequency through this preflight.
 
 ## Validation Evidence
-- `pnpm --filter @chaop/web test` passed with readiness helper coverage.
+- `pnpm --filter @chaop/web test` passed with readiness helper coverage, including exact matching for thread-scoped app-server instances.
 - `pnpm test` passed.
 - `pnpm build` passed.
 - Local Playwright visual smoke passed for desktop, narrow desktop, breakpoint-edge, and mobile Budget Board rendering, with no horizontal overflow.

@@ -741,7 +741,7 @@ export function dogfoodReadinessPreflight(
   const checks = [
     readinessCostCheck(data),
     readinessConnectorCheck(data, workspaceId),
-    readinessAppServerCheck(data, workspaceId),
+    readinessAppServerCheck(data, workspaceId, selectedThreadId),
     readinessInventoryCheck(data)
   ];
   const state = checks.some((check) => check.state === "blocked")
@@ -871,11 +871,12 @@ function readinessConnectorCheck(
 
 function readinessAppServerCheck(
   data: BootstrapPayload | undefined,
-  workspaceId: string | undefined
+  workspaceId: string | undefined,
+  selectedThreadId: string | undefined
 ): ReadinessPreflightCheck {
   const eligibleConnectorScopes = readinessEligibleConnectorScopes(data, workspaceId);
   const instances = (data?.app_server_instances ?? []).filter((instance) =>
-    readinessInstanceMatchesEligibleConnector(data, instance, eligibleConnectorScopes)
+    readinessInstanceMatchesEligibleConnector(data, instance, eligibleConnectorScopes, selectedThreadId)
   );
   const healthy = instances.filter((instance) => instance.state === "healthy");
   const activeTurns = healthy.reduce((total, instance) => total + instance.active_turn_count, 0);
@@ -952,12 +953,15 @@ function readinessEligibleConnectorScopes(
 function readinessInstanceMatchesEligibleConnector(
   data: BootstrapPayload | undefined,
   instance: AppServerInstanceSummary,
-  eligibleConnectorScopes: ReadinessConnectorScope[]
+  eligibleConnectorScopes: ReadinessConnectorScope[],
+  selectedThreadId: string | undefined
 ): boolean {
   const scope = eligibleConnectorScopes.find((item) => item.connector.id === instance.connector_id);
   if (!scope) return false;
   if (instance.scope === "connector") return true;
   if (instance.scope === "workspace") return Boolean(instance.workspace_id && scope.workspaceIds.has(instance.workspace_id));
+  if (!selectedThreadId) return false;
+  if (instance.thread_id !== selectedThreadId) return false;
   const thread = data?.threads.find((item) => item.id === instance.thread_id);
   return Boolean(thread && scope.workspaceIds.has(thread.workspace_id));
 }

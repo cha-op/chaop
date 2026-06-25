@@ -532,6 +532,36 @@ test("dogfoodReadinessPreflight scopes readiness to the target workspace", () =>
   assert.match(selectedWorkspace.checks.find((check) => check.id === "connector")?.detail ?? "", /workspace-docs/);
 });
 
+test("dogfoodReadinessPreflight requires thread-scoped app-server instances to match the target thread", () => {
+  const data = payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    threads: [
+      thread("thread-api", "workspace-api"),
+      thread("thread-docs", "workspace-api")
+    ],
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [
+      {
+        ...appServerInstance("app-server-docs", "healthy", "2026-06-12T10:01:00.000Z", "connector-a"),
+        scope: "thread",
+        thread_id: "thread-docs"
+      }
+    ]
+  });
+
+  const unrelatedThread = dogfoodReadinessPreflight(data, "thread-api");
+  const matchingThread = dogfoodReadinessPreflight(data, "thread-docs");
+
+  assert.equal(unrelatedThread.state, "blocked");
+  assert.equal(unrelatedThread.checks.find((check) => check.id === "connector")?.state, "ready");
+  assert.equal(
+    unrelatedThread.checks.find((check) => check.id === "app_server")?.detail,
+    "No healthy app-server instance is reported by a connector linked to workspace-api."
+  );
+  assert.equal(matchingThread.state, "ready");
+  assert.equal(matchingThread.checks.find((check) => check.id === "app_server")?.state, "ready");
+});
+
 test("dogfoodReadinessPreflight accepts externally managed listeners with app-server capabilities", () => {
   const externalInstance = {
     ...appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a"),

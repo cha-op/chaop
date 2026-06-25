@@ -19,6 +19,7 @@ superseded_by:
 - 这个 preflight 完全从现有 bootstrap payload 推导：`safety`、`budget`、`connectors` 和 `app_server_instances`。
 - 它不新增 Worker route、D1 write path、connector report、Host Session refresh，也不新增后台 poll。
 - Review follow-up 现在会把 readiness 限定到 Thread Centre 实际会打开的 thread，并且在跨视图导航时保留所选 thread 目标；只有没有任何可打开 thread 时才回退到默认 workspace，因此其它 workspace ready 不会让当前 dogfood path 被误判为 ready。
+- Thread-scoped app-server instance 现在必须精确匹配目标 thread 才能满足 readiness check，因此同一 workspace 中另一条 thread 的 dedicated instance 不会造成 false ready。
 - 如果 connector 明确报告 app-server thread 和 execution capabilities，外部 service manager 管理的 app-server listener 仍然可以算作 ready；preflight 检查的是 execution path，不是 service-manager ownership model。
 
 ## 范围
@@ -32,7 +33,7 @@ superseded_by:
 - 多个 Browser clients 不会因为这个 preflight 增加 connector report 频率。
 
 ## 验证证据
-- `pnpm --filter @chaop/web test` 已通过，覆盖 readiness helper。
+- `pnpm --filter @chaop/web test` 已通过，覆盖 readiness helper，并包含 thread-scoped app-server instance 的精确匹配回归测试。
 - `pnpm test` 已通过。
 - `pnpm build` 已通过。
 - 本地 Playwright 视觉 smoke 已通过，桌面、窄桌面、断点边缘和移动端 Budget Board 渲染正常，没有横向溢出。
