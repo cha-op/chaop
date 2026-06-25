@@ -421,6 +421,29 @@ if ! grep -q 'doctor ok' "$custom_target_output"; then
   exit 1
 fi
 
+missing_agent_state_dir="$WORK_DIR/missing-agent-state"
+missing_agent_pid_file="$missing_agent_state_dir/pids/connector.pid"
+missing_agent_pid_meta_file="$missing_agent_state_dir/pids/connector.pid.meta"
+missing_agent_log_file="$missing_agent_state_dir/logs/connector.log"
+started_count_before_missing_agent="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if "$REPO_ROOT/scripts/dogfood-connector.sh" \
+  --config "$CONFIG_FILE" \
+  --state-dir "$missing_agent_state_dir" \
+  --pid-file "$missing_agent_pid_file" \
+  --pid-meta-file "$missing_agent_pid_meta_file" \
+  --log-file "$missing_agent_log_file" \
+  --no-build \
+  --build-profile release \
+  start >/dev/null 2>"$WORK_DIR/missing-agent-start.err"; then
+  printf 'expected start to fail when the next agent binary is unavailable\n' >&2
+  exit 1
+fi
+started_count_after_missing_agent="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_missing_agent" != "$started_count_before_missing_agent" ]]; then
+  printf 'expected missing-agent start failure to avoid launching a connector, got %s starts\n' "$started_count_after_missing_agent" >&2
+  exit 1
+fi
+
 connector start
 first_pid="$(tr -d '[:space:]' < "$PID_FILE")"
 
@@ -451,6 +474,26 @@ if pid_is_live_non_zombie "$first_pid"; then
   printf 'expected managed pid %s to stop\n' "$first_pid" >&2
   exit 1
 fi
+
+missing_config_file="$WORK_DIR/missing-config.toml"
+printf '999999\n' > "$PID_FILE"
+if "$REPO_ROOT/scripts/dogfood-connector.sh" \
+  --config "$missing_config_file" \
+  --agent-bin "$FAKE_AGENT" \
+  --state-dir "$STATE_DIR" \
+  --pid-file "$PID_FILE" \
+  --pid-meta-file "$PID_META_FILE" \
+  --log-file "$LOG_FILE" \
+  restart >/dev/null 2>"$WORK_DIR/restart-preflight.err"; then
+  printf 'expected restart to fail before stopping when the next config is unavailable\n' >&2
+  exit 1
+fi
+restart_preflight_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+if [[ "$restart_preflight_pid" != "999999" ]]; then
+  printf 'expected failed restart preflight to preserve existing pid state, got %s\n' "$restart_preflight_pid" >&2
+  exit 1
+fi
+rm -f "$PID_FILE" "$PID_META_FILE"
 
 "$FAKE_AGENT" --config "$CONFIG_FILE" --connect &
 FOREIGN_PID="$!"

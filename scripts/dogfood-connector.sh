@@ -558,6 +558,14 @@ ensure_agent_bin() {
   printf '%s\n' "$AGENT_BIN"
 }
 
+resolve_start_agent_bin() {
+  local agent_bin
+  if ! agent_bin="$(ensure_agent_bin)"; then
+    return 1
+  fi
+  printf '%s\n' "$agent_bin"
+}
+
 pid_from_file() {
   [[ -f "$PID_FILE" ]] || return 1
   local pid
@@ -897,7 +905,9 @@ start_connector() {
   preflight_launch_files
 
   local agent_bin
-  agent_bin="$(ensure_agent_bin)"
+  if ! agent_bin="$(resolve_start_agent_bin)"; then
+    return 1
+  fi
   {
     printf '\n[%s] starting connector\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'agent_bin=%s\n' "$agent_bin"
@@ -1005,7 +1015,15 @@ recover_connector() {
 }
 
 restart_connector() {
+  normalise_paths
+  ensure_config
+  ensure_state_dirs
+  local agent_bin
+  if ! agent_bin="$(resolve_start_agent_bin)"; then
+    return 1
+  fi
   stop_connector
+  AGENT_BIN="$agent_bin"
   start_connector
 }
 
@@ -1044,7 +1062,9 @@ run_once() {
     die "pid file points to a running process; refusing to start one-shot connector"
   fi
   local agent_bin
-  agent_bin="$(ensure_agent_bin)"
+  if ! agent_bin="$(resolve_start_agent_bin)"; then
+    return 1
+  fi
   "$agent_bin" --config "$CONFIG_PATH" --connect --run-once
 }
 
