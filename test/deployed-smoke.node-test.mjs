@@ -176,6 +176,51 @@ describe("deployed smoke assets and cookies", () => {
     assert.deepEqual(requested, ["https://api.example.com/api/health"]);
   });
 
+  it("uses the GUI origin, not the full GUI URL path, for API Origin headers", async () => {
+    const config = readConfig({
+      ...smokeEnv(),
+      CHAOP_GUI_URL: "https://app.example.com/control/",
+    });
+    const seenOrigins = [];
+    const fetchImpl = async (url, init = {}) => {
+      if (init.headers?.Origin) {
+        seenOrigins.push(init.headers.Origin);
+      }
+      if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
+        throw new Error("Access header fetch did not disable automatic redirects");
+      }
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse(healthBody());
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: [] });
+      }
+      if (url === "https://api.example.com/api/usage-summary") {
+        return jsonResponse(healthyBudget());
+      }
+      if (url === "https://app.example.com/control") {
+        return textResponse('<script type="module" src="/assets/index.js"></script>');
+      }
+      if (url === "https://app.example.com/assets/index.js") {
+        return textResponse("console.log('ok');", { headers: { "content-type": "text/javascript" } });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    await runDeployedSmoke({
+      config,
+      fetchImpl,
+      options: {
+        skipBrowser: true,
+        allowMissingTelemetry: false,
+        maxBottleneckUsedPct: 90,
+        maxD1RowsWrittenUsedPct: 80,
+      },
+    });
+
+    assert.deepEqual(seenOrigins, ["https://app.example.com", "https://app.example.com"]);
+  });
+
   it("rejects malformed bootstrap JSON in skip-browser smoke", async () => {
     const config = readConfig(smokeEnv());
     const requested = [];
@@ -355,7 +400,7 @@ describe("deployed smoke assets and cookies", () => {
   });
 
   it("fails when the browser bootstrap request times out", async () => {
-    const config = readConfig(smokeEnv());
+    const config = readConfig({ ...smokeEnv(), CHAOP_SMOKE_BROWSER_TIMEOUT_MS: "5" });
     const fetchImpl = async (url, init = {}) => {
       if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
         throw new Error("Access header fetch did not disable automatic redirects");
@@ -386,7 +431,7 @@ describe("deployed smoke assets and cookies", () => {
           config,
           fetchImpl,
           browserLauncher: fakeBrowserLauncher({
-            evaluate: async () => ({ status: 0, contentType: "", hasWorkspaces: false, timedOut: true }),
+            responses: [],
           }),
           options: {
             skipBrowser: false,
@@ -395,12 +440,12 @@ describe("deployed smoke assets and cookies", () => {
             maxD1RowsWrittenUsedPct: 80,
           },
         }),
-      /Browser bootstrap request timed out/,
+      /Browser app did not request bootstrap before the browser smoke timeout/,
     );
   });
 
-  it("fails when the browser bootstrap response body times out", async () => {
-    const config = readConfig({ ...smokeEnv(), CHAOP_SMOKE_BROWSER_TIMEOUT_MS: "5" });
+  it("fails when the browser app bootstrap response is not API JSON", async () => {
+    const config = readConfig(smokeEnv());
     const fetchImpl = async (url, init = {}) => {
       if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
         throw new Error("Access header fetch did not disable automatic redirects");
@@ -432,7 +477,14 @@ describe("deployed smoke assets and cookies", () => {
             config,
             fetchImpl,
             browserLauncher: fakeBrowserLauncher({
-              evaluate: async (callback, argument) => withBrowserGlobals(() => callback(argument)),
+              responses: [
+                {
+                  status: 200,
+                  url: "https://api.example.com/api/bootstrap",
+                  headers: { "content-type": "text/html" },
+                  body: "<!doctype html>",
+                },
+              ],
             }),
             options: {
               skipBrowser: false,
@@ -442,9 +494,9 @@ describe("deployed smoke assets and cookies", () => {
             },
           }),
           100,
-          "browser bootstrap response body did not time out",
+          "browser bootstrap malformed response did not fail",
         ),
-      /Browser bootstrap request timed out/,
+      /Browser app bootstrap request did not return the expected API JSON/,
     );
   });
 
@@ -480,12 +532,6 @@ describe("deployed smoke assets and cookies", () => {
           config,
           fetchImpl,
           browserLauncher: fakeBrowserLauncher({
-            evaluate: async () => ({
-              status: 200,
-              contentType: "application/json",
-              hasWorkspaces: true,
-              timedOut: false,
-            }),
             goto: async () => {
               throw new Error("net::ERR_FAILED at https://app.example.com/");
             },
@@ -538,12 +584,6 @@ describe("deployed smoke assets and cookies", () => {
           config,
           fetchImpl,
           browserLauncher: fakeBrowserLauncher({
-            evaluate: async () => ({
-              status: 200,
-              contentType: "application/json",
-              hasWorkspaces: true,
-              timedOut: false,
-            }),
             responses: [{ status: 200, url: "https://stale-api.example.com/api/bootstrap" }],
           }),
           options: {
@@ -592,10 +632,12 @@ describe("deployed smoke assets and cookies", () => {
       config,
       fetchImpl,
       browserLauncher: fakeBrowserLauncher({
-        evaluate: async () => ({ status: 200, contentType: "application/json", hasWorkspaces: true, timedOut: false }),
         responses: [
           { status: 200, url: "https://api.example.com/api/bootstrap" },
           { status: 404, url: "https://app.example.com/favicon.ico" },
+        ],
+        requestFailures: [
+          { url: "https://app.example.com/favicon.ico", errorText: "net::ERR_FAILED" },
         ],
       }),
       options: {
@@ -641,12 +683,6 @@ describe("deployed smoke assets and cookies", () => {
           config,
           fetchImpl,
           browserLauncher: fakeBrowserLauncher({
-            evaluate: async () => ({
-              status: 200,
-              contentType: "application/json",
-              hasWorkspaces: true,
-              timedOut: false,
-            }),
             responses: [
               { status: 200, url: "https://api.example.com/api/bootstrap" },
               { status: 404, url: "https://app.example.com/assets/missing.js" },
@@ -660,6 +696,58 @@ describe("deployed smoke assets and cookies", () => {
           },
         }),
       /Browser observed failed deployed responses/,
+    );
+  });
+
+  it("fails on deployed browser request failures without HTTP responses", async () => {
+    const config = readConfig(smokeEnv());
+    const fetchImpl = async (url, init = {}) => {
+      if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
+        throw new Error("Access header fetch did not disable automatic redirects");
+      }
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse(healthBody(), { headers: { "set-cookie": "CF_Authorization=api-token; Path=/" } });
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: [] });
+      }
+      if (url === "https://api.example.com/api/usage-summary") {
+        return jsonResponse(healthyBudget());
+      }
+      if (url === "https://app.example.com") {
+        return textResponse('<script type="module" src="/assets/index.js"></script>', {
+          headers: { "set-cookie": "CF_Authorization=gui-token; Path=/" },
+        });
+      }
+      if (url === "https://app.example.com/assets/index.js") {
+        return textResponse("console.log('ok');", { headers: { "content-type": "text/javascript" } });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        runDeployedSmoke({
+          config,
+          fetchImpl,
+          browserLauncher: fakeBrowserLauncher({
+            requestFailures: [
+              { url: "https://app.example.com/assets/chunk.js", errorText: "net::ERR_FAILED" },
+            ],
+          }),
+          options: {
+            skipBrowser: false,
+            allowMissingTelemetry: false,
+            maxBottleneckUsedPct: 90,
+            maxD1RowsWrittenUsedPct: 80,
+          },
+        }),
+      (error) => {
+        assert.match(error.message, /Browser observed failed deployed responses/);
+        assert.doesNotMatch(JSON.stringify(error.details), /app\.example\.com/);
+        assert.match(JSON.stringify(error.details), /requestfailed/);
+        return true;
+      },
     );
   });
 });
@@ -910,9 +998,9 @@ function textResponse(body, init = {}) {
 }
 
 function fakeBrowserLauncher({
-  evaluate,
   goto = async () => {},
   responses = [{ status: 200, url: "https://api.example.com/api/bootstrap" }],
+  requestFailures = [],
 }) {
   return {
     async launch() {
@@ -923,20 +1011,32 @@ function fakeBrowserLauncher({
             async newPage() {
               return {
                 on(event, handler) {
-                  if (event !== "response") return;
-                  for (const response of responses) {
-                    handler({
-                      status: () => response.status,
-                      url: () => response.url,
-                    });
+                  if (event === "response") {
+                    for (const response of responses) {
+                      handler(fakeBrowserResponse(response));
+                    }
+                  } else if (event === "requestfailed") {
+                    for (const failure of requestFailures) {
+                      handler(fakeBrowserRequestFailure(failure));
+                    }
                   }
                 },
                 goto,
+                async waitForResponse(predicate, options = {}) {
+                  for (const response of responses) {
+                    const browserResponse = fakeBrowserResponse(response);
+                    if (predicate(browserResponse)) return browserResponse;
+                  }
+                  const timeout = Math.min(options.timeout ?? 0, 10);
+                  await new Promise((resolve) => setTimeout(resolve, timeout));
+                  const error = new Error("Timeout waiting for response");
+                  error.name = "TimeoutError";
+                  throw error;
+                },
                 async waitForFunction() {},
                 async title() {
                   return "Chaop Control Plane";
                 },
-                evaluate,
               };
             },
             async close() {},
@@ -948,28 +1048,27 @@ function fakeBrowserLauncher({
   };
 }
 
-async function withBrowserGlobals(callback) {
-  const originalFetch = globalThis.fetch;
-  const originalWindow = globalThis.window;
-  globalThis.window = { setTimeout, clearTimeout };
-  globalThis.fetch = async (_url, init = {}) => ({
-    status: 200,
-    headers: new Headers({ "content-type": "application/json" }),
-    json: async () =>
-      new Promise((_resolve, reject) => {
-        init.signal?.addEventListener("abort", () => reject(new Error("body aborted")));
-      }),
-  });
-  try {
-    return await callback();
-  } finally {
-    globalThis.fetch = originalFetch;
-    if (originalWindow === undefined) {
-      delete globalThis.window;
-    } else {
-      globalThis.window = originalWindow;
-    }
-  }
+function fakeBrowserResponse(response) {
+  return {
+    status: () => response.status,
+    url: () => response.url,
+    headers: () => response.headers ?? { "content-type": "application/json" },
+    async headerValue(name) {
+      const headers = response.headers ?? { "content-type": "application/json" };
+      return headers[name.toLowerCase()] ?? headers[name] ?? null;
+    },
+    async json() {
+      if (response.body instanceof Error) throw response.body;
+      return response.body ?? { workspaces: [] };
+    },
+  };
+}
+
+function fakeBrowserRequestFailure(failure) {
+  return {
+    url: () => failure.url,
+    failure: () => ({ errorText: failure.errorText }),
+  };
 }
 
 async function rejectAfter(promise, timeoutMs, message) {

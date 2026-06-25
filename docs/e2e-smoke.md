@@ -70,7 +70,7 @@ pnpm smoke:deployed -- --skip-browser
 The runner fails the smoke when:
 
 - API health, bootstrap, usage summary, GUI index, or referenced assets fail;
-- browser rendering fails or the browser observes deployed `4xx` or `5xx` responses;
+- browser rendering fails or the browser observes deployed `4xx`, `5xx`, or request failures;
 - Budget Board state is `hard_limited` or `throttled`;
 - the sampled hard budget bottleneck is missing;
 - sampled Cloudflare telemetry-backed hard constraints are missing;
@@ -125,9 +125,9 @@ Expected browser checks:
 - the body contains `Operations Map`;
 - the body contains `Budget Board`;
 - the body contains `Host Sessions`;
-- the app shell's own `/api/bootstrap` request uses the configured API origin, catching stale `VITE_CHAOP_API_BASE_URL` bundles;
-- `/api/bootstrap` on the configured API origin returns `200` JSON within the configured timeout;
-- no GUI HTML, static asset, or API response returns `4xx` or `5xx`. Browser-owned optional `/favicon.ico` failures are ignored because the app does not depend on that request.
+- the app shell's own `/api/bootstrap` response uses the configured API origin, returns `200`, and contains API JSON with a `workspaces` array, catching stale `VITE_CHAOP_API_BASE_URL` bundles;
+- no GUI HTML, static asset, or API response returns `4xx` or `5xx`;
+- no non-optional browser request fails before an HTTP response. Browser-owned optional `/favicon.ico` failures are ignored because the app does not depend on that request.
 
 Navigation failures are reported without printing the private GUI origin.
 

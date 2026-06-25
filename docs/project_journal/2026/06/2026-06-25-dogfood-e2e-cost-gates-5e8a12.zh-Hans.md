@@ -24,13 +24,14 @@ superseded_by:
 - 浏览器路径使用 Cloudflare Access cookie exchange，而不是把 service-token headers 注入跨域 browser requests。
 - 浏览器路径会在 Cloudflare 返回 Access binding cookies 时和 `CF_Authorization` 一起保留。
 - direct service-token fetches 会禁用自动重定向，避免同源 asset check 把 Access headers 泄露给 off-origin redirect target。
+- direct API checks 会从 GUI origin 派生 `Origin` header，而不是使用完整 GUI URL path，以匹配浏览器 Origin 语义。
 - direct API、asset、Access cookie-exchange 和 browser bootstrap fetches 都有 smoke-level timeout，避免部署检查卡住。
 - runner 会在发送 Cloudflare Access service-token headers 前拒绝显式的 `http://` GUI 或 API origin。
 - API health checks 会同时校验 `ok: true` 和 `service: "chaop-api"`，避免路由到错误 Worker 的部署误判通过。
 - direct bootstrap checks 会校验响应包含 `workspaces` 数组，避免 `--skip-browser` 在 malformed bootstrap JSON 上误判通过。
-- browser response checks 会忽略可选的 `/favicon.ico` 失败，但仍然会在真实 GUI asset 或 API `4xx`/`5xx` responses 上失败。
+- browser response checks 会忽略可选的 `/favicon.ico` 失败，但仍然会在真实 GUI asset/API `4xx`/`5xx` responses，以及没有 HTTP response 的非可选 request failure 上失败。
 - browser navigation failures 会被包装成已隐藏 origin 的 `SmokeError` messages，避免打印私有 GUI origin。
-- browser smoke 会比较 app shell 自己发起的 `/api/bootstrap` request origin 和配置的 API origin，用于发现 stale `VITE_CHAOP_API_BASE_URL` bundle。
+- browser smoke 会用配置的 API origin 校验 app shell 自己发起的 `/api/bootstrap` response origin、status 和 API JSON shape，用于发现 stale `VITE_CHAOP_API_BASE_URL` bundle。
 - app-server request deadline errors 现在会保留正在等待的 method name，避免 agent tests 在 suite load 下出现不稳定的 timeout 分类。
 - asset checks 会校验 JavaScript/CSS content types，避免 Cloudflare Assets 的 SPA fallback HTML 让缺失 asset 误判通过。
 - asset summaries 和 asset failure messages 会隐藏部署 origin，只报告路径。
@@ -43,6 +44,6 @@ superseded_by:
 - API/Web deploy 或 connector cost-control 变更后，继续使用 deployed smoke。
 
 ## 证据
-- 本地 Node tests 覆盖 argument parsing、HTTPS origin validation、API health service validation、bootstrap shape validation、browser navigation redaction、app API-origin validation、optional favicon filtering、asset 和 cookie parsing，以及 budget gate 的 pass/fail 行为。
+- 本地 Node tests 覆盖 argument parsing、HTTPS origin validation、API Origin header derivation、API health service validation、bootstrap shape validation、browser navigation redaction、app API-origin validation、optional favicon filtering、request-failure detection、asset 和 cookie parsing，以及 budget gate 的 pass/fail 行为。
 - 现有 Rust agent test 会覆盖 app-server resume deadline regression：不匹配的 resume response 应按 method timeout 收口。
 - 完整本地和 deployed validation 应在 merge 前记录到 PR readiness report。

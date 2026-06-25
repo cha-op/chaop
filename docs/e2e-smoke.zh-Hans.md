@@ -70,7 +70,7 @@ pnpm smoke:deployed -- --skip-browser
 runner 在这些情况下会让 smoke 失败：
 
 - API health、bootstrap、usage summary、GUI index 或被引用的 assets 失败；
-- 浏览器渲染失败，或浏览器观察到线上 `4xx` 或 `5xx` response；
+- 浏览器渲染失败，或浏览器观察到线上 `4xx`、`5xx` 或 request failure；
 - Budget Board state 是 `hard_limited` 或 `throttled`；
 - sampled hard budget bottleneck 缺失；
 - sampled Cloudflare telemetry-backed hard constraints 缺失；
@@ -125,9 +125,9 @@ curl -fsS \
 - body 包含 `Operations Map`；
 - body 包含 `Budget Board`；
 - body 包含 `Host Sessions`；
-- app shell 自己发起的 `/api/bootstrap` request 使用配置的 API origin，用于发现 stale `VITE_CHAOP_API_BASE_URL` bundle；
-- 配置的 API origin 上的 `/api/bootstrap` 在配置的 timeout 内返回 `200` JSON；
-- GUI HTML、静态 asset 和 API response 都没有返回 `4xx` 或 `5xx`。浏览器自动触发且应用不依赖的可选 `/favicon.ico` 失败会被忽略。
+- app shell 自己发起的 `/api/bootstrap` response 使用配置的 API origin，返回 `200`，且包含带 `workspaces` 数组的 API JSON，用于发现 stale `VITE_CHAOP_API_BASE_URL` bundle；
+- GUI HTML、静态 asset 和 API response 都没有返回 `4xx` 或 `5xx`；
+- 非可选浏览器 request 不会在收到 HTTP response 前失败。浏览器自动触发且应用不依赖的可选 `/favicon.ico` 失败会被忽略。
 
 Navigation failures 会在不打印私有 GUI origin 的情况下报告。
 

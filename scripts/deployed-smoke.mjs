@@ -189,7 +189,7 @@ export async function runDeployedSmoke({
 }
 
 async function runDirectApiSmoke({ config, fetchImpl }) {
-  const origin = config.guiUrl;
+  const origin = new URL(config.guiUrl).origin;
   const authHeaders = config.accessHeaders;
   const apiHeaders = { ...authHeaders, Origin: origin };
 
@@ -273,11 +273,6 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
   const launcher = browserLauncher ?? (await loadPlaywrightChromium());
   const cookies = await accessCookies({ config, fetchImpl });
   const failedResponses = [];
-  const appBootstrapUrls = [];
-  let resolveAppBootstrapResponse = () => {};
-  const appBootstrapResponse = new Promise((resolve) => {
-    resolveAppBootstrapResponse = resolve;
-  });
   let browser;
   try {
     browser = await launcher.launch({ headless: true });
@@ -290,16 +285,22 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
     const context = await browser.newContext();
     await context.addCookies(cookies);
     const page = await context.newPage();
+    const appBootstrapResponse = waitForBrowserAppBootstrapResponse(page, config.browserTimeoutMs);
     page.on("response", (response) => {
       const status = response.status();
       const url = response.url();
-      if (isBootstrapApiUrl(url)) {
-        appBootstrapUrls.push(url);
-        resolveAppBootstrapResponse();
-      }
       if (status >= 400 && !isOptionalBrowserFailure(url)) {
         failedResponses.push({ status, url: redactOrigin(url) });
       }
+    });
+    page.on("requestfailed", (request) => {
+      const url = request.url();
+      if (isOptionalBrowserFailure(url)) return;
+      failedResponses.push({
+        status: "requestfailed",
+        url: redactOrigin(url),
+        failure: browserRequestFailureText(request),
+      });
     });
     try {
       await page.goto(config.guiUrl, {
@@ -327,55 +328,10 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
     if (title !== "Chaop Control Plane") {
       throw new SmokeError(`Unexpected browser title: ${title}`);
     }
-    await waitForBrowserAppBootstrap(appBootstrapUrls, appBootstrapResponse, config.browserTimeoutMs);
-    const observedAppBootstrapUrls = [...appBootstrapUrls];
-    const bootstrap = await page.evaluate(async ({ apiBaseUrl, timeoutMs }) => {
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-      let response;
-      let contentType = "";
-      let body;
-      try {
-        response = await fetch(`${apiBaseUrl}/api/bootstrap`, {
-          credentials: "include",
-          signal: controller.signal,
-        });
-        contentType = response.headers.get("content-type") ?? "";
-        if (contentType.includes("application/json")) {
-          try {
-            body = await response.json();
-          } catch {
-            if (controller.signal.aborted) {
-              return { status: 0, contentType: "", hasWorkspaces: false, timedOut: true };
-            }
-            body = undefined;
-          }
-        }
-      } catch (error) {
-        if (controller.signal.aborted) {
-          return { status: 0, contentType: "", hasWorkspaces: false, timedOut: true };
-        }
-        throw error;
-      } finally {
-        window.clearTimeout(timeout);
-      }
-      return {
-        status: response.status,
-        contentType,
-        hasWorkspaces: Array.isArray(body?.workspaces),
-        timedOut: false,
-      };
-    }, { apiBaseUrl: config.apiBaseUrl, timeoutMs: config.browserTimeoutMs });
-    if (bootstrap.timedOut) {
-      throw new SmokeError("Browser bootstrap request timed out.", { timeout_ms: config.browserTimeoutMs });
-    }
-    if (bootstrap.status !== 200) {
-      throw new SmokeError(`Browser bootstrap request returned ${bootstrap.status}.`);
-    }
-    if (!bootstrap.contentType.includes("application/json") || !bootstrap.hasWorkspaces) {
-      throw new SmokeError("Browser bootstrap request did not return the expected API JSON.");
-    }
-    assertBrowserAppBootstrapOrigin(observedAppBootstrapUrls, config.apiBaseUrl);
+    const bootstrap = await assertBrowserAppBootstrapResponse(
+      await appBootstrapResponse,
+      config.apiBaseUrl,
+    );
     if (failedResponses.length > 0) {
       throw new SmokeError("Browser observed failed deployed responses.", { failedResponses });
     }
@@ -553,37 +509,60 @@ function isBootstrapApiUrl(value) {
   }
 }
 
-function assertBrowserAppBootstrapOrigin(urls, expectedApiBaseUrl) {
-  const expectedOrigin = new URL(expectedApiBaseUrl).origin;
-  if (urls.length === 0) {
-    throw new SmokeError("Browser app did not request bootstrap before the browser smoke timeout.");
-  }
-  if (!urls.every((value) => new URL(value).origin === expectedOrigin)) {
-    throw new SmokeError("Browser app bootstrap used an unexpected API origin.", {
-      expected: redactOrigin(`${expectedApiBaseUrl}/api/bootstrap`),
-      observed: urls.map(redactOrigin),
+async function waitForBrowserAppBootstrapResponse(page, timeoutMs) {
+  try {
+    return await page.waitForResponse((response) => isBootstrapApiUrl(response.url()), { timeout: timeoutMs });
+  } catch (error) {
+    throw new SmokeError("Browser app did not request bootstrap before the browser smoke timeout.", {
+      timeout_ms: timeoutMs,
+      cause: error instanceof Error ? error.name : "wait error",
     });
   }
 }
 
-async function waitForBrowserAppBootstrap(urls, appBootstrapResponse, timeoutMs) {
-  if (urls.length > 0) return;
-  let timeout;
-  try {
-    const observed = await Promise.race([
-      appBootstrapResponse.then(() => true),
-      new Promise((resolve) => {
-        timeout = setTimeout(() => resolve(false), timeoutMs);
-      }),
-    ]);
-    if (!observed && urls.length === 0) {
-      throw new SmokeError("Browser app did not request bootstrap before the browser smoke timeout.", {
-        timeout_ms: timeoutMs,
-      });
-    }
-  } finally {
-    clearTimeout(timeout);
+async function assertBrowserAppBootstrapResponse(response, expectedApiBaseUrl) {
+  assertBrowserAppBootstrapOrigin(response.url(), expectedApiBaseUrl);
+  const status = response.status();
+  if (status !== 200) {
+    throw new SmokeError(`Browser app bootstrap request returned ${status}.`);
   }
+
+  const contentType = await browserResponseHeader(response, "content-type");
+  let body;
+  if (contentType.includes("application/json")) {
+    try {
+      body = await response.json();
+    } catch {
+      body = undefined;
+    }
+  }
+  if (!contentType.includes("application/json") || !Array.isArray(body?.workspaces)) {
+    throw new SmokeError("Browser app bootstrap request did not return the expected API JSON.");
+  }
+  return { status };
+}
+
+function assertBrowserAppBootstrapOrigin(value, expectedApiBaseUrl) {
+  const expectedOrigin = new URL(expectedApiBaseUrl).origin;
+  if (new URL(value).origin !== expectedOrigin) {
+    throw new SmokeError("Browser app bootstrap used an unexpected API origin.", {
+      expected: redactOrigin(`${expectedApiBaseUrl}/api/bootstrap`),
+      observed: redactOrigin(value),
+    });
+  }
+}
+
+async function browserResponseHeader(response, name) {
+  if (typeof response.headerValue === "function") {
+    return (await response.headerValue(name)) ?? "";
+  }
+  const headers = typeof response.headers === "function" ? response.headers() : {};
+  return headers[name.toLowerCase()] ?? headers[name] ?? "";
+}
+
+function browserRequestFailureText(request) {
+  const failure = typeof request.failure === "function" ? request.failure() : undefined;
+  return failure?.errorText ?? "request failed";
 }
 
 export function analyseBudget(payload, options = {}) {
