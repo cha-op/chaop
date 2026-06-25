@@ -298,7 +298,7 @@ write_pid_metadata() {
   local agent_bin="$2"
   local run_token="$3"
   local started_at
-  started_at="$(wait_for_process_started_at "$pid" || true)"
+  started_at="$(wait_for_process_started_at "$pid")" || die "could not read connector process start time for pid $pid"
   {
     printf 'pid=%s\n' "$pid"
     printf 'run_token=%s\n' "$run_token"
@@ -316,9 +316,9 @@ pid_matches_metadata() {
   recorded_started_at="$(metadata_field started_at)" || return 1
   [[ "$recorded_pid" == "$pid" ]] || return 1
   [[ -n "$recorded_run_token" ]] || return 1
-  [[ -n "$recorded_started_at" ]] || return 0
+  [[ -n "$recorded_started_at" ]] || return 1
   current_started_at="$(process_started_at "$pid")"
-  [[ -n "$current_started_at" ]] || return 0
+  [[ -n "$current_started_at" ]] || return 1
   [[ "$current_started_at" == "$recorded_started_at" ]]
 }
 

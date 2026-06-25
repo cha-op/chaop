@@ -6,11 +6,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/chaop-dogfood-connector-test.XXXXXX")"
 CONFIG_FILE="$WORK_DIR/config/connector.toml"
 FAKE_AGENT="$WORK_DIR/bin/fake-chaop-agent"
+FAKE_PS="$WORK_DIR/bin/ps"
 STATE_DIR="$WORK_DIR/state"
 PID_FILE="$WORK_DIR/nested/pids/connector.pid"
 PID_META_FILE="$WORK_DIR/nested/pids/connector.pid.meta"
 LOG_FILE="$WORK_DIR/nested/logs/connector.log"
 FAKE_AGENT_STARTED_FILE="$WORK_DIR/agent-started.log"
+FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
+FAKE_PS_COMMAND="$FAKE_AGENT --config $CONFIG_FILE --connect"
 FOREIGN_PID=""
 
 cleanup() {
@@ -52,9 +55,34 @@ while true; do
   wait "$!"
 done
 AGENT
+cat > "$FAKE_PS" <<'PS'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-p" && "${3:-}" == "-o" ]]; then
+  case "${4:-}" in
+    lstart=)
+      printf '%s\n' "${FAKE_PS_LSTART:?}"
+      ;;
+    command=)
+      printf '%s\n' "${FAKE_PS_COMMAND:?}"
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
+
+exit 1
+PS
 chmod +x "$FAKE_AGENT"
+chmod +x "$FAKE_PS"
 touch "$FAKE_AGENT_STARTED_FILE"
 export FAKE_AGENT_STARTED_FILE
+export FAKE_PS_LSTART
+export FAKE_PS_COMMAND
+export PATH="$WORK_DIR/bin:$PATH"
 
 connector() {
   "$REPO_ROOT/scripts/dogfood-connector.sh" \
@@ -104,6 +132,28 @@ kill "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=""
 rm -f "$PID_FILE" "$PID_META_FILE"
 
+"$FAKE_AGENT" --config "$CONFIG_FILE" --connect &
+FOREIGN_PID="$!"
+printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
+{
+  printf 'pid=%s\n' "$FOREIGN_PID"
+  printf 'run_token=fake-token\n'
+  printf 'started_at=\n'
+  printf 'agent_bin=%s\n' "$FAKE_AGENT"
+  printf 'config=%s\n' "$CONFIG_FILE"
+} > "$PID_META_FILE"
+if connector stop >/dev/null 2>"$WORK_DIR/empty-started-at-stop.err"; then
+  printf 'expected stop to reject metadata without a process start time\n' >&2
+  exit 1
+fi
+if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
+  printf 'expected metadata-without-start-time pid %s to remain running\n' "$FOREIGN_PID" >&2
+  exit 1
+fi
+kill "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=""
+rm -f "$PID_FILE" "$PID_META_FILE"
+
 if "$REPO_ROOT/scripts/dogfood-connector.sh" \
   --config "$CONFIG_FILE" \
   --agent-bin "$FAKE_AGENT" \
@@ -117,7 +167,7 @@ if "$REPO_ROOT/scripts/dogfood-connector.sh" \
 fi
 
 started_count_after_collision="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
-if [[ "$started_count_after_collision" != "2" ]]; then
+if [[ "$started_count_after_collision" != "3" ]]; then
   printf 'expected path collision to avoid starting another connector\n' >&2
   exit 1
 fi
