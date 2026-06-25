@@ -161,6 +161,10 @@ normalise_paths() {
 ensure_state_dirs() {
   mkdir -p "$STATE_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")" "$(dirname "$PID_META_FILE")" "$(dirname "$LOG_FILE")"
   chmod 700 "$STATE_DIR" 2>/dev/null || true
+  touch "$LOG_FILE"
+}
+
+preflight_launch_files() {
   touch "$LOG_FILE" "$PID_FILE" "$PID_META_FILE"
   rm -f "$PID_FILE" "$PID_META_FILE"
 }
@@ -314,6 +318,10 @@ start_connector() {
     printf 'connector already running with pid %s\n' "$pid"
     return 0
   fi
+  if pid="$(pid_from_file)" && is_pid_running "$pid"; then
+    die "pid file points to a different running process; refusing to start another connector"
+  fi
+  preflight_launch_files
 
   local agent_bin
   agent_bin="$(ensure_agent_bin)"
