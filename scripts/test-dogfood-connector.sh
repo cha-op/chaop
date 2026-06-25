@@ -323,6 +323,16 @@ if [[ "${1:-}" == "-p" && "${3:-}" == "-o" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "-axo" && "${2:-}" == "pid=,ppid=" ]]; then
+  /bin/ps -axo pid=,ppid= 2>/dev/null
+  exit 0
+fi
+
+if [[ "${1:-}" == "-axo" && "${2:-}" == "pid=,pgid=" ]]; then
+  /bin/ps -axo pid=,pgid= 2>/dev/null
+  exit 0
+fi
+
 exit 1
 PS
 chmod +x "$FAKE_PS"
@@ -658,6 +668,40 @@ if pid_is_live_non_zombie "$force_stop_descendant_pid"; then
 fi
 if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
   printf 'expected force stop to remove pid state only after the pid exits\n' >&2
+  exit 1
+fi
+FAKE_AGENT_IGNORE_TERM=1
+FAKE_AGENT_CHILD_PID_FILE="$WORK_DIR/force-stop-fallback-child.pid"
+FAKE_AGENT_CHILD_IGNORE_TERM=0
+FAKE_AGENT_CHILD_OWN_PROCESS_GROUP=1
+FAKE_AGENT_DESCENDANT_PID_FILE="$WORK_DIR/force-stop-fallback-descendant.pid"
+FAKE_AGENT_DESCENDANT_IGNORE_TERM=1
+rm -f "$FAKE_AGENT_CHILD_PID_FILE" "$FAKE_AGENT_DESCENDANT_PID_FILE"
+export FAKE_AGENT_IGNORE_TERM
+export FAKE_AGENT_CHILD_PID_FILE
+export FAKE_AGENT_CHILD_IGNORE_TERM
+export FAKE_AGENT_CHILD_OWN_PROCESS_GROUP
+export FAKE_AGENT_DESCENDANT_PID_FILE
+export FAKE_AGENT_DESCENDANT_IGNORE_TERM
+connector start
+force_stop_fallback_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+force_stop_fallback_child_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_CHILD_PID_FILE")"
+force_stop_fallback_descendant_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_DESCENDANT_PID_FILE")"
+CHAOP_DOGFOOD_DISABLE_PGREP=1 CHAOP_DOGFOOD_STOP_TIMEOUT_SECONDS=0 connector stop --force
+if pid_is_live_non_zombie "$force_stop_fallback_pid"; then
+  printf 'expected fallback force-stopped pid %s to stop\n' "$force_stop_fallback_pid" >&2
+  exit 1
+fi
+if pid_is_live_non_zombie "$force_stop_fallback_child_pid"; then
+  printf 'expected fallback force-stopped child pid %s to stop\n' "$force_stop_fallback_child_pid" >&2
+  exit 1
+fi
+if pid_is_live_non_zombie "$force_stop_fallback_descendant_pid"; then
+  printf 'expected fallback force-stopped descendant pid %s to stop\n' "$force_stop_fallback_descendant_pid" >&2
+  exit 1
+fi
+if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
+  printf 'expected fallback force stop to remove pid state only after the pid exits\n' >&2
   exit 1
 fi
 FAKE_AGENT_IGNORE_TERM=0
@@ -1064,8 +1108,19 @@ done
 started_count_before_signal="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
 FAKE_PS_LSTART=""
 FAKE_AGENT_IGNORE_TERM=1
+FAKE_AGENT_CHILD_PID_FILE="$WORK_DIR/signalled-start-child.pid"
+FAKE_AGENT_CHILD_IGNORE_TERM=0
+FAKE_AGENT_CHILD_OWN_PROCESS_GROUP=1
+FAKE_AGENT_DESCENDANT_PID_FILE="$WORK_DIR/signalled-start-descendant.pid"
+FAKE_AGENT_DESCENDANT_IGNORE_TERM=1
+rm -f "$FAKE_AGENT_CHILD_PID_FILE" "$FAKE_AGENT_DESCENDANT_PID_FILE"
 export FAKE_PS_LSTART
 export FAKE_AGENT_IGNORE_TERM
+export FAKE_AGENT_CHILD_PID_FILE
+export FAKE_AGENT_CHILD_IGNORE_TERM
+export FAKE_AGENT_CHILD_OWN_PROCESS_GROUP
+export FAKE_AGENT_DESCENDANT_PID_FILE
+export FAKE_AGENT_DESCENDANT_IGNORE_TERM
 "$REPO_ROOT/scripts/dogfood-connector.sh" \
   --config "$CONFIG_FILE" \
   --agent-bin "$FAKE_AGENT" \
@@ -1097,8 +1152,18 @@ if [[ "$started_count_after_signal" != "$((started_count_before_signal + 1))" ]]
   exit 1
 fi
 signalled_child_pid="$(tail -n 1 "$FAKE_AGENT_STARTED_FILE" | awk '{print $1}')"
+signalled_start_child_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_CHILD_PID_FILE")"
+signalled_start_descendant_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_DESCENDANT_PID_FILE")"
 if pid_is_live_non_zombie "$signalled_child_pid"; then
   printf 'expected signal handler to stop child pid %s\n' "$signalled_child_pid" >&2
+  exit 1
+fi
+if pid_is_live_non_zombie "$signalled_start_child_pid"; then
+  printf 'expected signal handler to stop child process pid %s\n' "$signalled_start_child_pid" >&2
+  exit 1
+fi
+if pid_is_live_non_zombie "$signalled_start_descendant_pid"; then
+  printf 'expected signal handler to stop descendant pid %s\n' "$signalled_start_descendant_pid" >&2
   exit 1
 fi
 if [[ -e "$STATE_DIR/connector.lock" || -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
@@ -1107,14 +1172,35 @@ if [[ -e "$STATE_DIR/connector.lock" || -e "$PID_FILE" || -e "$PID_META_FILE" ]]
 fi
 FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
 FAKE_AGENT_IGNORE_TERM=0
+FAKE_AGENT_CHILD_PID_FILE=""
+FAKE_AGENT_CHILD_IGNORE_TERM=0
+FAKE_AGENT_CHILD_OWN_PROCESS_GROUP=0
+FAKE_AGENT_DESCENDANT_PID_FILE=""
+FAKE_AGENT_DESCENDANT_IGNORE_TERM=0
 export FAKE_PS_LSTART
 export FAKE_AGENT_IGNORE_TERM
+export FAKE_AGENT_CHILD_PID_FILE
+export FAKE_AGENT_CHILD_IGNORE_TERM
+export FAKE_AGENT_CHILD_OWN_PROCESS_GROUP
+export FAKE_AGENT_DESCENDANT_PID_FILE
+export FAKE_AGENT_DESCENDANT_IGNORE_TERM
 
 started_count_before_metadata_failure="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
 FAKE_PS_LSTART=""
 FAKE_AGENT_IGNORE_TERM=1
+FAKE_AGENT_CHILD_PID_FILE="$WORK_DIR/metadata-failure-child.pid"
+FAKE_AGENT_CHILD_IGNORE_TERM=0
+FAKE_AGENT_CHILD_OWN_PROCESS_GROUP=1
+FAKE_AGENT_DESCENDANT_PID_FILE="$WORK_DIR/metadata-failure-descendant.pid"
+FAKE_AGENT_DESCENDANT_IGNORE_TERM=1
+rm -f "$FAKE_AGENT_CHILD_PID_FILE" "$FAKE_AGENT_DESCENDANT_PID_FILE"
 export FAKE_PS_LSTART
 export FAKE_AGENT_IGNORE_TERM
+export FAKE_AGENT_CHILD_PID_FILE
+export FAKE_AGENT_CHILD_IGNORE_TERM
+export FAKE_AGENT_CHILD_OWN_PROCESS_GROUP
+export FAKE_AGENT_DESCENDANT_PID_FILE
+export FAKE_AGENT_DESCENDANT_IGNORE_TERM
 if connector start >/dev/null 2>"$WORK_DIR/metadata-failure-start.err"; then
   printf 'expected start to fail when process start time cannot be read\n' >&2
   exit 1
@@ -1125,8 +1211,18 @@ if [[ "$started_count_after_metadata_failure" != "$((started_count_before_metada
   exit 1
 fi
 metadata_failure_pid="$(tail -n 1 "$FAKE_AGENT_STARTED_FILE" | awk '{print $1}')"
+metadata_failure_child_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_CHILD_PID_FILE")"
+metadata_failure_descendant_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_DESCENDANT_PID_FILE")"
 if pid_is_live_non_zombie "$metadata_failure_pid"; then
   printf 'expected metadata-failure child pid %s to be stopped\n' "$metadata_failure_pid" >&2
+  exit 1
+fi
+if pid_is_live_non_zombie "$metadata_failure_child_pid"; then
+  printf 'expected metadata-failure child process pid %s to be stopped\n' "$metadata_failure_child_pid" >&2
+  exit 1
+fi
+if pid_is_live_non_zombie "$metadata_failure_descendant_pid"; then
+  printf 'expected metadata-failure descendant pid %s to be stopped\n' "$metadata_failure_descendant_pid" >&2
   exit 1
 fi
 if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
@@ -1135,7 +1231,17 @@ if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
 fi
 FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
 FAKE_AGENT_IGNORE_TERM=0
+FAKE_AGENT_CHILD_PID_FILE=""
+FAKE_AGENT_CHILD_IGNORE_TERM=0
+FAKE_AGENT_CHILD_OWN_PROCESS_GROUP=0
+FAKE_AGENT_DESCENDANT_PID_FILE=""
+FAKE_AGENT_DESCENDANT_IGNORE_TERM=0
 export FAKE_PS_LSTART
 export FAKE_AGENT_IGNORE_TERM
+export FAKE_AGENT_CHILD_PID_FILE
+export FAKE_AGENT_CHILD_IGNORE_TERM
+export FAKE_AGENT_CHILD_OWN_PROCESS_GROUP
+export FAKE_AGENT_DESCENDANT_PID_FILE
+export FAKE_AGENT_DESCENDANT_IGNORE_TERM
 
 printf 'dogfood connector script smoke passed\n'

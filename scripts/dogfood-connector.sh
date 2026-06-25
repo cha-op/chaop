@@ -562,13 +562,19 @@ pid_from_file() {
   [[ -f "$PID_FILE" ]] || return 1
   local pid
   pid="$(tr -d '[:space:]' < "$PID_FILE")"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  is_positive_pid "$pid" || return 1
   printf '%s\n' "$pid"
+}
+
+is_positive_pid() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$pid" -gt 0 ]] || return 1
 }
 
 is_pid_running() {
   local pid="$1"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  is_positive_pid "$pid" || return 1
   ps -p "$pid" >/dev/null 2>&1 || return 1
   ! is_pid_zombie "$pid"
 }
@@ -721,35 +727,52 @@ pid_matches_metadata() {
 
 stop_start_failure_child() {
   local pid="$1"
+  local child_pids
   local waited=0
+  child_pids="$(child_pids_of "$pid")"
+  signal_child_pid_list "$child_pids" TERM
   kill -TERM "$pid" 2>/dev/null || true
-  while is_pid_running "$pid"; do
+  while is_pid_running "$pid" || child_pid_list_has_running "$child_pids"; do
     if [[ "$waited" -ge "$START_FAILURE_STOP_TIMEOUT_SECONDS" ]]; then
+      signal_child_pid_list "$child_pids" KILL
       kill -KILL "$pid" 2>/dev/null || true
       break
     fi
     sleep 1
     waited=$((waited + 1))
   done
+  signal_child_pid_list "$child_pids" KILL
+  wait_for_child_pid_list_exit "$child_pids" || true
   wait "$pid" 2>/dev/null || true
+}
+
+has_pgrep() {
+  [[ "${CHAOP_DOGFOOD_DISABLE_PGREP:-0}" != "1" ]] || return 1
+  command -v pgrep >/dev/null 2>&1
 }
 
 child_pids_of() {
   local parent_pid="$1"
-  if command -v pgrep >/dev/null 2>&1; then
+  if has_pgrep; then
     pgrep -P "$parent_pid" 2>/dev/null || true
     return 0
   fi
-  ps -o pid= --ppid "$parent_pid" 2>/dev/null | awk '{ print $1 }' || true
+  if ps -o pid= --ppid "$parent_pid" 2>/dev/null | awk '{ print $1 }'; then
+    return 0
+  fi
+  ps -axo pid=,ppid= 2>/dev/null | awk -v parent_pid="$parent_pid" '$2 == parent_pid { print $1 }' || true
 }
 
 process_group_pids() {
   local group_id="$1"
-  if command -v pgrep >/dev/null 2>&1; then
+  if has_pgrep; then
     pgrep -g "$group_id" 2>/dev/null || true
     return 0
   fi
-  ps -o pid= -g "$group_id" 2>/dev/null | awk '{ print $1 }' || true
+  if ps -o pid= -g "$group_id" 2>/dev/null | awk '{ print $1 }'; then
+    return 0
+  fi
+  ps -axo pid=,pgid= 2>/dev/null | awk -v group_id="$group_id" '$2 == group_id { print $1 }' || true
 }
 
 signal_child_pid_list() {
@@ -757,7 +780,7 @@ signal_child_pid_list() {
   local signal_name="$2"
   local child_pid
   while IFS= read -r child_pid; do
-    [[ "$child_pid" =~ ^[0-9]+$ ]] || continue
+    is_positive_pid "$child_pid" || continue
     kill "-$signal_name" "-$child_pid" 2>/dev/null || true
     if is_pid_running "$child_pid"; then
       kill "-$signal_name" "$child_pid" 2>/dev/null || true
@@ -769,9 +792,9 @@ child_pid_list_has_running() {
   local child_pids="$1"
   local child_pid group_pid
   while IFS= read -r child_pid; do
-    [[ "$child_pid" =~ ^[0-9]+$ ]] || continue
+    is_positive_pid "$child_pid" || continue
     while IFS= read -r group_pid; do
-      [[ "$group_pid" =~ ^[0-9]+$ ]] || continue
+      is_positive_pid "$group_pid" || continue
       is_pid_running "$group_pid" && return 0
     done < <(process_group_pids "$child_pid")
     is_pid_running "$child_pid" && return 0
