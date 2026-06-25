@@ -144,6 +144,48 @@ describe("deployed smoke assets and cookies", () => {
     assert.equal(requested.includes("https://cdn.example.com/assets/index.js"), false);
   });
 
+  it("rejects HTML fallback responses for JavaScript assets", async () => {
+    const config = readConfig(smokeEnv());
+    const fetchImpl = async (url, init = {}) => {
+      if (init.headers?.["CF-Access-Client-Secret"] && init.redirect !== "manual") {
+        throw new Error("Access header fetch did not disable automatic redirects");
+      }
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse({ ok: true });
+      }
+      if (url === "https://api.example.com/api/bootstrap") {
+        return jsonResponse({ workspaces: [] });
+      }
+      if (url === "https://api.example.com/api/usage-summary") {
+        return jsonResponse(healthyBudget());
+      }
+      if (url === "https://app.example.com") {
+        return textResponse('<script type="module" src="/assets/missing.js"></script>');
+      }
+      if (url === "https://app.example.com/assets/missing.js") {
+        return textResponse("<!doctype html><title>Chaop</title>", {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        runDeployedSmoke({
+          config,
+          fetchImpl,
+          options: {
+            skipBrowser: true,
+            allowMissingTelemetry: false,
+            maxBottleneckUsedPct: 90,
+            maxD1RowsWrittenUsedPct: 80,
+          },
+        }),
+      /unexpected content type/,
+    );
+  });
+
   it("times out stalled direct requests", async () => {
     const config = readConfig({ ...smokeEnv(), CHAOP_SMOKE_BROWSER_TIMEOUT_MS: "5" });
     const fetchImpl = async (_url, init = {}) =>
@@ -219,7 +261,7 @@ describe("deployed smoke assets and cookies", () => {
         });
       }
       if (url === "https://app.example.com/assets/index.js") {
-        return textResponse("console.log('ok');");
+        return textResponse("console.log('ok');", { headers: { "content-type": "text/javascript" } });
       }
       throw new Error(`Unexpected request: ${url}`);
     };
@@ -264,7 +306,7 @@ describe("deployed smoke assets and cookies", () => {
         });
       }
       if (url === "https://app.example.com/assets/index.js") {
-        return textResponse("console.log('ok');");
+        return textResponse("console.log('ok');", { headers: { "content-type": "text/javascript" } });
       }
       throw new Error(`Unexpected request: ${url}`);
     };

@@ -214,10 +214,15 @@ async function runDirectSmoke({ config, fetchImpl }) {
     if (asset.status < 200 || asset.status >= 300) {
       throw new SmokeError(`Asset request failed: ${url}`, { status: asset.status });
     }
+    if (!assetContentTypeMatches(url, asset.contentType)) {
+      throw new SmokeError(`Asset returned an unexpected content type: ${url}`, {
+        content_type: asset.contentType || "missing",
+      });
+    }
     if (asset.body.length === 0) {
       throw new SmokeError(`Asset returned an empty body: ${url}`);
     }
-    assets.push({ url: redactOrigin(url), status: asset.status, bytes: asset.body.length });
+    assets.push({ url: redactOrigin(url), status: asset.status, bytes: asset.body.length, content_type: asset.contentType });
   }
 
   return {
@@ -433,10 +438,11 @@ async function fetchText(fetchImpl, url, init, timeoutMs) {
     response: incoming,
     body: await incoming.text(),
   }));
+  const contentType = response.headers.get("content-type") ?? "";
   if (response.status < 200 || response.status >= 300) {
     throw new SmokeError(`Request failed: ${redactOrigin(url)}`, { status: response.status });
   }
-  return { status: response.status, body };
+  return { status: response.status, body, contentType };
 }
 
 async function fetchWithinTimeout(fetchImpl, url, init, timeoutMs, readResponse) {
@@ -457,6 +463,14 @@ async function fetchWithinTimeout(fetchImpl, url, init, timeoutMs, readResponse)
 
 function noRedirect(init = {}) {
   return { ...init, redirect: "manual" };
+}
+
+function assetContentTypeMatches(url, contentType) {
+  const pathname = new URL(url).pathname.toLowerCase();
+  const normalised = contentType.toLowerCase().split(";")[0].trim();
+  if (pathname.endsWith(".css")) return normalised === "text/css";
+  if (pathname.endsWith(".js")) return normalised.includes("javascript") || normalised.includes("ecmascript");
+  return false;
 }
 
 function assertStatus(label, actual, expected) {

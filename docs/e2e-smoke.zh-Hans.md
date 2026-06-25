@@ -101,7 +101,7 @@ curl -fsS \
 - `/api/bootstrap` 在带允许的 GUI domain `Origin` header 时返回 `200` JSON。
 - `/api/usage-summary` 在 telemetry 已配置时返回 `200` JSON，并包含 sampled Cloudflare telemetry-backed constraints。若本地 usage windows 同时存在，顶层 `source` 可以仍然是 `d1_usage_windows`。
 - GUI index 返回 `200`。
-- index 引用的每个同源 JavaScript 和 CSS asset 都返回 `200`，并且 body 非空。off-origin assets 不会带 Cloudflare Access service-token headers 请求；direct smoke requests 会禁用自动重定向，所以同源 asset 不能通过重定向把这些 headers 带到其他 origin。
+- index 引用的每个同源 JavaScript 和 CSS asset 都返回 `200`、符合预期的 JavaScript 或 CSS content type，并且 body 非空。off-origin assets 不会带 Cloudflare Access service-token headers 请求；direct smoke requests 会禁用自动重定向，所以同源 asset 不能通过重定向把这些 headers 带到其他 origin。asset URL 返回 HTML SPA fallback 会被拒绝。
 
 ## Browser Smoke
 
