@@ -547,11 +547,21 @@ process_argv_matches() {
   fi
   local -a argv
   mapfile -t argv < <(tr '\0' '\n' < "/proc/$pid/cmdline")
-  [[ "${argv[0]:-}" == "$recorded_agent_bin" ]] || return 2
-  [[ "${argv[1]:-}" == "--config" ]] || return 2
-  [[ "${argv[2]:-}" == "$recorded_config" ]] || return 2
-  [[ "${argv[3]:-}" == "--connect" ]] || return 2
-  [[ "${#argv[@]}" -eq 4 ]] || return 2
+  [[ "${#argv[@]}" -gt 0 ]] || return 2
+  [[ "${argv[0]:-}" == "$recorded_agent_bin" ]] || return 1
+  [[ "${argv[1]:-}" == "--config" ]] || return 1
+  [[ "${argv[2]:-}" == "$recorded_config" ]] || return 1
+  [[ "${argv[3]:-}" == "--connect" ]] || return 1
+  [[ "${#argv[@]}" -eq 4 ]] || return 1
+}
+
+process_run_token_matches() {
+  local pid="$1"
+  local recorded_run_token="$2"
+  if [[ ! -r "/proc/$pid/environ" ]]; then
+    return 2
+  fi
+  tr '\0' '\n' < "/proc/$pid/environ" | grep -Fx "CHAOP_DOGFOOD_RUN_TOKEN=$recorded_run_token" >/dev/null
 }
 
 process_started_at() {
@@ -630,6 +640,13 @@ pid_matches_metadata() {
   current_started_at="$(process_started_at "$pid")"
   [[ -n "$current_started_at" ]] || return 1
   [[ "$current_started_at" == "$recorded_started_at" ]] || return 1
+  local token_status=0
+  if process_run_token_matches "$pid" "$recorded_run_token"; then
+    :
+  else
+    token_status=$?
+  fi
+  [[ "$token_status" -eq 0 || "$token_status" -eq 2 ]] || return 1
   local argv_status=0
   if process_argv_matches "$pid" "$recorded_agent_bin" "$recorded_config"; then
     return 0

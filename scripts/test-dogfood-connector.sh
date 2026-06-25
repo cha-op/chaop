@@ -334,7 +334,7 @@ if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
   printf 'expected foreign pid %s to remain running\n' "$FOREIGN_PID" >&2
   exit 1
 fi
-kill "$FOREIGN_PID" 2>/dev/null || true
+kill -KILL "$FOREIGN_PID" 2>/dev/null || true
 wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=""
 rm -f "$PID_FILE" "$PID_META_FILE"
@@ -439,6 +439,35 @@ fi
 kill "$FOREIGN_PID" 2>/dev/null || true
 wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=""
+FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
+export FAKE_PS_COMMAND
+rm -f "$PID_FILE" "$PID_META_FILE"
+
+if [[ -d "/proc" ]]; then
+  "$FAKE_AGENT" --config "$CONFIG_FILE" --connect &
+  FOREIGN_PID="$!"
+  printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
+  {
+    printf 'pid=%s\n' "$FOREIGN_PID"
+    printf 'run_token=fake-token\n'
+    printf 'started_at=%s\n' "$FAKE_PS_LSTART"
+    printf 'agent_bin=%s\n' "$RECORDED_FAKE_AGENT"
+    printf 'config=%s\n' "$RECORDED_CONFIG_FILE"
+  } > "$PID_META_FILE"
+  FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
+  export FAKE_PS_COMMAND
+  if connector stop >/dev/null 2>"$WORK_DIR/missing-token-stop.err"; then
+    printf 'expected stop to reject a command-line spoof without the wrapper run token\n' >&2
+    exit 1
+  fi
+  if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
+    printf 'expected missing-token pid %s to remain running\n' "$FOREIGN_PID" >&2
+    exit 1
+  fi
+  kill -KILL "$FOREIGN_PID" 2>/dev/null || true
+  wait "$FOREIGN_PID" 2>/dev/null || true
+  FOREIGN_PID=""
+fi
 FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
 export FAKE_PS_COMMAND
 rm -f "$PID_FILE" "$PID_META_FILE"
