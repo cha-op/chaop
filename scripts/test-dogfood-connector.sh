@@ -19,6 +19,7 @@ FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
 FAKE_PS_COMMAND=""
 FAKE_PS_KILL_ON_COMMAND=0
 FAKE_PS_KILL_ON_LSTART=0
+FAKE_PS_KILL_ON_LSTART_PID=""
 RECORDED_FAKE_AGENT=""
 RECORDED_CONFIG_FILE=""
 FOREIGN_PID=""
@@ -156,8 +157,10 @@ if [[ "${1:-}" == "-p" && "${3:-}" == "-o" ]]; then
     lstart=)
       printf '%s\n' "${FAKE_PS_LSTART:?}"
       if [[ "${FAKE_PS_KILL_ON_LSTART:-0}" == "1" ]]; then
-        kill -KILL "${2:?}" 2>/dev/null || true
-        sleep 0.2
+        if [[ -z "${FAKE_PS_KILL_ON_LSTART_PID:-}" || "${FAKE_PS_KILL_ON_LSTART_PID:-}" == "${2:?}" ]]; then
+          kill -KILL "${2:?}" 2>/dev/null || true
+          sleep 0.2
+        fi
       fi
       ;;
     command=)
@@ -191,6 +194,7 @@ export FAKE_PS_LSTART
 export FAKE_PS_COMMAND
 export FAKE_PS_KILL_ON_COMMAND
 export FAKE_PS_KILL_ON_LSTART
+export FAKE_PS_KILL_ON_LSTART_PID
 export FAKE_CARGO_TARGET_DIR
 export CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS=1
 export PATH="$WORK_DIR/bin:$PATH"
@@ -246,6 +250,41 @@ if kill -0 "$first_pid" 2>/dev/null; then
   exit 1
 fi
 
+sleep 30 &
+FOREIGN_PID="$!"
+printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
+{
+  printf 'pid=%s\n' "$FOREIGN_PID"
+  printf 'run_token=fake-token\n'
+  printf 'started_at=%s\n' "$FAKE_PS_LSTART"
+  printf 'agent_bin=%s\n' "$RECORDED_FAKE_AGENT"
+  printf 'config=%s\n' "$RECORDED_CONFIG_FILE"
+} > "$PID_META_FILE"
+FAKE_PS_COMMAND="sleep 30"
+export FAKE_PS_COMMAND
+started_count_before_reused_pid="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+connector start
+started_count_after_reused_pid="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_reused_pid" != "$((started_count_before_reused_pid + 1))" ]]; then
+  printf 'expected start to clear a stale pid file reused by a non-connector process\n' >&2
+  exit 1
+fi
+if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
+  printf 'expected reused foreign pid %s to remain running\n' "$FOREIGN_PID" >&2
+  exit 1
+fi
+kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=""
+FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
+export FAKE_PS_COMMAND
+reused_pid_connector_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+connector stop
+if kill -0 "$reused_pid_connector_pid" 2>/dev/null; then
+  printf 'expected reused-pid recovery connector pid %s to stop\n' "$reused_pid_connector_pid" >&2
+  exit 1
+fi
+
 mkdir -p "$STATE_DIR/connector.lock"
 printf '999999\n' > "$STATE_DIR/connector.lock/owner.pid"
 started_count_before_stale_lock="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
@@ -259,6 +298,32 @@ stale_lock_recovery_pid="$(tr -d '[:space:]' < "$PID_FILE")"
 connector stop
 if kill -0 "$stale_lock_recovery_pid" 2>/dev/null; then
   printf 'expected stale-lock-recovery pid %s to stop\n' "$stale_lock_recovery_pid" >&2
+  exit 1
+fi
+
+sleep 30 &
+FOREIGN_PID="$!"
+mkdir -p "$STATE_DIR/connector.lock"
+printf '%s\n' "$FOREIGN_PID" > "$STATE_DIR/connector.lock/owner.pid"
+printf 'Wed Jun 24 00:00:00 2026\n' > "$STATE_DIR/connector.lock/owner.started_at"
+started_count_before_reused_lock_owner="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+connector recover
+started_count_after_reused_lock_owner="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_reused_lock_owner" != "$((started_count_before_reused_lock_owner + 1))" ]]; then
+  printf 'expected recover to clear a stale lock whose owner pid was reused\n' >&2
+  exit 1
+fi
+if ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
+  printf 'expected reused lock owner pid %s to remain running\n' "$FOREIGN_PID" >&2
+  exit 1
+fi
+kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=""
+reused_lock_owner_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+connector stop
+if kill -0 "$reused_lock_owner_pid" 2>/dev/null; then
+  printf 'expected reused-lock-owner recovery pid %s to stop\n' "$reused_lock_owner_pid" >&2
   exit 1
 fi
 
@@ -300,13 +365,17 @@ export FAKE_AGENT_IGNORE_TERM
 connector start
 kill_race_pid="$(tr -d '[:space:]' < "$PID_FILE")"
 FAKE_PS_KILL_ON_LSTART=1
+FAKE_PS_KILL_ON_LSTART_PID="$kill_race_pid"
 export FAKE_PS_KILL_ON_LSTART
+export FAKE_PS_KILL_ON_LSTART_PID
 if ! connector stop >"$WORK_DIR/kill-race-stop.out" 2>"$WORK_DIR/kill-race-stop.err"; then
   printf 'expected stop to tolerate a connector exiting before TERM\n' >&2
   exit 1
 fi
 FAKE_PS_KILL_ON_LSTART=0
+FAKE_PS_KILL_ON_LSTART_PID=""
 export FAKE_PS_KILL_ON_LSTART
+export FAKE_PS_KILL_ON_LSTART_PID
 if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
   printf 'expected stop race cleanup to remove pid state\n' >&2
   exit 1

@@ -387,18 +387,21 @@ acquire_state_lock() {
   while true; do
     ensure_lock_dir_not_symlink
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-      if printf '%s\n' "$$" > "$LOCK_DIR/owner.pid"; then
+      if write_lock_owner; then
         LOCK_ACQUIRED=1
         chmod 700 "$LOCK_DIR" 2>/dev/null || true
         return 0
       fi
-      rm -f "$LOCK_DIR/owner.pid"
+      rm -f "$LOCK_DIR/owner.pid" "$LOCK_DIR/owner.started_at"
       rmdir "$LOCK_DIR" 2>/dev/null || true
     fi
-    if [[ "$waited" -gt 0 ]]; then
-      remove_stale_lock_dir 1
-    else
-      remove_stale_lock_dir 0
+    local remove_ownerless=0
+    local remove_unknown_owner=0
+    [[ "$waited" -gt 0 ]] && remove_ownerless=1
+    [[ "$waited" -ge "$LOCK_TIMEOUT_SECONDS" ]] && remove_unknown_owner=1
+    remove_stale_lock_dir "$remove_ownerless" "$remove_unknown_owner"
+    if [[ ! -e "$LOCK_DIR" ]]; then
+      continue
     fi
     if [[ "$waited" -ge "$LOCK_TIMEOUT_SECONDS" ]]; then
       die "could not acquire connector state lock: $LOCK_DIR"
@@ -408,17 +411,36 @@ acquire_state_lock() {
   done
 }
 
+write_lock_owner() {
+  local owner_started_at
+  owner_started_at="$(process_started_at "$$")" || true
+  printf '%s\n' "$$" > "$LOCK_DIR/owner.pid" || return 1
+  if [[ -n "$owner_started_at" ]]; then
+    printf '%s\n' "$owner_started_at" > "$LOCK_DIR/owner.started_at" || return 1
+  fi
+}
+
 remove_stale_lock_dir() {
   local remove_ownerless="${1:-0}"
+  local remove_unknown_owner="${2:-0}"
   local owner_file="$LOCK_DIR/owner.pid"
+  local owner_started_at_file="$LOCK_DIR/owner.started_at"
   local owner_pid=""
+  local owner_started_at=""
   ensure_lock_dir_not_symlink
   if [[ -f "$owner_file" ]]; then
     owner_pid="$(tr -d '[:space:]' < "$owner_file")"
     if is_pid_running "$owner_pid"; then
-      return 0
+      if [[ -f "$owner_started_at_file" ]]; then
+        owner_started_at="$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' "$owner_started_at_file")"
+        if [[ -n "$owner_started_at" && "$(process_started_at "$owner_pid")" == "$owner_started_at" ]]; then
+          return 0
+        fi
+      elif [[ "$remove_unknown_owner" -eq 0 ]]; then
+        return 0
+      fi
     fi
-    rm -f "$owner_file"
+    rm -f "$owner_file" "$owner_started_at_file"
     rmdir "$LOCK_DIR" 2>/dev/null || true
     return 0
   fi
@@ -429,7 +451,7 @@ remove_stale_lock_dir() {
 
 release_state_lock() {
   if [[ "$LOCK_ACQUIRED" -eq 1 ]]; then
-    rm -f "$LOCK_DIR/owner.pid"
+    rm -f "$LOCK_DIR/owner.pid" "$LOCK_DIR/owner.started_at"
     rmdir "$LOCK_DIR" 2>/dev/null || true
     LOCK_ACQUIRED=0
   fi
@@ -698,9 +720,17 @@ current_pid() {
 
 remove_stale_pid_file() {
   local pid
-  if pid="$(pid_from_file)" && ! is_pid_running "$pid"; then
-    rm -f "$PID_FILE" "$PID_META_FILE"
+  if ! pid="$(pid_from_file)"; then
+    return 0
   fi
+  if ! is_pid_running "$pid"; then
+    rm -f "$PID_FILE" "$PID_META_FILE"
+    return 0
+  fi
+  if pid_matches_connector "$pid" || pid_matches_connector_hint "$pid"; then
+    return 0
+  fi
+  rm -f "$PID_FILE" "$PID_META_FILE"
 }
 
 print_status() {
