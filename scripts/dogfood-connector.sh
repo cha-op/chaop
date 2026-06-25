@@ -591,7 +591,7 @@ process_command() {
       ps -ww -p "$pid" -o command= 2>/dev/null || true
       ;;
     *)
-      ps -p "$pid" -o command= 2>/dev/null || true
+      ps -ww -p "$pid" -o command= 2>/dev/null || ps -p "$pid" -o command= 2>/dev/null || true
       ;;
   esac
 }
@@ -943,12 +943,15 @@ run_once() {
   normalise_paths
   ensure_config
   ensure_state_dirs
-  remove_stale_pid_file
-  if current_pid >/dev/null; then
-    die "connector already running; stop it or use an isolated smoke config before running once"
-  fi
   local pid
-  if pid="$(pid_from_file)" && is_pid_running "$pid"; then
+  if pid="$(pid_from_file)"; then
+    if ! is_pid_running "$pid"; then
+      rm -f "$PID_FILE" "$PID_META_FILE"
+    else
+      die "pid file points to a running process; refusing to start one-shot connector"
+    fi
+  fi
+  if current_pid >/dev/null; then
     die "pid file points to a running process; refusing to start one-shot connector"
   fi
   local agent_bin

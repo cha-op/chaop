@@ -346,6 +346,15 @@ FOREIGN_PID="$!"
 printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
 rm -f "$PID_META_FILE"
 started_count_before_rejected_once_corrupt_meta="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if connector start >/dev/null 2>"$WORK_DIR/start-corrupt-meta.err"; then
+  printf 'expected start to reject a live connector-like pid with corrupt metadata\n' >&2
+  exit 1
+fi
+started_count_after_rejected_start_corrupt_meta="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_rejected_start_corrupt_meta" != "$started_count_before_rejected_once_corrupt_meta" ]]; then
+  printf 'expected rejected corrupt-metadata start to avoid starting another connector, got %s starts\n' "$started_count_after_rejected_start_corrupt_meta" >&2
+  exit 1
+fi
 if connector once >/dev/null 2>"$WORK_DIR/once-corrupt-meta.err"; then
   printf 'expected once to reject a live connector-like pid with corrupt metadata\n' >&2
   exit 1
