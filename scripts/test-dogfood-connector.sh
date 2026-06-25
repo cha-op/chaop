@@ -18,6 +18,7 @@ FAKE_AGENT_STARTED_FILE="$WORK_DIR/agent-started.log"
 FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
 FAKE_PS_COMMAND=""
 FAKE_PS_KILL_ON_COMMAND=0
+FAKE_PS_KILL_ON_LSTART=0
 RECORDED_FAKE_AGENT=""
 RECORDED_CONFIG_FILE=""
 FOREIGN_PID=""
@@ -145,10 +146,19 @@ if [[ "${1:-}" == "-ww" ]]; then
   shift
 fi
 
+if [[ "${1:-}" == "-p" && "$#" -eq 2 ]]; then
+  kill -0 "${2:?}" 2>/dev/null
+  exit $?
+fi
+
 if [[ "${1:-}" == "-p" && "${3:-}" == "-o" ]]; then
   case "${4:-}" in
     lstart=)
       printf '%s\n' "${FAKE_PS_LSTART:?}"
+      if [[ "${FAKE_PS_KILL_ON_LSTART:-0}" == "1" ]]; then
+        kill -KILL "${2:?}" 2>/dev/null || true
+        sleep 0.2
+      fi
       ;;
     command=)
       if [[ "$wide_output" -eq 1 ]]; then
@@ -180,6 +190,7 @@ export FAKE_AGENT_IGNORE_TERM=0
 export FAKE_PS_LSTART
 export FAKE_PS_COMMAND
 export FAKE_PS_KILL_ON_COMMAND
+export FAKE_PS_KILL_ON_LSTART
 export FAKE_CARGO_TARGET_DIR
 export CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS=1
 export PATH="$WORK_DIR/bin:$PATH"
@@ -270,16 +281,32 @@ if kill -0 "$concurrent_pid" 2>/dev/null; then
   exit 1
 fi
 
+FAKE_AGENT_IGNORE_TERM=1
+export FAKE_AGENT_IGNORE_TERM
+connector start
+force_stop_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+CHAOP_DOGFOOD_STOP_TIMEOUT_SECONDS=0 connector stop --force
+if kill -0 "$force_stop_pid" 2>/dev/null; then
+  printf 'expected force-stopped pid %s to stop\n' "$force_stop_pid" >&2
+  exit 1
+fi
+if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
+  printf 'expected force stop to remove pid state only after the pid exits\n' >&2
+  exit 1
+fi
+FAKE_AGENT_IGNORE_TERM=0
+export FAKE_AGENT_IGNORE_TERM
+
 connector start
 kill_race_pid="$(tr -d '[:space:]' < "$PID_FILE")"
-FAKE_PS_KILL_ON_COMMAND=1
-export FAKE_PS_KILL_ON_COMMAND
+FAKE_PS_KILL_ON_LSTART=1
+export FAKE_PS_KILL_ON_LSTART
 if ! connector stop >"$WORK_DIR/kill-race-stop.out" 2>"$WORK_DIR/kill-race-stop.err"; then
   printf 'expected stop to tolerate a connector exiting before TERM\n' >&2
   exit 1
 fi
-FAKE_PS_KILL_ON_COMMAND=0
-export FAKE_PS_KILL_ON_COMMAND
+FAKE_PS_KILL_ON_LSTART=0
+export FAKE_PS_KILL_ON_LSTART
 if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
   printf 'expected stop race cleanup to remove pid state\n' >&2
   exit 1

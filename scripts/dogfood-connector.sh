@@ -415,7 +415,7 @@ remove_stale_lock_dir() {
   ensure_lock_dir_not_symlink
   if [[ -f "$owner_file" ]]; then
     owner_pid="$(tr -d '[:space:]' < "$owner_file")"
-    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+    if is_pid_running "$owner_pid"; then
       return 0
     fi
     rm -f "$owner_file"
@@ -522,7 +522,8 @@ pid_from_file() {
 
 is_pid_running() {
   local pid="$1"
-  kill -0 "$pid" 2>/dev/null
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  ps -p "$pid" >/dev/null 2>&1
 }
 
 process_command() {
@@ -546,11 +547,11 @@ process_argv_matches() {
   fi
   local -a argv
   mapfile -t argv < <(tr '\0' '\n' < "/proc/$pid/cmdline")
-  [[ "${argv[0]:-}" == "$recorded_agent_bin" ]] || return 1
-  [[ "${argv[1]:-}" == "--config" ]] || return 1
-  [[ "${argv[2]:-}" == "$recorded_config" ]] || return 1
-  [[ "${argv[3]:-}" == "--connect" ]] || return 1
-  [[ "${#argv[@]}" -eq 4 ]] || return 1
+  [[ "${argv[0]:-}" == "$recorded_agent_bin" ]] || return 2
+  [[ "${argv[1]:-}" == "--config" ]] || return 2
+  [[ "${argv[2]:-}" == "$recorded_config" ]] || return 2
+  [[ "${argv[3]:-}" == "--connect" ]] || return 2
+  [[ "${#argv[@]}" -eq 4 ]] || return 2
 }
 
 process_started_at() {
@@ -790,6 +791,14 @@ stop_connector() {
       if [[ "$FORCE_STOP" -eq 1 ]]; then
         printf 'force killing connector pid %s after %s seconds\n' "$pid" "$STOP_TIMEOUT_SECONDS"
         kill -KILL "$pid" 2>/dev/null || true
+        local kill_waited=0
+        while is_pid_running "$pid"; do
+          if [[ "$kill_waited" -ge "$START_FAILURE_STOP_TIMEOUT_SECONDS" ]]; then
+            die "connector remained running after SIGKILL"
+          fi
+          sleep 1
+          kill_waited=$((kill_waited + 1))
+        done
         break
       fi
       die "connector did not stop after ${STOP_TIMEOUT_SECONDS}s; rerun stop --force if needed"
