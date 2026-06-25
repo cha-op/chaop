@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 COMMAND=""
 CONFIG_PATH="${CHAOP_AGENT_CONFIG:-${CHAOP_CONNECTOR_CONFIG:-}}"
 STATE_DIR="${CHAOP_DOGFOOD_STATE_DIR:-}"
@@ -513,7 +516,7 @@ ensure_config() {
 
 cargo_target_dir() {
   local metadata target_dir
-  metadata="$(cargo metadata --format-version 1 --no-deps 2>/dev/null)" || die "could not inspect Cargo target directory"
+  metadata="$(cd "$REPO_ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null)" || die "could not inspect Cargo target directory"
   if command -v node >/dev/null 2>&1; then
     target_dir="$(printf '%s' "$metadata" | node -e 'const fs = require("fs"); const input = fs.readFileSync(0, "utf8"); const metadata = JSON.parse(input); if (typeof metadata.target_directory !== "string" || metadata.target_directory.length === 0) process.exit(1); process.stdout.write(metadata.target_directory);')" || true
   else
@@ -537,13 +540,13 @@ ensure_agent_bin() {
     release)
       AGENT_BIN="$target_dir/release/chaop-agent"
       if [[ "$NO_BUILD" -eq 0 ]]; then
-        cargo build -p chaop-agent --release
+        (cd "$REPO_ROOT" && cargo build -p chaop-agent --release)
       fi
       ;;
     debug)
       AGENT_BIN="$target_dir/debug/chaop-agent"
       if [[ "$NO_BUILD" -eq 0 ]]; then
-        cargo build -p chaop-agent
+        (cd "$REPO_ROOT" && cargo build -p chaop-agent)
       fi
       ;;
     *)
@@ -731,6 +734,49 @@ stop_start_failure_child() {
   wait "$pid" 2>/dev/null || true
 }
 
+child_pids_of() {
+  local parent_pid="$1"
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -P "$parent_pid" 2>/dev/null || true
+    return 0
+  fi
+  ps -o pid= --ppid "$parent_pid" 2>/dev/null | awk '{ print $1 }' || true
+}
+
+signal_child_pid_list() {
+  local child_pids="$1"
+  local signal_name="$2"
+  local child_pid
+  while IFS= read -r child_pid; do
+    [[ "$child_pid" =~ ^[0-9]+$ ]] || continue
+    if is_pid_running "$child_pid"; then
+      kill "-$signal_name" "-$child_pid" 2>/dev/null || kill "-$signal_name" "$child_pid" 2>/dev/null || true
+    fi
+  done <<< "$child_pids"
+}
+
+child_pid_list_has_running() {
+  local child_pids="$1"
+  local child_pid
+  while IFS= read -r child_pid; do
+    [[ "$child_pid" =~ ^[0-9]+$ ]] || continue
+    is_pid_running "$child_pid" && return 0
+  done <<< "$child_pids"
+  return 1
+}
+
+wait_for_child_pid_list_exit() {
+  local child_pids="$1"
+  local waited=0
+  while child_pid_list_has_running "$child_pids"; do
+    if [[ "$waited" -ge "$START_FAILURE_STOP_TIMEOUT_SECONDS" ]]; then
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
 pid_matches_connector() {
   local pid="$1"
   pid_matches_metadata "$pid"
@@ -884,15 +930,21 @@ stop_connector() {
     if [[ "$waited" -ge "$STOP_TIMEOUT_SECONDS" ]]; then
       if [[ "$FORCE_STOP" -eq 1 ]]; then
         printf 'force killing connector pid %s after %s seconds\n' "$pid" "$STOP_TIMEOUT_SECONDS"
+        local child_pids
+        child_pids="$(child_pids_of "$pid")"
+        signal_child_pid_list "$child_pids" TERM
         kill -KILL "$pid" 2>/dev/null || true
         local kill_waited=0
         while is_pid_running "$pid"; do
           if [[ "$kill_waited" -ge "$START_FAILURE_STOP_TIMEOUT_SECONDS" ]]; then
+            signal_child_pid_list "$child_pids" KILL
             die "connector remained running after SIGKILL"
           fi
           sleep 1
           kill_waited=$((kill_waited + 1))
         done
+        signal_child_pid_list "$child_pids" KILL
+        wait_for_child_pid_list_exit "$child_pids" || die "connector child process remained running after SIGKILL"
         break
       fi
       die "connector did not stop after ${STOP_TIMEOUT_SECONDS}s; rerun stop --force if needed"

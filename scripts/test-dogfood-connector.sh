@@ -17,6 +17,7 @@ PID_FILE="$STATE_DIR/pids/connector.pid"
 PID_META_FILE="$STATE_DIR/pids/connector.pid.meta"
 LOG_FILE="$STATE_DIR/logs/connector.log"
 FAKE_AGENT_STARTED_FILE="$WORK_DIR/agent-started.log"
+FAKE_AGENT_CHILD_PID_FILE="$WORK_DIR/agent-child.pid"
 FAKE_PS_LSTART="Thu Jun 25 00:00:00 2026"
 FAKE_PS_COMMAND=""
 FAKE_PS_KILL_ON_COMMAND=0
@@ -43,6 +44,14 @@ cleanup() {
   if [[ -n "$ZOMBIE_PARENT_PID" ]] && kill -0 "$ZOMBIE_PARENT_PID" 2>/dev/null; then
     kill "$ZOMBIE_PARENT_PID" 2>/dev/null || true
     wait "$ZOMBIE_PARENT_PID" 2>/dev/null || true
+  fi
+  if [[ -f "$FAKE_AGENT_CHILD_PID_FILE" ]]; then
+    local child_pid
+    child_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_CHILD_PID_FILE")"
+    if [[ "$child_pid" =~ ^[0-9]+$ ]] && kill -0 "$child_pid" 2>/dev/null; then
+      kill -KILL "$child_pid" 2>/dev/null || true
+      wait "$child_pid" 2>/dev/null || true
+    fi
   fi
   rm -rf "$WORK_DIR"
 }
@@ -77,6 +86,10 @@ pid_is_live_non_zombie() {
     stat_line="$(< "/proc/$pid/stat")" || return 1
     stat_tail="${stat_line##*) }"
     [[ "${stat_tail%% *}" != "Z" ]] || return 1
+  else
+    local state
+    state="$(ps -p "$pid" -o stat= 2>/dev/null | awk 'NR == 1 { print substr($1, 1, 1) }')" || return 1
+    [[ "$state" != "Z" ]] || return 1
   fi
   return 0
 }
@@ -115,6 +128,31 @@ int main(int argc, char **argv) {
   if (strcmp(getenv("FAKE_AGENT_IGNORE_TERM") ? getenv("FAKE_AGENT_IGNORE_TERM") : "0", "1") == 0) {
     signal(SIGTERM, SIG_IGN);
     signal(SIGINT, SIG_IGN);
+  }
+
+  const char *child_pid_file = getenv("FAKE_AGENT_CHILD_PID_FILE");
+  if (child_pid_file != NULL && child_pid_file[0] != '\0') {
+    pid_t child = fork();
+    if (child < 0) {
+      perror("fork");
+      return 1;
+    }
+    if (child == 0) {
+      if (strcmp(getenv("FAKE_AGENT_CHILD_IGNORE_TERM") ? getenv("FAKE_AGENT_CHILD_IGNORE_TERM") : "0", "1") == 0) {
+        signal(SIGTERM, SIG_IGN);
+        signal(SIGINT, SIG_IGN);
+      }
+      for (;;) {
+        sleep(5);
+      }
+    }
+    FILE *child_file = fopen(child_pid_file, "w");
+    if (child_file == NULL) {
+      perror("fopen child pid");
+      return 1;
+    }
+    fprintf(child_file, "%ld\n", (long)child);
+    fclose(child_file);
   }
 
   const char *started_file = getenv("FAKE_AGENT_STARTED_FILE");
@@ -180,9 +218,17 @@ set -euo pipefail
 
 case "${1:-}" in
   metadata)
+    if [[ -n "${FAKE_CARGO_EXPECT_CWD:-}" && "$(pwd -P)" != "$FAKE_CARGO_EXPECT_CWD" ]]; then
+      printf 'expected fake cargo cwd %s, got %s\n' "$FAKE_CARGO_EXPECT_CWD" "$(pwd -P)" >&2
+      exit 1
+    fi
     printf '{"target_directory":"%s"}\n' "${FAKE_CARGO_TARGET_DIR:?}"
     ;;
   build)
+    if [[ -n "${FAKE_CARGO_EXPECT_CWD:-}" && "$(pwd -P)" != "$FAKE_CARGO_EXPECT_CWD" ]]; then
+      printf 'expected fake cargo cwd %s, got %s\n' "$FAKE_CARGO_EXPECT_CWD" "$(pwd -P)" >&2
+      exit 1
+    fi
     ;;
   *)
     printf 'unexpected fake cargo command: %s\n' "$*" >&2
@@ -228,6 +274,9 @@ if [[ "${1:-}" == "-p" && "${3:-}" == "-o" ]]; then
         sleep 0.2
       fi
       ;;
+    stat=)
+      /bin/ps -p "${2:?}" -o stat= 2>/dev/null
+      ;;
     *)
       exit 1
       ;;
@@ -243,6 +292,8 @@ RECORDED_FAKE_AGENT="$(resolve_test_path "$FAKE_AGENT")"
 RECORDED_CONFIG_FILE="$(resolve_test_path "$CONFIG_FILE")"
 FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
 export FAKE_AGENT_STARTED_FILE
+export FAKE_AGENT_CHILD_PID_FILE=""
+export FAKE_AGENT_CHILD_IGNORE_TERM=0
 export FAKE_AGENT_IGNORE_TERM=0
 export FAKE_PS_LSTART
 export FAKE_PS_COMMAND
@@ -250,6 +301,7 @@ export FAKE_PS_KILL_ON_COMMAND
 export FAKE_PS_KILL_ON_LSTART
 export FAKE_PS_KILL_ON_LSTART_PID
 export FAKE_CARGO_TARGET_DIR
+export FAKE_CARGO_EXPECT_CWD
 export CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS=1
 export PATH="$WORK_DIR/bin:$PATH"
 
@@ -292,7 +344,12 @@ connector() {
 }
 
 custom_target_output="$WORK_DIR/custom-target-doctor.out"
-if ! "$REPO_ROOT/scripts/dogfood-connector.sh" \
+FAKE_CARGO_EXPECT_CWD="$(resolve_test_path "$REPO_ROOT")"
+external_cwd="$WORK_DIR/external-cwd"
+mkdir -p "$external_cwd"
+if ! (
+  cd "$external_cwd"
+  "$REPO_ROOT/scripts/dogfood-connector.sh" \
   --config "$CONFIG_FILE" \
   --state-dir "$STATE_DIR" \
   --pid-file "$PID_FILE" \
@@ -300,10 +357,12 @@ if ! "$REPO_ROOT/scripts/dogfood-connector.sh" \
   --log-file "$LOG_FILE" \
   --no-build \
   --build-profile debug \
-  doctor > "$custom_target_output"; then
+    doctor > "$custom_target_output"
+); then
   printf 'expected doctor to use Cargo metadata target_directory when --agent-bin is omitted\n' >&2
   exit 1
 fi
+FAKE_CARGO_EXPECT_CWD=""
 if ! grep -q 'doctor ok' "$custom_target_output"; then
   printf 'expected custom target-dir doctor output, got:\n' >&2
   cat "$custom_target_output" >&2
@@ -526,12 +585,22 @@ if pid_is_live_non_zombie "$concurrent_pid"; then
 fi
 
 FAKE_AGENT_IGNORE_TERM=1
+FAKE_AGENT_CHILD_PID_FILE="$WORK_DIR/force-stop-child.pid"
+FAKE_AGENT_CHILD_IGNORE_TERM=1
+rm -f "$FAKE_AGENT_CHILD_PID_FILE"
 export FAKE_AGENT_IGNORE_TERM
+export FAKE_AGENT_CHILD_PID_FILE
+export FAKE_AGENT_CHILD_IGNORE_TERM
 connector start
 force_stop_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+force_stop_child_pid="$(tr -d '[:space:]' < "$FAKE_AGENT_CHILD_PID_FILE")"
 CHAOP_DOGFOOD_STOP_TIMEOUT_SECONDS=0 connector stop --force
 if pid_is_live_non_zombie "$force_stop_pid"; then
   printf 'expected force-stopped pid %s to stop\n' "$force_stop_pid" >&2
+  exit 1
+fi
+if pid_is_live_non_zombie "$force_stop_child_pid"; then
+  printf 'expected force-stopped child pid %s to stop\n' "$force_stop_child_pid" >&2
   exit 1
 fi
 if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
@@ -539,7 +608,11 @@ if [[ -e "$PID_FILE" || -e "$PID_META_FILE" ]]; then
   exit 1
 fi
 FAKE_AGENT_IGNORE_TERM=0
+FAKE_AGENT_CHILD_PID_FILE=""
+FAKE_AGENT_CHILD_IGNORE_TERM=0
 export FAKE_AGENT_IGNORE_TERM
+export FAKE_AGENT_CHILD_PID_FILE
+export FAKE_AGENT_CHILD_IGNORE_TERM
 
 connector start
 kill_race_pid="$(tr -d '[:space:]' < "$PID_FILE")"
