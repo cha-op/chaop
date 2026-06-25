@@ -350,6 +350,10 @@ ensure_no_state_file_symlinks() {
   ensure_state_file_not_symlink "$LOG_FILE"
 }
 
+ensure_lock_dir_not_symlink() {
+  [[ ! -L "$LOCK_DIR" ]] || die "state lock directory must not be a symlink: $LOCK_DIR"
+}
+
 ensure_state_safety() {
   local state_root
   state_root="$(ensure_state_root)"
@@ -381,6 +385,7 @@ acquire_state_lock() {
   ensure_private_state_dir "$(dirname "$LOCK_DIR")" "$state_root"
   local waited=0
   while true; do
+    ensure_lock_dir_not_symlink
     if mkdir "$LOCK_DIR" 2>/dev/null; then
       if printf '%s\n' "$$" > "$LOCK_DIR/owner.pid"; then
         LOCK_ACQUIRED=1
@@ -407,6 +412,7 @@ remove_stale_lock_dir() {
   local remove_ownerless="${1:-0}"
   local owner_file="$LOCK_DIR/owner.pid"
   local owner_pid=""
+  ensure_lock_dir_not_symlink
   if [[ -f "$owner_file" ]]; then
     owner_pid="$(tr -d '[:space:]' < "$owner_file")"
     if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then

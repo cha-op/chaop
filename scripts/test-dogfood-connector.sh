@@ -253,7 +253,7 @@ wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=""
 rm -f "$PID_FILE" "$PID_META_FILE"
 
-sleep 30 &
+"$FAKE_AGENT" --config "$CONFIG_FILE" --connect --spoofed &
 FOREIGN_PID="$!"
 printf '%s\n' "$FOREIGN_PID" > "$PID_FILE"
 {
@@ -439,6 +439,26 @@ if [[ "$started_count_after_lock_traversal" != "$started_count_before_lock_trave
   printf 'expected lock traversal rejection to avoid starting another connector\n' >&2
   exit 1
 fi
+
+lock_symlink_target_dir="$WORK_DIR/lock-symlink-target"
+mkdir -p "$lock_symlink_target_dir"
+printf '999999\n' > "$lock_symlink_target_dir/owner.pid"
+ln -s "$lock_symlink_target_dir" "$STATE_DIR/connector.lock"
+started_count_before_lock_symlink="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if CHAOP_DOGFOOD_LOCK_TIMEOUT_SECONDS=0 connector start >/dev/null 2>"$WORK_DIR/symlink-lock-path.err"; then
+  printf 'expected start to reject symlinked lock directory\n' >&2
+  exit 1
+fi
+if [[ ! -e "$lock_symlink_target_dir/owner.pid" ]]; then
+  printf 'expected symlinked lock rejection to preserve external owner.pid\n' >&2
+  exit 1
+fi
+started_count_after_lock_symlink="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_lock_symlink" != "$started_count_before_lock_symlink" ]]; then
+  printf 'expected symlinked lock rejection to avoid starting another connector\n' >&2
+  exit 1
+fi
+rm -f "$STATE_DIR/connector.lock"
 
 started_count_before_collision="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
 if "$REPO_ROOT/scripts/dogfood-connector.sh" \
