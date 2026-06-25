@@ -169,10 +169,14 @@ state_file_path_key() {
 
 state_file_identity() {
   local file_path="$1"
-  if stat -f '%d:%i' "$file_path" 2>/dev/null; then
-    return 0
-  fi
-  stat -c '%d:%i' "$file_path"
+  case "$(uname -s)" in
+    Darwin|FreeBSD|OpenBSD|NetBSD)
+      stat -f '%d:%i' "$file_path"
+      ;;
+    *)
+      stat -c '%d:%i' "$file_path"
+      ;;
+  esac
 }
 
 ensure_distinct_state_paths() {
