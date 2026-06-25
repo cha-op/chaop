@@ -31,6 +31,7 @@ superseded_by:
 - Direct bootstrap checks assert the response contains a `workspaces` array, so `--skip-browser` cannot pass on malformed bootstrap JSON.
 - Browser response checks ignore optional `/favicon.ico` failures, while continuing to fail on real GUI asset/API `4xx`/`5xx` responses and non-optional request failures without HTTP responses.
 - Browser navigation failures are wrapped in redacted `SmokeError` messages so private GUI origins are not printed.
+- The pending app-bootstrap response wait is consumed on early navigation or shell failures so the original smoke diagnostic is not followed by an unhandled rejection.
 - Browser smoke verifies the app shell's own `/api/bootstrap` response origin, status, and API JSON shape against the configured API origin, catching stale `VITE_CHAOP_API_BASE_URL` bundles.
 - App-server request deadline errors now keep the in-flight method name, avoiding suite-load-dependent timeout classification in the agent tests.
 - Asset checks validate JavaScript/CSS content types so Cloudflare Assets SPA fallback HTML cannot make a missing asset pass.
@@ -44,6 +45,6 @@ superseded_by:
 - Continue using the deployed smoke after API/Web deploys and after connector cost-control changes.
 
 ## Evidence
-- Local Node tests cover argument parsing, HTTPS origin validation, API Origin header derivation, API health service validation, bootstrap shape validation, browser navigation redaction, app API-origin validation, optional favicon filtering, request-failure detection, asset and cookie parsing, and budget gate pass/fail behaviour.
+- Local Node tests cover argument parsing, HTTPS origin validation, API Origin header derivation, API health service validation, bootstrap shape validation, browser navigation redaction without bootstrap-wait unhandled rejections, app API-origin validation, optional favicon filtering, request-failure detection, asset and cookie parsing, and budget gate pass/fail behaviour.
 - The app-server resume deadline regression is covered by the existing Rust agent test that checks unmatched resume responses time out by method.
 - Full local and deployed validation should be recorded in the PR readiness report before merge.

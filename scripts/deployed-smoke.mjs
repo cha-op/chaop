@@ -286,6 +286,8 @@ async function runBrowserSmoke({ config, fetchImpl, browserLauncher }) {
     await context.addCookies(cookies);
     const page = await context.newPage();
     const appBootstrapResponse = waitForBrowserAppBootstrapResponse(page, config.browserTimeoutMs);
+    // Early navigation or shell failures throw before this promise is awaited.
+    appBootstrapResponse.catch(() => {});
     page.on("response", (response) => {
       const status = response.status();
       const url = response.url();

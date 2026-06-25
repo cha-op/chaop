@@ -31,6 +31,7 @@ superseded_by:
 - direct bootstrap checks 会校验响应包含 `workspaces` 数组，避免 `--skip-browser` 在 malformed bootstrap JSON 上误判通过。
 - browser response checks 会忽略可选的 `/favicon.ico` 失败，但仍然会在真实 GUI asset/API `4xx`/`5xx` responses，以及没有 HTTP response 的非可选 request failure 上失败。
 - browser navigation failures 会被包装成已隐藏 origin 的 `SmokeError` messages，避免打印私有 GUI origin。
+- 早期 navigation 或 shell 失败时，pending app-bootstrap response wait 会被消费掉，避免原始 smoke diagnostic 后面跟着 unhandled rejection。
 - browser smoke 会用配置的 API origin 校验 app shell 自己发起的 `/api/bootstrap` response origin、status 和 API JSON shape，用于发现 stale `VITE_CHAOP_API_BASE_URL` bundle。
 - app-server request deadline errors 现在会保留正在等待的 method name，避免 agent tests 在 suite load 下出现不稳定的 timeout 分类。
 - asset checks 会校验 JavaScript/CSS content types，避免 Cloudflare Assets 的 SPA fallback HTML 让缺失 asset 误判通过。
@@ -44,6 +45,6 @@ superseded_by:
 - API/Web deploy 或 connector cost-control 变更后，继续使用 deployed smoke。
 
 ## 证据
-- 本地 Node tests 覆盖 argument parsing、HTTPS origin validation、API Origin header derivation、API health service validation、bootstrap shape validation、browser navigation redaction、app API-origin validation、optional favicon filtering、request-failure detection、asset 和 cookie parsing，以及 budget gate 的 pass/fail 行为。
+- 本地 Node tests 覆盖 argument parsing、HTTPS origin validation、API Origin header derivation、API health service validation、bootstrap shape validation、browser navigation redaction 且不会产生 bootstrap-wait unhandled rejection、app API-origin validation、optional favicon filtering、request-failure detection、asset 和 cookie parsing，以及 budget gate 的 pass/fail 行为。
 - 现有 Rust agent test 会覆盖 app-server resume deadline regression：不匹配的 resume response 应按 method timeout 收口。
 - 完整本地和 deployed validation 应在 merge 前记录到 PR readiness report。

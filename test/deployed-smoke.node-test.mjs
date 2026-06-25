@@ -526,30 +526,36 @@ describe("deployed smoke assets and cookies", () => {
       throw new Error(`Unexpected request: ${url}`);
     };
 
-    await assert.rejects(
+    const unhandledRejections = await collectUnhandledRejections(
       () =>
-        runDeployedSmoke({
-          config,
-          fetchImpl,
-          browserLauncher: fakeBrowserLauncher({
-            goto: async () => {
-              throw new Error("net::ERR_FAILED at https://app.example.com/");
-            },
-          }),
-          options: {
-            skipBrowser: false,
-            allowMissingTelemetry: false,
-            maxBottleneckUsedPct: 90,
-            maxD1RowsWrittenUsedPct: 80,
+        assert.rejects(
+          () =>
+            runDeployedSmoke({
+              config,
+              fetchImpl,
+              browserLauncher: fakeBrowserLauncher({
+                responses: [],
+                goto: async () => {
+                  throw new Error("net::ERR_FAILED at https://app.example.com/");
+                },
+              }),
+              options: {
+                skipBrowser: false,
+                allowMissingTelemetry: false,
+                maxBottleneckUsedPct: 90,
+                maxD1RowsWrittenUsedPct: 80,
+              },
+            }),
+          (error) => {
+            assert.match(error.message, /Browser navigation failed for the GUI origin/);
+            assert.doesNotMatch(error.message, /app\.example\.com/);
+            assert.doesNotMatch(JSON.stringify(error.details), /app\.example\.com/);
+            return true;
           },
-        }),
-      (error) => {
-        assert.match(error.message, /Browser navigation failed for the GUI origin/);
-        assert.doesNotMatch(error.message, /app\.example\.com/);
-        assert.doesNotMatch(JSON.stringify(error.details), /app\.example\.com/);
-        return true;
-      },
+        ),
+      20,
     );
+    assert.deepEqual(unhandledRejections, []);
   });
 
   it("fails when the deployed app uses a stale API origin", async () => {
@@ -1083,6 +1089,23 @@ async function rejectAfter(promise, timeoutMs, message) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function collectUnhandledRejections(callback, settleMs = 0) {
+  const rejections = [];
+  const onUnhandledRejection = (reason) => {
+    rejections.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    await callback();
+    if (settleMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, settleMs));
+    }
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+  }
+  return rejections;
 }
 
 function healthyBudget() {
