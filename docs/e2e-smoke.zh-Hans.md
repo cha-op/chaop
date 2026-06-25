@@ -6,13 +6,15 @@
 
 ## 范围
 
-默认 smoke 是只读验证：
+默认 smoke 会避免产品写操作：
 
 - 确认 Cloudflare Access service-token authentication 可用；
 - 确认 API Worker 对 `/api/health`、`/api/bootstrap` 和 `/api/usage-summary` 返回 JSON；
-- 确认 Web Worker 可以返回已部署的 HTML、JavaScript 和 CSS assets；
+- 确认 Web Worker 可以返回已部署的 HTML 和同源 JavaScript、CSS assets；
 - 确认真正的浏览器可以通过 Cloudflare Access cookies 打开生产 GUI；
 - 查看 Budget Board posture，但不创建 command、不刷新 Host Session inventory，也不 bootstrap usage windows。
+
+`/api/usage-summary` 检查仍可能触发 Worker 刷新 Cloudflare telemetry，并以 best-effort 方式写入一条 `budget_telemetry_samples` cache row。应把它视为低成本 smoke，而不是零写入 smoke。
 
 除非用户明确要求测试写路径，默认 smoke 不要执行这些动作：
 
@@ -34,6 +36,52 @@ CF_ACCESS_CLIENT_SECRET
 ```
 
 不要打印 service-token secret。总结结果时只输出 status code 和经过挑选的响应字段。
+已跟踪的 runner 会从 asset summary 和 asset failure messages 中隐藏部署 origin，只保留路径。
+GUI 和 API origins 必须使用 `https://`。runner 会在发送 Cloudflare Access service-token headers 前拒绝显式的 `http://` origin。
+
+## 已跟踪的 Runner
+
+普通部署验证使用已提交到仓库的低成本 runner：
+
+```bash
+pnpm install
+pnpm exec playwright install chromium
+
+set -a
+. path/to/deployment.env
+. path/to/cloudflare-access-smoke.env
+set +a
+
+pnpm smoke:deployed
+```
+
+如需 machine-readable output：
+
+```bash
+pnpm smoke:deployed -- --json
+```
+
+如果只做 API、asset 和 Budget Board 检查，不跑浏览器自动化：
+
+```bash
+pnpm smoke:deployed -- --skip-browser
+```
+
+runner 在这些情况下会让 smoke 失败：
+
+- API health、bootstrap、usage summary、GUI index 或被引用的 assets 失败；
+- 浏览器渲染失败，或浏览器观察到线上 `4xx`、`5xx` 或 request failure；
+- Budget Board state 是 `hard_limited` 或 `throttled`；
+- sampled hard budget bottleneck 缺失；
+- sampled Cloudflare telemetry-backed hard constraints 缺失；
+- 当前日 D1 rows-written 实测 activity 缺失；
+- bottleneck 或 daily D1 rows-written percentage 超过配置阈值。
+
+Budget Board gate 会在 `/api/usage-summary` 之后立即评估。若 gate 失败，runner 会在请求 GUI index、JavaScript/CSS assets 或启动 browser automation 之前停止，避免 hard limit 或 throttle 状态继续消耗额外部署请求。
+
+只有在已知 telemetry outage 或非 dogfood 环境里才使用 `--allow-missing-telemetry`。默认 dogfood gate 应要求 Cloudflare telemetry 可用，这样在更宽的测试前就能发现 cost posture regression。
+
+`CHAOP_SMOKE_BROWSER_TIMEOUT_MS` 同时控制 browser waits 和 direct deployed requests。direct API、index、asset 以及 Access cookie-exchange fetches 会禁用自动重定向并按 timeout 失败，而不是一直等到外层 CI timeout。
 
 ## API 和 Asset Smoke
 
@@ -54,10 +102,10 @@ curl -fsS \
 预期检查项：
 
 - `/api/health` 返回 `200` JSON，并包含 `ok: true` 和 `service: "chaop-api"`。
-- `/api/bootstrap` 在带允许的 GUI domain `Origin` header 时返回 `200` JSON。
-- `/api/usage-summary` 在 telemetry 已配置时返回 `200` JSON，并包含 `source: "cloudflare_analytics"`。
+- `/api/bootstrap` 在带允许的 GUI domain `Origin` header 时返回包含 `workspaces` 数组的 `200` JSON。即使使用 `--skip-browser`，也必须校验这个结构。
+- `/api/usage-summary` 在 telemetry 已配置时返回 `200` JSON，并包含 sampled Cloudflare telemetry-backed constraints。若本地 usage windows 同时存在，顶层 `source` 可以仍然是 `d1_usage_windows`。
 - GUI index 返回 `200`。
-- index 引用的每个 JavaScript 和 CSS asset 都返回 `200`，并且 body 非空。
+- index 引用的每个同源 JavaScript 和 CSS asset 都返回 `200`、符合预期的 JavaScript 或 CSS content type，并且 body 非空。off-origin assets 不会带 Cloudflare Access service-token headers 请求；direct smoke requests 会禁用自动重定向，所以同源 asset 不能通过重定向把这些 headers 带到其他 origin。asset URL 返回 HTML SPA fallback 会被拒绝。
 
 ## Browser Smoke
 
@@ -65,10 +113,10 @@ curl -fsS \
 
 改用这个流程：
 
-1. 带 service-token headers 请求 GUI domain，并捕获它返回的 `CF_Authorization` cookie。
-2. 带 service-token headers 请求 API domain，并捕获它返回的 `CF_Authorization` cookie。
+1. 带 service-token headers 请求 GUI domain，并捕获它返回的 `CF_Authorization` cookie 以及任何 Access binding cookie。
+2. 带 service-token headers 请求 API domain，并捕获它返回的 `CF_Authorization` cookie 以及任何 Access binding cookie。
 3. 启动不带 service-token headers 的 browser context。
-4. 把两个 `CF_Authorization` cookies 加到 browser context。
+4. 把这些 Access cookies 加到 browser context。
 5. 打开 GUI URL，并等待 app shell 渲染。
 
 预期 browser 检查项：
@@ -77,8 +125,11 @@ curl -fsS \
 - body 包含 `Operations Map`；
 - body 包含 `Budget Board`；
 - body 包含 `Host Sessions`；
-- `/api/bootstrap` 返回 `200`；
-- GUI HTML、静态 asset 和 API response 都没有返回 `4xx` 或 `5xx`。
+- app shell 自己发起的 `/api/bootstrap` response 使用配置的 API origin，返回 `200`，且包含带 `workspaces` 数组的 API JSON，用于发现 stale `VITE_CHAOP_API_BASE_URL` bundle；
+- GUI HTML、静态 asset 和 API response 都没有返回 `4xx` 或 `5xx`；
+- 非可选浏览器 request 不会在收到 HTTP response 前失败。浏览器自动触发且应用不依赖的可选 `/favicon.ico` 失败会被忽略。
+
+Navigation failures 会在不打印私有 GUI origin 的情况下报告。
 
 ## Budget Smoke
 

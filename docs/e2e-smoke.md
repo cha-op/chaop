@@ -6,13 +6,15 @@ This guide records the low-cost deployed smoke test for Chaop. It assumes deploy
 
 ## Scope
 
-The default smoke is read-only:
+The default smoke avoids product write actions:
 
 - confirm Cloudflare Access service-token authentication;
 - confirm the API Worker returns JSON for `/api/health`, `/api/bootstrap`, and `/api/usage-summary`;
-- confirm the Web Worker serves the deployed HTML, JavaScript, and CSS assets;
+- confirm the Web Worker serves the deployed HTML and same-origin JavaScript and CSS assets;
 - confirm a real browser can load the production GUI through Cloudflare Access cookies;
 - inspect Budget Board posture without creating commands, refreshing Host Session inventory, or bootstrapping usage windows.
+
+The `/api/usage-summary` check can still trigger the Worker to refresh Cloudflare telemetry and persist a best-effort `budget_telemetry_samples` cache row. Treat it as a low-cost smoke, not a zero-write smoke.
 
 Avoid these actions during the default smoke unless the user explicitly asks for a write-path test:
 
@@ -34,6 +36,52 @@ CF_ACCESS_CLIENT_SECRET
 ```
 
 Never print the service-token secret. When summarising results, print status codes and selected response fields only.
+The tracked runner redacts deployment origins from asset summaries and asset failure messages.
+The GUI and API origins must use `https://`. The runner rejects explicit `http://` origins before sending Cloudflare Access service-token headers.
+
+## Tracked Runner
+
+Use the tracked low-cost runner for ordinary deployment checks:
+
+```bash
+pnpm install
+pnpm exec playwright install chromium
+
+set -a
+. path/to/deployment.env
+. path/to/cloudflare-access-smoke.env
+set +a
+
+pnpm smoke:deployed
+```
+
+For machine-readable output:
+
+```bash
+pnpm smoke:deployed -- --json
+```
+
+For API, asset, and Budget Board checks without browser automation:
+
+```bash
+pnpm smoke:deployed -- --skip-browser
+```
+
+The runner fails the smoke when:
+
+- API health, bootstrap, usage summary, GUI index, or referenced assets fail;
+- browser rendering fails or the browser observes deployed `4xx`, `5xx`, or request failures;
+- Budget Board state is `hard_limited` or `throttled`;
+- the sampled hard budget bottleneck is missing;
+- sampled Cloudflare telemetry-backed hard constraints are missing;
+- measured current-day D1 rows-written activity is missing;
+- the bottleneck or daily D1 rows-written percentage exceeds the configured threshold.
+
+The Budget Board gate is evaluated immediately after `/api/usage-summary`. When it fails, the runner stops before requesting the GUI index, JavaScript/CSS assets, or browser automation, so a hard limit or throttle does not spend additional deployed requests.
+
+Use `--allow-missing-telemetry` only for a known telemetry outage or a non-dogfood environment. The default dogfood gate should require Cloudflare telemetry so cost posture regressions are caught before broader testing.
+
+`CHAOP_SMOKE_BROWSER_TIMEOUT_MS` controls both browser waits and direct deployed requests. Direct API, index, asset, and Access cookie-exchange fetches disable automatic redirects and time out instead of waiting for an outer CI timeout.
 
 ## API And Asset Smoke
 
@@ -54,10 +102,10 @@ curl -fsS \
 Expected checks:
 
 - `/api/health` returns `200` JSON with `ok: true` and `service: "chaop-api"`.
-- `/api/bootstrap` returns `200` JSON when sent with an allowed `Origin` header for the GUI domain.
-- `/api/usage-summary` returns `200` JSON with `source: "cloudflare_analytics"` when telemetry is configured.
+- `/api/bootstrap` returns `200` JSON with a `workspaces` array when sent with an allowed `Origin` header for the GUI domain. This shape is required even when `--skip-browser` is used.
+- `/api/usage-summary` returns `200` JSON with sampled Cloudflare telemetry-backed constraints when telemetry is configured. The top-level `source` can remain `d1_usage_windows` when local usage windows also exist.
 - The GUI index returns `200`.
-- Every JavaScript and CSS asset referenced by the index returns `200` and a non-zero body.
+- Every same-origin JavaScript and CSS asset referenced by the index returns `200`, the expected JavaScript or CSS content type, and a non-zero body. Off-origin assets are not fetched with Cloudflare Access service-token headers, and direct smoke requests disable automatic redirects so a same-origin asset cannot redirect those headers to another origin. HTML SPA fallback responses are rejected for asset URLs.
 
 ## Browser Smoke
 
@@ -65,10 +113,10 @@ Do not inject `CF-Access-Client-Id` and `CF-Access-Client-Secret` as browser ext
 
 Use this shape instead:
 
-1. Request the GUI domain with service-token headers and capture its `CF_Authorization` cookie.
-2. Request the API domain with service-token headers and capture its `CF_Authorization` cookie.
+1. Request the GUI domain with service-token headers and capture its `CF_Authorization` cookie plus any Access binding cookie.
+2. Request the API domain with service-token headers and capture its `CF_Authorization` cookie plus any Access binding cookie.
 3. Start a browser context without service-token headers.
-4. Add the two `CF_Authorization` cookies to the browser context.
+4. Add those Access cookies to the browser context.
 5. Open the GUI URL and wait for the app shell to render.
 
 Expected browser checks:
@@ -77,8 +125,11 @@ Expected browser checks:
 - the body contains `Operations Map`;
 - the body contains `Budget Board`;
 - the body contains `Host Sessions`;
-- `/api/bootstrap` returns `200`;
-- no GUI HTML, static asset, or API response returns `4xx` or `5xx`.
+- the app shell's own `/api/bootstrap` response uses the configured API origin, returns `200`, and contains API JSON with a `workspaces` array, catching stale `VITE_CHAOP_API_BASE_URL` bundles;
+- no GUI HTML, static asset, or API response returns `4xx` or `5xx`;
+- no non-optional browser request fails before an HTTP response. Browser-owned optional `/favicon.ico` failures are ignored because the app does not depend on that request.
+
+Navigation failures are reported without printing the private GUI origin.
 
 ## Budget Smoke
 

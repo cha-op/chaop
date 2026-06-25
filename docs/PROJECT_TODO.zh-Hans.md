@@ -29,4 +29,4 @@
 - [done] PR B：增加 Thread Centre chat MVP，支持 managed app-server threads、prompt submission、live progress 和 assistant final-answer rendering。
 - [done] PR C：为 Codex app-server turns 增加 human-in-the-loop approval/input handling。
 - [done] PR D：增加 persistent connector dogfood runbook 和用于 start、stop、observation、recovery 的 operational scripts。
-- [planned] PR E：强化 dogfood E2E 和 cost telemetry gates；只有再次出现无法解释的写入增长时，才加入精确 D1 write attribution。
+- [done] PR E：强化 dogfood E2E 和 cost telemetry gates；只有再次出现无法解释的写入增长时，才加入精确 D1 write attribution。
