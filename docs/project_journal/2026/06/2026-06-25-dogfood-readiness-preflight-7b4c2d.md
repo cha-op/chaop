@@ -15,9 +15,11 @@ superseded_by:
 # Connector And Budget Preflight
 
 ## Summary
-- PR G adds a passive readiness preflight to the Budget Board so an operator can check cost posture, connector capability, managed app-server availability, and the next safe action before daily dogfood work starts.
+- PR G adds a passive readiness preflight to the Budget Board so an operator can check cost posture, connector capability, app-server availability for the target workspace, and the next safe action before daily dogfood work starts.
 - The preflight derives its decision entirely from the existing bootstrap payload: `safety`, `budget`, `connectors`, and `app_server_instances`.
 - It does not add a Worker route, D1 write path, connector report, Host Session refresh, or background poll.
+- Review follow-up scopes readiness to the selected Thread Centre workspace, or the default workspace when no thread is selected, so another workspace cannot make the current dogfood path look ready.
+- Externally managed app-server listeners still count as ready when the connector reports the app-server thread and execution capabilities; the preflight tests the execution path, not the service-manager ownership model.
 
 ## Scope
 - Add a tested Web state helper that returns a compact `ready`, `attention`, or `blocked` preflight decision.
@@ -35,4 +37,4 @@ superseded_by:
 - `pnpm build` passed.
 - Local Playwright visual smoke passed for desktop, narrow desktop, breakpoint-edge, and mobile Budget Board rendering, with no horizontal overflow.
 - API and Web deployments were refreshed after the initial change; Web was refreshed again after review fixes.
-- `pnpm smoke:deployed` passed after the final Web refresh: direct API health/bootstrap/usage checks returned 200, browser bootstrap returned 200, Budget Board state was `normal`, source was `cloudflare_analytics`, and the bottleneck was D1 rows read / day at 10.8%.
+- `pnpm smoke:deployed` passed after the final Web refresh: direct API health/bootstrap/usage checks returned 200, browser bootstrap returned 200, Budget Board state was `normal`, source was `cloudflare_analytics`, and the bottleneck was D1 rows read / day at 11%.

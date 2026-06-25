@@ -1138,7 +1138,7 @@ export class ChaopApp extends LitElement {
     const generatedAt = budget.generated_at ?? this.data!.server_time;
     const windowSampleCount = budget.window_sample_count ?? windows.length;
     const constraintSampleCount = budget.constraint_sample_count ?? constraints.filter((constraint) => constraint.sampled).length;
-    const readiness = dogfoodReadinessPreflight(this.data);
+    const readiness = dogfoodReadinessPreflight(this.data, this.selectedThread()?.id);
     return html`
       ${this.renderDogfoodReadiness(readiness)}
       <section class="page-grid budget-grid">

@@ -475,7 +475,7 @@ test("dogfoodReadinessPreflight distinguishes busy and missing app-server report
   assert.equal(busy.state, "attention");
   assert.equal(busy.checks.find((check) => check.id === "app_server")?.detail, "1 healthy app-server instance with 2 active turns.");
   assert.equal(missing.state, "blocked");
-  assert.equal(missing.checks.find((check) => check.id === "app_server")?.detail, "No healthy app-server instance is reported by a workspace-linked managed connector.");
+  assert.equal(missing.checks.find((check) => check.id === "app_server")?.detail, "No healthy app-server instance is reported by a connector linked to workspace-api.");
 });
 
 test("dogfoodReadinessPreflight requires a workspace-linked managed connector", () => {
@@ -486,7 +486,7 @@ test("dogfoodReadinessPreflight requires a workspace-linked managed connector", 
 
   assert.equal(readiness.state, "blocked");
   assert.equal(readiness.next_action.href, "#host-sessions");
-  assert.equal(readiness.checks.find((check) => check.id === "connector")?.detail, "No online connector is linked to a workspace for managed dogfood.");
+  assert.equal(readiness.checks.find((check) => check.id === "connector")?.detail, "No online connector is linked to the target workspace for app-server dogfood.");
 });
 
 test("dogfoodReadinessPreflight does not borrow app-server health from an unrelated connector", () => {
@@ -501,7 +501,50 @@ test("dogfoodReadinessPreflight does not borrow app-server health from an unrela
 
   assert.equal(readiness.state, "blocked");
   assert.equal(readiness.checks.find((check) => check.id === "connector")?.state, "ready");
-  assert.equal(readiness.checks.find((check) => check.id === "app_server")?.detail, "No healthy app-server instance is reported by a workspace-linked managed connector.");
+  assert.equal(readiness.checks.find((check) => check.id === "app_server")?.detail, "No healthy app-server instance is reported by a connector linked to workspace-api.");
+});
+
+test("dogfoodReadinessPreflight scopes readiness to the target workspace", () => {
+  const data = payload({
+    workspaces: [
+      workspace("workspace-api", ["connector-a"]),
+      workspace("workspace-docs", ["connector-b"])
+    ],
+    threads: [
+      thread("thread-api", "workspace-api"),
+      thread("thread-docs", "workspace-docs")
+    ],
+    connectors: [
+      connector("connector-a", ["app_server_threads"]),
+      connector("connector-b", ["app_server_threads", "codex_app_server_exec"])
+    ],
+    app_server_instances: [appServerInstance("app-server-b", "healthy", "2026-06-12T10:01:00.000Z", "connector-b")]
+  });
+
+  const defaultWorkspace = dogfoodReadinessPreflight(data);
+  const selectedWorkspace = dogfoodReadinessPreflight(data, "thread-docs");
+
+  assert.equal(defaultWorkspace.state, "blocked");
+  assert.equal(defaultWorkspace.next_action.href, "#host-sessions");
+  assert.equal(defaultWorkspace.checks.find((check) => check.id === "connector")?.state, "attention");
+  assert.match(defaultWorkspace.checks.find((check) => check.id === "connector")?.detail ?? "", /workspace-api/);
+  assert.equal(selectedWorkspace.state, "ready");
+  assert.match(selectedWorkspace.checks.find((check) => check.id === "connector")?.detail ?? "", /workspace-docs/);
+});
+
+test("dogfoodReadinessPreflight accepts externally managed listeners with app-server capabilities", () => {
+  const externalInstance = {
+    ...appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a"),
+    endpoint_type: "external" as const
+  };
+  const readiness = dogfoodReadinessPreflight(payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [externalInstance]
+  }));
+
+  assert.equal(readiness.state, "ready");
+  assert.equal(readiness.checks.find((check) => check.id === "app_server")?.state, "ready");
 });
 
 test("mergeAppServerInstances applies connector snapshots without dropping incoming rows", () => {
