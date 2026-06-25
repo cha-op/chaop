@@ -7,6 +7,8 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/chaop-dogfood-connector-test.XXXXXX")"
 CONFIG_FILE="$WORK_DIR/config/connector.toml"
 FAKE_AGENT="$WORK_DIR/bin/fake-chaop-agent"
 FAKE_AGENT_SRC="$WORK_DIR/bin/fake-chaop-agent.c"
+ZOMBIE_HELPER="$WORK_DIR/bin/zombie-helper"
+ZOMBIE_HELPER_SRC="$WORK_DIR/bin/zombie-helper.c"
 FAKE_CARGO="$WORK_DIR/bin/cargo"
 FAKE_CARGO_TARGET_DIR="$WORK_DIR/custom-target"
 FAKE_PS="$WORK_DIR/bin/ps"
@@ -23,6 +25,7 @@ FAKE_PS_KILL_ON_LSTART_PID=""
 RECORDED_FAKE_AGENT=""
 RECORDED_CONFIG_FILE=""
 FOREIGN_PID=""
+ZOMBIE_PARENT_PID=""
 
 cleanup() {
   "$REPO_ROOT/scripts/dogfood-connector.sh" \
@@ -36,6 +39,10 @@ cleanup() {
   if [[ -n "$FOREIGN_PID" ]] && kill -0 "$FOREIGN_PID" 2>/dev/null; then
     kill "$FOREIGN_PID" 2>/dev/null || true
     wait "$FOREIGN_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$ZOMBIE_PARENT_PID" ]] && kill -0 "$ZOMBIE_PARENT_PID" 2>/dev/null; then
+    kill "$ZOMBIE_PARENT_PID" 2>/dev/null || true
+    wait "$ZOMBIE_PARENT_PID" 2>/dev/null || true
   fi
   rm -rf "$WORK_DIR"
 }
@@ -118,6 +125,33 @@ int main(int argc, char **argv) {
 }
 AGENT
 cc "$FAKE_AGENT_SRC" -o "$FAKE_AGENT"
+cat > "$ZOMBIE_HELPER_SRC" <<'ZOMBIE'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    return 2;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    return 3;
+  }
+  if (child == 0) {
+    _exit(0);
+  }
+  FILE *file = fopen(argv[1], "w");
+  if (file == NULL) {
+    return 4;
+  }
+  fprintf(file, "%ld\n", (long)child);
+  fclose(file);
+  sleep(30);
+  return 0;
+}
+ZOMBIE
+cc "$ZOMBIE_HELPER_SRC" -o "$ZOMBIE_HELPER"
 mkdir -p "$FAKE_CARGO_TARGET_DIR/debug"
 cp "$FAKE_AGENT" "$FAKE_CARGO_TARGET_DIR/debug/chaop-agent"
 cat > "$FAKE_CARGO" <<'CARGO'
@@ -283,6 +317,62 @@ connector stop
 if kill -0 "$reused_pid_connector_pid" 2>/dev/null; then
   printf 'expected reused-pid recovery connector pid %s to stop\n' "$reused_pid_connector_pid" >&2
   exit 1
+fi
+
+if [[ -d "/proc" ]]; then
+  zombie_pid_file="$WORK_DIR/zombie.pid"
+  "$ZOMBIE_HELPER" "$zombie_pid_file" &
+  ZOMBIE_PARENT_PID="$!"
+  for _ in {1..20}; do
+    if [[ -s "$zombie_pid_file" ]]; then
+      zombie_pid="$(tr -d '[:space:]' < "$zombie_pid_file")"
+      if [[ -r "/proc/$zombie_pid/stat" ]]; then
+        zombie_stat="$(< "/proc/$zombie_pid/stat")"
+        zombie_tail="${zombie_stat##*) }"
+        if [[ "${zombie_tail%% *}" == "Z" ]]; then
+          break
+        fi
+      fi
+    fi
+    sleep 0.1
+  done
+  zombie_pid="$(tr -d '[:space:]' < "$zombie_pid_file")"
+  if [[ ! -r "/proc/$zombie_pid/stat" ]]; then
+    printf 'expected zombie pid %s to exist for liveness test\n' "$zombie_pid" >&2
+    exit 1
+  fi
+  zombie_stat="$(< "/proc/$zombie_pid/stat")"
+  zombie_tail="${zombie_stat##*) }"
+  if [[ "${zombie_tail%% *}" != "Z" ]]; then
+    printf 'expected helper child pid %s to be a zombie, got state %s\n' "$zombie_pid" "${zombie_tail%% *}" >&2
+    exit 1
+  fi
+  printf '%s\n' "$zombie_pid" > "$PID_FILE"
+  {
+    printf 'pid=%s\n' "$zombie_pid"
+    printf 'run_token=fake-token\n'
+    printf 'started_at=%s\n' "$FAKE_PS_LSTART"
+    printf 'agent_bin=%s\n' "$RECORDED_FAKE_AGENT"
+    printf 'config=%s\n' "$RECORDED_CONFIG_FILE"
+  } > "$PID_META_FILE"
+  FAKE_PS_COMMAND="$RECORDED_FAKE_AGENT --config $RECORDED_CONFIG_FILE --connect"
+  export FAKE_PS_COMMAND
+  started_count_before_zombie_pid="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+  connector start
+  started_count_after_zombie_pid="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+  if [[ "$started_count_after_zombie_pid" != "$((started_count_before_zombie_pid + 1))" ]]; then
+    printf 'expected start to clear a stale pid file pointing at a zombie\n' >&2
+    exit 1
+  fi
+  zombie_recovery_connector_pid="$(tr -d '[:space:]' < "$PID_FILE")"
+  connector stop
+  if kill -0 "$zombie_recovery_connector_pid" 2>/dev/null; then
+    printf 'expected zombie-pid recovery connector pid %s to stop\n' "$zombie_recovery_connector_pid" >&2
+    exit 1
+  fi
+  kill "$ZOMBIE_PARENT_PID" 2>/dev/null || true
+  wait "$ZOMBIE_PARENT_PID" 2>/dev/null || true
+  ZOMBIE_PARENT_PID=""
 fi
 
 mkdir -p "$STATE_DIR/connector.lock"

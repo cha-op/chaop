@@ -545,7 +545,22 @@ pid_from_file() {
 is_pid_running() {
   local pid="$1"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  ps -p "$pid" >/dev/null 2>&1
+  ps -p "$pid" >/dev/null 2>&1 || return 1
+  ! is_pid_zombie "$pid"
+}
+
+is_pid_zombie() {
+  local pid="$1"
+  local state=""
+  if [[ -r "/proc/$pid/stat" ]]; then
+    local stat_line stat_tail
+    stat_line="$(< "/proc/$pid/stat")" || return 1
+    stat_tail="${stat_line##*) }"
+    state="${stat_tail%% *}"
+  else
+    state="$(ps -p "$pid" -o stat= 2>/dev/null | awk 'NR == 1 { print substr($1, 1, 1) }')" || return 1
+  fi
+  [[ "$state" == "Z" ]]
 }
 
 process_command() {
