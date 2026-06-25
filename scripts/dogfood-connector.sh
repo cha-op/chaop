@@ -639,9 +639,25 @@ process_run_token_matches() {
   tr '\0' '\n' < "/proc/$pid/environ" | grep -Fx "CHAOP_DOGFOOD_RUN_TOKEN=$recorded_run_token" >/dev/null
 }
 
+process_run_token_value() {
+  local pid="$1"
+  [[ -r "/proc/$pid/environ" ]] || return 2
+  tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^CHAOP_DOGFOOD_RUN_TOKEN=//p' | sed -n '1p'
+}
+
 process_started_at() {
   local pid="$1"
-  ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
+  if [[ "${CHAOP_DOGFOOD_FORCE_PS_LSTART:-0}" != "1" && -r "/proc/$pid/stat" ]]; then
+    local stat_line stat_tail start_ticks
+    stat_line="$(< "/proc/$pid/stat")" || return 1
+    stat_tail="${stat_line##*) }"
+    start_ticks="$(awk '{ print $20 }' <<< "$stat_tail")"
+    if [[ "$start_ticks" =~ ^[0-9]+$ ]]; then
+      printf 'proc:%s\n' "$start_ticks"
+      return 0
+    fi
+  fi
+  TZ=UTC LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
 }
 
 wait_for_process_started_at() {
@@ -837,6 +853,24 @@ pid_matches_connector_hint() {
   fi
 }
 
+recover_pid_metadata_from_hint() {
+  local pid="$1"
+  local command_line suffix recovered_agent_bin recovered_run_token token_status=0
+  command_line="$(process_command "$pid")"
+  suffix=" --config $CONFIG_PATH --connect"
+  [[ "$command_line" == *"$suffix" ]] || return 1
+  recovered_agent_bin="${command_line%"$suffix"}"
+  [[ -n "$recovered_agent_bin" ]] || return 1
+  if recovered_run_token="$(process_run_token_value "$pid")"; then
+    [[ -n "$recovered_run_token" ]] || return 1
+  else
+    token_status=$?
+    [[ "$token_status" -eq 2 ]] || return 1
+    recovered_run_token="recovered-$(new_run_token)"
+  fi
+  write_pid_metadata "$pid" "$recovered_agent_bin" "$recovered_run_token"
+}
+
 current_pid() {
   local pid
   pid="$(pid_from_file)" || return 1
@@ -1005,12 +1039,19 @@ stop_connector() {
 
 recover_connector() {
   normalise_paths
+  ensure_config
   ensure_state_safety
   if current_pid >/dev/null; then
     print_status
     return 0
   fi
   remove_stale_pid_file
+  local pid
+  if pid="$(pid_from_file)" && is_pid_running "$pid" && pid_matches_connector_hint "$pid"; then
+    recover_pid_metadata_from_hint "$pid" || true
+    printf 'connector already running with pid %s\n' "$pid"
+    return 0
+  fi
   start_connector
 }
 

@@ -355,6 +355,7 @@ export FAKE_PS_KILL_ON_LSTART_PID
 export FAKE_CARGO_TARGET_DIR
 export FAKE_CARGO_EXPECT_CWD
 export CHAOP_DOGFOOD_START_FAILURE_STOP_TIMEOUT_SECONDS=1
+export CHAOP_DOGFOOD_FORCE_PS_LSTART=1
 export PATH="$WORK_DIR/bin:$PATH"
 
 if ! env -u HOME -u XDG_STATE_HOME "$REPO_ROOT/scripts/dogfood-connector.sh" --help >/dev/null; then
@@ -526,6 +527,58 @@ kill -KILL "$FOREIGN_PID" 2>/dev/null || true
 wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=""
 rm -f "$PID_FILE" "$PID_META_FILE"
+
+relative_state_dir="$WORK_DIR/relative-state"
+relative_pid_file="$relative_state_dir/pids/connector.pid"
+relative_pid_meta_file="$relative_state_dir/pids/connector.pid.meta"
+relative_log_file="$relative_state_dir/logs/connector.log"
+started_count_before_relative_recover="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+(
+  cd "$WORK_DIR"
+  "$REPO_ROOT/scripts/dogfood-connector.sh" \
+    --config ./config/connector.toml \
+    --agent-bin "$FAKE_AGENT" \
+    --state-dir "$relative_state_dir" \
+    --pid-file "$relative_pid_file" \
+    --pid-meta-file "$relative_pid_meta_file" \
+    --log-file "$relative_log_file" \
+    start
+)
+relative_recover_pid="$(tr -d '[:space:]' < "$relative_pid_file")"
+rm -f "$relative_pid_meta_file"
+(
+  cd "$WORK_DIR"
+  "$REPO_ROOT/scripts/dogfood-connector.sh" \
+    --config ./config/connector.toml \
+    --agent-bin "$FAKE_AGENT" \
+    --state-dir "$relative_state_dir" \
+    --pid-file "$relative_pid_file" \
+    --pid-meta-file "$relative_pid_meta_file" \
+    --log-file "$relative_log_file" \
+    recover
+) >/dev/null
+started_count_after_relative_recover="$(wc -l < "$FAKE_AGENT_STARTED_FILE" | tr -d '[:space:]')"
+if [[ "$started_count_after_relative_recover" != "$((started_count_before_relative_recover + 1))" ]]; then
+  printf 'expected relative-config recover to preserve the running connector, got %s starts\n' "$started_count_after_relative_recover" >&2
+  exit 1
+fi
+relative_recovered_pid="$(tr -d '[:space:]' < "$relative_pid_file")"
+if [[ "$relative_recovered_pid" != "$relative_recover_pid" ]]; then
+  printf 'expected relative-config recover to keep pid %s, got %s\n' "$relative_recover_pid" "$relative_recovered_pid" >&2
+  exit 1
+fi
+"$REPO_ROOT/scripts/dogfood-connector.sh" \
+  --config "$CONFIG_FILE" \
+  --agent-bin "$FAKE_AGENT" \
+  --state-dir "$relative_state_dir" \
+  --pid-file "$relative_pid_file" \
+  --pid-meta-file "$relative_pid_meta_file" \
+  --log-file "$relative_log_file" \
+  stop
+if pid_is_live_non_zombie "$relative_recover_pid"; then
+  printf 'expected relative-config recovery pid %s to stop\n' "$relative_recover_pid" >&2
+  exit 1
+fi
 
 sleep 30 &
 FOREIGN_PID="$!"
