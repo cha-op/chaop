@@ -37,6 +37,7 @@ CF_ACCESS_CLIENT_SECRET
 
 Never print the service-token secret. When summarising results, print status codes and selected response fields only.
 The tracked runner redacts deployment origins from asset summaries and asset failure messages.
+The GUI and API origins must use `https://`. The runner rejects explicit `http://` origins before sending Cloudflare Access service-token headers.
 
 ## Tracked Runner
 

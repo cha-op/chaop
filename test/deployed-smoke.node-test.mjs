@@ -52,6 +52,26 @@ describe("deployed smoke config", () => {
     assert.equal(config.apiBaseUrl, "https://api.example.com");
     assert.equal(config.accessHeaders["CF-Access-Client-Id"], "client-id");
   });
+
+  it("rejects non-HTTPS deployed origins", () => {
+    assert.throws(
+      () =>
+        readConfig({
+          ...smokeEnv(),
+          CHAOP_GUI_DOMAIN: "http://app.example.com",
+        }),
+      /CHAOP_GUI_DOMAIN must use https:\/\//,
+    );
+
+    assert.throws(
+      () =>
+        readConfig({
+          ...smokeEnv(),
+          VITE_CHAOP_API_BASE_URL: "http://api.example.com/",
+        }),
+      /VITE_CHAOP_API_BASE_URL must use https:\/\//,
+    );
+  });
 });
 
 describe("deployed smoke assets and cookies", () => {
@@ -128,6 +148,34 @@ describe("deployed smoke assets and cookies", () => {
     ]);
   });
 
+  it("rejects API health responses from the wrong service", async () => {
+    const config = readConfig(smokeEnv());
+    const requested = [];
+    const fetchImpl = async (url) => {
+      requested.push(url);
+      if (url === "https://api.example.com/api/health") {
+        return jsonResponse({ ok: true, service: "wrong-api" });
+      }
+      throw new Error(`Unexpected request after health failure: ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        runDeployedSmoke({
+          config,
+          fetchImpl,
+          options: {
+            skipBrowser: true,
+            allowMissingTelemetry: false,
+            maxBottleneckUsedPct: 90,
+            maxD1RowsWrittenUsedPct: 80,
+          },
+        }),
+      /API health service/,
+    );
+    assert.deepEqual(requested, ["https://api.example.com/api/health"]);
+  });
+
   it("does not automatically follow asset redirects with Access headers", async () => {
     const config = readConfig(smokeEnv());
     const requested = [];
@@ -137,7 +185,7 @@ describe("deployed smoke assets and cookies", () => {
         throw new Error("Access header fetch did not disable automatic redirects");
       }
       if (url === "https://api.example.com/api/health") {
-        return jsonResponse({ ok: true });
+        return jsonResponse(healthBody());
       }
       if (url === "https://api.example.com/api/bootstrap") {
         return jsonResponse({ workspaces: [] });
@@ -181,7 +229,7 @@ describe("deployed smoke assets and cookies", () => {
         throw new Error("Access header fetch did not disable automatic redirects");
       }
       if (url === "https://api.example.com/api/health") {
-        return jsonResponse({ ok: true });
+        return jsonResponse(healthBody());
       }
       if (url === "https://api.example.com/api/bootstrap") {
         return jsonResponse({ workspaces: [] });
@@ -282,7 +330,7 @@ describe("deployed smoke assets and cookies", () => {
         throw new Error("Access header fetch did not disable automatic redirects");
       }
       if (url === "https://api.example.com/api/health") {
-        return jsonResponse({ ok: true }, { headers: { "set-cookie": "CF_Authorization=api-token; Path=/" } });
+        return jsonResponse(healthBody(), { headers: { "set-cookie": "CF_Authorization=api-token; Path=/" } });
       }
       if (url === "https://api.example.com/api/bootstrap") {
         return jsonResponse({ workspaces: [] });
@@ -327,7 +375,7 @@ describe("deployed smoke assets and cookies", () => {
         throw new Error("Access header fetch did not disable automatic redirects");
       }
       if (url === "https://api.example.com/api/health") {
-        return jsonResponse({ ok: true }, { headers: { "set-cookie": "CF_Authorization=api-token; Path=/" } });
+        return jsonResponse(healthBody(), { headers: { "set-cookie": "CF_Authorization=api-token; Path=/" } });
       }
       if (url === "https://api.example.com/api/bootstrap") {
         return jsonResponse({ workspaces: [] });
@@ -384,7 +432,7 @@ describe("deployed smoke budget gate", () => {
         throw new Error("Access header fetch did not disable automatic redirects");
       }
       if (url === "https://api.example.com/api/health") {
-        return jsonResponse({ ok: true });
+        return jsonResponse(healthBody());
       }
       if (url === "https://api.example.com/api/bootstrap") {
         return jsonResponse({ workspaces: [] });
@@ -591,6 +639,13 @@ function smokeEnv() {
     VITE_CHAOP_API_BASE_URL: "https://api.example.com/",
     CF_ACCESS_CLIENT_ID: "client-id",
     CF_ACCESS_CLIENT_SECRET: "client-secret",
+  };
+}
+
+function healthBody() {
+  return {
+    ok: true,
+    service: "chaop-api",
   };
 }
 

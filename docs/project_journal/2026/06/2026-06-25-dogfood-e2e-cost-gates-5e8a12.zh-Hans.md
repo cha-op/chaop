@@ -1,6 +1,6 @@
 ---
 id: 20260625-5e8a12-zh-Hans
-title: Dogfood E2E Cost Gates
+title: Dogfood E2E 成本门禁
 status: completed
 created: 2026-06-25
 updated: 2026-06-25
@@ -12,7 +12,7 @@ superseded_by:
 
 [ [British English](2026-06-25-dogfood-e2e-cost-gates-5e8a12.md) | 简体中文 ]
 
-# Dogfood E2E Cost Gates
+# Dogfood E2E 成本门禁
 
 ## 摘要
 - PR E 把 deployed smoke workflow 从临时 runner 固化为已跟踪的低成本脚本。
@@ -25,6 +25,9 @@ superseded_by:
 - 浏览器路径会在 Cloudflare 返回 Access binding cookies 时和 `CF_Authorization` 一起保留。
 - direct service-token fetches 会禁用自动重定向，避免同源 asset check 把 Access headers 泄露给 off-origin redirect target。
 - direct API、asset、Access cookie-exchange 和 browser bootstrap fetches 都有 smoke-level timeout，避免部署检查卡住。
+- runner 会在发送 Cloudflare Access service-token headers 前拒绝显式的 `http://` GUI 或 API origin。
+- API health checks 会同时校验 `ok: true` 和 `service: "chaop-api"`，避免路由到错误 Worker 的部署误判通过。
+- app-server request deadline errors 现在会保留正在等待的 method name，避免 agent tests 在 suite load 下出现不稳定的 timeout 分类。
 - asset checks 会校验 JavaScript/CSS content types，避免 Cloudflare Assets 的 SPA fallback HTML 让缺失 asset 误判通过。
 - asset summaries 和 asset failure messages 会隐藏部署 origin，只报告路径。
 - deployed smoke runner 会在 `/api/usage-summary` 后立即评估 budget gate，gate 失败时会在 GUI asset 或 browser checks 前停止。
@@ -36,5 +39,6 @@ superseded_by:
 - API/Web deploy 或 connector cost-control 变更后，继续使用 deployed smoke。
 
 ## 证据
-- 本地 Node tests 覆盖 argument parsing、asset 和 cookie parsing，以及 budget gate 的 pass/fail 行为。
+- 本地 Node tests 覆盖 argument parsing、HTTPS origin validation、API health service validation、asset 和 cookie parsing，以及 budget gate 的 pass/fail 行为。
+- 现有 Rust agent test 会覆盖 app-server resume deadline regression：不匹配的 resume response 应按 method timeout 收口。
 - 完整本地和 deployed validation 应在 merge 前记录到 PR readiness report。

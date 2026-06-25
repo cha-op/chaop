@@ -3578,7 +3578,11 @@ fn send_app_server_request_inner(
 
     loop {
         if let Some((timeout, deadline)) = archive_budget {
-            ensure_app_server_local_budget(deadline)?;
+            if ensure_app_server_local_budget(deadline).is_err() {
+                return Err(
+                    format!("app-server {method} timed out before matching response").into(),
+                );
+            }
             configure_socket_timeout(
                 socket,
                 remaining_app_server_archive_timeout(timeout, deadline),

@@ -37,6 +37,7 @@ CF_ACCESS_CLIENT_SECRET
 
 不要打印 service-token secret。总结结果时只输出 status code 和经过挑选的响应字段。
 已跟踪的 runner 会从 asset summary 和 asset failure messages 中隐藏部署 origin，只保留路径。
+GUI 和 API origins 必须使用 `https://`。runner 会在发送 Cloudflare Access service-token headers 前拒绝显式的 `http://` origin。
 
 ## 已跟踪的 Runner
 

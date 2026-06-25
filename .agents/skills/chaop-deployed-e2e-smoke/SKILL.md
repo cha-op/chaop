@@ -16,6 +16,7 @@ Use this repo-local skill when verifying a deployed Chaop slice, especially afte
 ## Default Workflow
 
 1. Source the private deployment env and Access smoke env without echoing values.
+   Confirm the configured GUI and API origins are HTTPS before sending Cloudflare Access service-token headers.
 2. Run the low-cost API and asset smoke:
    - `/api/health`;
    - `/api/bootstrap` with the allowed GUI Origin;

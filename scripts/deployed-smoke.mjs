@@ -131,6 +131,9 @@ function normaliseOriginUrl(value, key) {
   if (!value) throw new UsageError(`${key} is required.`);
   const withScheme = /^https?:\/\//i.test(value) ? value : `https://${value}`;
   const url = new URL(withScheme);
+  if (url.protocol !== "https:") {
+    throw new UsageError(`${key} must use https:// for deployed smoke.`);
+  }
   url.pathname = url.pathname === "/" ? "/" : url.pathname.replace(/\/+$/, "");
   url.search = "";
   url.hash = "";
@@ -195,6 +198,7 @@ async function runDirectApiSmoke({ config, fetchImpl }) {
   }, config.browserTimeoutMs);
   assertStatus("API health", health.status, 200);
   assertEqual("API health ok", health.body?.ok, true);
+  assertEqual("API health service", health.body?.service, "chaop-api");
 
   const bootstrap = await fetchJson(fetchImpl, `${config.apiBaseUrl}/api/bootstrap`, {
     headers: apiHeaders,
