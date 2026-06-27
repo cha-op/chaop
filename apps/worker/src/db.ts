@@ -50,7 +50,6 @@ const DEFAULT_WORKSPACE_ID = "workspace-api";
 const DEFAULT_THREAD_ID = "thread-orders-500";
 const DEFAULT_TASK_ID = "task-orders-500";
 const APP_SERVER_UNCHANGED_SUMMARY_DEBOUNCE_MS = 15 * 60 * 1000;
-const APP_SERVER_INVENTORY_EVENTUAL_CONSISTENCY_GRACE_MS = 60_000;
 const DEFAULT_TURN_INTERACTION_AUTO_RESOLUTION_RESPONSE_GRACE_MS = 250;
 const TURN_INTERACTION_RESOLUTION_CLAIM_TTL_MS = 60_000;
 const TURN_INTERACTION_RESOLUTION_DISPATCH_TTL_MS = 5 * 60_000;
@@ -693,12 +692,7 @@ export async function recordHostSessions(
     const previous = await findHostSession(env, session.session_id, connectorId);
     const reportedAppServerPresent = agentHostSessionAppServerPresent(session);
     const appServerPresent =
-      !reportedAppServerPresent &&
-      previous?.app_server_present === true &&
-      (
-        !canUseAppServerAbsence ||
-        appServerInventoryGraceActive(previous.updated_at, syncedAt)
-      )
+      !reportedAppServerPresent && !canUseAppServerAbsence && previous?.app_server_present === true
         ? 1
         : reportedAppServerPresent ? 1 : 0;
     const result = await env.DB.prepare(
@@ -784,9 +778,6 @@ export async function recordHostSessions(
       if (reportedSessionIds.has(row.session_id)) {
         continue;
       }
-      if (appServerInventoryGraceActive(row.updated_at, syncedAt)) {
-        continue;
-      }
       const result = await env.DB.prepare(
         `UPDATE host_sessions
          SET app_server_present = 0, updated_at = ?
@@ -839,13 +830,6 @@ export async function recordHostSessions(
     failed_events: failedEvents,
     snapshot: canClearMissingAppServerSessions
   };
-}
-
-function appServerInventoryGraceActive(updatedAt: string, syncedAt: string): boolean {
-  const elapsedMs = Date.parse(syncedAt) - Date.parse(updatedAt);
-  return Number.isFinite(elapsedMs) &&
-    elapsedMs >= 0 &&
-    elapsedMs < APP_SERVER_INVENTORY_EVENTUAL_CONSISTENCY_GRACE_MS;
 }
 
 export async function markHostSessionAppServerPresentInDb(
