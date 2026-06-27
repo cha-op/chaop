@@ -29,12 +29,10 @@ superseded_by:
 - 带 Access 认证的人工 Browser 检查已确认 connector 与 managed app-server 可见且健康。已实际创建 local thread 并运行一次有边界的 managed turn。随后，仓库内已跟踪的 service-token smoke 通过了直接 health、bootstrap、usage-summary、same-origin asset 与真实 Chromium 检查，浏览器没有观察到失败 response。
 - 第一次 inventory 产生了明显的 D1 rows-written 峰值，随后在完成有边界的 product flow 时，当日实测总数只从 1,242 增至 1,277。代码检查显示新 connector 首次连接时最多会导入 200 个 Host Sessions；table 与 index 写入可以解释这次一次性峰值，而后续无变化的 report 会跳过 Host Session row update。
 - 生产 D1 的只读聚合确认：新 connector 今天发现了 217 个 Host Sessions，旧 connector 当日没有 inventory 变化。按每次 Host Session insert 约触发 5 个 D1 row mutation 估算，这些记录可以解释当日实测 1,277 次写入中的约 1,085 次。Database 历史累计已有 1,545 个 Host Sessions，说明 top-N report 限制不是 retention 上限。
-- 替代 build 后第一次 connector restart 发生在当日实测写入从 1,277 增至 1,552 的区间。后续只读聚合只发现新增 12 个 Host Sessions，因此 inserts 无法单独解释这 275 rows；已有 inventory update、sync/connector/app-server state 与 telemetry sample 都可能贡献，精确 path attribution 仍需 query-meta instrumentation。代码检查另外发现：相同更新时间会通过随机化的 `HashMap` order 进入 top-N 截断。本地 follow-up 会按 session id 排列 ties，移除这个潜在 restart drift。
-- Dogfood 暴露了空 thread 的状态恢复竞态：app-server state database 还没有暴露刚创建的 thread 时，即时完整 inventory 可能清除新 attach session 的 app-server presence，导致切走再返回后只剩 placeholder execution。本地修复会让 create 与 ensure 之后的 inventory report 使用 incremental scope，同时保留普通完整 inventory 供后续清理。第一次 internal review 否决了更早的 Worker 宽限期实现，因为其 snapshot 与 timestamp 语义不可靠；该实现已删除。替代修复已由 LaunchDaemon 运行，但尚未针对它执行空 thread navigation 回归。
+- 替代 build 后第一次 connector restart 发生在当日实测写入从 1,277 增至 1,552 的区间。后续只读聚合只发现新增 12 个 Host Sessions，因此 inserts 无法单独解释这 275 rows；已有 inventory update、sync/connector/app-server state 与 telemetry sample 都可能贡献，精确 path attribution 仍需 query-meta instrumentation。代码检查另外发现：相同更新时间会通过随机化的 `HashMap` order 进入 top-N 截断。已部署的 follow-up 会按 session id 排列 ties。第一次 restart 在 17 个本机 rollout 文件发生变化的同时，让当前 connector 的 stored sessions 从 229 增至 236；紧接着的第二次 restart 保持在 236，确认稳定 report 不会继续导入另一组随机 subset。
+- Dogfood 暴露了空 thread 的状态恢复竞态：app-server state database 还没有暴露刚创建的 thread 时，即时完整 inventory 可能清除新 attach session 的 app-server presence，导致切走再返回后只剩 placeholder execution。已部署的修复会让 create 与 ensure 之后的 inventory report 使用 incremental scope，同时保留普通完整 inventory 供后续清理。第一次 internal review 否决了更早的 Worker 宽限期实现，因为其 snapshot 与 timestamp 语义不可靠；该实现已删除。随后，一个真实空 thread 在没有发送 prompt 的情况下静置：五秒后的 bootstrap 仍报告 app-server presence，Chromium 初次打开以及切到 Fleet health 再返回后都保持 App-server 选中，且没有失败的 browser response。
 
 ## 下一步
-- 针对已部署的 inventory 竞态修复创建空 thread；先不发 turn，切走再返回，确认仍默认选择 app-server execution。
-- 使用稳定 inventory ordering 重新 build 并 restart 一次，再确认第二次 restart 不会导入另一组随机 Host Session subset。
 - 等首次导入的斜率退出窗口后观察一个 idle 15 分钟 D1 delta；只有 rows 明显持续高于有边界的 telemetry sample write 时才继续深挖。
 - 为 stale unattached Host Sessions 增加 retention 或 cleanup，避免滚动 top-N inventory 让 D1 长期只增不减。
 - Managed app-server recovery 部署验证后，再用一个聚焦改动从 product flow 删除 placeholder execution。
@@ -51,3 +49,7 @@ superseded_by:
 - Wrangler D1 只读聚合查询；每条查询都报告 `rows_written: 0`，且没有输出 connector 或 session identifier。
 - Internal review 与稳定排序修复后的 `pnpm test`（48 个 script、3 个 protocol、61 个 web、294 个 Worker 和 167 个 Rust tests 全部通过）。
 - `pnpm build`。
+- 独立 Codex review 检查了 `origin/master..57304c9`，没有发现可操作的 correctness issue。
+- 两次相邻的 LaunchDaemon restart 都恢复了 loopback app-server listener 与 Worker connection；第二次保持相同的 236-session D1 聚合。
+- 不发送 prompt 的空 thread recovery smoke 已通过；navigation 前后都保留 app-server presence 与选择，也没有发送 command。
+- 最终仓库内已跟踪 deployed smoke 通过了 direct API、assets 与真实 Chromium 检查。Budget state 保持 `normal`；当日实测 D1 rows written 仍为 1,552（`1.6%`），D1 rows-read bottleneck 为 `4.3%`。
