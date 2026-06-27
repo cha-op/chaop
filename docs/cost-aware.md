@@ -78,6 +78,8 @@ Codex prompts are passed over stdin for `codex_exec` and through `turn/start` fo
 
 Host Session inventory is quiet while the connector is idle. The Browser Host Sessions page has a manual refresh button and an opt-in one-minute auto-refresh; the Durable Object deduplicates those refresh requests per connector so extra browser windows do not increase connector rescan frequency. User actions that mutate Host Sessions, such as creating or attaching a local thread, can still trigger one immediate inventory report so the UI does not stay stale.
 
+The first inventory from a new connector can create up to `session_inventory.max_sessions` Host Session rows. Because D1 counts table and index mutations, that one-time import can appear as a sharp rows-written burst and make short-window projections look much higher than the subsequent idle rate. Later unchanged reports skip Host Session row updates; they still update one sync summary and the connector activity timestamp.
+
 The dogfood guard separates current-command cleanup from new work dispatch. Terminal connector events such as `command.finished` and `command.failed` can still close an in-flight command during a pause or hard limit, but pending command lease/dispatch checks `command_create` safety again before starting another turn, including after stale app-server target cleanup. `conservative` posture blocks broad Host Session refresh only; it still allows already accepted focused command dispatch. Host Session detach is guarded as a write action because it can clear attachments, fail commands, and trigger follow-up dispatch.
 
 ## Cost Controls To Keep

@@ -1912,6 +1912,29 @@ test("recordHostSessions clears app-server-only sessions omitted from inventory 
   assert.equal(db.demotedSessions, 1);
 });
 
+test("recordHostSessions preserves recently attached app-server sessions omitted from inventory reports", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "app_server",
+    initialUpdatedAt: "2026-06-12T11:00:00.000Z"
+  });
+
+  const result = await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "full",
+      app_server_inventory_ok: true,
+      sessions: []
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(result.snapshot, true);
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
+});
+
 test("recordHostSessions preserves app-server-only sessions from legacy reports without inventory scope", async () => {
   const db = hostSessionsInventoryDb({
     initialAppServerPresent: 1,
@@ -2167,7 +2190,7 @@ test("recordHostSessions tracks current app-server presence independent from tit
           title_source: "metadata",
           app_server_present: true,
           cwd: "/workspace/refreshed",
-          updated_at: "2026-06-12T11:00:00.000Z"
+          updated_at: "2026-06-12T10:58:00.000Z"
         }
       ]
     },
@@ -2199,6 +2222,38 @@ test("recordHostSessions tracks current app-server presence independent from tit
 
   assert.equal(db.titleOf("session-attached"), "History title after archive");
   assert.equal(db.appServerPresentOf("session-attached"), 0);
+});
+
+test("recordHostSessions preserves recent app-server presence while a full report catches up", async () => {
+  const db = hostSessionsInventoryDb({
+    initialAppServerPresent: 1,
+    initialTitleSource: "app_server",
+    initialUpdatedAt: "2026-06-12T11:00:00.000Z"
+  });
+
+  await recordHostSessions(
+    { DB: db } as Env,
+    "connector-online",
+    {
+      inventory_scope: "full",
+      app_server_inventory_ok: true,
+      sessions: [
+        {
+          session_id: "session-attached",
+          title: "Thread awaiting app-server state DB visibility",
+          title_source: "metadata",
+          app_server_present: false,
+          cwd: "/workspace/refreshed",
+          updated_at: "2026-06-12T11:00:01.000Z"
+        }
+      ]
+    },
+    "2026-06-12T11:00:05.000Z"
+  );
+
+  assert.equal(db.titleOf("session-attached"), "Thread awaiting app-server state DB visibility");
+  assert.equal(db.appServerPresentOf("session-attached"), 1);
+  assert.equal(db.demotedSessions, 0);
 });
 
 test("recordHostSessions preserves app-server presence for reported absence in incremental inventory", async () => {
@@ -4694,6 +4749,7 @@ function hostSessionsInventoryDb(options: {
   workspaceId?: string;
   initialAppServerPresent?: number;
   initialTitleSource?: string;
+  initialUpdatedAt?: string;
 } = {}) {
   const selectedWorkspaceId = options.workspaceId ?? "workspace-api";
   type StoredHostSession = {
@@ -4726,7 +4782,7 @@ function hostSessionsInventoryDb(options: {
         cwd: "/workspace/attached",
         attached_task_id: "task-attached",
         attached_thread_id: "thread-attached",
-        updated_at: "2026-06-12T10:00:00.000Z"
+        updated_at: options.initialUpdatedAt ?? "2026-06-12T10:00:00.000Z"
       }
     ]
   ]);

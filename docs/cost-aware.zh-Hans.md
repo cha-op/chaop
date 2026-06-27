@@ -78,6 +78,8 @@ App-server execution 当前只会把 lifecycle events 和最终 assistant messag
 
 Connector 空闲时 Host Session inventory 会保持静默。Browser 的 Host Sessions 页面提供手动 refresh 按钮，以及显式启用的一分钟自动刷新；Durable Object 会按 connector 去重这些 refresh 请求，所以额外打开的浏览器窗口不会提高 connector 重扫频率。创建或 attach 本机 thread 这类会修改 Host Sessions 的用户动作，仍然可以触发一次即时 inventory report，避免 UI 长时间停留在旧状态。
 
+新 connector 的第一次 inventory 最多可以创建 `session_inventory.max_sessions` 条 Host Session 记录。D1 会计算 table 和 index mutation，因此这次一次性导入可能表现为陡峭的 rows-written 峰值，让短窗口 projection 远高于后续 idle rate。之后没有变化的 report 会跳过 Host Session row update，但仍会更新一条 sync summary 和 connector activity timestamp。
+
 Dogfood guard 会区分当前 command cleanup 和新 work dispatch。`command.finished`、`command.failed` 这类终态 connector events 在 pause 或 hard limit 期间仍然可以关闭正在运行的 command；但 pending command 在 lease/dispatch 前会重新检查 `command_create` safety，包括 stale app-server target cleanup 之后的二次检查，避免继续启动下一轮工作。`conservative` posture 只阻止宽泛 Host Session refresh；已经被接受的 focused command dispatch 仍然允许继续。Host Session detach 也作为写入动作受 guard 保护，因为它可能清除 attachment、失败 command，并触发后续 dispatch。
 
 ## 后续需要保留的成本控制
