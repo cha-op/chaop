@@ -223,7 +223,12 @@ pub fn build_host_sessions_report(
             resolve_session(draft, app_title, &history_sessions)
         })
         .collect::<Vec<_>>();
-    sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
     let inventory_scope = if app_server_inventory_truncated
         || sessions.len() > config.session_inventory.max_sessions
     {
@@ -6369,6 +6374,44 @@ mod tests {
         assert_eq!(report.inventory_scope, InventoryScope::Incremental);
         assert_eq!(report.sessions.len(), 1);
         assert_eq!(report.sessions[0].session_id, "session-2");
+    }
+
+    #[test]
+    fn host_session_report_uses_stable_session_id_ties_before_truncation() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let lines = (0..10)
+            .rev()
+            .map(|index| {
+                format!(
+                    r#"{{"id":"session-{index:02}","thread_name":"Session {index:02}","updated_at":"2026-06-12T10:00:00.000Z"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(codex_home.join("session_index.jsonl"), lines).expect("session index");
+
+        let mut config = test_config(codex_home);
+        config.session_inventory.max_sessions = 5;
+
+        let report = build_host_sessions_report(&config).expect("report");
+        let session_ids = report
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(report.inventory_scope, InventoryScope::Incremental);
+        assert_eq!(
+            session_ids,
+            vec![
+                "session-00",
+                "session-01",
+                "session-02",
+                "session-03",
+                "session-04"
+            ]
+        );
     }
 
     #[test]
