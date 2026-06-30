@@ -5,7 +5,9 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -28,7 +30,29 @@ const APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE: usize = 2;
 const APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS: u64 = 12;
 const AUTO_RESOLUTION_RESPONSE_GRACE_MS: u64 = 250;
 
-type AppServerSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+enum AppServerSocket {
+    Tcp(WebSocket<MaybeTlsStream<TcpStream>>),
+    #[cfg(unix)]
+    Unix(WebSocket<UnixStream>),
+}
+
+impl AppServerSocket {
+    fn read(&mut self) -> tungstenite::Result<Message> {
+        match self {
+            Self::Tcp(socket) => socket.read(),
+            #[cfg(unix)]
+            Self::Unix(socket) => socket.read(),
+        }
+    }
+
+    fn send(&mut self, message: Message) -> tungstenite::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.send(message),
+            #[cfg(unix)]
+            Self::Unix(socket) => socket.send(message),
+        }
+    }
+}
 
 pub struct AppServerCommandChannels {
     pub event_sender: Sender<ConnectorEvent>,
@@ -1036,15 +1060,19 @@ fn connect_app_server(
     timeout: Duration,
     auth_token_file: Option<&Path>,
 ) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
+    if let Some(path) = url.strip_prefix("unix://") {
+        return connect_unix_app_server(Path::new(path), auth_token_file, timeout);
+    }
     let uri = url.parse::<Uri>()?;
-    if uri.scheme_str() == Some("ws") {
-        return connect_plain_app_server(url, auth_token_file, &uri, timeout);
+    match uri.scheme_str() {
+        Some("ws") => return connect_plain_app_server(url, auth_token_file, &uri, timeout),
+        _ => {}
     }
 
     let request = app_server_client_request(url, auth_token_file)?;
     let (mut socket, _) = connect(request)?;
-    configure_socket_timeout(&mut socket, timeout)?;
-    Ok(socket)
+    configure_tcp_socket_timeout(&mut socket, timeout)?;
+    Ok(AppServerSocket::Tcp(socket))
 }
 
 fn app_server_client_request(
@@ -1057,7 +1085,7 @@ fn app_server_client_request(
     };
     let uri = url.parse::<Uri>()?;
     if !app_server_auth_url_is_safe(&uri) {
-        return Err("app-server auth tokens require wss:// or a loopback ws:// listener".into());
+        return Err("app-server auth tokens require wss://".into());
     }
     let token = fs::read_to_string(path)?;
     let token = token.trim();
@@ -1070,20 +1098,7 @@ fn app_server_client_request(
 }
 
 fn app_server_auth_url_is_safe(uri: &Uri) -> bool {
-    match uri.scheme_str() {
-        Some("wss") => true,
-        Some("ws") => uri.host().is_some_and(|host| {
-            let normalised = host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_ascii_lowercase();
-            normalised == "localhost"
-                || normalised
-                    .parse::<IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        }),
-        _ => false,
-    }
+    uri.scheme_str() == Some("wss")
 }
 
 fn connect_plain_app_server(
@@ -1114,7 +1129,7 @@ fn connect_plain_app_server(
                         return Err("app-server websocket handshake was interrupted".into());
                     }
                 };
-                return Ok(socket);
+                return Ok(AppServerSocket::Tcp(socket));
             }
             Err(error) => {
                 last_error = Some(error);
@@ -1128,8 +1143,43 @@ fn connect_plain_app_server(
     })
 }
 
-fn configure_socket_timeout(
-    socket: &mut AppServerSocket,
+#[cfg(unix)]
+fn connect_unix_app_server(
+    path: &Path,
+    auth_token_file: Option<&Path>,
+    timeout: Duration,
+) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
+    if auth_token_file.is_some() {
+        return Err("app-server auth tokens are not supported over unix:// sockets".into());
+    }
+    if !path.is_absolute() || path == Path::new("/") {
+        return Err("app-server unix:// URLs require an absolute socket path".into());
+    }
+    let stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let request = "ws://localhost/".into_client_request()?;
+    let (socket, _) = match client(request, stream) {
+        Ok(result) => result,
+        Err(HandshakeError::Failure(error)) => return Err(error.into()),
+        Err(HandshakeError::Interrupted(_)) => {
+            return Err("app-server websocket handshake was interrupted".into());
+        }
+    };
+    Ok(AppServerSocket::Unix(socket))
+}
+
+#[cfg(not(unix))]
+fn connect_unix_app_server(
+    _path: &Path,
+    _auth_token_file: Option<&Path>,
+    _timeout: Duration,
+) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
+    Err("app-server unix:// URLs are only supported on Unix platforms".into())
+}
+
+fn configure_tcp_socket_timeout(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     timeout: Duration,
 ) -> std::io::Result<()> {
     match socket.get_mut() {
@@ -1142,6 +1192,20 @@ fn configure_socket_timeout(
             stream.get_ref().set_write_timeout(Some(timeout))
         }
         _ => Ok(()),
+    }
+}
+
+fn configure_socket_timeout(
+    socket: &mut AppServerSocket,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    match socket {
+        AppServerSocket::Tcp(socket) => configure_tcp_socket_timeout(socket, timeout),
+        #[cfg(unix)]
+        AppServerSocket::Unix(socket) => {
+            socket.get_mut().set_read_timeout(Some(timeout))?;
+            socket.get_mut().set_write_timeout(Some(timeout))
+        }
     }
 }
 
@@ -4032,11 +4096,11 @@ mod tests {
         SessionDraft, TitleSource, TurnInteractionInputAnswer, TurnInteractionResponse,
         TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
         acknowledge_turn_interaction_delivery, app_server_client_request,
-        app_server_command_result_events_with_cancel, app_server_sessions_from_response,
-        app_server_thread_from_response, app_server_titles_from_response,
-        build_host_session_backfill, build_host_sessions_report, create_app_server_thread_at,
-        ensure_app_server_host_session_at, load_app_server_sessions, read_recent_lines,
-        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
+        app_server_command_result_events_with_cancel, app_server_health_check,
+        app_server_sessions_from_response, app_server_thread_from_response,
+        app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
+        create_app_server_thread_at, ensure_app_server_host_session_at, load_app_server_sessions,
+        read_recent_lines, remaining_app_server_archive_timeout, resolve_session, rollout_paths,
         set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
         unix_seconds_to_iso,
     };
@@ -4044,7 +4108,10 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::fs;
-    use std::net::{TcpListener, TcpStream};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -4060,8 +4127,9 @@ mod tests {
         let token_file = tempdir.path().join("app-server.token");
         fs::write(&token_file, "test-capability-token\n").expect("write token");
 
-        let request = app_server_client_request("ws://127.0.0.1:9876", Some(token_file.as_path()))
-            .expect("request");
+        let request =
+            app_server_client_request("wss://app.example.test", Some(token_file.as_path()))
+                .expect("request");
 
         assert_eq!(
             request
@@ -4078,7 +4146,7 @@ mod tests {
         let token_file = tempdir.path().join("app-server.token");
         fs::write(&token_file, "\n").expect("write token");
 
-        let error = app_server_client_request("ws://127.0.0.1:9876", Some(token_file.as_path()))
+        let error = app_server_client_request("wss://app.example.test", Some(token_file.as_path()))
             .expect_err("empty token rejected");
 
         assert!(
@@ -4089,18 +4157,57 @@ mod tests {
     }
 
     #[test]
-    fn app_server_client_request_rejects_token_over_non_loopback_ws() {
+    fn app_server_client_request_rejects_token_over_plaintext_ws() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let token_file = tempdir.path().join("app-server.token");
         fs::write(&token_file, "test-capability-token\n").expect("write token");
 
-        let error = app_server_client_request("ws://192.168.1.20:9876", Some(token_file.as_path()))
-            .expect_err("plaintext non-loopback token rejected");
+        let error = app_server_client_request("ws://127.0.0.1:9876", Some(token_file.as_path()))
+            .expect_err("plaintext token rejected");
 
-        assert_eq!(
-            error.to_string(),
-            "app-server auth tokens require wss:// or a loopback ws:// listener"
-        );
+        assert_eq!(error.to_string(), "app-server auth tokens require wss://");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_health_check_supports_unix_socket() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept unix client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {
+                            "userAgent": "codex-test",
+                            "codexHome": "/tmp/codex",
+                            "platformFamily": "unix",
+                            "platformOs": "macos"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized.get("method").and_then(Value::as_str),
+                Some("initialized")
+            );
+        });
+
+        app_server_health_check(&format!("unix://{}", socket_path.display()), 1)
+            .expect("unix socket health check");
+        server.join().expect("unix app-server");
     }
 
     fn turn_interaction_delivery(
@@ -8512,7 +8619,8 @@ mod tests {
     #[test]
     fn app_server_turn_wait_interrupts_when_cancelled_after_turn_id_is_known() {
         let (url, requests) = run_fake_app_server_single_request();
-        let (mut socket, _) = tungstenite::connect(url.as_str()).expect("connect fake app-server");
+        let (socket, _) = tungstenite::connect(url.as_str()).expect("connect fake app-server");
+        let mut socket = super::AppServerSocket::Tcp(socket);
         let cancel = AtomicBool::new(true);
         let mut next_request_id = 4;
 
@@ -9250,8 +9358,8 @@ mod tests {
         (format!("ws://{address}"), requests_rx)
     }
 
-    fn read_fake_app_server_message(
-        socket: &mut tungstenite::WebSocket<TcpStream>,
+    fn read_fake_app_server_message<S: Read + Write>(
+        socket: &mut tungstenite::WebSocket<S>,
     ) -> serde_json::Value {
         let message = socket.read().expect("read app-server request");
         let Message::Text(text) = message else {

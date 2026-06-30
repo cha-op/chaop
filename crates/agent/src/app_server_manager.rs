@@ -433,7 +433,7 @@ impl AppServerManager {
         let Some(listen_url) = self.validated_listen_url() else {
             self.set_state(
                 AppServerInstanceState::Degraded,
-                "Managed app-server listen URL is missing or not loopback.",
+                "Managed app-server listen URL is missing or not local.",
                 Some("Invalid managed app-server listen URL."),
             );
             return None;
@@ -603,9 +603,9 @@ impl AppServerManager {
             );
             return None;
         };
-        if !is_loopback_listen_url(&listen_url) {
+        if !is_local_listen_url(&listen_url) {
             eprintln!(
-                "managed app-server listen URL must use localhost or a loopback IP address: {listen_url}"
+                "managed app-server listen URL must use an absolute unix:// socket path or a loopback IP address: {listen_url}"
             );
             return None;
         }
@@ -815,18 +815,24 @@ fn upgrade_marker_modified(marker: Option<&std::path::PathBuf>) -> Option<System
         .and_then(|metadata| metadata.modified().ok())
 }
 
-fn is_loopback_listen_url(listen_url: &str) -> bool {
+fn is_local_listen_url(listen_url: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(path) = listen_url.strip_prefix("unix://") {
+        let path = std::path::Path::new(path);
+        return path.is_absolute() && path != std::path::Path::new("/");
+    }
     let Ok(uri) = listen_url.parse::<Uri>() else {
         return false;
     };
     match uri.scheme_str() {
-        Some("ws") | Some("wss") => {}
-        _ => return false,
+        Some("ws") | Some("wss") => {
+            let Some(host) = uri.host() else {
+                return false;
+            };
+            is_loopback_host(host)
+        }
+        _ => false,
     }
-    let Some(host) = uri.host() else {
-        return false;
-    };
-    is_loopback_host(host)
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -913,7 +919,7 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerInstanceState, AppServerManager, AppServerRestartReason, is_loopback_listen_url,
+        AppServerInstanceState, AppServerManager, AppServerRestartReason, is_local_listen_url,
         terminate_child,
     };
     use crate::config::{
@@ -930,13 +936,16 @@ mod tests {
     static TEST_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
     #[test]
-    fn managed_listen_url_requires_loopback_host() {
-        assert!(is_loopback_listen_url("ws://localhost:65530"));
-        assert!(is_loopback_listen_url("ws://127.0.0.1:65530"));
-        assert!(is_loopback_listen_url("ws://[::1]:65530"));
-        assert!(!is_loopback_listen_url("ws://0.0.0.0:65530"));
-        assert!(!is_loopback_listen_url("ws://192.168.1.20:65530"));
-        assert!(!is_loopback_listen_url("ws://codex.example.test:65530"));
+    fn managed_listen_url_requires_local_endpoint() {
+        assert!(is_local_listen_url("ws://localhost:65530"));
+        assert!(is_local_listen_url("ws://127.0.0.1:65530"));
+        assert!(is_local_listen_url("ws://[::1]:65530"));
+        #[cfg(unix)]
+        assert!(is_local_listen_url("unix:///tmp/chaop-app-server.sock"));
+        assert!(!is_local_listen_url("unix://relative.sock"));
+        assert!(!is_local_listen_url("ws://0.0.0.0:65530"));
+        assert!(!is_local_listen_url("ws://192.168.1.20:65530"));
+        assert!(!is_local_listen_url("ws://codex.example.test:65530"));
     }
 
     #[test]
