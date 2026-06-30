@@ -3,7 +3,7 @@ id: 20260627-6f3a91
 title: Second Dogfood Connector Onboarding
 status: active
 created: 2026-06-27
-updated: 2026-06-27
+updated: 2026-06-30
 branch: master
 pr:
 supersedes: []
@@ -15,7 +15,7 @@ superseded_by:
 # Second Dogfood Connector Onboarding
 
 ## Summary
-- A second host is being onboarded against the existing Cloudflare control plane so Chaop can be used to continue developing Chaop.
+- A second host is onboarded against the existing Cloudflare control plane, and Chaop can now perform bounded writes inside its own repository for self-hosted development.
 - Its connector identity and private token, spool, upgrade-marker, and process-state paths are isolated from the temporarily unavailable first host.
 - Deployment-instance names, domains, account identifiers, secrets, and local paths remain only in the private ops repository and ignored local state.
 
@@ -31,8 +31,11 @@ superseded_by:
 - Read-only production D1 aggregation confirmed 217 Host Sessions discovered today for the new connector and no current-day inventory changes for the legacy connector. At roughly five D1 row mutations per Host Session insert, those rows explain about 1,085 of the measured 1,277 daily writes. The database contains 1,545 historical Host Sessions, showing that the top-N report limit is not a retention cap.
 - The first connector restart after the replacement build occurred during a measured daily-write increase from 1,277 to 1,552. A later read-only aggregate found only 12 additional Host Sessions, so inserts alone do not explain the 275-row interval; existing inventory updates, sync/connector/app-server state, and telemetry samples can also contribute, and exact path attribution still needs query-meta instrumentation. Code inspection separately found that equal update timestamps reached top-N truncation through randomised `HashMap` order. The deployed follow-up sorts ties by session id. A first restart advanced the current connector from 229 to 236 stored sessions while 17 local rollout files had changed; an immediate second restart held at 236, confirming that a stable report no longer imports another random subset.
 - Dogfood exposed an empty-thread recovery race: an immediate complete inventory could clear a newly attached session's app-server presence before the app-server state database exposed the thread, leaving only placeholder execution after navigating away and back. The deployed fix makes post-create and post-ensure inventory reports incremental while keeping normal complete inventory available for later cleanup. The first internal review rejected an earlier Worker grace-period implementation because its snapshot and timestamp semantics were unsound; that implementation was removed. A real empty thread was then left without a prompt: bootstrap still reported app-server presence after five seconds, and Chromium kept App-server selected both initially and after navigating to Fleet health and back, with no failed browser responses.
+- The managed app-server now uses an opt-in workspace-write permission profile fixed to the Chaop repository. Git metadata, repository policy and skills, project Codex configuration, GitHub workflows, common credential files, dynamic workspace roots, and general home-directory reads remain outside the write boundary. Builds use a dedicated private temporary directory, cached Cargo dependencies stay offline, and test networking is loopback-only.
+- A real managed turn created an ignored canary through the deployed Chaop command path and reached `command.finished` without an out-of-profile approval. The canary content and mode were verified, tracked files stayed clean, and the canary was removed afterwards. The exact profile also passed 48 script, 3 protocol, 61 Web, 294 Worker, and 167 Rust tests plus the production build.
 
 ## Next Steps
+- Use the bounded write profile for one small real source change, keeping commit/push outside the managed turn until that workflow is deliberately designed.
 - Observe an idle 15-minute D1 delta after the initial import slope ages out; investigate further only if rows continue rising materially above the bounded telemetry-sample writes.
 - Add retention or cleanup for stale unattached Host Sessions so rolling top-N inventory does not grow D1 indefinitely.
 - Remove placeholder execution from the product flow in a later focused change once managed app-server recovery is deployed and verified.
@@ -53,3 +56,4 @@ superseded_by:
 - Two adjacent LaunchDaemon restarts restored the loopback app-server listener and Worker connection; the second retained the same 236-session D1 aggregate.
 - The no-prompt empty-thread recovery smoke passed with app-server presence and selection retained after navigation; it sent no command.
 - The final tracked deployed smoke passed direct API, asset, and real Chromium checks. Budget state remained `normal`; measured current-day D1 rows written remained 1,552 (`1.6%`) and the D1 rows-read bottleneck was `4.3%`.
+- The post-write deployed smoke passed direct API, assets, and real Chromium checks with no failed browser response. Budget state remained `normal`; sampled current-day D1 rows written remained 1,235 (`1.2%`).
