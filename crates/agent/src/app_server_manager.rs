@@ -1,5 +1,5 @@
 use crate::config::AgentConfig;
-use crate::session_inventory::app_server_health_check;
+use crate::session_inventory::app_server_health_check_with_auth;
 use crate::shutdown::shutdown_requested;
 use std::io::{self, ErrorKind};
 use std::net::IpAddr;
@@ -387,7 +387,14 @@ impl AppServerManager {
             return;
         }
         self.last_external_probe = Some(now);
-        match app_server_health_check(url, config.session_inventory.app_server_timeout_seconds) {
+        match app_server_health_check_with_auth(
+            url,
+            config.session_inventory.app_server_timeout_seconds,
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .as_deref(),
+        ) {
             Ok(()) => self.set_state(
                 AppServerInstanceState::Healthy,
                 "External app-server is healthy.",
@@ -406,9 +413,13 @@ impl AppServerManager {
             return None;
         };
 
-        if app_server_health_check(
+        if app_server_health_check_with_auth(
             &listen_url,
             config.session_inventory.app_server_timeout_seconds,
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .as_deref(),
         )
         .is_ok()
         {
@@ -429,9 +440,13 @@ impl AppServerManager {
         };
 
         self.clear_exited_child();
-        if app_server_health_check(
+        if app_server_health_check_with_auth(
             &listen_url,
             config.session_inventory.app_server_timeout_seconds,
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .as_deref(),
         )
         .is_ok()
         {
@@ -659,9 +674,13 @@ impl AppServerManager {
             if self.child.is_none() {
                 return false;
             }
-            if app_server_health_check(
+            if app_server_health_check_with_auth(
                 listen_url,
                 config.session_inventory.app_server_timeout_seconds,
+                config
+                    .session_inventory
+                    .app_server_auth_token_file
+                    .as_deref(),
             )
             .is_ok()
             {

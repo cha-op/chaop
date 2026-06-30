@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -14,7 +14,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tungstenite::{
-    Message, WebSocket, client::client, connect, handshake::HandshakeError, http::Uri,
+    Message, WebSocket,
+    client::{IntoClientRequest, client},
+    connect,
+    handshake::HandshakeError,
+    http::{HeaderValue, Uri, header::AUTHORIZATION},
     stream::MaybeTlsStream,
 };
 
@@ -180,10 +184,14 @@ pub fn build_host_sessions_report(
         read_history_sessions(&codex_home, config.session_inventory.max_sessions)?;
     let (app_server_sessions, app_server_inventory_ok, app_server_inventory_truncated) =
         if let Some(url) = config.session_inventory.app_server_url.as_deref() {
-            match load_app_server_sessions(
+            match load_app_server_sessions_with_auth(
                 url,
                 config.session_inventory.max_sessions,
                 config.session_inventory.app_server_timeout_seconds,
+                config
+                    .session_inventory
+                    .app_server_auth_token_file
+                    .as_deref(),
             ) {
                 Ok(inventory) => (inventory.sessions, Some(true), inventory.truncated),
                 Err(_) => (HashMap::new(), Some(false), false),
@@ -937,13 +945,23 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+#[cfg(test)]
 fn load_app_server_sessions(
     url: &str,
     limit: usize,
     timeout_seconds: u64,
 ) -> Result<AppServerSessionInventory, Box<dyn std::error::Error>> {
+    load_app_server_sessions_with_auth(url, limit, timeout_seconds, None)
+}
+
+fn load_app_server_sessions_with_auth(
+    url: &str,
+    limit: usize,
+    timeout_seconds: u64,
+    auth_token_file: Option<&Path>,
+) -> Result<AppServerSessionInventory, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let mut socket = connect_app_server(url, timeout)?;
+    let mut socket = connect_app_server(url, timeout, auth_token_file)?;
     initialize_app_server_connection(&mut socket)?;
     let session_limit = limit.max(1);
     let page_limit = session_limit.saturating_add(1);
@@ -975,8 +993,16 @@ pub fn app_server_health_check(
     url: &str,
     timeout_seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    app_server_health_check_with_auth(url, timeout_seconds, None)
+}
+
+pub fn app_server_health_check_with_auth(
+    url: &str,
+    timeout_seconds: u64,
+    auth_token_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let mut socket = connect_app_server(url, timeout)?;
+    let mut socket = connect_app_server(url, timeout, auth_token_file)?;
     initialize_app_server_connection(&mut socket)
 }
 
@@ -1008,19 +1034,61 @@ fn read_app_server_inventory_page(
 fn connect_app_server(
     url: &str,
     timeout: Duration,
+    auth_token_file: Option<&Path>,
 ) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
     let uri = url.parse::<Uri>()?;
     if uri.scheme_str() == Some("ws") {
-        return connect_plain_app_server(url, &uri, timeout);
+        return connect_plain_app_server(url, auth_token_file, &uri, timeout);
     }
 
-    let (mut socket, _) = connect(url)?;
+    let request = app_server_client_request(url, auth_token_file)?;
+    let (mut socket, _) = connect(request)?;
     configure_socket_timeout(&mut socket, timeout)?;
     Ok(socket)
 }
 
+fn app_server_client_request(
+    url: &str,
+    auth_token_file: Option<&Path>,
+) -> Result<tungstenite::http::Request<()>, Box<dyn std::error::Error>> {
+    let mut request = url.into_client_request()?;
+    let Some(path) = auth_token_file else {
+        return Ok(request);
+    };
+    let uri = url.parse::<Uri>()?;
+    if !app_server_auth_url_is_safe(&uri) {
+        return Err("app-server auth tokens require wss:// or a loopback ws:// listener".into());
+    }
+    let token = fs::read_to_string(path)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(format!("app-server auth token file is empty: {}", path.display()).into());
+    }
+    let value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+    request.headers_mut().insert(AUTHORIZATION, value);
+    Ok(request)
+}
+
+fn app_server_auth_url_is_safe(uri: &Uri) -> bool {
+    match uri.scheme_str() {
+        Some("wss") => true,
+        Some("ws") => uri.host().is_some_and(|host| {
+            let normalised = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase();
+            normalised == "localhost"
+                || normalised
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
 fn connect_plain_app_server(
     url: &str,
+    auth_token_file: Option<&Path>,
     uri: &Uri,
     timeout: Duration,
 ) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
@@ -1038,7 +1106,8 @@ fn connect_plain_app_server(
                 stream.set_nodelay(true)?;
                 stream.set_read_timeout(Some(timeout))?;
                 stream.set_write_timeout(Some(timeout))?;
-                let (socket, _) = match client(url, MaybeTlsStream::Plain(stream)) {
+                let request = app_server_client_request(url, auth_token_file)?;
+                let (socket, _) = match client(request, MaybeTlsStream::Plain(stream)) {
                     Ok(result) => result,
                     Err(HandshakeError::Failure(error)) => return Err(error.into()),
                     Err(HandshakeError::Interrupted(_)) => {
@@ -1212,11 +1281,15 @@ pub fn create_app_server_thread(
         .as_deref()
         .ok_or("session_inventory.app_server_url is required for local thread creation")?;
     let cwd = config.workspace_root.to_string_lossy().into_owned();
-    create_app_server_thread_at(
+    create_app_server_thread_at_with_auth(
         url,
         title,
         &cwd,
         config.session_inventory.app_server_timeout_seconds,
+        config
+            .session_inventory
+            .app_server_auth_token_file
+            .as_deref(),
     )
 }
 
@@ -1236,7 +1309,7 @@ pub fn ensure_app_server_host_session(
         .codex_home
         .clone()
         .unwrap_or_else(default_codex_home);
-    ensure_app_server_host_session_at(
+    ensure_app_server_host_session_at_with_auth(
         url,
         session_id,
         title,
@@ -1244,6 +1317,10 @@ pub fn ensure_app_server_host_session(
         None,
         Some((&codex_home, config.session_inventory.max_sessions)),
         config.session_inventory.app_server_timeout_seconds,
+        config
+            .session_inventory
+            .app_server_auth_token_file
+            .as_deref(),
     )
 }
 
@@ -1262,12 +1339,16 @@ pub fn set_app_server_thread_archived(
         .codex_home
         .clone()
         .unwrap_or_else(default_codex_home);
-    set_app_server_thread_archived_at_with_rollout_lookup(
+    set_app_server_thread_archived_at_with_auth(
         url,
         thread_id,
         archived,
         Some((&codex_home, config.session_inventory.max_sessions)),
         config.session_inventory.app_server_timeout_seconds,
+        config
+            .session_inventory
+            .app_server_auth_token_file
+            .as_deref(),
     )
 }
 
@@ -1346,8 +1427,15 @@ fn run_app_server_command(
         config.session_inventory.app_server_timeout_seconds,
         timeout_seconds,
     );
-    let mut socket = connect_app_server(url, socket_timeout)
-        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+    let mut socket = connect_app_server(
+        url,
+        socket_timeout,
+        config
+            .session_inventory
+            .app_server_auth_token_file
+            .as_deref(),
+    )
+    .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
     initialize_app_server_connection_for_command(
         &mut socket,
         socket_timeout,
@@ -2977,6 +3065,7 @@ fn set_app_server_thread_archived_at(
     )
 }
 
+#[cfg(test)]
 fn set_app_server_thread_archived_at_with_rollout_lookup(
     url: &str,
     thread_id: &str,
@@ -2984,10 +3073,31 @@ fn set_app_server_thread_archived_at_with_rollout_lookup(
     rollout_lookup: Option<(&Path, usize)>,
     timeout_seconds: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    set_app_server_thread_archived_at_with_auth(
+        url,
+        thread_id,
+        archived,
+        rollout_lookup,
+        timeout_seconds,
+        None,
+    )
+}
+
+fn set_app_server_thread_archived_at_with_auth(
+    url: &str,
+    thread_id: &str,
+    archived: bool,
+    rollout_lookup: Option<(&Path, usize)>,
+    timeout_seconds: u64,
+    auth_token_file: Option<&Path>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS);
     let timeout = app_server_archive_socket_timeout(timeout_seconds);
-    let mut socket =
-        connect_app_server(url, remaining_app_server_archive_timeout(timeout, deadline))?;
+    let mut socket = connect_app_server(
+        url,
+        remaining_app_server_archive_timeout(timeout, deadline),
+        auth_token_file,
+    )?;
     initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
     let mut request_id = 1;
     let Some(resolution) = resolve_app_server_thread_ids_for_archive(
@@ -3259,6 +3369,7 @@ fn app_server_archive_socket_timeout(timeout_seconds: u64) -> Duration {
     )
 }
 
+#[cfg(test)]
 fn ensure_app_server_host_session_at(
     url: &str,
     session_id: &str,
@@ -3268,8 +3379,30 @@ fn ensure_app_server_host_session_at(
     rollout_lookup: Option<(&Path, usize)>,
     timeout_seconds: u64,
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    ensure_app_server_host_session_at_with_auth(
+        url,
+        session_id,
+        title,
+        cwd,
+        rollout_path,
+        rollout_lookup,
+        timeout_seconds,
+        None,
+    )
+}
+
+fn ensure_app_server_host_session_at_with_auth(
+    url: &str,
+    session_id: &str,
+    title: Option<&str>,
+    cwd: &str,
+    rollout_path: Option<&Path>,
+    rollout_lookup: Option<(&Path, usize)>,
+    timeout_seconds: u64,
+    auth_token_file: Option<&Path>,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let mut socket = connect_app_server(url, timeout)?;
+    let mut socket = connect_app_server(url, timeout, auth_token_file)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
     initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
     let mut request_id = 1;
@@ -3438,14 +3571,25 @@ fn scan_app_server_thread_id_for_ensure(
     }
 }
 
+#[cfg(test)]
 fn create_app_server_thread_at(
     url: &str,
     title: Option<&str>,
     cwd: &str,
     timeout_seconds: u64,
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    create_app_server_thread_at_with_auth(url, title, cwd, timeout_seconds, None)
+}
+
+fn create_app_server_thread_at_with_auth(
+    url: &str,
+    title: Option<&str>,
+    cwd: &str,
+    timeout_seconds: u64,
+    auth_token_file: Option<&Path>,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let mut socket = connect_app_server(url, timeout)?;
+    let mut socket = connect_app_server(url, timeout, auth_token_file)?;
     initialize_app_server_connection(&mut socket)?;
     let start_response = send_app_server_request(
         &mut socket,
@@ -3887,11 +4031,12 @@ mod tests {
         AppServerCommandChannels, AppServerTurnOutput, HistorySession, InventoryScope,
         SessionDraft, TitleSource, TurnInteractionInputAnswer, TurnInteractionResponse,
         TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
-        acknowledge_turn_interaction_delivery, app_server_command_result_events_with_cancel,
-        app_server_sessions_from_response, app_server_thread_from_response,
-        app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
-        create_app_server_thread_at, ensure_app_server_host_session_at, load_app_server_sessions,
-        read_recent_lines, remaining_app_server_archive_timeout, resolve_session, rollout_paths,
+        acknowledge_turn_interaction_delivery, app_server_client_request,
+        app_server_command_result_events_with_cancel, app_server_sessions_from_response,
+        app_server_thread_from_response, app_server_titles_from_response,
+        build_host_session_backfill, build_host_sessions_report, create_app_server_thread_at,
+        ensure_app_server_host_session_at, load_app_server_sessions, read_recent_lines,
+        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
         set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
         unix_seconds_to_iso,
     };
@@ -3908,6 +4053,55 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use tungstenite::{Message, accept};
+
+    #[test]
+    fn app_server_client_request_reads_bearer_token_from_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let token_file = tempdir.path().join("app-server.token");
+        fs::write(&token_file, "test-capability-token\n").expect("write token");
+
+        let request = app_server_client_request("ws://127.0.0.1:9876", Some(token_file.as_path()))
+            .expect("request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-capability-token")
+        );
+    }
+
+    #[test]
+    fn app_server_client_request_rejects_empty_token_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let token_file = tempdir.path().join("app-server.token");
+        fs::write(&token_file, "\n").expect("write token");
+
+        let error = app_server_client_request("ws://127.0.0.1:9876", Some(token_file.as_path()))
+            .expect_err("empty token rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("app-server auth token file is empty")
+        );
+    }
+
+    #[test]
+    fn app_server_client_request_rejects_token_over_non_loopback_ws() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let token_file = tempdir.path().join("app-server.token");
+        fs::write(&token_file, "test-capability-token\n").expect("write token");
+
+        let error = app_server_client_request("ws://192.168.1.20:9876", Some(token_file.as_path()))
+            .expect_err("plaintext non-loopback token rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "app-server auth tokens require wss:// or a loopback ws:// listener"
+        );
+    }
 
     fn turn_interaction_delivery(
         dispatch: TurnInteractionResponseDispatch,

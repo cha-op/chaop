@@ -54,6 +54,8 @@ pub struct SessionInventoryConfig {
     pub report_interval_seconds: u64,
     #[serde(default)]
     pub app_server_url: Option<String>,
+    #[serde(default)]
+    pub app_server_auth_token_file: Option<PathBuf>,
     #[serde(default = "default_app_server_timeout_seconds")]
     pub app_server_timeout_seconds: u64,
     #[serde(default)]
@@ -103,6 +105,7 @@ impl Default for SessionInventoryConfig {
             max_sessions: default_session_inventory_max_sessions(),
             report_interval_seconds: default_session_inventory_report_interval_seconds(),
             app_server_url: None,
+            app_server_auth_token_file: None,
             app_server_timeout_seconds: default_app_server_timeout_seconds(),
             managed_app_server: ManagedAppServerConfig::default(),
         }
@@ -314,6 +317,9 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
 [execution]
 mode = "app_server"
 
+[session_inventory]
+app_server_auth_token_file = "/Users/you/.chaop/app-server.token"
+
 [session_inventory.managed_app_server]
 enabled = true
 listen_url = "ws://127.0.0.1:6174"
@@ -331,6 +337,15 @@ upgrade_marker_file = "/Users/you/.chaop/app-server-upgrade.marker"
 
         assert_eq!(config.execution.mode, super::ExecutionMode::AppServer);
         assert!(config.session_inventory.managed_app_server.enabled);
+        assert_eq!(
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .as_deref(),
+            Some("/Users/you/.chaop/app-server.token")
+        );
         assert_eq!(
             config
                 .session_inventory

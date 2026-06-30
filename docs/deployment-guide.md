@@ -414,6 +414,7 @@ report_interval_seconds = 60
 app_server_timeout_seconds = 2
 # codex_home = "/Users/you/.codex"
 # app_server_url = "ws://127.0.0.1:9876"
+# app_server_auth_token_file = "/path/to/private/app-server.token"
 
 [session_inventory.managed_app_server]
 enabled = false
@@ -447,10 +448,17 @@ codex_timeout_seconds = 300
 
 [session_inventory]
 app_server_timeout_seconds = 2
+app_server_auth_token_file = "/path/to/private/app-server.token"
 
 [session_inventory.managed_app_server]
 enabled = true
 listen_url = "ws://127.0.0.1:9876"
+extra_args = [
+  "--ws-auth",
+  "capability-token",
+  "--ws-token-file",
+  "/path/to/private/app-server.token",
+]
 startup_timeout_seconds = 10
 restart_backoff_seconds = 5
 drain_timeout_seconds = 300
@@ -481,7 +489,7 @@ Session inventory is enabled by default. The connector reads local Codex metadat
 
 When a user explicitly attaches a Host Session, the Worker asks that session's connector for a bounded history backfill for that single session. The connector reads the matching local rollout, skips injected developer/context records, reasoning records, and tool output records, and returns short user, assistant, and tool-call summaries only. If no rollout is found, it falls back to a recent `history.jsonl` prompt for that session. Imported events keep the original local event timestamp, so old backfilled history does not crowd out newer control-plane events in the global recent-event feed. Backfill failures do not block the attachment; the Browser shows the attached thread and reports the backfill warning separately.
 
-Use `session_inventory.managed_app_server.enabled = true` when Chaop should manage one dedicated local Codex app-server listener for this connector. The connector starts `codex app-server` with the configured `execution.codex_profile`, `execution.codex_model`, `session_inventory.managed_app_server.extra_args`, and `--listen <listen_url>` when the listener is absent, health-checks the listener before advertising app-server capabilities, and retries after `restart_backoff_seconds` if the child exits or fails startup. Managed listener URLs must bind to `localhost`, `127.0.0.1`, or `::1`; the connector refuses non-loopback hosts instead of exposing the app-server protocol to a LAN interface. If you already manage the listener with another service manager, leave managed mode disabled and set `session_inventory.app_server_url` to the external listener instead.
+Use `session_inventory.managed_app_server.enabled = true` when Chaop should manage one dedicated local Codex app-server listener for this connector. The connector starts `codex app-server` with the configured `execution.codex_profile`, `execution.codex_model`, `session_inventory.managed_app_server.extra_args`, and `--listen <listen_url>` when the listener is absent, health-checks the listener before advertising app-server capabilities, and retries after `restart_backoff_seconds` if the child exits or fails startup. Managed listener URLs must bind to `localhost`, `127.0.0.1`, or `::1`; the connector refuses non-loopback hosts instead of exposing the app-server protocol to a LAN interface. Loopback is not an authentication boundary when model-invoked tools can also reach local services. In that case, start Codex with `--ws-auth capability-token --ws-token-file <path>` and set `session_inventory.app_server_auth_token_file` to the same private file. Keep that file outside the workspace and deny tool access to it; the connector reads it only to add the WebSocket Bearer header. If you already manage the listener with another service manager, leave managed mode disabled and set `session_inventory.app_server_url` to the external listener instead.
 
 In managed mode, the connector advertises `app_server_threads` and `app_server_archive` only while the managed app-server URL is healthy enough to initialise the protocol, and advertises `codex_app_server_exec` plus `host_session_app_server_ensure` only when that URL is healthy and `execution.mode = "app_server"`. It refreshes those capabilities through `agent.ready` after connecting to the Worker, so a degraded managed listener stops being selected for new app-server work. With an externally managed `session_inventory.app_server_url`, capability advertisement follows the configured URL and the external service manager is responsible for keeping the listener healthy. This is separate from the CLI-only `codex_exec` capability. The Worker rejects new local thread requests when no online app-server connector has `app_server_threads`. Attached app-server command execution requires the owning connector to advertise `codex_app_server_exec`; Chaop rejects command creation or leasing instead of falling back to `codex_exec` on a different connector. Host Session attach only sends the app-server resume/ensure control message when the connector advertises `host_session_app_server_ensure`; older app-server execution connectors keep the D1-only attach path instead of timing out on an unknown control envelope. Archive/unarchive remains D1-only when the connector does not advertise `app_server_archive`; when it does, Chaop updates D1 first, then the connector resolves the stored Codex session id to an app-server thread id before calling `thread/archive` or `thread/unarchive`. Sync failures are returned to the Browser as warnings instead of blocking the local archive state. Keep `app_server_timeout_seconds` short so a stopped app-server cannot stall connector startup, thread creation, command setup, Host Session attach, or archive synchronisation longer than necessary.
 
@@ -502,6 +510,7 @@ Then set the matching private connector config:
 ```toml
 [session_inventory]
 app_server_url = "ws://127.0.0.1:9876"
+# app_server_auth_token_file = "/path/to/private/app-server.token"
 ```
 
 Host Session inventory is demand-driven by default. The connector does not periodically rescan local Codex sessions while idle; the Host Sessions refresh button asks online connectors to rescan and report immediately, and the Browser can opt into a one-minute auto-refresh while the Host Sessions page is open. The Durable Object debounces refresh requests per connector, so multiple browser listeners do not increase connector rescan frequency. User actions that create, attach, archive, or otherwise mutate local sessions may still trigger one immediate inventory report to keep the UI coherent. `report_interval_seconds` is retained for private compatibility and future connector-side auto modes, but it is not the default idle polling path. App-server inventory reports are treated as complete only when the app-server list call succeeds, all `thread/list` pages are exhausted, and the combined Host Session report is not truncated by `max_sessions`; transient app-server list failures or truncated reports do not clear known app-server presence for existing Host Sessions. Immediate inventory reports after local thread creation or app-server ensure are incremental, so a lagging app-server state database cannot clear the exact session already returned to and persisted by the Browser API. A later operator-requested complete report can still clear a genuinely unavailable app-server session.
@@ -589,9 +598,9 @@ CHAOP_FIRST_WORKSPACE_ROOT
 - If Browser command submission fails before reaching the Worker, check whether the request has become a CORS preflight and either keep the simple request shape or allow `OPTIONS /api/*` through Cloudflare Access.
 - If the connector gets `401`, check `AGENT_BOOTSTRAP_SECRET` and whether `/connector/bootstrap` and `/ws/agent` are excluded from Browser Access.
 - If the private CLI fallback returns `Codex executable not found`, set `execution.codex_command` to an absolute path that the connector process can execute, for example `/opt/homebrew/bin/codex` on this macOS deployment. This is separate from the attached session `cwd`.
-- If app-server execution fails before the turn starts, check that `execution.mode = "app_server"`, `session_inventory.app_server_url` is set, the target Chaop thread is attached to an app-server Host Session, and the app-server is running on the configured listener.
+- If app-server execution fails before the turn starts, check that `execution.mode = "app_server"`, `session_inventory.app_server_url` is set, the target Chaop thread is attached to an app-server Host Session, and the app-server is running on the configured listener. For an authenticated listener, also confirm that `session_inventory.app_server_auth_token_file` points to the same non-empty token used by `--ws-token-file`.
 - If the connector connects but never receives commands, check that connector bootstrap has seeded workspace membership, that the command targets an executable connector, and that `WorkspaceDO` is bound in the deployed Worker.
-- If New local thread fails with an app-server error, check that `codex app-server --listen ws://127.0.0.1:9876` is running, `session_inventory.app_server_url` matches it, and the connector was restarted after the config change.
+- If New local thread fails with an app-server error, check that `codex app-server --listen ws://127.0.0.1:9876` is running, `session_inventory.app_server_url` and any capability-token file match it, and the connector was restarted after the config change.
 - If Host Sessions is empty or stale, use the Host Sessions refresh button, wait up to `session_inventory.report_interval_seconds`, check that the connector was restarted after this slice, `session_inventory.enabled` is true, and the connector user can read `CODEX_HOME` or `~/.codex`.
 - If an attached historical Host Session still shows only a few events, check that the connector user can read the matching `~/.codex/sessions/**/rollout-*.jsonl` file. Backfill is intentionally bounded to short summaries for one explicitly attached session; full transcript and artefact capture are still deferred.
 - If D1 migration fails, confirm the D1 database UUID is present in the Worker config.
