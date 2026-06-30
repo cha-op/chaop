@@ -58,5 +58,5 @@ superseded_by:
 - 不发送 prompt 的空 thread recovery smoke 已通过；navigation 前后都保留 app-server presence 与选择，也没有发送 command。
 - 最终仓库内已跟踪 deployed smoke 通过了 direct API、assets 与真实 Chromium 检查。Budget state 保持 `normal`；当日实测 D1 rows written 仍为 1,552（`1.6%`），D1 rows-read bottleneck 为 `4.3%`。
 - Post-write deployed smoke 通过了 direct API、assets 与真实 Chromium 检查，没有失败的 browser response。Budget state 保持 `normal`；采样到的当日 D1 rows written 仍为 1,235（`1.2%`）。
-- 连续两轮冻结提交范围独立审查共发现四个边界：已部署 binary 可写、credential pattern 覆盖不完整、runtime root 扩大写权限，以及未认证 loopback control listener。最终 profile 使用固定绝对 write root，保护 binary 与 credential families，并强制使用 managed tools 无法读取的 capability token。重载后的 LaunchDaemon 已在运行中 app-server arguments 里暴露最终 profile 与 auth flags，且一次部署后 control-plane turn 已通过认证 connector 完成。
+- 连续冻结提交范围独立审查共发现五个边界：已部署 binary 可写、credential pattern 覆盖不完整、runtime root 扩大写权限、未认证 loopback control listener，以及 isolated-review state 可写。最终 profile 使用固定绝对 write root，保护 binary 与 credential families，deny `.codex-tmp`，并强制使用 managed tools 无法读取的 capability token。重载后的 LaunchDaemon 已在运行中 app-server arguments 里暴露最终 profile 与 auth flags，且一次部署后 control-plane turn 已通过认证 connector 完成。
 - 最终 post-authentication skip-browser deployed smoke 的 health、bootstrap、usage summary 与两个引用 assets 均返回 `200`。Budget state 保持 `normal`；当日实测 D1 rows written 为 1,859（`1.9%`），D1 rows-read bottleneck 为 `2.2%`。
