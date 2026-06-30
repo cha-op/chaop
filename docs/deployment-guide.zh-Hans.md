@@ -213,7 +213,7 @@ CF_TELEMETRY_CACHE_SECONDS=300
 手动运行 Wrangler 时，复制 example 文件并替换本地专用值：
 
 ```bash
-cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+cp apps/worker/dev.vars.example apps/worker/.dev.vars
 ```
 
 不要在生产环境使用 `.dev.vars` 里的值。

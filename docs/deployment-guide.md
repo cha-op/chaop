@@ -213,7 +213,7 @@ The checked-in Worker config keeps `CHAOP_DEV_ALLOW_INSECURE=false` for producti
 For manual Wrangler runs, copy the example file and replace local-only values:
 
 ```bash
-cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+cp apps/worker/dev.vars.example apps/worker/.dev.vars
 ```
 
 Do not use `.dev.vars` values in production.
