@@ -817,7 +817,7 @@ fn upgrade_marker_modified(marker: Option<&std::path::PathBuf>) -> Option<System
 
 fn is_local_listen_url(listen_url: &str) -> bool {
     #[cfg(unix)]
-    if let Some(path) = listen_url.strip_prefix("unix://") {
+    if let Some(path) = strip_unix_scheme(listen_url) {
         let path = std::path::Path::new(path);
         return path.is_absolute() && path != std::path::Path::new("/");
     }
@@ -825,7 +825,7 @@ fn is_local_listen_url(listen_url: &str) -> bool {
         return false;
     };
     match uri.scheme_str() {
-        Some("ws") | Some("wss") => {
+        Some(scheme) if scheme.eq_ignore_ascii_case("ws") || scheme.eq_ignore_ascii_case("wss") => {
             let Some(host) = uri.host() else {
                 return false;
             };
@@ -833,6 +833,14 @@ fn is_local_listen_url(listen_url: &str) -> bool {
         }
         _ => false,
     }
+}
+
+#[cfg(unix)]
+fn strip_unix_scheme(url: &str) -> Option<&str> {
+    const PREFIX: &str = "unix://";
+    url.get(..PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+        .map(|_| &url[PREFIX.len()..])
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -938,10 +946,13 @@ mod tests {
     #[test]
     fn managed_listen_url_requires_local_endpoint() {
         assert!(is_local_listen_url("ws://localhost:65530"));
+        assert!(is_local_listen_url("WS://localhost:65530"));
         assert!(is_local_listen_url("ws://127.0.0.1:65530"));
         assert!(is_local_listen_url("ws://[::1]:65530"));
         #[cfg(unix)]
         assert!(is_local_listen_url("unix:///tmp/chaop-app-server.sock"));
+        #[cfg(unix)]
+        assert!(is_local_listen_url("UNIX:///tmp/chaop-app-server.sock"));
         assert!(!is_local_listen_url("unix://relative.sock"));
         assert!(!is_local_listen_url("ws://0.0.0.0:65530"));
         assert!(!is_local_listen_url("ws://192.168.1.20:65530"));

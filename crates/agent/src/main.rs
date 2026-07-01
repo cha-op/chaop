@@ -2,6 +2,7 @@ use chaop_agent::app_server_manager::AppServerManager;
 use chaop_agent::config::AgentConfig;
 use chaop_agent::connector::{RunMode, run_connector};
 use chaop_agent::placeholder::placeholder_event_stream;
+use chaop_agent::session_inventory::app_server_health_check_with_auth;
 use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,8 +11,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connect = args.iter().any(|arg| arg == "--connect");
     let run_once = args.iter().any(|arg| arg == "--run-once");
     let print_placeholder = args.iter().any(|arg| arg == "--print-placeholder-events");
+    let app_server_health_check = args.iter().any(|arg| arg == "--app-server-health-check");
 
     let config = AgentConfig::load(config_path)?;
+
+    if app_server_health_check {
+        let url = config
+            .session_inventory
+            .app_server_url
+            .as_deref()
+            .or_else(|| {
+                config
+                    .session_inventory
+                    .managed_app_server
+                    .enabled
+                    .then_some(
+                        config
+                            .session_inventory
+                            .managed_app_server
+                            .listen_url
+                            .as_deref(),
+                    )
+                    .flatten()
+            })
+            .ok_or("connector config does not define an app-server URL")?;
+        app_server_health_check_with_auth(
+            url,
+            config.session_inventory.app_server_timeout_seconds,
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .as_deref(),
+        )?;
+        println!("app-server health: PASS");
+        return Ok(());
+    }
 
     if print_placeholder {
         let prompt = arg_value(&args, "--prompt").unwrap_or("placeholder command");
