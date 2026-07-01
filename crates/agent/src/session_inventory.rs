@@ -3804,10 +3804,11 @@ fn resume_app_server_thread_from_rollout_path_for_archive(
         "path": rollout_path.to_string_lossy(),
         "excludeTurns": true
     });
-    if let Some(cwd) = locked_cwd
-        .map(ToOwned::to_owned)
-        .or(rollout_resume_cwd(&rollout_path, thread_id)?)
-    {
+    let resume_cwd = match locked_cwd {
+        Some(cwd) => Some(cwd.to_owned()),
+        None => rollout_resume_cwd(&rollout_path, thread_id)?,
+    };
+    if let Some(cwd) = resume_cwd {
         params["cwd"] = serde_json::json!(cwd.clone());
         params["runtimeWorkspaceRoots"] = serde_json::json!([cwd]);
     }
@@ -7286,15 +7287,12 @@ mod tests {
         let codex_home = tempdir.path();
         let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
         fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
-        fs::write(
-            &rollout_path,
-            concat!(
-                r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
-                "\n",
-                r#"{"timestamp":"2026-06-16T15:01:00.000Z","type":"turn_context","payload":{"cwd":"/tmp/project-from-turn"}}"#
-            ),
-        )
-        .expect("rollout");
+        let mut rollout =
+            br#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}
+"#
+            .to_vec();
+        rollout.push(0xff);
+        fs::write(&rollout_path, rollout).expect("rollout");
         let (url, requests) = run_fake_app_server_with_requests(vec![
             json!({
                 "jsonrpc": "2.0",
