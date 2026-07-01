@@ -2328,7 +2328,7 @@ test("listThreadEventsInDb returns a thread tail by seq independent of global ev
   );
 });
 
-test("chooseConnectorForLocalThread selects app-server capable connectors", async () => {
+test("chooseConnectorForLocalThread prioritises healthy idle app-server connectors", async () => {
   const connectorId = await chooseConnectorForLocalThread(
     { DB: localThreadConnectorDb({ id: "connector-online" }) } as Env,
     { id: "user-1", email: "operator@example.com", name: "Operator" },
@@ -5229,6 +5229,13 @@ function localThreadConnectorDb(row: { id: string } | null): D1Database {
               assert.equal(second, "workspace-api");
             } else {
               assert.equal(first, "workspace-api");
+              assert.match(sql, /ORDER BY CASE WHEN EXISTS/);
+              assert.match(sql, /FROM app_server_instances asi/);
+              assert.match(sql, /asi\.connector_id = c\.id/);
+              assert.match(sql, /asi\.state = 'healthy'/);
+              assert.match(sql, /asi\.active_turn_count = 0/);
+              assert.match(sql, /asi\.scope = 'connector'/);
+              assert.match(sql, /asi\.scope = 'workspace' AND asi\.workspace_id = wc\.workspace_id/);
             }
             return {
               async first() {

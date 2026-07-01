@@ -24,6 +24,7 @@ superseded_by:
 - 如果 connector 明确报告 app-server thread 和 execution capabilities，外部 service manager 管理的 app-server listener 仍然可以算作 ready；preflight 检查的是 execution path，不是 service-manager ownership model。
 - 最终 review follow-up 会把缺少真实预算采样的状态导向 Budget Board，而不是显示 ready；只要存在一个健康且空闲的 app-server instance，即使另一个 instance 正忙也可以算 ready；对于已经 attach 的现有 app-server thread，也允许只具备 execution capability 的 connector 继续运行。
 - Thread Centre 空状态现在直接显示本机 app-server thread 创建表单；本机 thread 的 connector 选择已端到端对齐：Web readiness、创建表单和 Worker 自动选择都要求同一 workspace connector 同时具备 create 和 exec capability。
+- Worker 自动选择会优先采用拥有健康且空闲的 connector-scoped 或匹配 workspace-scoped app-server instance 的 connector，然后才按更新时间回退，因此另一个不健康 connector 不会消费 workspace-level ready decision。
 
 ## 范围
 - 增加一个有测试覆盖的 Web state helper，返回简洁的 `ready`、`attention` 或 `blocked` preflight decision。
@@ -41,5 +42,3 @@ superseded_by:
 - 合入最新 `master` 后，`pnpm test` 已通过：48 个 script、3 个 protocol、75 个 Web、294 个 Worker 和 203 个 Rust tests。
 - `pnpm build` 已通过。
 - 本地 Playwright 视觉 smoke 已通过，桌面、窄桌面、断点边缘和移动端 Budget Board 渲染正常，没有横向溢出。
-- 最终 review fixes 后已刷新 API 和 Web 部署。
-- `pnpm smoke:deployed` 在最终部署刷新后已通过：direct API health/bootstrap/usage 检查均返回 200，browser bootstrap 返回 200，Budget Board 状态为 `normal`，source 为 `cloudflare_analytics`，bottleneck 为 D1 rows read / day，使用率 11.7%。

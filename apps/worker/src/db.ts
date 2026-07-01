@@ -4710,7 +4710,18 @@ async function findBestLocalThreadConnector(
      WHERE wc.workspace_id = ? AND wc.can_execute = 1 AND c.status = 'online'
        AND c.capabilities_json LIKE '%"app_server_threads"%'
        AND c.capabilities_json LIKE '%"codex_app_server_exec"%'
-     ORDER BY c.last_seen_at DESC, c.updated_at DESC
+     ORDER BY CASE WHEN EXISTS (
+       SELECT 1
+       FROM app_server_instances asi
+       WHERE asi.connector_id = c.id
+         AND asi.state = 'healthy'
+         AND asi.active_turn_count = 0
+         AND (
+           asi.scope = 'connector'
+           OR (asi.scope = 'workspace' AND asi.workspace_id = wc.workspace_id)
+         )
+     ) THEN 0 ELSE 1 END,
+     c.last_seen_at DESC, c.updated_at DESC
      LIMIT 1`
   )
     .bind(workspaceId)

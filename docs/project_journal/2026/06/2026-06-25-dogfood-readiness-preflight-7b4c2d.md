@@ -24,6 +24,7 @@ superseded_by:
 - Externally managed app-server listeners still count as ready when the connector reports the app-server thread and execution capabilities; the preflight tests the execution path, not the service-manager ownership model.
 - Final review follow-up routes missing sampled budget constraints to Budget Board instead of marking the path ready, treats any idle healthy app-server instance as sufficient even when another instance is busy, and allows selected existing attached app-server threads to run on exec-only connectors.
 - The Thread Centre empty state now exposes the local app-server thread creation form, and local thread connector selection is aligned end-to-end: Web readiness, the create form, and Worker auto-selection all require create-and-exec capability on the same workspace connector.
+- Worker auto-selection prioritises connectors with a healthy idle connector- or workspace-scoped app-server instance before falling back to recency, so a different unhealthy connector cannot consume a workspace-level ready decision.
 
 ## Scope
 - Add a tested Web state helper that returns a compact `ready`, `attention`, or `blocked` preflight decision.
@@ -41,5 +42,3 @@ superseded_by:
 - `pnpm test` passed after merging the latest `master`: 48 script, 3 protocol, 75 Web, 294 Worker, and 203 Rust tests.
 - `pnpm build` passed.
 - Local Playwright visual smoke passed for desktop, narrow desktop, breakpoint-edge, and mobile Budget Board rendering, with no horizontal overflow.
-- API and Web deployments were refreshed after the final review fixes.
-- `pnpm smoke:deployed` passed after the final deployment refresh: direct API health/bootstrap/usage checks returned 200, browser bootstrap returned 200, Budget Board state was `normal`, source was `cloudflare_analytics`, and the bottleneck was D1 rows read / day at 11.7%.

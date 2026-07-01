@@ -6095,6 +6095,13 @@ function localThreadCreateDb(): D1Database & { readonly userWrites: number; read
         assert.match(sql, /c\.status = 'online'/);
         assert.match(sql, /c\.capabilities_json LIKE '%"app_server_threads"%'/);
         assert.match(sql, /c\.capabilities_json LIKE '%"codex_app_server_exec"%'/);
+        assert.match(sql, /ORDER BY CASE WHEN EXISTS/);
+        assert.match(sql, /FROM app_server_instances asi/);
+        assert.match(sql, /asi\.connector_id = c\.id/);
+        assert.match(sql, /asi\.state = 'healthy'/);
+        assert.match(sql, /asi\.active_turn_count = 0/);
+        assert.match(sql, /asi\.scope = 'connector'/);
+        assert.match(sql, /asi\.scope = 'workspace' AND asi\.workspace_id = wc\.workspace_id/);
         return {
           bind(workspaceId: string) {
             assert.equal(workspaceId, "workspace-api");
