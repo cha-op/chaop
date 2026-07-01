@@ -45,6 +45,7 @@ app_server_timeout_seconds = 2
 [session_inventory.managed_app_server]
 enabled = true
 listen_url = "unix:///path/to/private/app-server.sock"
+lock_cwd_to_workspace_root = true
 startup_timeout_seconds = 10
 restart_backoff_seconds = 5
 drain_timeout_seconds = 300

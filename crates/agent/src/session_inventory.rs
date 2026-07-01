@@ -1549,9 +1549,13 @@ fn run_app_server_command(
                     "active app-server thread {session_id} was not found and no local rollout was available"
                 )));
             };
-            let resume_cwd = rollout_resume_cwd(&rollout_path, session_id)
-                .map_err(|error| AppServerCommandError::Other(error.to_string()))?
-                .unwrap_or_else(|| cwd.clone());
+            let resume_cwd = if lock_app_server_cwd_to_workspace_root(config) {
+                cwd.clone()
+            } else {
+                rollout_resume_cwd(&rollout_path, session_id)
+                    .map_err(|error| AppServerCommandError::Other(error.to_string()))?
+                    .unwrap_or_else(|| cwd.clone())
+            };
             (
                 serde_json::json!({
                     "threadId": session_id,
@@ -1603,12 +1607,16 @@ fn run_app_server_command(
         Some(resumed) => resumed.id.clone(),
         None => response_thread_id(&resume_response).unwrap_or(fallback_thread_id),
     };
-    let turn_cwd = resume_response
-        .pointer("/result/thread/cwd")
-        .and_then(Value::as_str)
-        .filter(|cwd| !cwd.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or(requested_turn_cwd);
+    let turn_cwd = if lock_app_server_cwd_to_workspace_root(config) {
+        cwd
+    } else {
+        resume_response
+            .pointer("/result/thread/cwd")
+            .and_then(Value::as_str)
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or(requested_turn_cwd)
+    };
 
     let turn_response = send_app_server_turn_start_for_command(
         &mut socket,
@@ -2986,9 +2994,20 @@ fn turn_id_from_start_response(value: &Value) -> Option<&str> {
 }
 
 fn app_server_command_cwd(config: &AgentConfig, cwd: Option<&str>) -> String {
+    if lock_app_server_cwd_to_workspace_root(config) {
+        return config.workspace_root.to_string_lossy().into_owned();
+    }
     cwd.filter(|value| Path::new(value).is_absolute())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| config.workspace_root.to_string_lossy().into_owned())
+}
+
+fn lock_app_server_cwd_to_workspace_root(config: &AgentConfig) -> bool {
+    config.session_inventory.managed_app_server.enabled
+        && config
+            .session_inventory
+            .managed_app_server
+            .lock_cwd_to_workspace_root
 }
 
 fn turn_is_terminal(turn: &Value) -> bool {
@@ -7140,6 +7159,100 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("Say exactly: chaop-smoke")
         );
+    }
+
+    #[test]
+    fn managed_app_server_can_lock_resume_and_turn_cwd_to_workspace_root() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [{
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "cwd": "/tmp/project/nested",
+                        "updatedAt": 1781263443
+                    }]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "cwd": "/tmp/project/nested",
+                        "turns": []
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "turn": completed_turn("turn-1", "locked cwd")
+                }
+            }),
+        ]);
+        let mut config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        config.session_inventory.managed_app_server.enabled = true;
+        config
+            .session_inventory
+            .managed_app_server
+            .lock_cwd_to_workspace_root = true;
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            Some("/tmp/project/nested"),
+            "command-1",
+            "Use the workspace root",
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+        let _list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let turn_start_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("turn/start request");
+
+        for request in [&resume_request, &turn_start_request] {
+            assert_eq!(
+                request
+                    .pointer("/params/cwd")
+                    .and_then(serde_json::Value::as_str),
+                Some("/tmp/project")
+            );
+            assert_eq!(
+                request
+                    .pointer("/params/runtimeWorkspaceRoots/0")
+                    .and_then(serde_json::Value::as_str),
+                Some("/tmp/project")
+            );
+        }
     }
 
     #[test]

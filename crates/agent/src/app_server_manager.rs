@@ -1931,6 +1931,7 @@ mod tests {
                     enabled,
                     listen_url: None,
                     extra_args: Vec::new(),
+                    lock_cwd_to_workspace_root: false,
                     startup_timeout_seconds: 1,
                     restart_backoff_seconds: 1,
                     drain_timeout_seconds: 300,
