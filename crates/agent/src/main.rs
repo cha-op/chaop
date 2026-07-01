@@ -61,6 +61,7 @@ fn app_server_health_target(config: &AgentConfig) -> Option<&str> {
             .managed_app_server
             .listen_url
             .as_deref()
+            .or(config.session_inventory.app_server_url.as_deref())
     } else {
         config.session_inventory.app_server_url.as_deref()
     }
@@ -102,6 +103,12 @@ mod tests {
         assert_eq!(
             app_server_health_target(&config),
             Some("unix:///tmp/managed.sock")
+        );
+
+        config.session_inventory.managed_app_server.listen_url = None;
+        assert_eq!(
+            app_server_health_target(&config),
+            Some("wss://external.example.test")
         );
 
         config.session_inventory.managed_app_server.enabled = false;
