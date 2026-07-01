@@ -5,16 +5,24 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::{
+    fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    unix::{ffi::OsStrExt, net::UnixStream},
+};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
+    mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError},
 };
 use std::time::{Duration, Instant};
 use tungstenite::{
-    Message, WebSocket, client::client, connect, handshake::HandshakeError, http::Uri,
+    Message, WebSocket,
+    client::{IntoClientRequest, client},
+    handshake::HandshakeError,
+    http::{HeaderValue, Uri, header::AUTHORIZATION},
     stream::MaybeTlsStream,
 };
 
@@ -24,7 +32,29 @@ const APP_SERVER_ARCHIVE_SYNC_MAX_PAGES_PER_STATE: usize = 2;
 const APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS: u64 = 12;
 const AUTO_RESOLUTION_RESPONSE_GRACE_MS: u64 = 250;
 
-type AppServerSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+enum AppServerSocket {
+    Tcp(WebSocket<MaybeTlsStream<TcpStream>>),
+    #[cfg(unix)]
+    Unix(WebSocket<UnixStream>),
+}
+
+impl AppServerSocket {
+    fn read(&mut self) -> tungstenite::Result<Message> {
+        match self {
+            Self::Tcp(socket) => socket.read(),
+            #[cfg(unix)]
+            Self::Unix(socket) => socket.read(),
+        }
+    }
+
+    fn send(&mut self, message: Message) -> tungstenite::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.send(message),
+            #[cfg(unix)]
+            Self::Unix(socket) => socket.send(message),
+        }
+    }
+}
 
 pub struct AppServerCommandChannels {
     pub event_sender: Sender<ConnectorEvent>,
@@ -180,10 +210,14 @@ pub fn build_host_sessions_report(
         read_history_sessions(&codex_home, config.session_inventory.max_sessions)?;
     let (app_server_sessions, app_server_inventory_ok, app_server_inventory_truncated) =
         if let Some(url) = config.session_inventory.app_server_url.as_deref() {
-            match load_app_server_sessions(
+            match load_app_server_sessions_with_auth(
                 url,
                 config.session_inventory.max_sessions,
                 config.session_inventory.app_server_timeout_seconds,
+                config
+                    .session_inventory
+                    .app_server_auth_token_file
+                    .as_deref(),
             ) {
                 Ok(inventory) => (inventory.sessions, Some(true), inventory.truncated),
                 Err(_) => (HashMap::new(), Some(false), false),
@@ -223,7 +257,12 @@ pub fn build_host_sessions_report(
             resolve_session(draft, app_title, &history_sessions)
         })
         .collect::<Vec<_>>();
-    sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
     let inventory_scope = if app_server_inventory_truncated
         || sessions.len() > config.session_inventory.max_sessions
     {
@@ -932,28 +971,37 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+#[cfg(test)]
 fn load_app_server_sessions(
     url: &str,
     limit: usize,
     timeout_seconds: u64,
 ) -> Result<AppServerSessionInventory, Box<dyn std::error::Error>> {
+    load_app_server_sessions_with_auth(url, limit, timeout_seconds, None)
+}
+
+fn load_app_server_sessions_with_auth(
+    url: &str,
+    limit: usize,
+    timeout_seconds: u64,
+    auth_token_file: Option<&Path>,
+) -> Result<AppServerSessionInventory, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let mut socket = connect_app_server(url, timeout)?;
-    initialize_app_server_connection(&mut socket)?;
+    let deadline = Instant::now() + timeout;
+    let mut socket = connect_app_server(url, timeout, auth_token_file)?;
+    initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
     let session_limit = limit.max(1);
     let page_limit = session_limit.saturating_add(1);
-    socket.send(Message::Text(
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "thread/list",
-            "params": app_server_thread_list_params(page_limit, None, Some(false))
-        })
-        .to_string()
-        .into(),
-    ))?;
-
-    let value = read_app_server_inventory_page(&mut socket, 1)?;
+    let value = send_app_server_thread_list_request(
+        &mut socket,
+        1,
+        page_limit,
+        None,
+        Some(false),
+        timeout,
+        deadline,
+    )?;
+    validate_app_server_thread_list_response(&value)?;
     let sessions = app_server_sessions_from_response(&value);
     let raw_thread_count = app_server_thread_list_data(&value)
         .map(|threads| threads.len())
@@ -970,52 +1018,85 @@ pub fn app_server_health_check(
     url: &str,
     timeout_seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let mut socket = connect_app_server(url, timeout)?;
-    initialize_app_server_connection(&mut socket)
+    app_server_health_check_with_auth(url, timeout_seconds, None)
 }
 
-fn read_app_server_inventory_page(
-    socket: &mut AppServerSocket,
-    request_id: i64,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    loop {
-        match socket.read()? {
-            Message::Text(text) => {
-                let value = serde_json::from_str::<Value>(text.as_ref())?;
-                if value.get("id").and_then(Value::as_i64) != Some(request_id) {
-                    continue;
-                }
-                if let Some(error) = value.get("error") {
-                    return Err(app_server_error("thread/list", error).into());
-                }
-                validate_app_server_thread_list_response(&value)?;
-                return Ok(value);
-            }
-            Message::Close(_) => {
-                return Err("app-server closed before thread/list response".into());
-            }
-            _ => {}
-        }
-    }
+pub fn app_server_health_check_with_auth(
+    url: &str,
+    timeout_seconds: u64,
+    auth_token_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+    app_server_health_check_with_auth_timeout(url, timeout, auth_token_file)
+}
+
+pub(crate) fn app_server_health_check_with_auth_timeout(
+    url: &str,
+    timeout: Duration,
+    auth_token_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut socket = connect_app_server(url, timeout, auth_token_file)?;
+    initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)
 }
 
 fn connect_app_server(
     url: &str,
     timeout: Duration,
+    auth_token_file: Option<&Path>,
 ) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
-    let uri = url.parse::<Uri>()?;
-    if uri.scheme_str() == Some("ws") {
-        return connect_plain_app_server(url, &uri, timeout);
+    if let Some(path) = strip_app_server_unix_scheme(url) {
+        return connect_unix_app_server(Path::new(path), auth_token_file, timeout);
     }
-
-    let (mut socket, _) = connect(url)?;
-    configure_socket_timeout(&mut socket, timeout)?;
-    Ok(socket)
+    let uri = url.parse::<Uri>()?;
+    if app_server_uri_scheme_is(&uri, "ws") || app_server_uri_scheme_is(&uri, "wss") {
+        connect_tcp_app_server(url, auth_token_file, &uri, timeout)
+    } else {
+        Err("app-server URL must use ws://, wss://, or unix://".into())
+    }
 }
 
-fn connect_plain_app_server(
+fn strip_app_server_unix_scheme(url: &str) -> Option<&str> {
+    const PREFIX: &str = "unix://";
+    url.get(..PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+        .map(|_| &url[PREFIX.len()..])
+}
+
+fn app_server_client_request(
     url: &str,
+    auth_token_file: Option<&Path>,
+) -> Result<tungstenite::http::Request<()>, Box<dyn std::error::Error>> {
+    let mut request = url.into_client_request()?;
+    let Some(path) = auth_token_file else {
+        return Ok(request);
+    };
+    let uri = url.parse::<Uri>()?;
+    if !app_server_auth_url_is_safe(&uri) {
+        return Err("app-server auth tokens require wss://".into());
+    }
+    let token = fs::read_to_string(path)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(format!("app-server auth token file is empty: {}", path.display()).into());
+    }
+    let value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+    request.headers_mut().insert(AUTHORIZATION, value);
+    Ok(request)
+}
+
+fn app_server_auth_url_is_safe(uri: &Uri) -> bool {
+    app_server_uri_scheme_is(uri, "wss")
+}
+
+fn app_server_uri_scheme_is(uri: &Uri, expected: &str) -> bool {
+    uri.scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(expected))
+}
+
+fn connect_tcp_app_server(
+    url: &str,
+    auth_token_file: Option<&Path>,
     uri: &Uri,
     timeout: Duration,
 ) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
@@ -1024,23 +1105,63 @@ fn connect_plain_app_server(
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or(host);
-    let port = uri.port_u16().unwrap_or(80);
+    let uses_tls = app_server_uri_scheme_is(uri, "wss");
+    let port = app_server_port(uri, uses_tls)?;
+    let deadline = Instant::now() + timeout;
+    let request = app_server_client_request(url, auth_token_file)?;
+    let remaining = app_server_connection_time_remaining(deadline, url)?;
+    let addresses = resolve_app_server_addresses(host, port, remaining, url)?;
+    let address_count = addresses.len();
     let mut last_error = None;
 
-    for addr in (host, port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, timeout) {
+    for (index, addr) in addresses.into_iter().enumerate() {
+        let remaining = app_server_connection_time_remaining(deadline, url)?;
+        let connect_timeout = app_server_connect_attempt_timeout(
+            remaining,
+            address_count.saturating_sub(index).max(1),
+        );
+        match TcpStream::connect_timeout(&addr, connect_timeout) {
             Ok(stream) => {
                 stream.set_nodelay(true)?;
-                stream.set_read_timeout(Some(timeout))?;
-                stream.set_write_timeout(Some(timeout))?;
-                let (socket, _) = match client(url, MaybeTlsStream::Plain(stream)) {
+                let watchdog_stream = stream.try_clone()?;
+                let mut deadline_guard =
+                    ConnectionDeadlineGuard::start(deadline, url, move || {
+                        let _ = watchdog_stream.shutdown(Shutdown::Both);
+                    })?;
+                let remaining = app_server_connection_time_remaining(deadline, url)?;
+                stream.set_read_timeout(Some(remaining))?;
+                stream.set_write_timeout(Some(remaining))?;
+                let stream = if uses_tls {
+                    let connector = native_tls::TlsConnector::new()?;
+                    let tls_stream = match connector.connect(host, stream) {
+                        Ok(stream) => stream,
+                        Err(native_tls::HandshakeError::Failure(error)) => {
+                            return Err(error.into());
+                        }
+                        Err(native_tls::HandshakeError::WouldBlock(_)) => {
+                            return Err(format!(
+                                "timed out during TLS handshake with app-server URL {url}"
+                            )
+                            .into());
+                        }
+                    };
+                    MaybeTlsStream::NativeTls(tls_stream)
+                } else {
+                    MaybeTlsStream::Plain(stream)
+                };
+                let remaining = app_server_connection_time_remaining(deadline, url)?;
+                configure_maybe_tls_stream_timeout(&stream, remaining)?;
+                let (mut socket, _) = match client(request, stream) {
                     Ok(result) => result,
                     Err(HandshakeError::Failure(error)) => return Err(error.into()),
                     Err(HandshakeError::Interrupted(_)) => {
                         return Err("app-server websocket handshake was interrupted".into());
                     }
                 };
-                return Ok(socket);
+                deadline_guard.cancel();
+                app_server_connection_time_remaining(deadline, url)?;
+                configure_tcp_socket_timeout(&mut socket, timeout)?;
+                return Ok(AppServerSocket::Tcp(socket));
             }
             Err(error) => {
                 last_error = Some(error);
@@ -1054,11 +1175,589 @@ fn connect_plain_app_server(
     })
 }
 
-fn configure_socket_timeout(
-    socket: &mut AppServerSocket,
+fn app_server_connect_attempt_timeout(
+    remaining: Duration,
+    remaining_address_count: usize,
+) -> Duration {
+    let divisor = u32::try_from(remaining_address_count.max(1)).unwrap_or(u32::MAX);
+    (remaining / divisor).max(Duration::from_nanos(1))
+}
+
+fn app_server_port(uri: &Uri, uses_tls: bool) -> Result<u16, Box<dyn std::error::Error>> {
+    match app_server_explicit_port(uri) {
+        Some(port) => match port.parse::<u16>() {
+            Ok(0) | Err(_) => Err(format!("app-server URL port is invalid: {port}").into()),
+            Ok(port) => Ok(port),
+        },
+        None => Ok(if uses_tls { 443 } else { 80 }),
+    }
+}
+
+pub(crate) fn app_server_explicit_port(uri: &Uri) -> Option<&str> {
+    let authority = uri.authority()?.as_str();
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, value)| value);
+    if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        let (_, suffix) = bracketed.split_once(']')?;
+        return suffix.strip_prefix(':');
+    }
+    host_and_port.rsplit_once(':').map(|(_, port)| port)
+}
+
+struct ConnectionDeadlineGuard {
+    cancellation_sender: Option<SyncSender<()>>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ConnectionDeadlineGuard {
+    fn start<F>(
+        deadline: Instant,
+        url: &str,
+        shutdown: F,
+    ) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let remaining = app_server_connection_time_remaining(deadline, url)?;
+        let (cancellation_sender, cancellation_receiver) = std::sync::mpsc::sync_channel(1);
+        let watchdog = std::thread::Builder::new()
+            .name("chaop-app-server-deadline".to_owned())
+            .spawn(move || {
+                if matches!(
+                    cancellation_receiver.recv_timeout(remaining),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    shutdown();
+                }
+            })?;
+        Ok(Self {
+            cancellation_sender: Some(cancellation_sender),
+            watchdog: Some(watchdog),
+        })
+    }
+
+    fn cancel(&mut self) {
+        if let Some(sender) = self.cancellation_sender.take() {
+            let _ = sender.try_send(());
+        }
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
+impl Drop for ConnectionDeadlineGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+type AppServerResolverFn =
+    dyn Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + Sync + 'static;
+
+// Blocking system DNS calls cannot be cancelled portably. Replace a stalled
+// generation for recovery, but cap abandoned workers so retries stay bounded.
+const APP_SERVER_MAX_RETIRED_RESOLVER_WORKERS: usize = 2;
+const APP_SERVER_RESOLVER_QUEUE_CAPACITY: usize = 8;
+
+struct AppServerResolveRequest {
+    host: String,
+    port: u16,
+    response_sender: SyncSender<std::io::Result<Vec<SocketAddr>>>,
+}
+
+struct AppServerResolverWorker {
+    generation: u64,
+    request_sender: SyncSender<AppServerResolveRequest>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+struct AppServerResolverState {
+    active: Option<AppServerResolverWorker>,
+    retired: Vec<std::thread::JoinHandle<()>>,
+    next_generation: u64,
+}
+
+struct AppServerResolver {
+    resolver: Arc<AppServerResolverFn>,
+    state: Mutex<AppServerResolverState>,
+}
+
+impl AppServerResolver {
+    fn start<F>(resolver: F) -> std::io::Result<Self>
+    where
+        F: Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + Sync + 'static,
+    {
+        let resolver: Arc<AppServerResolverFn> = Arc::new(resolver);
+        let active = Self::spawn_worker(Arc::clone(&resolver), 0)?;
+        Ok(Self {
+            resolver,
+            state: Mutex::new(AppServerResolverState {
+                active: Some(active),
+                retired: Vec::new(),
+                next_generation: 1,
+            }),
+        })
+    }
+
+    fn spawn_worker(
+        resolver: Arc<AppServerResolverFn>,
+        generation: u64,
+    ) -> std::io::Result<AppServerResolverWorker> {
+        let (request_sender, request_receiver) = std::sync::mpsc::sync_channel::<
+            AppServerResolveRequest,
+        >(APP_SERVER_RESOLVER_QUEUE_CAPACITY);
+        let handle = std::thread::Builder::new()
+            .name(format!("chaop-app-server-resolver-{generation}"))
+            .spawn(move || {
+                while let Ok(request) = request_receiver.recv() {
+                    let result = resolver(request.host.as_str(), request.port);
+                    let _ = request.response_sender.send(result);
+                }
+            })?;
+        Ok(AppServerResolverWorker {
+            generation,
+            request_sender,
+            handle,
+        })
+    }
+
+    fn active_sender(
+        &self,
+    ) -> Result<(u64, SyncSender<AppServerResolveRequest>), Box<dyn std::error::Error>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "app-server resolver state lock is poisoned")?;
+        Self::reap_finished_workers(&mut state);
+        let Some(active) = state.active.as_ref() else {
+            return Err("app-server resolver is stopped".into());
+        };
+        Ok((active.generation, active.request_sender.clone()))
+    }
+
+    fn replace_timed_out_worker(&self, generation: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "app-server resolver state lock is poisoned")?;
+        Self::reap_finished_workers(&mut state);
+        if state.active.as_ref().map(|worker| worker.generation) != Some(generation) {
+            return Ok(());
+        }
+        if state.retired.len() >= APP_SERVER_MAX_RETIRED_RESOLVER_WORKERS {
+            return Err("app-server resolver recovery limit reached".into());
+        }
+        let replacement = Self::spawn_worker(Arc::clone(&self.resolver), state.next_generation)?;
+        state.next_generation = state.next_generation.saturating_add(1);
+        let timed_out = state
+            .active
+            .replace(replacement)
+            .expect("active resolver worker");
+        drop(timed_out.request_sender);
+        state.retired.push(timed_out.handle);
+        Ok(())
+    }
+
+    fn reap_finished_workers(state: &mut AppServerResolverState) {
+        let mut index = 0;
+        while index < state.retired.len() {
+            if state.retired[index].is_finished() {
+                let worker = state.retired.swap_remove(index);
+                let _ = worker.join();
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        let state = self.state.lock().expect("resolver state");
+        usize::from(state.active.is_some()) + state.retired.len()
+    }
+
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+        url: &str,
+    ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
+        let (response_sender, response_receiver) = std::sync::mpsc::sync_channel(1);
+        let request = AppServerResolveRequest {
+            host: host.to_owned(),
+            port,
+            response_sender,
+        };
+        let (generation, request_sender) = self.active_sender()?;
+        match request_sender.try_send(request) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err(format!("app-server resolver is busy resolving {url}").into());
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                let recovery = self.replace_timed_out_worker(generation);
+                return Err(match recovery {
+                    Ok(()) => format!("app-server resolver stopped before resolving {url}").into(),
+                    Err(error) => {
+                        format!("app-server resolver stopped before resolving {url}; {error}")
+                            .into()
+                    }
+                });
+            }
+        }
+        match response_receiver.recv_timeout(timeout) {
+            Ok(Ok(addresses)) => Ok(addresses),
+            Ok(Err(error)) => Err(error.into()),
+            Err(RecvTimeoutError::Timeout) => match self.replace_timed_out_worker(generation) {
+                Ok(()) => Err(format!("timed out resolving app-server URL {url}").into()),
+                Err(error) => {
+                    Err(format!("timed out resolving app-server URL {url}; {error}").into())
+                }
+            },
+            Err(RecvTimeoutError::Disconnected) => {
+                let recovery = self.replace_timed_out_worker(generation);
+                Err(match recovery {
+                    Ok(()) => format!("app-server resolver stopped before resolving {url}").into(),
+                    Err(error) => {
+                        format!("app-server resolver stopped before resolving {url}; {error}")
+                            .into()
+                    }
+                })
+            }
+        }
+    }
+}
+
+impl Drop for AppServerResolver {
+    fn drop(&mut self) {
+        let Ok(state) = self.state.get_mut() else {
+            return;
+        };
+        let mut workers = std::mem::take(&mut state.retired);
+        if let Some(active) = state.active.take() {
+            drop(active.request_sender);
+            workers.push(active.handle);
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+}
+
+static APP_SERVER_RESOLVER: OnceLock<Result<AppServerResolver, String>> = OnceLock::new();
+
+fn shared_app_server_resolver() -> Result<&'static AppServerResolver, Box<dyn std::error::Error>> {
+    match APP_SERVER_RESOLVER.get_or_init(|| {
+        AppServerResolver::start(|host, port| {
+            (host, port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect::<Vec<_>>())
+        })
+        .map_err(|error| error.to_string())
+    }) {
+        Ok(resolver) => Ok(resolver),
+        Err(error) => Err(format!("failed to start app-server resolver: {error}").into()),
+    }
+}
+
+fn resolve_app_server_addresses(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    url: &str,
+) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(address, port)]);
+    }
+    shared_app_server_resolver()?.resolve(host, port, timeout, url)
+}
+
+fn app_server_connection_time_remaining(
+    deadline: Instant,
+    url: &str,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| format!("timed out connecting to app-server URL {url}").into())
+}
+
+#[cfg(unix)]
+fn wait_for_unix_socket_writable(raw_fd: libc::c_int, deadline: Instant) -> std::io::Result<()> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "timed out connecting to app-server Unix socket",
+                )
+            })?;
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
+        let mut poll_fd = libc::pollfd {
+            fd: raw_fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let poll_result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if poll_result > 0 {
+            return Ok(());
+        }
+        if poll_result == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "timed out connecting to app-server Unix socket",
+            ));
+        }
+        let poll_error = std::io::Error::last_os_error();
+        if poll_error.kind() != ErrorKind::Interrupted {
+            return Err(poll_error);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn connect_unix_stream_with_deadline(
+    path: &Path,
+    deadline: Instant,
+) -> std::io::Result<UnixStream> {
+    // std::os::unix::net::UnixStream has no connect_timeout equivalent. Drive
+    // a non-blocking connect with poll so a full listener backlog is bounded.
+    let path_bytes = path.as_os_str().as_bytes();
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    if path_bytes.contains(&0) || path_bytes.len() >= address.sun_path.len() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "app-server Unix socket path is invalid or too long",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            path_bytes.len(),
+        );
+    }
+    let address_base = std::ptr::addr_of!(address) as usize;
+    let path_offset = std::ptr::addr_of!(address.sun_path) as usize - address_base;
+    let address_len = (path_offset + path_bytes.len() + 1) as libc::socklen_t;
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        address.sun_len = address_len as u8;
+    }
+
+    // Use the atomic close-on-exec socket flag where the target exposes it.
+    // Apple targets do not, so the descriptor flag below is also required as
+    // the portable fallback.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    let socket_type = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    let socket_type = libc::SOCK_STREAM;
+
+    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let socket = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let descriptor_flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if descriptor_flags & libc::FD_CLOEXEC == 0
+        && unsafe {
+            libc::fcntl(
+                socket.as_raw_fd(),
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let original_flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+    if original_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe {
+        libc::fcntl(
+            socket.as_raw_fd(),
+            libc::F_SETFL,
+            original_flags | libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    enum ConnectState {
+        Retry,
+        BacklogFull,
+        InProgress,
+    }
+
+    let mut state = ConnectState::Retry;
+    loop {
+        match state {
+            ConnectState::Retry => {
+                let connect_result = unsafe {
+                    libc::connect(
+                        socket.as_raw_fd(),
+                        std::ptr::addr_of!(address).cast::<libc::sockaddr>(),
+                        address_len,
+                    )
+                };
+                if connect_result == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                let raw_error = error.raw_os_error();
+                if raw_error == Some(libc::EINTR) {
+                    continue;
+                }
+                if raw_error == Some(libc::EISCONN) {
+                    break;
+                }
+                state = if raw_error == Some(libc::EAGAIN) || raw_error == Some(libc::EWOULDBLOCK) {
+                    ConnectState::BacklogFull
+                } else if raw_error == Some(libc::EINPROGRESS) || raw_error == Some(libc::EALREADY)
+                {
+                    ConnectState::InProgress
+                } else {
+                    return Err(error);
+                };
+            }
+            ConnectState::BacklogFull => {
+                wait_for_unix_socket_writable(socket.as_raw_fd(), deadline)?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "timed out connecting to app-server Unix socket",
+                    ));
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                state = ConnectState::Retry;
+            }
+            ConnectState::InProgress => {
+                wait_for_unix_socket_writable(socket.as_raw_fd(), deadline)?;
+                let mut socket_error = 0;
+                let mut socket_error_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        std::ptr::addr_of_mut!(socket_error).cast(),
+                        &mut socket_error_len,
+                    )
+                } < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if socket_error == 0 || socket_error == libc::EISCONN {
+                    break;
+                }
+                state = if socket_error == libc::EAGAIN || socket_error == libc::EWOULDBLOCK {
+                    ConnectState::BacklogFull
+                } else if socket_error == libc::EINPROGRESS || socket_error == libc::EALREADY {
+                    ConnectState::InProgress
+                } else {
+                    return Err(std::io::Error::from_raw_os_error(socket_error));
+                };
+            }
+        }
+    }
+
+    if unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFL, original_flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { UnixStream::from_raw_fd(socket.into_raw_fd()) })
+}
+
+#[cfg(unix)]
+fn connect_unix_app_server(
+    path: &Path,
+    auth_token_file: Option<&Path>,
+    timeout: Duration,
+) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
+    if auth_token_file.is_some() {
+        return Err("app-server auth tokens are not supported over unix:// sockets".into());
+    }
+    if !path.is_absolute() || path == Path::new("/") {
+        return Err("app-server unix:// URLs require an absolute socket path".into());
+    }
+    let url = format!("unix://{}", path.display());
+    let deadline = Instant::now() + timeout;
+    let stream = connect_unix_stream_with_deadline(path, deadline)?;
+    let watchdog_stream = stream.try_clone()?;
+    let mut deadline_guard = ConnectionDeadlineGuard::start(deadline, &url, move || {
+        let _ = watchdog_stream.shutdown(Shutdown::Both);
+    })?;
+    let remaining = app_server_connection_time_remaining(deadline, &url)?;
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))?;
+    let request = "ws://localhost/".into_client_request()?;
+    let (mut socket, _) = match client(request, stream) {
+        Ok(result) => result,
+        Err(HandshakeError::Failure(error)) => return Err(error.into()),
+        Err(HandshakeError::Interrupted(_)) => {
+            return Err("app-server websocket handshake was interrupted".into());
+        }
+    };
+    deadline_guard.cancel();
+    app_server_connection_time_remaining(deadline, &url)?;
+    socket.get_mut().set_read_timeout(Some(timeout))?;
+    socket.get_mut().set_write_timeout(Some(timeout))?;
+    Ok(AppServerSocket::Unix(socket))
+}
+
+#[cfg(not(unix))]
+fn connect_unix_app_server(
+    _path: &Path,
+    _auth_token_file: Option<&Path>,
+    _timeout: Duration,
+) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
+    Err("app-server unix:// URLs are only supported on Unix platforms".into())
+}
+
+fn configure_tcp_socket_timeout(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     timeout: Duration,
 ) -> std::io::Result<()> {
-    match socket.get_mut() {
+    configure_maybe_tls_stream_timeout(socket.get_mut(), timeout)
+}
+
+fn configure_maybe_tls_stream_timeout(
+    stream: &MaybeTlsStream<TcpStream>,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    match stream {
         tungstenite::stream::MaybeTlsStream::Plain(stream) => {
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))
@@ -1068,6 +1767,20 @@ fn configure_socket_timeout(
             stream.get_ref().set_write_timeout(Some(timeout))
         }
         _ => Ok(()),
+    }
+}
+
+fn configure_socket_timeout(
+    socket: &mut AppServerSocket,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    match socket {
+        AppServerSocket::Tcp(socket) => configure_tcp_socket_timeout(socket, timeout),
+        #[cfg(unix)]
+        AppServerSocket::Unix(socket) => {
+            socket.get_mut().set_read_timeout(Some(timeout))?;
+            socket.get_mut().set_write_timeout(Some(timeout))
+        }
     }
 }
 
@@ -1207,11 +1920,15 @@ pub fn create_app_server_thread(
         .as_deref()
         .ok_or("session_inventory.app_server_url is required for local thread creation")?;
     let cwd = config.workspace_root.to_string_lossy().into_owned();
-    create_app_server_thread_at(
+    create_app_server_thread_at_with_auth(
         url,
         title,
         &cwd,
         config.session_inventory.app_server_timeout_seconds,
+        config
+            .session_inventory
+            .app_server_auth_token_file
+            .as_deref(),
     )
 }
 
@@ -1231,7 +1948,7 @@ pub fn ensure_app_server_host_session(
         .codex_home
         .clone()
         .unwrap_or_else(default_codex_home);
-    ensure_app_server_host_session_at(
+    ensure_app_server_host_session_at_with_auth(
         url,
         session_id,
         title,
@@ -1239,6 +1956,11 @@ pub fn ensure_app_server_host_session(
         None,
         Some((&codex_home, config.session_inventory.max_sessions)),
         config.session_inventory.app_server_timeout_seconds,
+        lock_app_server_cwd_to_workspace_root(config),
+        config
+            .session_inventory
+            .app_server_auth_token_file
+            .as_deref(),
     )
 }
 
@@ -1257,12 +1979,19 @@ pub fn set_app_server_thread_archived(
         .codex_home
         .clone()
         .unwrap_or_else(default_codex_home);
-    set_app_server_thread_archived_at_with_rollout_lookup(
+    let locked_cwd = lock_app_server_cwd_to_workspace_root(config)
+        .then(|| config.workspace_root.to_string_lossy().into_owned());
+    set_app_server_thread_archived_at_with_auth(
         url,
         thread_id,
         archived,
         Some((&codex_home, config.session_inventory.max_sessions)),
         config.session_inventory.app_server_timeout_seconds,
+        locked_cwd.as_deref(),
+        config
+            .session_inventory
+            .app_server_auth_token_file
+            .as_deref(),
     )
 }
 
@@ -1341,8 +2070,15 @@ fn run_app_server_command(
         config.session_inventory.app_server_timeout_seconds,
         timeout_seconds,
     );
-    let mut socket = connect_app_server(url, socket_timeout)
-        .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
+    let mut socket = connect_app_server(
+        url,
+        socket_timeout,
+        config
+            .session_inventory
+            .app_server_auth_token_file
+            .as_deref(),
+    )
+    .map_err(|error| AppServerCommandError::Other(error.to_string()))?;
     initialize_app_server_connection_for_command(
         &mut socket,
         socket_timeout,
@@ -1392,9 +2128,13 @@ fn run_app_server_command(
                     "active app-server thread {session_id} was not found and no local rollout was available"
                 )));
             };
-            let resume_cwd = rollout_resume_cwd(&rollout_path, session_id)
-                .map_err(|error| AppServerCommandError::Other(error.to_string()))?
-                .unwrap_or_else(|| cwd.clone());
+            let resume_cwd = if lock_app_server_cwd_to_workspace_root(config) {
+                cwd.clone()
+            } else {
+                rollout_resume_cwd(&rollout_path, session_id)
+                    .map_err(|error| AppServerCommandError::Other(error.to_string()))?
+                    .unwrap_or_else(|| cwd.clone())
+            };
             (
                 serde_json::json!({
                     "threadId": session_id,
@@ -1446,12 +2186,16 @@ fn run_app_server_command(
         Some(resumed) => resumed.id.clone(),
         None => response_thread_id(&resume_response).unwrap_or(fallback_thread_id),
     };
-    let turn_cwd = resume_response
-        .pointer("/result/thread/cwd")
-        .and_then(Value::as_str)
-        .filter(|cwd| !cwd.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or(requested_turn_cwd);
+    let turn_cwd = if lock_app_server_cwd_to_workspace_root(config) {
+        cwd
+    } else {
+        resume_response
+            .pointer("/result/thread/cwd")
+            .and_then(Value::as_str)
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or(requested_turn_cwd)
+    };
 
     let turn_response = send_app_server_turn_start_for_command(
         &mut socket,
@@ -2829,9 +3573,20 @@ fn turn_id_from_start_response(value: &Value) -> Option<&str> {
 }
 
 fn app_server_command_cwd(config: &AgentConfig, cwd: Option<&str>) -> String {
+    if lock_app_server_cwd_to_workspace_root(config) {
+        return config.workspace_root.to_string_lossy().into_owned();
+    }
     cwd.filter(|value| Path::new(value).is_absolute())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| config.workspace_root.to_string_lossy().into_owned())
+}
+
+fn lock_app_server_cwd_to_workspace_root(config: &AgentConfig) -> bool {
+    config.session_inventory.managed_app_server.enabled
+        && config
+            .session_inventory
+            .managed_app_server
+            .lock_cwd_to_workspace_root
 }
 
 fn turn_is_terminal(turn: &Value) -> bool {
@@ -2972,6 +3727,7 @@ fn set_app_server_thread_archived_at(
     )
 }
 
+#[cfg(test)]
 fn set_app_server_thread_archived_at_with_rollout_lookup(
     url: &str,
     thread_id: &str,
@@ -2979,10 +3735,52 @@ fn set_app_server_thread_archived_at_with_rollout_lookup(
     rollout_lookup: Option<(&Path, usize)>,
     timeout_seconds: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    set_app_server_thread_archived_at_with_rollout_lookup_and_cwd(
+        url,
+        thread_id,
+        archived,
+        rollout_lookup,
+        timeout_seconds,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn set_app_server_thread_archived_at_with_rollout_lookup_and_cwd(
+    url: &str,
+    thread_id: &str,
+    archived: bool,
+    rollout_lookup: Option<(&Path, usize)>,
+    timeout_seconds: u64,
+    locked_cwd: Option<&str>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    set_app_server_thread_archived_at_with_auth(
+        url,
+        thread_id,
+        archived,
+        rollout_lookup,
+        timeout_seconds,
+        locked_cwd,
+        None,
+    )
+}
+
+fn set_app_server_thread_archived_at_with_auth(
+    url: &str,
+    thread_id: &str,
+    archived: bool,
+    rollout_lookup: Option<(&Path, usize)>,
+    timeout_seconds: u64,
+    locked_cwd: Option<&str>,
+    auth_token_file: Option<&Path>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS);
     let timeout = app_server_archive_socket_timeout(timeout_seconds);
-    let mut socket =
-        connect_app_server(url, remaining_app_server_archive_timeout(timeout, deadline))?;
+    let mut socket = connect_app_server(
+        url,
+        remaining_app_server_archive_timeout(timeout, deadline),
+        auth_token_file,
+    )?;
     initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
     let mut request_id = 1;
     let Some(resolution) = resolve_app_server_thread_ids_for_archive(
@@ -2998,6 +3796,7 @@ fn set_app_server_thread_archived_at_with_rollout_lookup(
             &mut socket,
             thread_id,
             rollout_lookup,
+            locked_cwd,
             &mut request_id,
             timeout,
             deadline,
@@ -3052,6 +3851,7 @@ fn resume_app_server_thread_from_rollout_path_for_archive(
     socket: &mut AppServerSocket,
     thread_id: &str,
     rollout_lookup: Option<(&Path, usize)>,
+    locked_cwd: Option<&str>,
     next_request_id: &mut i64,
     timeout: Duration,
     deadline: Instant,
@@ -3067,7 +3867,11 @@ fn resume_app_server_thread_from_rollout_path_for_archive(
         "path": rollout_path.to_string_lossy(),
         "excludeTurns": true
     });
-    if let Some(cwd) = rollout_resume_cwd(&rollout_path, thread_id)? {
+    let resume_cwd = match locked_cwd {
+        Some(cwd) => Some(cwd.to_owned()),
+        None => rollout_resume_cwd(&rollout_path, thread_id)?,
+    };
+    if let Some(cwd) = resume_cwd {
         params["cwd"] = serde_json::json!(cwd.clone());
         params["runtimeWorkspaceRoots"] = serde_json::json!([cwd]);
     }
@@ -3254,6 +4058,7 @@ fn app_server_archive_socket_timeout(timeout_seconds: u64) -> Duration {
     )
 }
 
+#[cfg(test)]
 fn ensure_app_server_host_session_at(
     url: &str,
     session_id: &str,
@@ -3263,8 +4068,32 @@ fn ensure_app_server_host_session_at(
     rollout_lookup: Option<(&Path, usize)>,
     timeout_seconds: u64,
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    ensure_app_server_host_session_at_with_auth(
+        url,
+        session_id,
+        title,
+        cwd,
+        rollout_path,
+        rollout_lookup,
+        timeout_seconds,
+        false,
+        None,
+    )
+}
+
+fn ensure_app_server_host_session_at_with_auth(
+    url: &str,
+    session_id: &str,
+    title: Option<&str>,
+    cwd: &str,
+    rollout_path: Option<&Path>,
+    rollout_lookup: Option<(&Path, usize)>,
+    timeout_seconds: u64,
+    lock_cwd_to_workspace_root: bool,
+    auth_token_file: Option<&Path>,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let mut socket = connect_app_server(url, timeout)?;
+    let mut socket = connect_app_server(url, timeout, auth_token_file)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
     initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
     let mut request_id = 1;
@@ -3312,8 +4141,11 @@ fn ensure_app_server_host_session_at(
             )
             .into());
         };
-        let resume_cwd =
-            rollout_resume_cwd(&rollout_path, session_id)?.unwrap_or_else(|| cwd.to_owned());
+        let resume_cwd = if lock_cwd_to_workspace_root {
+            cwd.to_owned()
+        } else {
+            rollout_resume_cwd(&rollout_path, session_id)?.unwrap_or_else(|| cwd.to_owned())
+        };
         serde_json::json!({
             "threadId": session_id,
             "path": rollout_path.to_string_lossy(),
@@ -3338,7 +4170,11 @@ fn ensure_app_server_host_session_at(
         )
         .into());
     }
-    let cwd = resumed.cwd.or_else(|| Some(cwd.to_owned()));
+    let cwd = if lock_cwd_to_workspace_root {
+        Some(cwd.to_owned())
+    } else {
+        resumed.cwd.or_else(|| Some(cwd.to_owned()))
+    };
     Ok(AgentHostSession {
         session_id: session_id.to_owned(),
         title: compact_title(resumed.name.as_deref())
@@ -3433,16 +4269,28 @@ fn scan_app_server_thread_id_for_ensure(
     }
 }
 
+#[cfg(test)]
 fn create_app_server_thread_at(
     url: &str,
     title: Option<&str>,
     cwd: &str,
     timeout_seconds: u64,
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
+    create_app_server_thread_at_with_auth(url, title, cwd, timeout_seconds, None)
+}
+
+fn create_app_server_thread_at_with_auth(
+    url: &str,
+    title: Option<&str>,
+    cwd: &str,
+    timeout_seconds: u64,
+    auth_token_file: Option<&Path>,
+) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let mut socket = connect_app_server(url, timeout)?;
-    initialize_app_server_connection(&mut socket)?;
-    let start_response = send_app_server_request(
+    let deadline = Instant::now() + timeout;
+    let mut socket = connect_app_server(url, timeout, auth_token_file)?;
+    initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
+    let start_response = send_app_server_request_before_deadline(
         &mut socket,
         1,
         "thread/start",
@@ -3451,12 +4299,14 @@ fn create_app_server_thread_at(
             "ephemeral": false,
             "threadSource": "user"
         }),
+        timeout,
+        deadline,
     )?;
     let started = app_server_thread_from_response(&start_response)?;
     let requested_title = compact_title(title);
 
     if let Some(title) = requested_title.as_deref() {
-        let _ = send_app_server_request(
+        let _ = send_app_server_request_before_deadline(
             &mut socket,
             2,
             "thread/name/set",
@@ -3464,6 +4314,8 @@ fn create_app_server_thread_at(
                 "threadId": started.id,
                 "name": title
             }),
+            timeout,
+            deadline,
         );
     }
 
@@ -3517,45 +4369,6 @@ fn initialize_app_server_connection_before_deadline(
         .into(),
     ))?;
     Ok(())
-}
-
-fn initialize_app_server_connection(
-    socket: &mut AppServerSocket,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = send_app_server_request(
-        socket,
-        0,
-        "initialize",
-        serde_json::json!({
-            "clientInfo": {
-                "name": "chaop-agent",
-                "title": "Chaop connector",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "capabilities": {
-                "experimentalApi": true,
-                "requestAttestation": false
-            }
-        }),
-    )?;
-    socket.send(Message::Text(
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "initialized"
-        })
-        .to_string()
-        .into(),
-    ))?;
-    Ok(())
-}
-
-fn send_app_server_request(
-    socket: &mut AppServerSocket,
-    id: i64,
-    method: &str,
-    params: Value,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    send_app_server_request_inner(socket, id, method, params, None)
 }
 
 fn send_app_server_request_inner(
@@ -3877,32 +4690,622 @@ fn default_codex_home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::connect_unix_stream_with_deadline;
     use super::{
-        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AUTO_RESOLUTION_RESPONSE_GRACE_MS,
-        AppServerCommandChannels, AppServerTurnOutput, HistorySession, InventoryScope,
-        SessionDraft, TitleSource, TurnInteractionInputAnswer, TurnInteractionResponse,
-        TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
-        acknowledge_turn_interaction_delivery, app_server_command_result_events_with_cancel,
+        APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, APP_SERVER_MAX_RETIRED_RESOLVER_WORKERS,
+        AUTO_RESOLUTION_RESPONSE_GRACE_MS, AppServerCommandChannels, AppServerResolver,
+        AppServerTurnOutput, HistorySession, InventoryScope, SessionDraft, TitleSource,
+        TurnInteractionInputAnswer, TurnInteractionResponse, TurnInteractionResponseDelivery,
+        TurnInteractionResponseDispatch, acknowledge_turn_interaction_delivery,
+        app_server_client_request, app_server_command_result_events_with_cancel,
+        app_server_connect_attempt_timeout, app_server_health_check, app_server_port,
         app_server_sessions_from_response, app_server_thread_from_response,
         app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
-        create_app_server_thread_at, ensure_app_server_host_session_at, load_app_server_sessions,
-        read_recent_lines, remaining_app_server_archive_timeout, resolve_session, rollout_paths,
-        set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
-        unix_seconds_to_iso,
+        connect_app_server, create_app_server_thread_at, ensure_app_server_host_session_at,
+        ensure_app_server_host_session_at_with_auth, load_app_server_sessions, read_recent_lines,
+        remaining_app_server_archive_timeout, resolve_app_server_addresses, resolve_session,
+        rollout_paths, set_app_server_thread_archived_at,
+        set_app_server_thread_archived_at_with_rollout_lookup,
+        set_app_server_thread_archived_at_with_rollout_lookup_and_cwd, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::fs;
-    use std::net::{TcpListener, TcpStream};
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::{fd::AsRawFd, unix::net::UnixListener};
     use std::sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     };
     use std::thread;
     use std::time::{Duration, Instant};
-    use tungstenite::{Message, accept};
+    use tungstenite::{Message, accept, http::Uri};
+
+    #[test]
+    fn app_server_client_request_reads_bearer_token_from_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let token_file = tempdir.path().join("app-server.token");
+        fs::write(&token_file, "test-capability-token\n").expect("write token");
+
+        let request =
+            app_server_client_request("wss://app.example.test", Some(token_file.as_path()))
+                .expect("request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-capability-token")
+        );
+    }
+
+    #[test]
+    fn app_server_client_request_accepts_uppercase_wss_scheme() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let token_file = tempdir.path().join("app-server.token");
+        fs::write(&token_file, "test-capability-token\n").expect("write token");
+
+        let request =
+            app_server_client_request("WSS://app.example.test", Some(token_file.as_path()))
+                .expect("uppercase WSS request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-capability-token")
+        );
+    }
+
+    #[test]
+    fn app_server_client_request_rejects_empty_token_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let token_file = tempdir.path().join("app-server.token");
+        fs::write(&token_file, "\n").expect("write token");
+
+        let error = app_server_client_request("wss://app.example.test", Some(token_file.as_path()))
+            .expect_err("empty token rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("app-server auth token file is empty")
+        );
+    }
+
+    #[test]
+    fn app_server_client_request_rejects_token_over_plaintext_ws() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let token_file = tempdir.path().join("app-server.token");
+        fs::write(&token_file, "test-capability-token\n").expect("write token");
+
+        let error = app_server_client_request("ws://127.0.0.1:9876", Some(token_file.as_path()))
+            .expect_err("plaintext token rejected");
+
+        assert_eq!(error.to_string(), "app-server auth tokens require wss://");
+    }
+
+    #[test]
+    fn app_server_port_rejects_out_of_range_values_before_defaulting() {
+        let explicit = "wss://app.example.test:8443"
+            .parse::<Uri>()
+            .expect("explicit port URI");
+        let default_tls = "wss://app.example.test"
+            .parse::<Uri>()
+            .expect("default TLS URI");
+        let default_plaintext = "ws://app.example.test"
+            .parse::<Uri>()
+            .expect("default plaintext URI");
+        let explicit_ipv6 = "ws://[::1]:6174"
+            .parse::<Uri>()
+            .expect("explicit IPv6 port URI");
+        let default_ipv6 = "ws://[::1]".parse::<Uri>().expect("default IPv6 URI");
+        let invalid = "wss://app.example.test:99999"
+            .parse::<Uri>()
+            .expect("out-of-range port URI");
+        let zero = "ws://app.example.test:0"
+            .parse::<Uri>()
+            .expect("zero port URI");
+
+        assert_eq!(app_server_port(&explicit, true).unwrap(), 8443);
+        assert_eq!(app_server_port(&default_tls, true).unwrap(), 443);
+        assert_eq!(app_server_port(&default_plaintext, false).unwrap(), 80);
+        assert_eq!(app_server_port(&explicit_ipv6, false).unwrap(), 6174);
+        assert_eq!(app_server_port(&default_ipv6, false).unwrap(), 80);
+        assert_eq!(
+            app_server_port(&invalid, true).unwrap_err().to_string(),
+            "app-server URL port is invalid: 99999"
+        );
+        assert_eq!(
+            app_server_port(&zero, false).unwrap_err().to_string(),
+            "app-server URL port is invalid: 0"
+        );
+    }
+
+    #[test]
+    fn app_server_connect_timeout_reserves_budget_for_later_addresses() {
+        let remaining = Duration::from_millis(900);
+
+        assert_eq!(
+            app_server_connect_attempt_timeout(remaining, 3),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            app_server_connect_attempt_timeout(remaining, 2),
+            Duration::from_millis(450)
+        );
+        assert_eq!(app_server_connect_attempt_timeout(remaining, 1), remaining);
+    }
+
+    #[test]
+    fn app_server_connection_does_not_follow_redirects() {
+        let redirect_target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+        redirect_target
+            .set_nonblocking(true)
+            .expect("nonblocking redirect target");
+        let target_address = redirect_target
+            .local_addr()
+            .expect("redirect target address");
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect listener");
+        let redirect_address = redirect_listener.local_addr().expect("redirect address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = redirect_listener.accept().expect("accept redirect request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("redirect read timeout");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read websocket request");
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: ws://{target_address}/redirected\r\nContent-Length: 0\r\n\r\n"
+            )
+            .expect("write redirect response");
+        });
+
+        let error = match connect_app_server(
+            &format!("ws://{redirect_address}/initial"),
+            Duration::from_secs(1),
+            None,
+        ) {
+            Ok(_) => panic!("redirect should not be followed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("HTTP error"));
+        server.join().expect("redirect server");
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            redirect_target
+                .accept()
+                .expect_err("redirect target should not receive a connection")
+                .kind(),
+            ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn app_server_tls_handshake_respects_connection_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled TLS listener");
+        let address = listener.local_addr().expect("stalled TLS address");
+        thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept stalled TLS client");
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        let started = Instant::now();
+        let error = match connect_app_server(
+            &format!("wss://{address}/"),
+            Duration::from_millis(200),
+            None,
+        ) {
+            Ok(_) => panic!("stalled TLS handshake should time out"),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn app_server_websocket_handshake_respects_absolute_connection_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow websocket listener");
+        let address = listener.local_addr().expect("slow websocket address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept websocket client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("websocket request timeout");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read websocket request");
+            for byte in b"HTTP/1.1 101 Switching Protocols\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+        });
+
+        let started = Instant::now();
+        let error = match connect_app_server(
+            &format!("ws://{address}/"),
+            Duration::from_millis(200),
+            None,
+        ) {
+            Ok(_) => panic!("slow websocket handshake should time out"),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!error.to_string().is_empty());
+        server.join().expect("slow websocket server");
+    }
+
+    #[test]
+    fn app_server_dns_resolution_recovers_after_a_stalled_worker() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let resolver_release = Arc::clone(&release);
+        let resolver = AppServerResolver::start(move |host, _| {
+            if host == "stalled.example.test" {
+                let (lock, condition) = &*resolver_release;
+                let mut released = lock.lock().expect("resolver release lock");
+                while !*released {
+                    released = condition.wait(released).expect("resolver release wait");
+                }
+            }
+            Ok(vec!["127.0.0.1:443".parse().expect("socket address")])
+        })
+        .expect("start resolver");
+
+        let started = Instant::now();
+        let error = resolver
+            .resolve(
+                "stalled.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://stalled.example.test",
+            )
+            .expect_err("stalled resolver should time out");
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(error.to_string().contains("timed out resolving"));
+
+        let addresses = resolver
+            .resolve(
+                "healthy.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://healthy.example.test",
+            )
+            .expect("replacement resolver should recover");
+        assert_eq!(addresses, vec!["127.0.0.1:443".parse().unwrap()]);
+
+        let (lock, condition) = &*release;
+        *lock.lock().expect("resolver release lock") = true;
+        condition.notify_all();
+    }
+
+    #[test]
+    fn app_server_dns_resolution_limits_stalled_worker_generations() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let resolver_release = Arc::clone(&release);
+        let resolver = AppServerResolver::start(move |_, _| {
+            let (lock, condition) = &*resolver_release;
+            let mut released = lock.lock().expect("resolver release lock");
+            while !*released {
+                released = condition.wait(released).expect("resolver release wait");
+            }
+            Ok(Vec::new())
+        })
+        .expect("start resolver");
+
+        for generation in 0..=APP_SERVER_MAX_RETIRED_RESOLVER_WORKERS {
+            let error = resolver
+                .resolve(
+                    &format!("stalled-{generation}.example.test"),
+                    443,
+                    Duration::from_millis(50),
+                    "wss://stalled.example.test",
+                )
+                .expect_err("stalled resolver should time out");
+            assert!(error.to_string().contains("timed out resolving"));
+            if generation == APP_SERVER_MAX_RETIRED_RESOLVER_WORKERS {
+                assert!(error.to_string().contains("recovery limit reached"));
+            }
+        }
+        assert_eq!(
+            resolver.worker_count(),
+            APP_SERVER_MAX_RETIRED_RESOLVER_WORKERS + 1
+        );
+
+        let (lock, condition) = &*release;
+        *lock.lock().expect("resolver release lock") = true;
+        condition.notify_all();
+        let addresses = resolver
+            .resolve(
+                "recovered.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://recovered.example.test",
+            )
+            .expect("active worker should recover after the blocked call returns");
+        assert!(addresses.is_empty());
+    }
+
+    #[test]
+    fn app_server_dns_resolution_returns_worker_results() {
+        let resolver = AppServerResolver::start(|_, _| {
+            Ok(vec!["127.0.0.1:443".parse().expect("socket address")])
+        })
+        .expect("start resolver");
+
+        let addresses = resolver
+            .resolve(
+                "app.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://app.example.test",
+            )
+            .expect("resolve address");
+
+        assert_eq!(addresses, vec!["127.0.0.1:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn app_server_ip_literals_bypass_dns_resolution() {
+        assert_eq!(
+            resolve_app_server_addresses(
+                "127.0.0.1",
+                9876,
+                Duration::from_millis(1),
+                "ws://127.0.0.1:9876",
+            )
+            .expect("IPv4 address"),
+            vec!["127.0.0.1:9876".parse().unwrap()]
+        );
+        assert_eq!(
+            resolve_app_server_addresses("::1", 9876, Duration::from_millis(1), "ws://[::1]:9876",)
+                .expect("IPv6 address"),
+            vec!["[::1]:9876".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn app_server_dns_resolution_recovers_after_worker_disconnect() {
+        let first_request = Arc::new(AtomicBool::new(true));
+        let resolver_first_request = Arc::clone(&first_request);
+        let resolver = AppServerResolver::start(move |_, _| {
+            assert!(
+                !resolver_first_request.swap(false, Ordering::SeqCst),
+                "disconnect resolver worker"
+            );
+            Ok(vec!["127.0.0.1:443".parse().expect("socket address")])
+        })
+        .expect("start resolver");
+
+        let error = resolver
+            .resolve(
+                "disconnect.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://disconnect.example.test",
+            )
+            .expect_err("disconnected resolver should fail the current request");
+        assert!(error.to_string().contains("resolver stopped"));
+
+        let addresses = resolver
+            .resolve(
+                "healthy.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://healthy.example.test",
+            )
+            .expect("replacement resolver should recover");
+        assert_eq!(addresses, vec!["127.0.0.1:443".parse().unwrap()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_unix_connection_is_close_on_exec() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("close-on-exec.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind Unix socket");
+
+        let client = connect_unix_stream_with_deadline(
+            &socket_path,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("connect Unix socket");
+        let descriptor_flags = unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) };
+
+        assert!(descriptor_flags >= 0, "read Unix socket descriptor flags");
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_unix_connect_is_bounded_when_backlog_is_full() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("backlog.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind Unix socket");
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let mut clients = Vec::new();
+        let mut bounded_error = None;
+
+        for _ in 0..64 {
+            let started = Instant::now();
+            match connect_unix_stream_with_deadline(
+                &socket_path,
+                Instant::now() + Duration::from_millis(100),
+            ) {
+                Ok(client) => clients.push(client),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::TimedOut | ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    assert!(started.elapsed() < Duration::from_secs(1));
+                    bounded_error = Some(error.kind());
+                    break;
+                }
+                Err(error) => panic!("fill Unix socket backlog: {error}"),
+            }
+        }
+
+        assert!(bounded_error.is_some(), "Unix socket backlog did not fill");
+        #[cfg(target_os = "linux")]
+        assert_eq!(bounded_error, Some(ErrorKind::TimedOut));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_unix_websocket_handshake_respects_absolute_connection_deadline() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("slow-handshake.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind Unix socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept Unix socket client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("websocket request timeout");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read websocket request");
+            for byte in b"HTTP/1.1 101 Switching Protocols\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+        });
+
+        let started = Instant::now();
+        let error = match connect_app_server(
+            &format!("unix://{}", socket_path.display()),
+            Duration::from_millis(200),
+            None,
+        ) {
+            Ok(_) => panic!("slow Unix websocket handshake should time out"),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!error.to_string().is_empty());
+        server.join().expect("slow Unix websocket server");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_health_check_supports_unix_socket() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept unix client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {
+                            "userAgent": "codex-test",
+                            "codexHome": "/tmp/codex",
+                            "platformFamily": "unix",
+                            "platformOs": "macos"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized.get("method").and_then(Value::as_str),
+                Some("initialized")
+            );
+        });
+
+        app_server_health_check(&format!("unix://{}", socket_path.display()), 1)
+            .expect("unix socket health check");
+        server.join().expect("unix app-server");
+    }
+
+    #[test]
+    fn app_server_health_check_has_absolute_initialisation_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind app-server listener");
+        let address = listener.local_addr().expect("app-server address");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            let stop = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < stop {
+                if socket
+                    .send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "server/heartbeat"
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let started = Instant::now();
+        let error = app_server_health_check(&format!("ws://{address}"), 1)
+            .expect_err("irrelevant messages must not extend the health deadline");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out"));
+        server.join().expect("app-server server");
+    }
+
+    #[test]
+    fn app_server_inventory_has_absolute_response_deadline() {
+        let (url, server) = spawn_irrelevant_message_app_server("thread/list");
+
+        let started = Instant::now();
+        let error = load_app_server_sessions(&url, 10, 1)
+            .expect_err("irrelevant messages must not extend the inventory deadline");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out"));
+        server.join().expect("app-server server");
+    }
+
+    #[test]
+    fn app_server_thread_create_has_absolute_response_deadline() {
+        let (url, server) = spawn_irrelevant_message_app_server("thread/start");
+
+        let started = Instant::now();
+        let error = create_app_server_thread_at(&url, None, "/tmp/project", 1)
+            .expect_err("irrelevant messages must not extend the thread-create deadline");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out"));
+        server.join().expect("app-server server");
+    }
 
     fn turn_interaction_delivery(
         dispatch: TurnInteractionResponseDispatch,
@@ -5017,6 +6420,81 @@ mod tests {
     }
 
     #[test]
+    fn locked_host_session_resume_ignores_rollout_cwd() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rollout_path = tempdir
+            .path()
+            .join("sessions/2026/06/16/rollout-session-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project/nested"}}"#,
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "data": [] }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": { "data": [] }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-1",
+                        "name": "Locked resume",
+                        "cwd": "/tmp/project/nested",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+        ]);
+
+        let session = ensure_app_server_host_session_at_with_auth(
+            &url,
+            "session-1",
+            Some("Fallback"),
+            "/tmp/project",
+            Some(&rollout_path),
+            None,
+            1,
+            true,
+            None,
+        )
+        .expect("locked path-based resume");
+        let _active_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("active thread/list request");
+        let _archived_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("archived thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+
+        assert_eq!(
+            resume_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/runtimeWorkspaceRoots/0")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/project"));
+    }
+
+    #[test]
     fn ensure_host_session_errors_without_resolved_thread_or_rollout_path() {
         let (url, requests) = run_fake_app_server_with_requests(vec![
             json!({
@@ -5988,6 +7466,94 @@ mod tests {
     }
 
     #[test]
+    fn archive_sync_locked_cwd_overrides_rollout_cwd() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        let mut rollout =
+            br#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}
+"#
+            .to_vec();
+        rollout.push(0xff);
+        fs::write(&rollout_path, rollout).expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "data": [] }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": { "data": [] }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-tree-1",
+                        "cwd": "/tmp/project-root",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {}
+            }),
+        ]);
+
+        assert!(
+            set_app_server_thread_archived_at_with_rollout_lookup_and_cwd(
+                &url,
+                "session-tree-1",
+                true,
+                Some((codex_home, SessionInventoryConfig::default().max_sessions)),
+                1,
+                Some("/tmp/project-root"),
+            )
+            .expect("archive fallback")
+        );
+
+        let _source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("source thread/list request");
+        let _target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let archive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/archive request");
+
+        assert_eq!(
+            resume_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-root")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/runtimeWorkspaceRoots/0")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-root")
+        );
+        assert_eq!(
+            archive_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-from-path")
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
     fn archive_sync_rejects_mismatched_rollout_resume_session_id() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let codex_home = tempdir.path();
@@ -6369,6 +7935,44 @@ mod tests {
         assert_eq!(report.inventory_scope, InventoryScope::Incremental);
         assert_eq!(report.sessions.len(), 1);
         assert_eq!(report.sessions[0].session_id, "session-2");
+    }
+
+    #[test]
+    fn host_session_report_uses_stable_session_id_ties_before_truncation() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let lines = (0..10)
+            .rev()
+            .map(|index| {
+                format!(
+                    r#"{{"id":"session-{index:02}","thread_name":"Session {index:02}","updated_at":"2026-06-12T10:00:00.000Z"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(codex_home.join("session_index.jsonl"), lines).expect("session index");
+
+        let mut config = test_config(codex_home);
+        config.session_inventory.max_sessions = 5;
+
+        let report = build_host_sessions_report(&config).expect("report");
+        let session_ids = report
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(report.inventory_scope, InventoryScope::Incremental);
+        assert_eq!(
+            session_ids,
+            vec![
+                "session-00",
+                "session-01",
+                "session-02",
+                "session-03",
+                "session-04"
+            ]
+        );
     }
 
     #[test]
@@ -6796,6 +8400,100 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("Say exactly: chaop-smoke")
         );
+    }
+
+    #[test]
+    fn managed_app_server_can_lock_resume_and_turn_cwd_to_workspace_root() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "data": [{
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "cwd": "/tmp/project/nested",
+                        "updatedAt": 1781263443
+                    }]
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": "thread-live-1",
+                        "sessionId": "session-tree-1",
+                        "cwd": "/tmp/project/nested",
+                        "turns": []
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "turn": completed_turn("turn-1", "locked cwd")
+                }
+            }),
+        ]);
+        let mut config = AgentConfig {
+            execution: ExecutionConfig {
+                codex_timeout_seconds: 5,
+                ..ExecutionConfig::default()
+            },
+            session_inventory: SessionInventoryConfig {
+                app_server_url: Some(url),
+                app_server_timeout_seconds: 1,
+                ..SessionInventoryConfig::default()
+            },
+            ..test_config(tempdir.path())
+        };
+        config.session_inventory.managed_app_server.enabled = true;
+        config
+            .session_inventory
+            .managed_app_server
+            .lock_cwd_to_workspace_root = true;
+
+        let events = app_server_command_result_events_with_cancel(
+            &config,
+            "session-tree-1",
+            Some("/tmp/project/nested"),
+            "command-1",
+            "Use the workspace root",
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("command.finished")
+        );
+        let _list_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let turn_start_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("turn/start request");
+
+        for request in [&resume_request, &turn_start_request] {
+            assert_eq!(
+                request
+                    .pointer("/params/cwd")
+                    .and_then(serde_json::Value::as_str),
+                Some("/tmp/project")
+            );
+            assert_eq!(
+                request
+                    .pointer("/params/runtimeWorkspaceRoots/0")
+                    .and_then(serde_json::Value::as_str),
+                Some("/tmp/project")
+            );
+        }
     }
 
     #[test]
@@ -8275,7 +9973,8 @@ mod tests {
     #[test]
     fn app_server_turn_wait_interrupts_when_cancelled_after_turn_id_is_known() {
         let (url, requests) = run_fake_app_server_single_request();
-        let (mut socket, _) = tungstenite::connect(url.as_str()).expect("connect fake app-server");
+        let (socket, _) = tungstenite::connect(url.as_str()).expect("connect fake app-server");
+        let mut socket = super::AppServerSocket::Tcp(socket);
         let cancel = AtomicBool::new(true);
         let mut next_request_id = 4;
 
@@ -9013,8 +10712,63 @@ mod tests {
         (format!("ws://{address}"), requests_rx)
     }
 
-    fn read_fake_app_server_message(
-        socket: &mut tungstenite::WebSocket<TcpStream>,
+    fn spawn_irrelevant_message_app_server(
+        expected_method: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind app-server listener");
+        let address = listener.local_addr().expect("app-server address");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized.get("method").and_then(Value::as_str),
+                Some("initialized")
+            );
+            let request = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                request.get("method").and_then(Value::as_str),
+                Some(expected_method)
+            );
+            let stop = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < stop {
+                if socket
+                    .send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "server/heartbeat"
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        (format!("ws://{address}"), server)
+    }
+
+    fn read_fake_app_server_message<S: Read + Write>(
+        socket: &mut tungstenite::WebSocket<S>,
     ) -> serde_json::Value {
         let message = socket.read().expect("read app-server request");
         let Message::Text(text) = message else {

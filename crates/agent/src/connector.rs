@@ -395,7 +395,34 @@ fn send_host_sessions(
     state: &mut HostSessionsSendState,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let message = host_sessions_message(config);
+    send_host_sessions_with_scope(socket, config, state, force, None)
+}
+
+fn send_incremental_host_sessions(
+    socket: &mut AgentSocket,
+    config: &AgentConfig,
+    state: &mut HostSessionsSendState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_host_sessions_with_scope(
+        socket,
+        config,
+        state,
+        true,
+        Some(InventoryScope::Incremental),
+    )
+}
+
+fn send_host_sessions_with_scope(
+    socket: &mut AgentSocket,
+    config: &AgentConfig,
+    state: &mut HostSessionsSendState,
+    force: bool,
+    inventory_scope: Option<InventoryScope>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let message = match inventory_scope {
+        Some(inventory_scope) => host_sessions_message_with_scope(config, Some(inventory_scope)),
+        None => host_sessions_message(config),
+    };
     let now = Instant::now();
     if !should_send_host_sessions(&message, state, force, now) {
         return Ok(());
@@ -607,10 +634,20 @@ fn bounded_app_server_instance_text(value: &str) -> String {
 }
 
 fn host_sessions_message(config: &AgentConfig) -> String {
-    let report = build_host_sessions_report(config).unwrap_or_else(|error| {
+    host_sessions_message_with_scope(config, None)
+}
+
+fn host_sessions_message_with_scope(
+    config: &AgentConfig,
+    inventory_scope: Option<InventoryScope>,
+) -> String {
+    let mut report = build_host_sessions_report(config).unwrap_or_else(|error| {
         eprintln!("chaop-agent: host session inventory failed: {error}");
         fallback_host_sessions_report(config)
     });
+    if let Some(inventory_scope) = inventory_scope {
+        report.inventory_scope = inventory_scope;
+    }
     json!({
         "kind": "agent.host_sessions",
         "payload": report
@@ -898,7 +935,7 @@ fn handle_thread_create(
                 .to_string()
                 .into(),
             ))?;
-            send_host_sessions(socket, config, host_sessions_state, true)?;
+            send_incremental_host_sessions(socket, config, host_sessions_state)?;
         }
         Err(error) => {
             socket.send(Message::Text(
@@ -1039,7 +1076,7 @@ fn handle_host_session_app_server_ensure(
                 .to_string()
                 .into(),
             ))?;
-            send_host_sessions(socket, config, host_sessions_state, true)?;
+            send_incremental_host_sessions(socket, config, host_sessions_state)?;
         }
         Err(error) => {
             socket.send(Message::Text(
@@ -1928,15 +1965,15 @@ mod tests {
         apply_app_server_instances_ack_text, apply_host_sessions_ack_text,
         bounded_app_server_instance_text, classify_ack_wait_text, command_events,
         drain_pending_connector_events, handle_background_ack_message, host_sessions_ack_message,
-        host_sessions_message, host_sessions_retry_interval, is_read_timeout,
-        record_agent_ready_sent, requires_app_server_execution_mode, should_send_agent_ready,
-        should_send_app_server_instances, should_send_host_sessions,
+        host_sessions_message, host_sessions_message_with_scope, host_sessions_retry_interval,
+        is_read_timeout, record_agent_ready_sent, requires_app_server_execution_mode,
+        should_send_agent_ready, should_send_app_server_instances, should_send_host_sessions,
         turn_interaction_response_ack_for_text,
     };
     use crate::app_server_manager::AppServerManager;
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use crate::placeholder::ConnectorEvent;
-    use crate::session_inventory::TurnInteractionResponseDelivery;
+    use crate::session_inventory::{InventoryScope, TurnInteractionResponseDelivery};
     use serde_json::Value;
     use std::fs;
     use std::io::{self, ErrorKind};
@@ -2254,6 +2291,33 @@ mod tests {
             Some("incremental")
         );
         assert!(value.pointer("/payload/app_server_inventory_ok").is_none());
+    }
+
+    #[test]
+    fn host_sessions_message_can_force_incremental_scope_after_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.session_inventory.codex_home = Some(temp.path().to_path_buf());
+
+        let full: Value =
+            serde_json::from_str(&host_sessions_message(&config)).expect("full host sessions json");
+        let incremental: Value = serde_json::from_str(&host_sessions_message_with_scope(
+            &config,
+            Some(InventoryScope::Incremental),
+        ))
+        .expect("incremental host sessions json");
+
+        assert_eq!(
+            full.pointer("/payload/inventory_scope")
+                .and_then(Value::as_str),
+            Some("full")
+        );
+        assert_eq!(
+            incremental
+                .pointer("/payload/inventory_scope")
+                .and_then(Value::as_str),
+            Some("incremental")
+        );
     }
 
     #[test]

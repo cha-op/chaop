@@ -50,6 +50,7 @@ name = "chaop-agent"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "native-tls",
  "serde",
  "serde_json",
  "tempfile",

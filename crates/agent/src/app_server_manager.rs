@@ -1,12 +1,24 @@
 use crate::config::AgentConfig;
-use crate::session_inventory::app_server_health_check;
+use crate::session_inventory::{
+    app_server_explicit_port, app_server_health_check_with_auth,
+    app_server_health_check_with_auth_timeout,
+};
 use crate::shutdown::shutdown_requested;
 use std::io::{self, ErrorKind};
-use std::net::IpAddr;
+use std::net::{IpAddr, TcpListener};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
+#[cfg(unix)]
+use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant, SystemTime};
 use tungstenite::http::Uri;
 
@@ -15,6 +27,10 @@ const APP_SERVER_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(20);
 const APP_SERVER_EXTERNAL_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const APP_SERVER_DRAIN_TIMEOUT_DETAIL: &str =
     "Drain timeout elapsed while active turns were still running.";
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
 
 #[derive(Debug)]
 pub struct AppServerManager {
@@ -24,6 +40,7 @@ pub struct AppServerManager {
     last_start_failure: Option<Instant>,
     last_external_probe: Option<Instant>,
     shutdown_requested: fn() -> bool,
+    terminate_child: fn(&mut Child) -> io::Result<()>,
     state: AppServerInstanceState,
     generation: u64,
     active_turn_count: u32,
@@ -50,6 +67,7 @@ impl AppServerManager {
             last_start_failure: None,
             last_external_probe: None,
             shutdown_requested,
+            terminate_child,
             state: AppServerInstanceState::Stopped,
             generation: 0,
             active_turn_count: 0,
@@ -84,6 +102,32 @@ impl AppServerManager {
         let mut runtime = config.clone();
         runtime.session_inventory.app_server_url = self.active_turn_app_server_url(config);
         runtime
+    }
+
+    pub fn preflight_managed_app_server(config: &AgentConfig) -> io::Result<()> {
+        let mut manager = Self::new(config);
+        if !manager.enabled {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "managed app-server preflight requires managed mode",
+            ));
+        }
+        let configured_listen_url = manager.validated_listen_url().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "managed app-server preflight requires a local listen URL",
+            )
+        })?;
+        let endpoint = AppServerPreflightEndpoint::new(&configured_listen_url)?;
+        manager.child = Some(manager.spawn_app_server(config, &endpoint.listen_url)?);
+        if !manager.wait_until_ready(config, &endpoint.listen_url) {
+            manager.stop_child("managed app-server preflight failed");
+            return Err(io::Error::other(
+                "managed app-server preflight did not become healthy",
+            ));
+        }
+        manager.stop_child_checked("managed app-server preflight passed")?;
+        Ok(())
     }
 
     fn runtime_config_with_start_policy(
@@ -286,7 +330,16 @@ impl AppServerManager {
             pending.reason.restarting_summary(force_restart),
             force_restart.then_some("Drain timeout elapsed while active turns were still running."),
         );
-        self.stop_child(pending.reason.stop_reason(force_restart));
+        if let Err(error) = self.stop_child_checked(pending.reason.stop_reason(force_restart)) {
+            eprintln!("failed to stop managed app-server for restart: {error}");
+            self.pending_restart = Some(pending);
+            self.set_state(
+                AppServerInstanceState::Degraded,
+                "Failed to stop managed app-server for restart.",
+                Some(&error.to_string()),
+            );
+            return None;
+        }
         if self.block_unowned_listener_restart(config, pending.reason) {
             self.pending_restart = Some(pending);
             return None;
@@ -387,7 +440,14 @@ impl AppServerManager {
             return;
         }
         self.last_external_probe = Some(now);
-        match app_server_health_check(url, config.session_inventory.app_server_timeout_seconds) {
+        match app_server_health_check_with_auth(
+            url,
+            config.session_inventory.app_server_timeout_seconds,
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .as_deref(),
+        ) {
             Ok(()) => self.set_state(
                 AppServerInstanceState::Healthy,
                 "External app-server is healthy.",
@@ -406,9 +466,13 @@ impl AppServerManager {
             return None;
         };
 
-        if app_server_health_check(
+        if app_server_health_check_with_auth(
             &listen_url,
             config.session_inventory.app_server_timeout_seconds,
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .as_deref(),
         )
         .is_ok()
         {
@@ -422,16 +486,20 @@ impl AppServerManager {
         let Some(listen_url) = self.validated_listen_url() else {
             self.set_state(
                 AppServerInstanceState::Degraded,
-                "Managed app-server listen URL is missing or not loopback.",
+                "Managed app-server listen URL is missing or not local.",
                 Some("Invalid managed app-server listen URL."),
             );
             return None;
         };
 
         self.clear_exited_child();
-        if app_server_health_check(
+        if app_server_health_check_with_auth(
             &listen_url,
             config.session_inventory.app_server_timeout_seconds,
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .as_deref(),
         )
         .is_ok()
         {
@@ -468,7 +536,16 @@ impl AppServerManager {
                 "Restarting unhealthy managed app-server.",
                 None,
             );
-            self.stop_child("restarting unhealthy managed app-server");
+            if let Err(error) = self.stop_child_checked("restarting unhealthy managed app-server") {
+                eprintln!("failed to stop unhealthy managed app-server: {error}");
+                self.record_start_failure();
+                self.set_state(
+                    AppServerInstanceState::Degraded,
+                    "Failed to stop unhealthy managed app-server.",
+                    Some(&error.to_string()),
+                );
+                return None;
+            }
         }
 
         match self.spawn_app_server(config, &listen_url) {
@@ -551,13 +628,19 @@ impl AppServerManager {
     }
 
     fn stop_child(&mut self, reason: &str) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        eprintln!("{reason}; stopping managed app-server");
-        if let Err(error) = terminate_child(&mut child) {
+        if let Err(error) = self.stop_child_checked(reason) {
             eprintln!("failed to stop managed app-server: {error}");
         }
+    }
+
+    fn stop_child_checked(&mut self, reason: &str) -> io::Result<()> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        eprintln!("{reason}; stopping managed app-server");
+        (self.terminate_child)(child)?;
+        self.child.take();
+        Ok(())
     }
 
     fn can_attempt_start(&self, config: &AgentConfig) -> bool {
@@ -588,9 +671,9 @@ impl AppServerManager {
             );
             return None;
         };
-        if !is_loopback_listen_url(&listen_url) {
+        if !is_managed_listen_url(&listen_url) {
             eprintln!(
-                "managed app-server listen URL must use localhost or a loopback IP address: {listen_url}"
+                "managed app-server listen URL must use an absolute unix:// socket path or a loopback IP address: {listen_url}"
             );
             return None;
         }
@@ -659,17 +742,164 @@ impl AppServerManager {
             if self.child.is_none() {
                 return false;
             }
-            if app_server_health_check(
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let health_timeout = remaining.min(Duration::from_secs(
+                config.session_inventory.app_server_timeout_seconds.max(1),
+            ));
+            if app_server_health_check_with_auth_timeout(
                 listen_url,
-                config.session_inventory.app_server_timeout_seconds,
+                health_timeout,
+                config
+                    .session_inventory
+                    .app_server_auth_token_file
+                    .as_deref(),
             )
             .is_ok()
+                && Instant::now() <= deadline
             {
                 return true;
             }
-            thread::sleep(Duration::from_millis(100));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(remaining.min(Duration::from_millis(100)));
+            }
         }
         false
+    }
+}
+
+#[derive(Debug)]
+struct AppServerPreflightEndpoint {
+    listen_url: String,
+    cleanup_path: Option<PathBuf>,
+    cleanup_dir: Option<PathBuf>,
+}
+
+impl AppServerPreflightEndpoint {
+    fn new(configured_listen_url: &str) -> io::Result<Self> {
+        #[cfg(unix)]
+        if let Some(path) = strip_unix_scheme(configured_listen_url) {
+            let configured_path = Path::new(path);
+            validate_managed_unix_socket_path(configured_path)?;
+            let cleanup_dir = create_private_preflight_dir(Path::new("/tmp"), "chaop-pf")?;
+            let cleanup_path = cleanup_dir.join("s");
+            return Ok(Self {
+                listen_url: format!("unix://{}", cleanup_path.display()),
+                cleanup_path: Some(cleanup_path),
+                cleanup_dir: Some(cleanup_dir),
+            });
+        }
+
+        let uri = configured_listen_url
+            .parse::<Uri>()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let scheme = uri.scheme_str().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "managed app-server listen URL has no scheme",
+            )
+        })?;
+        let host = uri.host().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "managed app-server listen URL has no host",
+            )
+        })?;
+        let bind_ip = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let listener = TcpListener::bind((bind_ip, 0))?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        Ok(Self {
+            listen_url: format!("{scheme}://{address}"),
+            cleanup_path: None,
+            cleanup_dir: None,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn validate_managed_unix_socket_path(path: &Path) -> io::Result<()> {
+    if !is_valid_unix_socket_path(path) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "managed app-server Unix socket path is invalid or too long",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "managed app-server Unix socket has no parent directory",
+        )
+    })?;
+    if !std::fs::metadata(parent)?.is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::NotADirectory,
+            "managed app-server Unix socket parent is not a directory",
+        ));
+    }
+    let probe_dir = create_private_preflight_dir(parent, ".chaop-pf-check")?;
+    let result = std::fs::remove_dir(&probe_dir);
+    if result.is_err() {
+        let _ = std::fs::remove_dir(&probe_dir);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn create_private_preflight_dir(parent: &Path, prefix: &str) -> io::Result<PathBuf> {
+    let base_nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0_u128..16 {
+        let path = parent.join(format!(
+            "{prefix}-{}-{:x}",
+            std::process::id(),
+            base_nonce.saturating_add(attempt)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        ErrorKind::AlreadyExists,
+        "unable to allocate a unique managed app-server preflight directory",
+    ))
+}
+
+impl Drop for AppServerPreflightEndpoint {
+    fn drop(&mut self) {
+        if let Some(path) = &self.cleanup_path {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => eprintln!(
+                    "failed to remove managed app-server preflight socket {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+        if let Some(path) = &self.cleanup_dir {
+            match std::fs::remove_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => eprintln!(
+                    "failed to remove managed app-server preflight directory {}: {error}",
+                    path.display()
+                ),
+            }
+        }
     }
 }
 
@@ -796,18 +1026,107 @@ fn upgrade_marker_modified(marker: Option<&std::path::PathBuf>) -> Option<System
         .and_then(|metadata| metadata.modified().ok())
 }
 
-fn is_loopback_listen_url(listen_url: &str) -> bool {
-    let Ok(uri) = listen_url.parse::<Uri>() else {
+pub fn is_app_server_url(url: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(path) = strip_unix_scheme(url) {
+        let path = std::path::Path::new(path);
+        return is_valid_unix_socket_path(path);
+    }
+    let Some(uri) = app_server_websocket_uri(url) else {
         return false;
     };
-    match uri.scheme_str() {
-        Some("ws") | Some("wss") => {}
-        _ => return false,
+    if uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("wss"))
+    {
+        return true;
     }
+    uri.host().is_some_and(is_loopback_host)
+}
+
+pub fn is_local_listen_url(listen_url: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(path) = strip_unix_scheme(listen_url) {
+        let path = std::path::Path::new(path);
+        return is_valid_unix_socket_path(path);
+    }
+    let Some(uri) = app_server_websocket_uri(listen_url) else {
+        return false;
+    };
     let Some(host) = uri.host() else {
         return false;
     };
     is_loopback_host(host)
+}
+
+pub fn is_managed_listen_url(listen_url: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(path) = strip_unix_scheme(listen_url) {
+        return is_valid_unix_socket_path(Path::new(path));
+    }
+    let Some(uri) = app_server_websocket_uri(listen_url) else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let Some(scheme_separator) = listen_url.find("://") else {
+        return false;
+    };
+    if !uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws"))
+        || authority.as_str().contains('@')
+        || scheme_separator + 3 + authority.as_str().len() != listen_url.len()
+    {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let Ok(ip) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    else {
+        return false;
+    };
+    if !ip.is_loopback() {
+        return false;
+    }
+    app_server_explicit_port(&uri)
+        .and_then(|port| port.parse::<u16>().ok())
+        .is_some_and(|port| port > 0)
+}
+
+#[cfg(unix)]
+fn is_valid_unix_socket_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path != Path::new("/")
+        && path.as_os_str().as_bytes().len() <= UNIX_SOCKET_PATH_MAX_BYTES
+}
+
+fn app_server_websocket_uri(url: &str) -> Option<Uri> {
+    let uri = url.parse::<Uri>().ok()?;
+    let scheme = uri.scheme_str()?;
+    if !scheme.eq_ignore_ascii_case("ws") && !scheme.eq_ignore_ascii_case("wss") {
+        return None;
+    }
+    uri.host()?;
+    if let Some(port) = app_server_explicit_port(&uri) {
+        if port.parse::<u16>().ok()? == 0 {
+            return None;
+        }
+    }
+    Some(uri)
+}
+
+#[cfg(unix)]
+fn strip_unix_scheme(url: &str) -> Option<&str> {
+    const PREFIX: &str = "unix://";
+    url.get(..PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+        .map(|_| &url[PREFIX.len()..])
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -894,7 +1213,8 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerInstanceState, AppServerManager, AppServerRestartReason, is_loopback_listen_url,
+        AppServerInstanceState, AppServerManager, AppServerPreflightEndpoint,
+        AppServerRestartReason, is_app_server_url, is_local_listen_url, is_managed_listen_url,
         terminate_child,
     };
     use crate::config::{
@@ -902,6 +1222,8 @@ mod tests {
         SessionInventoryConfig,
     };
     use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -911,13 +1233,209 @@ mod tests {
     static TEST_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
     #[test]
-    fn managed_listen_url_requires_loopback_host() {
-        assert!(is_loopback_listen_url("ws://localhost:65530"));
-        assert!(is_loopback_listen_url("ws://127.0.0.1:65530"));
-        assert!(is_loopback_listen_url("ws://[::1]:65530"));
-        assert!(!is_loopback_listen_url("ws://0.0.0.0:65530"));
-        assert!(!is_loopback_listen_url("ws://192.168.1.20:65530"));
-        assert!(!is_loopback_listen_url("ws://codex.example.test:65530"));
+    fn managed_listen_url_requires_local_endpoint() {
+        assert!(is_local_listen_url("ws://localhost:65530"));
+        assert!(is_local_listen_url("WS://localhost:65530"));
+        assert!(is_local_listen_url("ws://127.0.0.1:65530"));
+        assert!(is_local_listen_url("ws://[::1]:65530"));
+        #[cfg(unix)]
+        assert!(is_local_listen_url("unix:///tmp/chaop-app-server.sock"));
+        #[cfg(unix)]
+        assert!(is_local_listen_url("UNIX:///tmp/chaop-app-server.sock"));
+        assert!(!is_local_listen_url("unix://relative.sock"));
+        assert!(!is_local_listen_url("ws://0.0.0.0:65530"));
+        assert!(!is_local_listen_url("ws://192.168.1.20:65530"));
+        assert!(!is_local_listen_url("ws://codex.example.test:65530"));
+        assert!(!is_local_listen_url("ws://127.0.0.1:99999"));
+        assert!(!is_local_listen_url("http://127.0.0.1:65530"));
+        #[cfg(unix)]
+        assert!(!is_local_listen_url(&format!(
+            "unix:///tmp/{}",
+            "x".repeat(super::UNIX_SOCKET_PATH_MAX_BYTES)
+        )));
+    }
+
+    #[test]
+    fn managed_listen_url_matches_codex_listener_contract() {
+        assert!(is_managed_listen_url("ws://127.0.0.1:65530"));
+        assert!(is_managed_listen_url("WS://[::1]:65530"));
+        #[cfg(unix)]
+        assert!(is_managed_listen_url("unix:///tmp/chaop-app-server.sock"));
+        assert!(!is_managed_listen_url("ws://localhost:65530"));
+        assert!(!is_managed_listen_url("wss://127.0.0.1:65530"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1:0"));
+        assert!(!is_managed_listen_url("ws://user@127.0.0.1:65530"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1:65530/"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1:65530/path"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1:65530?query"));
+    }
+
+    #[test]
+    fn app_server_url_requires_supported_transport_and_valid_port() {
+        assert!(is_app_server_url("ws://127.0.0.1:65530"));
+        assert!(is_app_server_url("wss://codex.example.test"));
+        #[cfg(unix)]
+        assert!(is_app_server_url("unix:///tmp/chaop-app-server.sock"));
+        assert!(!is_app_server_url("ws://127.0.0.1:99999"));
+        assert!(!is_app_server_url("ws://127.0.0.1:0"));
+        assert!(!is_app_server_url("ws://192.0.2.1:6174"));
+        assert!(!is_app_server_url("http://codex.example.test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_app_server_preflight_uses_bounded_private_unix_socket() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let configured_path = tempdir.path().join("configured.sock");
+        let configured_url = format!("unix://{}", configured_path.display());
+
+        let endpoint = AppServerPreflightEndpoint::new(&configured_url).expect("endpoint");
+        let cleanup_dir = endpoint.cleanup_dir.clone().expect("cleanup directory");
+        let second_endpoint =
+            AppServerPreflightEndpoint::new(&configured_url).expect("second endpoint");
+        let second_cleanup_dir = second_endpoint
+            .cleanup_dir
+            .clone()
+            .expect("second cleanup directory");
+
+        assert_ne!(endpoint.listen_url, configured_url);
+        assert_ne!(second_endpoint.listen_url, endpoint.listen_url);
+        assert_eq!(cleanup_dir.parent(), Some(std::path::Path::new("/tmp")));
+        assert!(endpoint.listen_url.len() < 80);
+        assert!(cleanup_dir.exists());
+        assert!(second_cleanup_dir.exists());
+        assert_eq!(
+            std::fs::metadata(&cleanup_dir)
+                .expect("cleanup directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(!configured_path.exists());
+        drop(endpoint);
+        drop(second_endpoint);
+        assert!(!cleanup_dir.exists());
+        assert!(!second_cleanup_dir.exists());
+
+        let missing_parent_url = format!(
+            "unix://{}",
+            tempdir.path().join("missing/configured.sock").display()
+        );
+        assert_eq!(
+            AppServerPreflightEndpoint::new(&missing_parent_url)
+                .expect_err("missing configured parent must fail")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn managed_app_server_stop_propagates_termination_failure() {
+        fn fail_termination(_child: &mut std::process::Child) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected termination failure",
+            ))
+        }
+
+        let config = config_with_managed(true);
+        let mut manager = AppServerManager::new(&config);
+        manager.terminate_child = fail_termination;
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
+        manager.child = Some(command.spawn().expect("spawn child"));
+
+        let error = manager
+            .stop_child_checked("test termination failure")
+            .expect_err("termination failure must propagate");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "injected termination failure");
+        assert!(manager.child.is_some());
+        manager.terminate_child = terminate_child;
+        manager
+            .stop_child_checked("clean up retained child")
+            .expect("retained child can be stopped");
+        assert!(manager.child.is_none());
+    }
+
+    #[test]
+    fn pending_restart_stops_when_child_termination_fails() {
+        fn fail_termination(_child: &mut std::process::Child) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected restart termination failure",
+            ))
+        }
+
+        let config = config_with_managed(true);
+        let mut manager = AppServerManager::new(&config);
+        manager.terminate_child = fail_termination;
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
+        let child = command.spawn().expect("spawn child");
+        let child_id = child.id();
+        manager.child = Some(child);
+        manager.request_restart(AppServerRestartReason::UpgradeMarker);
+
+        assert_eq!(manager.advance_pending_restart(&config), None);
+
+        assert_eq!(
+            manager.child.as_ref().map(std::process::Child::id),
+            Some(child_id)
+        );
+        assert_eq!(
+            manager.pending_restart.map(|pending| pending.reason),
+            Some(AppServerRestartReason::UpgradeMarker)
+        );
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.last_error.as_deref(),
+            Some("injected restart termination failure")
+        );
+        manager.terminate_child = terminate_child;
+        manager
+            .stop_child_checked("clean up retained restart child")
+            .expect("retained restart child can be stopped");
+    }
+
+    #[test]
+    fn managed_app_server_preflight_rejects_candidate_that_exits() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let command = tempdir.path().join("codex-stub");
+        write_executable(&command, "#!/bin/sh\nexit 2\n");
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = command.to_string_lossy().into_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .startup_timeout_seconds = 1;
+        #[cfg(unix)]
+        {
+            config.session_inventory.managed_app_server.listen_url = Some(format!(
+                "unix://{}",
+                tempdir.path().join("configured.sock").display()
+            ));
+        }
+
+        let error = AppServerManager::preflight_managed_app_server(&config)
+            .expect_err("exited candidate must fail preflight");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "managed app-server preflight did not become healthy"
+        );
     }
 
     #[test]
@@ -1773,6 +2291,46 @@ mod tests {
     }
 
     #[test]
+    fn managed_app_server_startup_timeout_bounds_health_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled app-server");
+        let listen_url = format!(
+            "ws://{}",
+            listener.local_addr().expect("stalled app-server address")
+        );
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept health probe");
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(stream);
+        });
+
+        let mut config = config_with_managed(true);
+        config.session_inventory.app_server_timeout_seconds = 60;
+        config
+            .session_inventory
+            .managed_app_server
+            .startup_timeout_seconds = 1;
+        let mut manager = AppServerManager::new(&config);
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
+        manager.child = Some(command.spawn().expect("spawn managed child"));
+
+        let started_at = Instant::now();
+        assert!(!manager.wait_until_ready(&config, &listen_url));
+        assert!(started_at.elapsed() < Duration::from_secs(3));
+
+        let _ = release_tx.send(());
+        server.join().expect("stalled app-server worker");
+        manager
+            .stop_child_checked("clean up startup deadline child")
+            .expect("stop startup deadline child");
+    }
+
+    #[test]
     fn managed_app_server_restart_backoff_starts_after_startup_failure() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let marker = tempdir.path().join("spawned");
@@ -1903,6 +2461,7 @@ mod tests {
                     enabled,
                     listen_url: None,
                     extra_args: Vec::new(),
+                    lock_cwd_to_workspace_root: false,
                     startup_timeout_seconds: 1,
                     restart_backoff_seconds: 1,
                     drain_timeout_seconds: 300,
