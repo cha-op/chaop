@@ -44,7 +44,8 @@ app_server_timeout_seconds = 2
 
 [session_inventory.managed_app_server]
 enabled = true
-listen_url = "ws://127.0.0.1:9876"
+listen_url = "unix:///path/to/private/app-server.sock"
+lock_cwd_to_workspace_root = true
 startup_timeout_seconds = 10
 restart_backoff_seconds = 5
 drain_timeout_seconds = 300
@@ -52,7 +53,7 @@ scheduled_restart_interval_seconds = 86400
 upgrade_marker_file = "/path/to/private/app-server-upgrade.marker"
 ```
 
-常驻 connector 应使用绝对路径形式的 `codex_command`。启动服务和 SSH 会话通常不会继承交互式终端里的同一个 `PATH`。
+常驻 connector 应使用绝对路径形式的 `codex_command`。启动服务和 SSH 会话通常不会继承交互式终端里的同一个 `PATH`。在 Unix 主机上，应把 app-server socket 放在 workspace 外 mode `0700` 的私密目录中，并 deny model-invoked tools 访问整个目录。
 
 ## 持久化状态
 
@@ -145,7 +146,7 @@ pnpm dogfood:connector -- schedule-upgrade
 
 1. 用 `logs` 检查 app-server startup error。
 2. 确认 `codex_command` 是绝对路径且可执行。
-3. 确认 `listen_url` 只绑定 loopback，并且没有被另一个进程占用。
+3. 确认绝对 `unix://` socket 的父目录是私密的、connector 用户可写；只有确认没有 app-server process 持有时，才能删除 stale socket。
 4. 修复本机 Codex 安装后，touch upgrade marker 或运行 `restart`。
 
 如果 UI 里 Host Sessions 陈旧，优先使用 Browser refresh button，而不是重启 connector。只有 connector offline、degraded，或仍在使用旧私有配置时才重启。

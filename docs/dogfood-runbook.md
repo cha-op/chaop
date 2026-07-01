@@ -44,7 +44,8 @@ app_server_timeout_seconds = 2
 
 [session_inventory.managed_app_server]
 enabled = true
-listen_url = "ws://127.0.0.1:9876"
+listen_url = "unix:///path/to/private/app-server.sock"
+lock_cwd_to_workspace_root = true
 startup_timeout_seconds = 10
 restart_backoff_seconds = 5
 drain_timeout_seconds = 300
@@ -52,7 +53,7 @@ scheduled_restart_interval_seconds = 86400
 upgrade_marker_file = "/path/to/private/app-server-upgrade.marker"
 ```
 
-Use an absolute `codex_command` path for a persistent connector. Launch services and SSH sessions often do not inherit the same `PATH` as an interactive terminal.
+Use an absolute `codex_command` path for a persistent connector. Launch services and SSH sessions often do not inherit the same `PATH` as an interactive terminal. On Unix hosts, keep the app-server socket in a mode `0700` private directory outside the workspace and deny model-invoked tools access to that directory.
 
 ## Persistent State
 
@@ -145,7 +146,7 @@ If the managed app-server is degraded:
 
 1. Check `logs` for the app-server startup error.
 2. Confirm `codex_command` is absolute and executable.
-3. Confirm `listen_url` is loopback-only and not already owned by another process.
+3. Confirm the absolute `unix://` socket parent is private and writable by the connector user, and remove a stale socket only after confirming no app-server process owns it.
 4. Touch the upgrade marker or run `restart` after fixing the local Codex install.
 
 If the UI shows stale Host Sessions, prefer the Browser refresh button rather than restarting the connector. Restart only when the connector is offline, degraded, or running with outdated private config.

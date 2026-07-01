@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use tungstenite::http::Uri;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -54,6 +56,8 @@ pub struct SessionInventoryConfig {
     pub report_interval_seconds: u64,
     #[serde(default)]
     pub app_server_url: Option<String>,
+    #[serde(default)]
+    pub app_server_auth_token_file: Option<PathBuf>,
     #[serde(default = "default_app_server_timeout_seconds")]
     pub app_server_timeout_seconds: u64,
     #[serde(default)]
@@ -68,6 +72,8 @@ pub struct ManagedAppServerConfig {
     pub listen_url: Option<String>,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    #[serde(default)]
+    pub lock_cwd_to_workspace_root: bool,
     #[serde(default = "default_managed_app_server_startup_timeout_seconds")]
     pub startup_timeout_seconds: u64,
     #[serde(default = "default_managed_app_server_restart_backoff_seconds")]
@@ -103,6 +109,7 @@ impl Default for SessionInventoryConfig {
             max_sessions: default_session_inventory_max_sessions(),
             report_interval_seconds: default_session_inventory_report_interval_seconds(),
             app_server_url: None,
+            app_server_auth_token_file: None,
             app_server_timeout_seconds: default_app_server_timeout_seconds(),
             managed_app_server: ManagedAppServerConfig::default(),
         }
@@ -115,6 +122,7 @@ impl Default for ManagedAppServerConfig {
             enabled: false,
             listen_url: None,
             extra_args: Vec::new(),
+            lock_cwd_to_workspace_root: false,
             startup_timeout_seconds: default_managed_app_server_startup_timeout_seconds(),
             restart_backoff_seconds: default_managed_app_server_restart_backoff_seconds(),
             drain_timeout_seconds: default_managed_app_server_drain_timeout_seconds(),
@@ -149,7 +157,44 @@ pub struct BootstrapRequest {
 impl AgentConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let content = fs::read_to_string(path).map_err(ConfigError::Read)?;
-        toml::from_str(&content).map_err(ConfigError::Parse)
+        let config: Self = toml::from_str(&content).map_err(ConfigError::Parse)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.session_inventory.managed_app_server.enabled
+            && self.session_inventory.app_server_auth_token_file.is_some()
+        {
+            return Err(ConfigError::Invalid(
+                "session_inventory.app_server_auth_token_file cannot be set when session_inventory.managed_app_server.enabled is true"
+                    .to_owned(),
+            ));
+        }
+        if self.session_inventory.app_server_auth_token_file.is_some()
+            && !self
+                .session_inventory
+                .app_server_url
+                .as_deref()
+                .is_some_and(app_server_url_uses_wss)
+        {
+            return Err(ConfigError::Invalid(
+                "session_inventory.app_server_auth_token_file requires session_inventory.app_server_url to use wss://"
+                    .to_owned(),
+            ));
+        }
+        if self
+            .session_inventory
+            .app_server_url
+            .as_deref()
+            .is_some_and(app_server_url_uses_remote_plaintext_ws)
+        {
+            return Err(ConfigError::Invalid(
+                "session_inventory.app_server_url requires wss:// for non-loopback endpoints"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn capabilities(&self) -> Vec<String> {
@@ -196,6 +241,36 @@ impl AgentConfig {
         let value = fs::read_to_string(&self.bootstrap.secret_file).map_err(ConfigError::Read)?;
         Ok(value.trim().to_owned())
     }
+}
+
+fn app_server_url_uses_wss(url: &str) -> bool {
+    url.parse::<Uri>()
+        .ok()
+        .and_then(|uri| uri.scheme_str().map(str::to_owned))
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("wss"))
+}
+
+fn app_server_url_uses_remote_plaintext_ws(url: &str) -> bool {
+    let Ok(uri) = url.parse::<Uri>() else {
+        return false;
+    };
+    if !uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws"))
+    {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let normalised = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    normalised != "localhost"
+        && !normalised
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn default_codex_command() -> String {
@@ -246,6 +321,7 @@ fn default_managed_app_server_drain_timeout_seconds() -> u64 {
 pub enum ConfigError {
     Read(std::io::Error),
     Parse(toml::de::Error),
+    Invalid(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -253,6 +329,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::Read(error) => write!(formatter, "failed to read connector config: {error}"),
             Self::Parse(error) => write!(formatter, "failed to parse connector config: {error}"),
+            Self::Invalid(error) => write!(formatter, "invalid connector config: {error}"),
         }
     }
 }
@@ -263,6 +340,7 @@ impl std::error::Error for ConfigError {}
 mod tests {
     use super::AgentConfig;
     use std::fs;
+    use std::path::Path;
 
     #[test]
     fn loads_connector_config() {
@@ -295,6 +373,37 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
     }
 
     #[test]
+    fn rejects_remote_plaintext_app_server_url() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("agent.toml");
+        fs::write(
+            &config_path,
+            r#"
+connector_name = "mac-studio"
+control_url = "wss://api.example.com/ws/agent"
+bootstrap_url = "https://api.example.com/connector/bootstrap"
+workspace_root = "/Users/you/Program"
+token_file = "/Users/you/.chaop/connector.token"
+spool_db = "/Users/you/.chaop/connector-spool.sqlite"
+
+[bootstrap]
+secret_file = "/Users/you/.chaop/bootstrap.secret"
+
+[session_inventory]
+app_server_url = "ws://192.0.2.1:6174"
+"#,
+        )
+        .expect("write config");
+
+        let error = AgentConfig::load(config_path).expect_err("remote ws must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid connector config: session_inventory.app_server_url requires wss:// for non-loopback endpoints"
+        );
+    }
+
+    #[test]
     fn loads_managed_app_server_config() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config_path = tempdir.path().join("agent.toml");
@@ -318,6 +427,7 @@ mode = "app_server"
 enabled = true
 listen_url = "ws://127.0.0.1:6174"
 extra_args = ["--ws-project-doc-max-bytes", "131072"]
+lock_cwd_to_workspace_root = true
 startup_timeout_seconds = 3
 restart_backoff_seconds = 2
 drain_timeout_seconds = 30
@@ -331,6 +441,12 @@ upgrade_marker_file = "/Users/you/.chaop/app-server-upgrade.marker"
 
         assert_eq!(config.execution.mode, super::ExecutionMode::AppServer);
         assert!(config.session_inventory.managed_app_server.enabled);
+        assert!(
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .is_none()
+        );
         assert_eq!(
             config
                 .session_inventory
@@ -380,6 +496,128 @@ upgrade_marker_file = "/Users/you/.chaop/app-server-upgrade.marker"
         assert_eq!(
             config.session_inventory.managed_app_server.extra_args,
             vec!["--ws-project-doc-max-bytes", "131072"]
+        );
+        assert!(
+            config
+                .session_inventory
+                .managed_app_server
+                .lock_cwd_to_workspace_root
+        );
+    }
+
+    #[test]
+    fn rejects_managed_app_server_with_external_auth_token() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("agent.toml");
+        fs::write(
+            &config_path,
+            r#"
+connector_name = "mac-studio"
+control_url = "wss://api.example.com/ws/agent"
+bootstrap_url = "https://api.example.com/connector/bootstrap"
+workspace_root = "/Users/you/Program"
+token_file = "/Users/you/.chaop/connector.token"
+spool_db = "/Users/you/.chaop/connector-spool.sqlite"
+
+[bootstrap]
+secret_file = "/Users/you/.chaop/bootstrap.secret"
+
+[session_inventory]
+app_server_auth_token_file = "/Users/you/.chaop/app-server.token"
+
+[session_inventory.managed_app_server]
+enabled = true
+listen_url = "unix:///Users/you/.chaop/app-server.sock"
+"#,
+        )
+        .expect("write config");
+
+        let error = AgentConfig::load(config_path).expect_err("reject invalid config");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid connector config: session_inventory.app_server_auth_token_file cannot be set when session_inventory.managed_app_server.enabled is true"
+        );
+    }
+
+    #[test]
+    fn rejects_external_app_server_auth_token_without_wss_url() {
+        for app_server_url in [
+            None,
+            Some("ws://127.0.0.1:6174"),
+            Some("unix:///Users/you/.chaop/app-server.sock"),
+        ] {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let config_path = tempdir.path().join("agent.toml");
+            let app_server_url = app_server_url
+                .map(|url| format!("app_server_url = \"{url}\"\n"))
+                .unwrap_or_default();
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+connector_name = "mac-studio"
+control_url = "wss://api.example.com/ws/agent"
+bootstrap_url = "https://api.example.com/connector/bootstrap"
+workspace_root = "/Users/you/Program"
+token_file = "/Users/you/.chaop/connector.token"
+spool_db = "/Users/you/.chaop/connector-spool.sqlite"
+
+[bootstrap]
+secret_file = "/Users/you/.chaop/bootstrap.secret"
+
+[session_inventory]
+{app_server_url}app_server_auth_token_file = "/Users/you/.chaop/app-server.token"
+"#
+                ),
+            )
+            .expect("write config");
+
+            let error = AgentConfig::load(config_path).expect_err("reject invalid config");
+
+            assert_eq!(
+                error.to_string(),
+                "invalid connector config: session_inventory.app_server_auth_token_file requires session_inventory.app_server_url to use wss://"
+            );
+        }
+    }
+
+    #[test]
+    fn loads_external_app_server_auth_token_with_wss_url() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("agent.toml");
+        fs::write(
+            &config_path,
+            r#"
+connector_name = "mac-studio"
+control_url = "wss://api.example.com/ws/agent"
+bootstrap_url = "https://api.example.com/connector/bootstrap"
+workspace_root = "/Users/you/Program"
+token_file = "/Users/you/.chaop/connector.token"
+spool_db = "/Users/you/.chaop/connector-spool.sqlite"
+
+[bootstrap]
+secret_file = "/Users/you/.chaop/bootstrap.secret"
+
+[session_inventory]
+app_server_url = "WSS://app.example.com"
+app_server_auth_token_file = "/Users/you/.chaop/app-server.token"
+"#,
+        )
+        .expect("write config");
+
+        let config = AgentConfig::load(config_path).expect("load secure config");
+
+        assert_eq!(
+            config.session_inventory.app_server_url.as_deref(),
+            Some("WSS://app.example.com")
+        );
+        assert_eq!(
+            config
+                .session_inventory
+                .app_server_auth_token_file
+                .as_deref(),
+            Some(Path::new("/Users/you/.chaop/app-server.token"))
         );
     }
 
