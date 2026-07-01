@@ -48,6 +48,7 @@ import {
   appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
+  budgetBoardHash,
   budgetPctLabel,
   budgetSourceLabel,
   codexCliFallbackAvailable,
@@ -69,6 +70,7 @@ import {
   normaliseCommandMode,
   safetyActionBlocked,
   safetyActionReason,
+  threadIdFromHashValue,
   threadTurnsForDisplay,
   TURN_INTERACTION_OTHER_SELECT_VALUE,
   turnInteractionAnswerForSelectValue,
@@ -293,8 +295,9 @@ export class ChaopApp extends LitElement {
   };
 
   private navItem(view: View, label: string) {
+    const href = view === "budget-board" ? budgetBoardHash(this.selectedThreadId) : `#${view}`;
     return html`
-      <a class=${this.view === view ? "active" : ""} href=${`#${view}`}>${label}</a>
+      <a class=${this.view === view ? "active" : ""} href=${href}>${label}</a>
     `;
   }
 
@@ -1138,7 +1141,7 @@ export class ChaopApp extends LitElement {
     const generatedAt = budget.generated_at ?? this.data!.server_time;
     const windowSampleCount = budget.window_sample_count ?? windows.length;
     const constraintSampleCount = budget.constraint_sample_count ?? constraints.filter((constraint) => constraint.sampled).length;
-    const readiness = dogfoodReadinessPreflight(this.data, this.selectedThreadId);
+    const readiness = dogfoodReadinessPreflight(this.data, threadIdFromHash());
     return html`
       ${this.renderDogfoodReadiness(readiness)}
       <section class="page-grid budget-grid">
@@ -2112,9 +2115,7 @@ function viewFromHash(): View {
 }
 
 function threadIdFromHash(): string | undefined {
-  const query = window.location.hash.split("?")[1];
-  if (!query) return undefined;
-  return new URLSearchParams(query).get("thread") ?? undefined;
+  return threadIdFromHashValue(window.location.hash);
 }
 
 function hashPath(): string {

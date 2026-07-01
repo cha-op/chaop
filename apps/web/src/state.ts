@@ -82,6 +82,16 @@ export const TURN_INTERACTION_OTHER_SELECT_VALUE = "other";
 
 const TURN_INTERACTION_OPTION_SELECT_PREFIX = "option:";
 
+export function budgetBoardHash(threadId: string | undefined): string {
+  return threadId ? `#budget-board?thread=${encodeURIComponent(threadId)}` : "#budget-board";
+}
+
+export function threadIdFromHashValue(hash: string): string | undefined {
+  const query = hash.split("?")[1];
+  if (!query) return undefined;
+  return new URLSearchParams(query).get("thread") || undefined;
+}
+
 export function turnInteractionOptionSelectValue(index: number): string {
   return `${TURN_INTERACTION_OPTION_SELECT_PREFIX}${index}`;
 }
@@ -867,6 +877,41 @@ function readinessConnectorCheck(
       detail: target.kind === "attached_thread"
         ? `${full.length} workspace connector${full.length === 1 ? "" : "s"} can run the selected app-server thread for ${workspaceLabel}.`
         : `${full.length} workspace connector${full.length === 1 ? "" : "s"} can create and run app-server threads for ${workspaceLabel}.`
+    };
+  }
+  if (target.kind === "attached_thread") {
+    const owner = readinessConnectorScopes(data, workspaceId).find(
+      (scope) => scope.connector.id === target.connectorId
+    );
+    if (!owner) {
+      return {
+        id: "connector",
+        label: "Connector",
+        state: "blocked",
+        detail: "The connector attached to the selected thread is no longer reported."
+      };
+    }
+    if (owner.workspaceIds.size === 0) {
+      return {
+        id: "connector",
+        label: "Connector",
+        state: "blocked",
+        detail: `The connector attached to the selected thread is no longer linked to ${workspaceLabel}.`
+      };
+    }
+    if (owner.connector.status !== "online") {
+      return {
+        id: "connector",
+        label: "Connector",
+        state: "blocked",
+        detail: `The connector attached to the selected thread is ${owner.connector.status}.`
+      };
+    }
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "The connector attached to the selected thread does not report app-server execution capability."
     };
   }
   if (online.length === 0) {

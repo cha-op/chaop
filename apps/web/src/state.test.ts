@@ -17,6 +17,7 @@ import {
   appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
+  budgetBoardHash,
   budgetPctLabel,
   budgetSourceLabel,
   codexCliFallbackAvailable,
@@ -39,6 +40,7 @@ import {
   primaryAppServerInstanceForConnector,
   safetyActionBlocked,
   safetyActionReason,
+  threadIdFromHashValue,
   threadTurnsForDisplay,
   TURN_INTERACTION_OTHER_SELECT_VALUE,
   turnInteractionAnswerForSelectValue,
@@ -46,6 +48,14 @@ import {
   turnInteractionQuestionSelectValue,
   type PendingTurnInteractionQuestion
 } from "./state.ts";
+
+test("budget board navigation carries only an explicit thread target", () => {
+  assert.equal(budgetBoardHash(undefined), "#budget-board");
+  assert.equal(budgetBoardHash("thread/one"), "#budget-board?thread=thread%2Fone");
+  assert.equal(threadIdFromHashValue("#budget-board"), undefined);
+  assert.equal(threadIdFromHashValue("#budget-board?thread=thread%2Fone"), "thread/one");
+  assert.equal(threadIdFromHashValue("#budget-board?thread="), undefined);
+});
 
 test("turn interaction select helpers keep answer values separate from UI sentinel values", () => {
   const sentinelAnswer = "__chaop_other__";
@@ -569,6 +579,62 @@ test("dogfoodReadinessPreflight limits a selected attached thread to its owning 
     readiness.checks.find((check) => check.id === "app_server")?.detail,
     "No healthy app-server instance is reported by a connector linked to workspace-api."
   );
+});
+
+test("dogfoodReadinessPreflight diagnoses an unavailable attached-thread owner", () => {
+  const scenarios = [
+    {
+      name: "missing",
+      workspaceConnectorIds: ["connector-a", "connector-b"],
+      owner: undefined,
+      detail: "The connector attached to the selected thread is no longer reported."
+    },
+    {
+      name: "unlinked",
+      workspaceConnectorIds: ["connector-b"],
+      owner: connector("connector-a", ["codex_app_server_exec"]),
+      detail: "The connector attached to the selected thread is no longer linked to workspace-api."
+    },
+    {
+      name: "offline",
+      workspaceConnectorIds: ["connector-a", "connector-b"],
+      owner: connector("connector-a", ["codex_app_server_exec"], "offline"),
+      detail: "The connector attached to the selected thread is offline."
+    },
+    {
+      name: "missing execution capability",
+      workspaceConnectorIds: ["connector-a", "connector-b"],
+      owner: connector("connector-a", ["app_server_threads"]),
+      detail: "The connector attached to the selected thread does not report app-server execution capability."
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    const connectors = scenario.owner
+      ? [scenario.owner, connector("connector-b", ["app_server_threads", "codex_app_server_exec"])]
+      : [connector("connector-b", ["app_server_threads", "codex_app_server_exec"])];
+    const readiness = dogfoodReadinessPreflight(payload({
+      workspaces: [workspace("workspace-api", scenario.workspaceConnectorIds)],
+      threads: [thread("thread-api", "workspace-api")],
+      host_sessions: [
+        hostSession("session-api", {
+          connector_id: "connector-a",
+          workspace_id: "workspace-api",
+          attached_thread_id: "thread-api",
+          app_server_present: true
+        })
+      ],
+      connectors,
+      app_server_instances: [
+        appServerInstance("app-server-b", "healthy", "2026-06-12T10:01:00.000Z", "connector-b")
+      ]
+    }), "thread-api");
+
+    assert.equal(readiness.state, "blocked", scenario.name);
+    assert.equal(readiness.checks.find((check) => check.id === "connector")?.state, "blocked", scenario.name);
+    assert.equal(readiness.checks.find((check) => check.id === "connector")?.detail, scenario.detail, scenario.name);
+    assert.equal(readiness.summary, scenario.detail, scenario.name);
+  }
 });
 
 test("dogfoodReadinessPreflight blocks a selected thread without an app-server attachment", () => {
