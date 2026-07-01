@@ -1,12 +1,19 @@
 use crate::config::AgentConfig;
-use crate::session_inventory::app_server_health_check_with_auth;
+use crate::session_inventory::{app_server_explicit_port, app_server_health_check_with_auth};
 use crate::shutdown::shutdown_requested;
 use std::io::{self, ErrorKind};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, TcpListener};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
+#[cfg(unix)]
+use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant, SystemTime};
 use tungstenite::http::Uri;
 
@@ -84,6 +91,32 @@ impl AppServerManager {
         let mut runtime = config.clone();
         runtime.session_inventory.app_server_url = self.active_turn_app_server_url(config);
         runtime
+    }
+
+    pub fn preflight_managed_app_server(config: &AgentConfig) -> io::Result<()> {
+        let mut manager = Self::new(config);
+        if !manager.enabled {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "managed app-server preflight requires managed mode",
+            ));
+        }
+        let configured_listen_url = manager.validated_listen_url().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "managed app-server preflight requires a local listen URL",
+            )
+        })?;
+        let endpoint = AppServerPreflightEndpoint::new(&configured_listen_url)?;
+        manager.child = Some(manager.spawn_app_server(config, &endpoint.listen_url)?);
+        if !manager.wait_until_ready(config, &endpoint.listen_url) {
+            manager.stop_child("managed app-server preflight failed");
+            return Err(io::Error::other(
+                "managed app-server preflight did not become healthy",
+            ));
+        }
+        manager.stop_child("managed app-server preflight passed");
+        Ok(())
     }
 
     fn runtime_config_with_start_policy(
@@ -692,6 +725,103 @@ impl AppServerManager {
     }
 }
 
+struct AppServerPreflightEndpoint {
+    listen_url: String,
+    cleanup_path: Option<PathBuf>,
+    cleanup_dir: Option<PathBuf>,
+}
+
+impl AppServerPreflightEndpoint {
+    fn new(configured_listen_url: &str) -> io::Result<Self> {
+        #[cfg(unix)]
+        if let Some(path) = strip_unix_scheme(configured_listen_url) {
+            let configured_path = Path::new(path);
+            let parent = configured_path.parent().ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "managed app-server Unix socket has no parent directory",
+                )
+            })?;
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            let cleanup_dir =
+                parent.join(format!(".chaop-preflight-{}-{nonce:x}", std::process::id()));
+            std::fs::create_dir(&cleanup_dir)?;
+            if let Err(error) =
+                std::fs::set_permissions(&cleanup_dir, std::fs::Permissions::from_mode(0o700))
+            {
+                let _ = std::fs::remove_dir(&cleanup_dir);
+                return Err(error);
+            }
+            let cleanup_path = cleanup_dir.join("s");
+            return Ok(Self {
+                listen_url: format!("unix://{}", cleanup_path.display()),
+                cleanup_path: Some(cleanup_path),
+                cleanup_dir: Some(cleanup_dir),
+            });
+        }
+
+        let uri = configured_listen_url
+            .parse::<Uri>()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let scheme = uri.scheme_str().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "managed app-server listen URL has no scheme",
+            )
+        })?;
+        let host = uri.host().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "managed app-server listen URL has no host",
+            )
+        })?;
+        let bind_ip = if host.eq_ignore_ascii_case("localhost") {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        } else {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?
+        };
+        let listener = TcpListener::bind((bind_ip, 0))?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        Ok(Self {
+            listen_url: format!("{scheme}://{address}"),
+            cleanup_path: None,
+            cleanup_dir: None,
+        })
+    }
+}
+
+impl Drop for AppServerPreflightEndpoint {
+    fn drop(&mut self) {
+        if let Some(path) = &self.cleanup_path {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => eprintln!(
+                    "failed to remove managed app-server preflight socket {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+        if let Some(path) = &self.cleanup_dir {
+            match std::fs::remove_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => eprintln!(
+                    "failed to remove managed app-server preflight directory {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerInstanceSnapshot {
     pub instance_key: String,
@@ -815,24 +945,41 @@ fn upgrade_marker_modified(marker: Option<&std::path::PathBuf>) -> Option<System
         .and_then(|metadata| metadata.modified().ok())
 }
 
+pub fn is_app_server_url(url: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(path) = strip_unix_scheme(url) {
+        let path = std::path::Path::new(path);
+        return path.is_absolute() && path != std::path::Path::new("/");
+    }
+    app_server_websocket_uri(url).is_some()
+}
+
 pub fn is_local_listen_url(listen_url: &str) -> bool {
     #[cfg(unix)]
     if let Some(path) = strip_unix_scheme(listen_url) {
         let path = std::path::Path::new(path);
         return path.is_absolute() && path != std::path::Path::new("/");
     }
-    let Ok(uri) = listen_url.parse::<Uri>() else {
+    let Some(uri) = app_server_websocket_uri(listen_url) else {
         return false;
     };
-    match uri.scheme_str() {
-        Some(scheme) if scheme.eq_ignore_ascii_case("ws") || scheme.eq_ignore_ascii_case("wss") => {
-            let Some(host) = uri.host() else {
-                return false;
-            };
-            is_loopback_host(host)
-        }
-        _ => false,
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    is_loopback_host(host)
+}
+
+fn app_server_websocket_uri(url: &str) -> Option<Uri> {
+    let uri = url.parse::<Uri>().ok()?;
+    let scheme = uri.scheme_str()?;
+    if !scheme.eq_ignore_ascii_case("ws") && !scheme.eq_ignore_ascii_case("wss") {
+        return None;
     }
+    uri.host()?;
+    if let Some(port) = app_server_explicit_port(&uri) {
+        port.parse::<u16>().ok()?;
+    }
+    Some(uri)
 }
 
 #[cfg(unix)]
@@ -927,8 +1074,8 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerInstanceState, AppServerManager, AppServerRestartReason, is_local_listen_url,
-        terminate_child,
+        AppServerInstanceState, AppServerManager, AppServerPreflightEndpoint,
+        AppServerRestartReason, is_app_server_url, is_local_listen_url, terminate_child,
     };
     use crate::config::{
         AgentConfig, BootstrapConfig, ExecutionConfig, ExecutionMode, ManagedAppServerConfig,
@@ -957,6 +1104,65 @@ mod tests {
         assert!(!is_local_listen_url("ws://0.0.0.0:65530"));
         assert!(!is_local_listen_url("ws://192.168.1.20:65530"));
         assert!(!is_local_listen_url("ws://codex.example.test:65530"));
+        assert!(!is_local_listen_url("ws://127.0.0.1:99999"));
+        assert!(!is_local_listen_url("http://127.0.0.1:65530"));
+    }
+
+    #[test]
+    fn app_server_url_requires_supported_transport_and_valid_port() {
+        assert!(is_app_server_url("ws://127.0.0.1:65530"));
+        assert!(is_app_server_url("wss://codex.example.test"));
+        #[cfg(unix)]
+        assert!(is_app_server_url("unix:///tmp/chaop-app-server.sock"));
+        assert!(!is_app_server_url("ws://127.0.0.1:99999"));
+        assert!(!is_app_server_url("http://codex.example.test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_app_server_preflight_uses_isolated_unix_socket() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let configured_path = tempdir.path().join("configured.sock");
+        let configured_url = format!("unix://{}", configured_path.display());
+
+        let endpoint = AppServerPreflightEndpoint::new(&configured_url).expect("endpoint");
+        let cleanup_dir = endpoint.cleanup_dir.clone().expect("cleanup directory");
+
+        assert_ne!(endpoint.listen_url, configured_url);
+        assert_eq!(cleanup_dir.parent(), configured_path.parent());
+        assert!(cleanup_dir.exists());
+        assert!(!configured_path.exists());
+        drop(endpoint);
+        assert!(!cleanup_dir.exists());
+    }
+
+    #[test]
+    fn managed_app_server_preflight_rejects_candidate_that_exits() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let command = tempdir.path().join("codex-stub");
+        write_executable(&command, "#!/bin/sh\nexit 2\n");
+        let mut config = config_with_managed(true);
+        config.execution.codex_command = command.to_string_lossy().into_owned();
+        config
+            .session_inventory
+            .managed_app_server
+            .startup_timeout_seconds = 1;
+        #[cfg(unix)]
+        {
+            config.session_inventory.managed_app_server.listen_url = Some(format!(
+                "unix://{}",
+                tempdir.path().join("configured.sock").display()
+            ));
+        }
+
+        let error = AppServerManager::preflight_managed_app_server(&config)
+            .expect_err("exited candidate must fail preflight");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "managed app-server preflight did not become healthy"
+        );
     }
 
     #[test]

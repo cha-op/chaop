@@ -1197,7 +1197,7 @@ fn app_server_port(uri: &Uri, uses_tls: bool) -> Result<u16, Box<dyn std::error:
     }
 }
 
-fn app_server_explicit_port(uri: &Uri) -> Option<&str> {
+pub(crate) fn app_server_explicit_port(uri: &Uri) -> Option<&str> {
     let authority = uri.authority()?.as_str();
     let host_and_port = authority
         .rsplit_once('@')

@@ -1,4 +1,4 @@
-use chaop_agent::app_server_manager::{AppServerManager, is_local_listen_url};
+use chaop_agent::app_server_manager::{AppServerManager, is_app_server_url, is_local_listen_url};
 use chaop_agent::config::AgentConfig;
 use chaop_agent::connector::{RunMode, run_connector};
 use chaop_agent::placeholder::placeholder_event_stream;
@@ -12,9 +12,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_once = args.iter().any(|arg| arg == "--run-once");
     let print_placeholder = args.iter().any(|arg| arg == "--print-placeholder-events");
     let app_server_health_check = args.iter().any(|arg| arg == "--app-server-health-check");
+    let managed_app_server_preflight = args
+        .iter()
+        .any(|arg| arg == "--managed-app-server-preflight-check");
     let validate_config = args.iter().any(|arg| arg == "--validate-config");
 
     let config = AgentConfig::load(config_path)?;
+
+    if managed_app_server_preflight {
+        validate_deployment_config(&config)?;
+        AppServerManager::preflight_managed_app_server(&config)?;
+        println!("managed app-server preflight: PASS");
+        return Ok(());
+    }
 
     if validate_config {
         validate_deployment_config(&config)?;
@@ -76,10 +86,17 @@ fn app_server_health_target(config: &AgentConfig) -> Option<&str> {
 }
 
 fn validate_deployment_config(config: &AgentConfig) -> Result<(), &'static str> {
-    if config.session_inventory.managed_app_server.enabled
-        && app_server_health_target(config).is_none()
+    if config.session_inventory.managed_app_server.enabled {
+        if app_server_health_target(config).is_none() {
+            return Err("managed app-server config requires a valid local listen URL");
+        }
+    } else if config
+        .session_inventory
+        .app_server_url
+        .as_deref()
+        .is_some_and(|url| !is_app_server_url(url))
     {
-        return Err("managed app-server config requires a local listen URL");
+        return Err("app-server config requires a ws://, wss://, or absolute unix:// URL");
     }
     Ok(())
 }
@@ -133,7 +150,7 @@ mod tests {
         assert_eq!(app_server_health_target(&config), None);
         assert_eq!(
             validate_deployment_config(&config),
-            Err("managed app-server config requires a local listen URL")
+            Err("managed app-server config requires a valid local listen URL")
         );
 
         config.session_inventory.managed_app_server.enabled = false;
@@ -142,5 +159,17 @@ mod tests {
             Some("wss://external.example.test")
         );
         assert_eq!(validate_deployment_config(&config), Ok(()));
+
+        config.session_inventory.app_server_url = Some("ws://127.0.0.1:99999".to_owned());
+        assert_eq!(
+            validate_deployment_config(&config),
+            Err("app-server config requires a ws://, wss://, or absolute unix:// URL")
+        );
+
+        config.session_inventory.app_server_url = Some("http://external.example.test".to_owned());
+        assert_eq!(
+            validate_deployment_config(&config),
+            Err("app-server config requires a ws://, wss://, or absolute unix:// URL")
+        );
     }
 }
