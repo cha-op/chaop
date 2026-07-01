@@ -1235,6 +1235,7 @@ mod tests {
         assert!(!is_managed_listen_url("wss://127.0.0.1:65530"));
         assert!(!is_managed_listen_url("ws://127.0.0.1"));
         assert!(!is_managed_listen_url("ws://127.0.0.1:0"));
+        assert!(!is_managed_listen_url("ws://user@127.0.0.1:65530"));
         assert!(!is_managed_listen_url("ws://127.0.0.1:65530/"));
         assert!(!is_managed_listen_url("ws://127.0.0.1:65530/path"));
         assert!(!is_managed_listen_url("ws://127.0.0.1:65530?query"));

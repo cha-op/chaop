@@ -1103,11 +1103,16 @@ fn connect_tcp_app_server(
     let request = app_server_client_request(url, auth_token_file)?;
     let remaining = app_server_connection_time_remaining(deadline, url)?;
     let addresses = resolve_app_server_addresses(host, port, remaining, url)?;
+    let address_count = addresses.len();
     let mut last_error = None;
 
-    for addr in addresses {
+    for (index, addr) in addresses.into_iter().enumerate() {
         let remaining = app_server_connection_time_remaining(deadline, url)?;
-        match TcpStream::connect_timeout(&addr, remaining) {
+        let connect_timeout = app_server_connect_attempt_timeout(
+            remaining,
+            address_count.saturating_sub(index).max(1),
+        );
+        match TcpStream::connect_timeout(&addr, connect_timeout) {
             Ok(stream) => {
                 stream.set_nodelay(true)?;
                 let watchdog_stream = stream.try_clone()?;
@@ -1160,6 +1165,14 @@ fn connect_tcp_app_server(
         Some(error) => format!("unable to connect to app-server {url}: {error}").into(),
         None => format!("app-server URL {url} resolved to no socket addresses").into(),
     })
+}
+
+fn app_server_connect_attempt_timeout(
+    remaining: Duration,
+    remaining_address_count: usize,
+) -> Duration {
+    let divisor = u32::try_from(remaining_address_count.max(1)).unwrap_or(u32::MAX);
+    (remaining / divisor).max(Duration::from_nanos(1))
 }
 
 fn app_server_port(uri: &Uri, uses_tls: bool) -> Result<u16, Box<dyn std::error::Error>> {
@@ -4678,10 +4691,10 @@ mod tests {
         TurnInteractionInputAnswer, TurnInteractionResponse, TurnInteractionResponseDelivery,
         TurnInteractionResponseDispatch, acknowledge_turn_interaction_delivery,
         app_server_client_request, app_server_command_result_events_with_cancel,
-        app_server_health_check, app_server_port, app_server_sessions_from_response,
-        app_server_thread_from_response, app_server_titles_from_response,
-        build_host_session_backfill, build_host_sessions_report, connect_app_server,
-        create_app_server_thread_at, ensure_app_server_host_session_at,
+        app_server_connect_attempt_timeout, app_server_health_check, app_server_port,
+        app_server_sessions_from_response, app_server_thread_from_response,
+        app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
+        connect_app_server, create_app_server_thread_at, ensure_app_server_host_session_at,
         ensure_app_server_host_session_at_with_auth, load_app_server_sessions, read_recent_lines,
         remaining_app_server_archive_timeout, resolve_app_server_addresses, resolve_session,
         rollout_paths, set_app_server_thread_archived_at,
@@ -4806,6 +4819,21 @@ mod tests {
             app_server_port(&zero, false).unwrap_err().to_string(),
             "app-server URL port is invalid: 0"
         );
+    }
+
+    #[test]
+    fn app_server_connect_timeout_reserves_budget_for_later_addresses() {
+        let remaining = Duration::from_millis(900);
+
+        assert_eq!(
+            app_server_connect_attempt_timeout(remaining, 3),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            app_server_connect_attempt_timeout(remaining, 2),
+            Duration::from_millis(450)
+        );
+        assert_eq!(app_server_connect_attempt_timeout(remaining, 1), remaining);
     }
 
     #[test]
