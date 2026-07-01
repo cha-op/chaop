@@ -1027,7 +1027,10 @@ test("command mode labels keep UI modes separate from protocol types", () => {
   assert.equal(commandExecutionModeForRequest("placeholder"), undefined);
   assert.equal(commandExecutionModeForRequest("app_server"), "app_server");
   assert.equal(commandExecutionModeForRequest("codex_cli_fallback"), "codex_cli_fallback");
-  assert.equal(MANAGED_APP_SERVER_UNAVAILABLE, "No managed app-server connector is online.");
+  assert.equal(
+    MANAGED_APP_SERVER_UNAVAILABLE,
+    "No online connector can both create and run managed app-server threads."
+  );
 });
 
 test("managedAppServerCommandAvailable requires an attached app-server session and capable connector", () => {

@@ -1380,7 +1380,7 @@ export class ChaopApp extends LitElement {
     }
     if (localThreadConnectors(this.data, workspaceId).length === 0) {
       this.newThreadState = "failed";
-      this.actionError = `${MANAGED_APP_SERVER_UNAVAILABLE} Local thread creation requires app-server thread capability.`;
+      this.actionError = MANAGED_APP_SERVER_UNAVAILABLE;
       return;
     }
     if (!this.guardSafetyAction("local_thread_create")) {

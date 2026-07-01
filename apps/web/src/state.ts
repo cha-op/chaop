@@ -76,7 +76,8 @@ type ReadinessTarget =
   | { kind: "unattached_thread"; threadId: string; workspaceId: string }
   | { kind: "attached_thread"; threadId: string; workspaceId: string; connectorId: string };
 
-export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
+export const MANAGED_APP_SERVER_UNAVAILABLE =
+  "No online connector can both create and run managed app-server threads.";
 export const TURN_INTERACTION_OTHER_SELECT_VALUE = "other";
 
 const TURN_INTERACTION_OPTION_SELECT_PREFIX = "option:";
