@@ -1455,6 +1455,41 @@ fn app_server_connection_time_remaining(
 }
 
 #[cfg(unix)]
+fn wait_for_unix_socket_writable(raw_fd: libc::c_int, deadline: Instant) -> std::io::Result<()> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "timed out connecting to app-server Unix socket",
+                )
+            })?;
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
+        let mut poll_fd = libc::pollfd {
+            fd: raw_fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let poll_result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if poll_result > 0 {
+            return Ok(());
+        }
+        if poll_result == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "timed out connecting to app-server Unix socket",
+            ));
+        }
+        let poll_error = std::io::Error::last_os_error();
+        if poll_error.kind() != ErrorKind::Interrupted {
+            return Err(poll_error);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn connect_unix_stream_with_deadline(
     path: &Path,
     deadline: Instant,
@@ -1512,72 +1547,82 @@ fn connect_unix_stream_with_deadline(
         return Err(std::io::Error::last_os_error());
     }
 
-    let connect_result = unsafe {
-        libc::connect(
-            socket.as_raw_fd(),
-            std::ptr::addr_of!(address).cast::<libc::sockaddr>(),
-            address_len,
-        )
-    };
-    if connect_result < 0 {
-        let error = std::io::Error::last_os_error();
-        let raw_error = error.raw_os_error();
-        if raw_error != Some(libc::EINPROGRESS)
-            && raw_error != Some(libc::EAGAIN)
-            && raw_error != Some(libc::EWOULDBLOCK)
-        {
-            return Err(error);
-        }
+    enum ConnectState {
+        Retry,
+        BacklogFull,
+        InProgress,
+    }
 
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        ErrorKind::TimedOut,
-                        "timed out connecting to app-server Unix socket",
+    let mut state = ConnectState::Retry;
+    loop {
+        match state {
+            ConnectState::Retry => {
+                let connect_result = unsafe {
+                    libc::connect(
+                        socket.as_raw_fd(),
+                        std::ptr::addr_of!(address).cast::<libc::sockaddr>(),
+                        address_len,
                     )
-                })?;
-            let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
-            let mut poll_fd = libc::pollfd {
-                fd: socket.as_raw_fd(),
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            let poll_result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-            if poll_result < 0 {
-                let poll_error = std::io::Error::last_os_error();
-                if poll_error.kind() == ErrorKind::Interrupted {
+                };
+                if connect_result == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                let raw_error = error.raw_os_error();
+                if raw_error == Some(libc::EINTR) {
                     continue;
                 }
-                return Err(poll_error);
+                if raw_error == Some(libc::EISCONN) {
+                    break;
+                }
+                state = if raw_error == Some(libc::EAGAIN) || raw_error == Some(libc::EWOULDBLOCK) {
+                    ConnectState::BacklogFull
+                } else if raw_error == Some(libc::EINPROGRESS) || raw_error == Some(libc::EALREADY)
+                {
+                    ConnectState::InProgress
+                } else {
+                    return Err(error);
+                };
             }
-            if poll_result == 0 {
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    "timed out connecting to app-server Unix socket",
-                ));
+            ConnectState::BacklogFull => {
+                wait_for_unix_socket_writable(socket.as_raw_fd(), deadline)?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "timed out connecting to app-server Unix socket",
+                    ));
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                state = ConnectState::Retry;
             }
-
-            let mut socket_error = 0;
-            let mut socket_error_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            if unsafe {
-                libc::getsockopt(
-                    socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_ERROR,
-                    std::ptr::addr_of_mut!(socket_error).cast(),
-                    &mut socket_error_len,
-                )
-            } < 0
-            {
-                return Err(std::io::Error::last_os_error());
+            ConnectState::InProgress => {
+                wait_for_unix_socket_writable(socket.as_raw_fd(), deadline)?;
+                let mut socket_error = 0;
+                let mut socket_error_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        std::ptr::addr_of_mut!(socket_error).cast(),
+                        &mut socket_error_len,
+                    )
+                } < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if socket_error == 0 || socket_error == libc::EISCONN {
+                    break;
+                }
+                state = if socket_error == libc::EAGAIN || socket_error == libc::EWOULDBLOCK {
+                    ConnectState::BacklogFull
+                } else if socket_error == libc::EINPROGRESS || socket_error == libc::EALREADY {
+                    ConnectState::InProgress
+                } else {
+                    return Err(std::io::Error::from_raw_os_error(socket_error));
+                };
             }
-            if socket_error != 0 {
-                return Err(std::io::Error::from_raw_os_error(socket_error));
-            }
-            break;
         }
     }
 
@@ -1866,12 +1911,15 @@ pub fn set_app_server_thread_archived(
         .codex_home
         .clone()
         .unwrap_or_else(default_codex_home);
+    let locked_cwd = lock_app_server_cwd_to_workspace_root(config)
+        .then(|| config.workspace_root.to_string_lossy().into_owned());
     set_app_server_thread_archived_at_with_auth(
         url,
         thread_id,
         archived,
         Some((&codex_home, config.session_inventory.max_sessions)),
         config.session_inventory.app_server_timeout_seconds,
+        locked_cwd.as_deref(),
         config
             .session_inventory
             .app_server_auth_token_file
@@ -3619,12 +3667,32 @@ fn set_app_server_thread_archived_at_with_rollout_lookup(
     rollout_lookup: Option<(&Path, usize)>,
     timeout_seconds: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    set_app_server_thread_archived_at_with_rollout_lookup_and_cwd(
+        url,
+        thread_id,
+        archived,
+        rollout_lookup,
+        timeout_seconds,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn set_app_server_thread_archived_at_with_rollout_lookup_and_cwd(
+    url: &str,
+    thread_id: &str,
+    archived: bool,
+    rollout_lookup: Option<(&Path, usize)>,
+    timeout_seconds: u64,
+    locked_cwd: Option<&str>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     set_app_server_thread_archived_at_with_auth(
         url,
         thread_id,
         archived,
         rollout_lookup,
         timeout_seconds,
+        locked_cwd,
         None,
     )
 }
@@ -3635,6 +3703,7 @@ fn set_app_server_thread_archived_at_with_auth(
     archived: bool,
     rollout_lookup: Option<(&Path, usize)>,
     timeout_seconds: u64,
+    locked_cwd: Option<&str>,
     auth_token_file: Option<&Path>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(APP_SERVER_ARCHIVE_SYNC_DEADLINE_SECONDS);
@@ -3659,6 +3728,7 @@ fn set_app_server_thread_archived_at_with_auth(
             &mut socket,
             thread_id,
             rollout_lookup,
+            locked_cwd,
             &mut request_id,
             timeout,
             deadline,
@@ -3713,6 +3783,7 @@ fn resume_app_server_thread_from_rollout_path_for_archive(
     socket: &mut AppServerSocket,
     thread_id: &str,
     rollout_lookup: Option<(&Path, usize)>,
+    locked_cwd: Option<&str>,
     next_request_id: &mut i64,
     timeout: Duration,
     deadline: Instant,
@@ -3728,7 +3799,10 @@ fn resume_app_server_thread_from_rollout_path_for_archive(
         "path": rollout_path.to_string_lossy(),
         "excludeTurns": true
     });
-    if let Some(cwd) = rollout_resume_cwd(&rollout_path, thread_id)? {
+    if let Some(cwd) = locked_cwd
+        .map(ToOwned::to_owned)
+        .or(rollout_resume_cwd(&rollout_path, thread_id)?)
+    {
         params["cwd"] = serde_json::json!(cwd.clone());
         params["runtimeWorkspaceRoots"] = serde_json::json!([cwd]);
     }
@@ -4597,7 +4671,7 @@ mod tests {
         ensure_app_server_host_session_at_with_auth, load_app_server_sessions, read_recent_lines,
         remaining_app_server_archive_timeout, resolve_session, rollout_paths,
         set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
-        unix_seconds_to_iso,
+        set_app_server_thread_archived_at_with_rollout_lookup_and_cwd, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::{Value, json};
@@ -4917,9 +4991,9 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).expect("bind Unix socket");
         assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
         let mut clients = Vec::new();
-        let mut bounded_failure = false;
+        let mut bounded_error = None;
 
-        for _ in 0..16 {
+        for _ in 0..64 {
             let started = Instant::now();
             match connect_unix_stream_with_deadline(
                 &socket_path,
@@ -4933,14 +5007,16 @@ mod tests {
                     ) =>
                 {
                     assert!(started.elapsed() < Duration::from_secs(1));
-                    bounded_failure = true;
+                    bounded_error = Some(error.kind());
                     break;
                 }
                 Err(error) => panic!("fill Unix socket backlog: {error}"),
             }
         }
 
-        assert!(bounded_failure, "Unix socket backlog did not fill");
+        assert!(bounded_error.is_some(), "Unix socket backlog did not fill");
+        #[cfg(target_os = "linux")]
+        assert_eq!(bounded_error, Some(ErrorKind::TimedOut));
     }
 
     #[cfg(unix)]
@@ -7169,6 +7245,97 @@ mod tests {
                 .get("method")
                 .and_then(serde_json::Value::as_str),
             Some("thread/archive")
+        );
+        assert_eq!(
+            archive_request
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str),
+            Some("thread-from-path")
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn archive_sync_locked_cwd_overrides_rollout_cwd() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path();
+        let rollout_path = codex_home.join("sessions/2026/06/16/rollout-session-tree-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent")).expect("sessions dir");
+        fs::write(
+            &rollout_path,
+            concat!(
+                r#"{"timestamp":"2026-06-16T15:00:00.000Z","type":"session_meta","payload":{"id":"session-tree-1","cwd":"/tmp/project"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-16T15:01:00.000Z","type":"turn_context","payload":{"cwd":"/tmp/project-from-turn"}}"#
+            ),
+        )
+        .expect("rollout");
+        let (url, requests) = run_fake_app_server_with_requests(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "data": [] }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": { "data": [] }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": "thread-from-path",
+                        "sessionId": "session-tree-1",
+                        "cwd": "/tmp/project-root",
+                        "updatedAt": 1781263443
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {}
+            }),
+        ]);
+
+        assert!(
+            set_app_server_thread_archived_at_with_rollout_lookup_and_cwd(
+                &url,
+                "session-tree-1",
+                true,
+                Some((codex_home, SessionInventoryConfig::default().max_sessions)),
+                1,
+                Some("/tmp/project-root"),
+            )
+            .expect("archive fallback")
+        );
+
+        let _source_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("source thread/list request");
+        let _target_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target thread/list request");
+        let resume_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/resume request");
+        let archive_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread/archive request");
+
+        assert_eq!(
+            resume_request
+                .pointer("/params/cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-root")
+        );
+        assert_eq!(
+            resume_request
+                .pointer("/params/runtimeWorkspaceRoots/0")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project-root")
         );
         assert_eq!(
             archive_request
