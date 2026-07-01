@@ -1,12 +1,15 @@
 use crate::config::AgentConfig;
-use crate::session_inventory::{app_server_explicit_port, app_server_health_check_with_auth};
+use crate::session_inventory::{
+    app_server_explicit_port, app_server_health_check_with_auth,
+    app_server_health_check_with_auth_timeout,
+};
 use crate::shutdown::shutdown_requested;
 use std::io::{self, ErrorKind};
-use std::net::{IpAddr, Ipv4Addr, TcpListener};
+use std::net::{IpAddr, TcpListener};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::DirBuilderExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
@@ -739,19 +742,30 @@ impl AppServerManager {
             if self.child.is_none() {
                 return false;
             }
-            if app_server_health_check_with_auth(
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let health_timeout = remaining.min(Duration::from_secs(
+                config.session_inventory.app_server_timeout_seconds.max(1),
+            ));
+            if app_server_health_check_with_auth_timeout(
                 listen_url,
-                config.session_inventory.app_server_timeout_seconds,
+                health_timeout,
                 config
                     .session_inventory
                     .app_server_auth_token_file
                     .as_deref(),
             )
             .is_ok()
+                && Instant::now() <= deadline
             {
                 return true;
             }
-            thread::sleep(Duration::from_millis(100));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(remaining.min(Duration::from_millis(100)));
+            }
         }
         false
     }
@@ -794,14 +808,11 @@ impl AppServerPreflightEndpoint {
                 "managed app-server listen URL has no host",
             )
         })?;
-        let bind_ip = if host.eq_ignore_ascii_case("localhost") {
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        } else {
-            host.trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<IpAddr>()
-                .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?
-        };
+        let bind_ip = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
         let listener = TcpListener::bind((bind_ip, 0))?;
         let address = listener.local_addr()?;
         drop(listener);
@@ -853,16 +864,10 @@ fn create_private_preflight_dir(parent: &Path, prefix: &str) -> io::Result<PathB
             std::process::id(),
             base_nonce.saturating_add(attempt)
         ));
-        match std::fs::create_dir(&path) {
-            Ok(()) => {
-                if let Err(error) =
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                {
-                    let _ = std::fs::remove_dir(&path);
-                    return Err(error);
-                }
-                return Ok(path);
-            }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -1218,6 +1223,8 @@ mod tests {
     };
     use std::net::TcpListener;
     #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -1298,6 +1305,14 @@ mod tests {
         assert!(endpoint.listen_url.len() < 80);
         assert!(cleanup_dir.exists());
         assert!(second_cleanup_dir.exists());
+        assert_eq!(
+            std::fs::metadata(&cleanup_dir)
+                .expect("cleanup directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         assert!(!configured_path.exists());
         drop(endpoint);
         drop(second_endpoint);
@@ -2273,6 +2288,46 @@ mod tests {
         assert_eq!(runtime.session_inventory.app_server_url, None);
         assert!(manager.child.is_none());
         assert!(!manager.can_attempt_start(&config));
+    }
+
+    #[test]
+    fn managed_app_server_startup_timeout_bounds_health_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled app-server");
+        let listen_url = format!(
+            "ws://{}",
+            listener.local_addr().expect("stalled app-server address")
+        );
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept health probe");
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(stream);
+        });
+
+        let mut config = config_with_managed(true);
+        config.session_inventory.app_server_timeout_seconds = 60;
+        config
+            .session_inventory
+            .managed_app_server
+            .startup_timeout_seconds = 1;
+        let mut manager = AppServerManager::new(&config);
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
+        manager.child = Some(command.spawn().expect("spawn managed child"));
+
+        let started_at = Instant::now();
+        assert!(!manager.wait_until_ready(&config, &listen_url));
+        assert!(started_at.elapsed() < Duration::from_secs(3));
+
+        let _ = release_tx.send(());
+        server.join().expect("stalled app-server worker");
+        manager
+            .stop_child_checked("clean up startup deadline child")
+            .expect("stop startup deadline child");
     }
 
     #[test]

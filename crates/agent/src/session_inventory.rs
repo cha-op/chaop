@@ -1027,6 +1027,14 @@ pub fn app_server_health_check_with_auth(
     auth_token_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
+    app_server_health_check_with_auth_timeout(url, timeout, auth_token_file)
+}
+
+pub(crate) fn app_server_health_check_with_auth_timeout(
+    url: &str,
+    timeout: Duration,
+    auth_token_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     let mut socket = connect_app_server(url, timeout, auth_token_file)?;
     initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)
