@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use tungstenite::http::Uri;
 
@@ -182,6 +183,17 @@ impl AgentConfig {
                     .to_owned(),
             ));
         }
+        if self
+            .session_inventory
+            .app_server_url
+            .as_deref()
+            .is_some_and(app_server_url_uses_remote_plaintext_ws)
+        {
+            return Err(ConfigError::Invalid(
+                "session_inventory.app_server_url requires wss:// for non-loopback endpoints"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -236,6 +248,29 @@ fn app_server_url_uses_wss(url: &str) -> bool {
         .ok()
         .and_then(|uri| uri.scheme_str().map(str::to_owned))
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("wss"))
+}
+
+fn app_server_url_uses_remote_plaintext_ws(url: &str) -> bool {
+    let Ok(uri) = url.parse::<Uri>() else {
+        return false;
+    };
+    if !uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws"))
+    {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let normalised = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    normalised != "localhost"
+        && !normalised
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn default_codex_command() -> String {
@@ -335,6 +370,37 @@ secret_file = "/Users/you/.chaop/bootstrap.secret"
             "/Users/you/.chaop/bootstrap.secret"
         );
         assert_eq!(config.execution.mode, super::ExecutionMode::Placeholder);
+    }
+
+    #[test]
+    fn rejects_remote_plaintext_app_server_url() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("agent.toml");
+        fs::write(
+            &config_path,
+            r#"
+connector_name = "mac-studio"
+control_url = "wss://api.example.com/ws/agent"
+bootstrap_url = "https://api.example.com/connector/bootstrap"
+workspace_root = "/Users/you/Program"
+token_file = "/Users/you/.chaop/connector.token"
+spool_db = "/Users/you/.chaop/connector-spool.sqlite"
+
+[bootstrap]
+secret_file = "/Users/you/.chaop/bootstrap.secret"
+
+[session_inventory]
+app_server_url = "ws://192.0.2.1:6174"
+"#,
+        )
+        .expect("write config");
+
+        let error = AgentConfig::load(config_path).expect_err("remote ws must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid connector config: session_inventory.app_server_url requires wss:// for non-loopback endpoints"
+        );
     }
 
     #[test]
