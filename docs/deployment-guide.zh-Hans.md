@@ -413,7 +413,10 @@ max_sessions = 100
 report_interval_seconds = 60
 app_server_timeout_seconds = 2
 # codex_home = "/Users/you/.codex"
+# 本机 Unix socket；不要设置 app-server auth token：
 # app_server_url = "unix:///path/to/private/app-server.sock"
+# 或同时使用下面两行连接经过证书验证的外部 listener：
+# app_server_url = "wss://app-server.example.com"
 # app_server_auth_token_file = "/path/to/private/app-server.token"
 
 [session_inventory.managed_app_server]
