@@ -59,7 +59,7 @@ export type ReadinessPreflight = {
   summary: string;
   next_action: {
     label: string;
-    href: "#budget-board" | "#host-sessions" | "#thread-centre";
+    href: "#budget-board" | `#budget-board?thread=${string}` | "#host-sessions" | "#thread-centre";
     detail: string;
   };
   checks: ReadinessPreflightCheck[];
@@ -82,7 +82,9 @@ export const TURN_INTERACTION_OTHER_SELECT_VALUE = "other";
 
 const TURN_INTERACTION_OPTION_SELECT_PREFIX = "option:";
 
-export function budgetBoardHash(threadId: string | undefined): string {
+export function budgetBoardHash(
+  threadId: string | undefined
+): "#budget-board" | `#budget-board?thread=${string}` {
   return threadId ? `#budget-board?thread=${encodeURIComponent(threadId)}` : "#budget-board";
 }
 
@@ -768,7 +770,7 @@ export function dogfoodReadinessPreflight(
     : checks.some((check) => check.state === "attention")
       ? "attention"
       : "ready";
-  const nextAction = readinessNextAction(state, checks);
+  const nextAction = readinessNextAction(state, checks, target);
   return {
     state,
     title: readinessTitle(state),
@@ -1124,13 +1126,22 @@ function readinessInventoryCheck(data: BootstrapPayload | undefined): ReadinessP
 
 function readinessNextAction(
   state: ReadinessPreflightState,
-  checks: ReadinessPreflightCheck[]
+  checks: ReadinessPreflightCheck[],
+  target: ReadinessTarget
 ): ReadinessPreflight["next_action"] {
+  if (target.kind === "missing_thread") {
+    return {
+      label: "Open Thread Centre",
+      href: "#thread-centre",
+      detail: "Choose an available thread before evaluating app-server readiness."
+    };
+  }
+  const budgetHref = budgetBoardHash(target.kind === "workspace" ? undefined : target.threadId);
   const blocked = checks.find((check) => check.state === "blocked");
   if (blocked?.id === "cost") {
     return {
       label: "Review Budget Board",
-      href: "#budget-board",
+      href: budgetHref,
       detail: "Clear the cost posture before starting an app-server turn."
     };
   }
@@ -1146,7 +1157,7 @@ function readinessNextAction(
     if (attention?.id === "cost") {
       return {
         label: "Review Budget Board",
-        href: "#budget-board",
+        href: budgetHref,
         detail: "Confirm the cost warning before starting daily dogfood work."
       };
     }

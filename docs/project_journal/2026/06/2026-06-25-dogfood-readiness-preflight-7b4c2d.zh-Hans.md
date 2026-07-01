@@ -16,7 +16,7 @@ superseded_by:
 
 ## 摘要
 - PR G 在 Budget Board 顶部增加一个被动 readiness preflight，让 operator 在开始日常 dogfood 前可以先检查 cost posture、connector capability、目标 workspace 的 app-server availability，以及下一步安全操作。
-- 这个 preflight 完全从现有 bootstrap payload 推导：`safety`、`budget`、`connectors` 和 `app_server_instances`。
+- 这个 preflight 完全从现有 bootstrap payload 推导：`safety`、`budget`、`connectors`、`workspaces`、`threads`、`host_sessions` 和 `app_server_instances`。
 - 它不新增 Worker route、D1 write path、connector report、Host Session refresh，也不新增后台 poll。
 - Review follow-up 现在会把 readiness 限定到 Thread Centre 实际会打开的 thread，并且在跨视图导航时保留所选 thread 目标；只有没有显式 thread target 时才回退到默认 workspace，因此其它 workspace ready 不会让当前 dogfood path 被误判为 ready。
 - 已选择且已 attach 的 thread 现在只接受拥有其 app-server Host Session 的 connector 所报告的 health；如果选择的现有 thread 尚未 attach app-server，则 readiness 会 blocked 并导向 Host Sessions，不会借用 workspace-level capacity 后落入 placeholder execution。
@@ -39,7 +39,7 @@ superseded_by:
 - 缺少 live 或 persisted budget samples 时会明确显示需要关注，因此首次使用的 operator 需要先 bootstrap 或检查 Budget Board，再依赖 readiness。
 
 ## 验证证据
-- `pnpm --filter @chaop/web test` 已通过 77 个 tests，覆盖 thread-scoped app-server instance 精确匹配、缺少真实预算采样、busy/idle app-server 混合状态、已选现有 attached app-server thread、多个 connectors 之间的 attachment-owner isolation 和诊断、显式 Budget Board URL target，以及已选但未 attach thread 必须 blocked 的回归场景。
-- 合入最新 `master` 后，`pnpm test` 已通过：48 个 script、3 个 protocol、77 个 Web、294 个 Worker 和 203 个 Rust tests。
+- `pnpm --filter @chaop/web test` 已通过 78 个 tests，覆盖 thread-scoped app-server instance 精确匹配、缺少真实预算采样、busy/idle app-server 混合状态、已选现有 attached app-server thread、多个 connectors 之间的 attachment-owner isolation 和诊断、显式 Budget Board URL target，以及已选但未 attach 或已缺失 thread 的 blocked 和恢复导航场景。
+- 合入最新 `master` 后，`pnpm test` 已通过：48 个 script、3 个 protocol、78 个 Web、294 个 Worker 和 203 个 Rust tests。
 - `pnpm build` 已通过。
 - 本地 Playwright 视觉 smoke 已通过，桌面、窄桌面、断点边缘和移动端 Budget Board 渲染正常，没有横向溢出。

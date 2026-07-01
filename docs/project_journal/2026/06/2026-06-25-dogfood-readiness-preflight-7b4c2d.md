@@ -16,7 +16,7 @@ superseded_by:
 
 ## Summary
 - PR G adds a passive readiness preflight to the Budget Board so an operator can check cost posture, connector capability, app-server availability for the target workspace, and the next safe action before daily dogfood work starts.
-- The preflight derives its decision entirely from the existing bootstrap payload: `safety`, `budget`, `connectors`, and `app_server_instances`.
+- The preflight derives its decision entirely from the existing bootstrap payload: `safety`, `budget`, `connectors`, `workspaces`, `threads`, `host_sessions`, and `app_server_instances`.
 - It does not add a Worker route, D1 write path, connector report, Host Session refresh, or background poll.
 - Review follow-up scopes readiness to the thread that Thread Centre will actually open, preserves the selected thread target across view navigation, and falls back to the default workspace only when no explicit thread target is supplied, so another workspace cannot make the current dogfood path look ready.
 - A selected attached thread now accepts health only from the connector that owns its app-server Host Session; a selected existing thread without an app-server attachment is blocked and routed to Host Sessions instead of borrowing workspace-level capacity and falling through to placeholder execution.
@@ -39,7 +39,7 @@ superseded_by:
 - Missing live or persisted budget samples are intentionally shown as requiring attention, so first-run operators must bootstrap or inspect Budget Board before relying on readiness.
 
 ## Validation Evidence
-- `pnpm --filter @chaop/web test` passed with 77 tests covering exact matching for thread-scoped app-server instances, missing sampled budgets, mixed busy/idle app-server instances, selected existing attached app-server threads, attachment-owner isolation and diagnostics across multiple connectors, explicit Budget Board URL targets, and blocking for selected unattached threads.
-- `pnpm test` passed after merging the latest `master`: 48 script, 3 protocol, 77 Web, 294 Worker, and 203 Rust tests.
+- `pnpm --filter @chaop/web test` passed with 78 tests covering exact matching for thread-scoped app-server instances, missing sampled budgets, mixed busy/idle app-server instances, selected existing attached app-server threads, attachment-owner isolation and diagnostics across multiple connectors, explicit Budget Board URL targets, and blocking or recovery navigation for selected unattached or missing threads.
+- `pnpm test` passed after merging the latest `master`: 48 script, 3 protocol, 78 Web, 294 Worker, and 203 Rust tests.
 - `pnpm build` passed.
 - Local Playwright visual smoke passed for desktop, narrow desktop, breakpoint-edge, and mobile Budget Board rendering, with no horizontal overflow.

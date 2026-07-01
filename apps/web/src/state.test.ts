@@ -423,6 +423,15 @@ test("dogfoodReadinessPreflight blocks on cost posture before connector state", 
   const baseSafety = safety();
   const data = payload({
     workspaces: [workspace("workspace-api", ["connector-a"])],
+    threads: [thread("thread-api", "workspace-api")],
+    host_sessions: [
+      hostSession("session-api", {
+        connector_id: "connector-a",
+        workspace_id: "workspace-api",
+        attached_thread_id: "thread-api",
+        app_server_present: true
+      })
+    ],
     connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
     app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")],
     safety: {
@@ -442,10 +451,10 @@ test("dogfoodReadinessPreflight blocks on cost posture before connector state", 
     }
   });
 
-  const readiness = dogfoodReadinessPreflight(data);
+  const readiness = dogfoodReadinessPreflight(data, "thread-api");
 
   assert.equal(readiness.state, "blocked");
-  assert.equal(readiness.next_action.href, "#budget-board");
+  assert.equal(readiness.next_action.href, "#budget-board?thread=thread-api");
   assert.equal(readiness.summary, "D1 rows written hard limit is active.");
 });
 
@@ -657,6 +666,20 @@ test("dogfoodReadinessPreflight blocks a selected thread without an app-server a
     readiness.checks.find((check) => check.id === "app_server")?.detail,
     "Attach an app-server Host Session before running the selected thread."
   );
+});
+
+test("dogfoodReadinessPreflight sends a missing thread back to Thread Centre", () => {
+  const readiness = dogfoodReadinessPreflight(payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [
+      appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")
+    ]
+  }), "thread-missing");
+
+  assert.equal(readiness.state, "blocked");
+  assert.equal(readiness.next_action.href, "#thread-centre");
+  assert.equal(readiness.next_action.detail, "Choose an available thread before evaluating app-server readiness.");
 });
 
 test("dogfoodReadinessPreflight requires a workspace-linked managed connector", () => {
