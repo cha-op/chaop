@@ -5,14 +5,14 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
+    mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError},
 };
 use std::time::{Duration, Instant};
 use tungstenite::{
@@ -1115,7 +1115,8 @@ fn connect_tcp_app_server(
         });
     let deadline = Instant::now() + timeout;
     let request = app_server_client_request(url, auth_token_file)?;
-    let addresses = resolve_app_server_addresses(host, port, timeout, url)?;
+    let remaining = app_server_connection_time_remaining(deadline, url)?;
+    let addresses = resolve_app_server_addresses(host, port, remaining, url)?;
     let mut last_error = None;
 
     for addr in addresses {
@@ -1123,6 +1124,7 @@ fn connect_tcp_app_server(
         match TcpStream::connect_timeout(&addr, remaining) {
             Ok(stream) => {
                 stream.set_nodelay(true)?;
+                let mut deadline_guard = TcpConnectionDeadlineGuard::start(&stream, deadline, url)?;
                 let remaining = app_server_connection_time_remaining(deadline, url)?;
                 stream.set_read_timeout(Some(remaining))?;
                 stream.set_write_timeout(Some(remaining))?;
@@ -1144,6 +1146,8 @@ fn connect_tcp_app_server(
                 } else {
                     MaybeTlsStream::Plain(stream)
                 };
+                let remaining = app_server_connection_time_remaining(deadline, url)?;
+                configure_maybe_tls_stream_timeout(&stream, remaining)?;
                 let (mut socket, _) = match client(request, stream) {
                     Ok(result) => result,
                     Err(HandshakeError::Failure(error)) => return Err(error.into()),
@@ -1151,6 +1155,8 @@ fn connect_tcp_app_server(
                         return Err("app-server websocket handshake was interrupted".into());
                     }
                 };
+                app_server_connection_time_remaining(deadline, url)?;
+                deadline_guard.cancel();
                 configure_tcp_socket_timeout(&mut socket, timeout)?;
                 return Ok(AppServerSocket::Tcp(socket));
             }
@@ -1166,42 +1172,154 @@ fn connect_tcp_app_server(
     })
 }
 
+struct TcpConnectionDeadlineGuard {
+    cancellation_sender: Option<SyncSender<()>>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TcpConnectionDeadlineGuard {
+    fn start(
+        stream: &TcpStream,
+        deadline: Instant,
+        url: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let remaining = app_server_connection_time_remaining(deadline, url)?;
+        let watchdog_stream = stream.try_clone()?;
+        let (cancellation_sender, cancellation_receiver) = std::sync::mpsc::sync_channel(1);
+        let watchdog = std::thread::Builder::new()
+            .name("chaop-app-server-deadline".to_owned())
+            .spawn(move || {
+                if matches!(
+                    cancellation_receiver.recv_timeout(remaining),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    let _ = watchdog_stream.shutdown(Shutdown::Both);
+                }
+            })?;
+        Ok(Self {
+            cancellation_sender: Some(cancellation_sender),
+            watchdog: Some(watchdog),
+        })
+    }
+
+    fn cancel(&mut self) {
+        if let Some(sender) = self.cancellation_sender.take() {
+            let _ = sender.try_send(());
+        }
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
+impl Drop for TcpConnectionDeadlineGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+struct AppServerResolveRequest {
+    host: String,
+    port: u16,
+    response_sender: SyncSender<std::io::Result<Vec<SocketAddr>>>,
+}
+
+struct AppServerResolver {
+    request_sender: Option<SyncSender<AppServerResolveRequest>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AppServerResolver {
+    fn start<F>(mut resolver: F) -> std::io::Result<Self>
+    where
+        F: FnMut(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+    {
+        let (request_sender, request_receiver) =
+            std::sync::mpsc::sync_channel::<AppServerResolveRequest>(1);
+        let worker = std::thread::Builder::new()
+            .name("chaop-app-server-resolver".to_owned())
+            .spawn(move || {
+                while let Ok(request) = request_receiver.recv() {
+                    let result = resolver(request.host.as_str(), request.port);
+                    let _ = request.response_sender.send(result);
+                }
+            })?;
+        Ok(Self {
+            request_sender: Some(request_sender),
+            worker: Some(worker),
+        })
+    }
+
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+        url: &str,
+    ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
+        let (response_sender, response_receiver) = std::sync::mpsc::sync_channel(1);
+        let request = AppServerResolveRequest {
+            host: host.to_owned(),
+            port,
+            response_sender,
+        };
+        let Some(request_sender) = self.request_sender.as_ref() else {
+            return Err("app-server resolver is stopped".into());
+        };
+        match request_sender.try_send(request) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err(format!("app-server resolver is busy resolving {url}").into());
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(format!("app-server resolver stopped before resolving {url}").into());
+            }
+        }
+        match response_receiver.recv_timeout(timeout) {
+            Ok(Ok(addresses)) => Ok(addresses),
+            Ok(Err(error)) => Err(error.into()),
+            Err(RecvTimeoutError::Timeout) => {
+                Err(format!("timed out resolving app-server URL {url}").into())
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(format!("app-server resolver stopped before resolving {url}").into())
+            }
+        }
+    }
+}
+
+impl Drop for AppServerResolver {
+    fn drop(&mut self) {
+        self.request_sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+static APP_SERVER_RESOLVER: OnceLock<Result<AppServerResolver, String>> = OnceLock::new();
+
+fn shared_app_server_resolver() -> Result<&'static AppServerResolver, Box<dyn std::error::Error>> {
+    match APP_SERVER_RESOLVER.get_or_init(|| {
+        AppServerResolver::start(|host, port| {
+            (host, port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect::<Vec<_>>())
+        })
+        .map_err(|error| error.to_string())
+    }) {
+        Ok(resolver) => Ok(resolver),
+        Err(error) => Err(format!("failed to start app-server resolver: {error}").into()),
+    }
+}
+
 fn resolve_app_server_addresses(
     host: &str,
     port: u16,
     timeout: Duration,
     url: &str,
 ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
-    let host = host.to_owned();
-    resolve_app_server_addresses_with(timeout, url, move || {
-        (host.as_str(), port)
-            .to_socket_addrs()
-            .map(|addresses| addresses.collect::<Vec<_>>())
-    })
-}
-
-fn resolve_app_server_addresses_with<F>(
-    timeout: Duration,
-    url: &str,
-    resolver: F,
-) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>>
-where
-    F: FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
-{
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = sender.send(resolver());
-    });
-    match receiver.recv_timeout(timeout) {
-        Ok(Ok(addresses)) => Ok(addresses),
-        Ok(Err(error)) => Err(error.into()),
-        Err(RecvTimeoutError::Timeout) => {
-            Err(format!("timed out resolving app-server URL {url}").into())
-        }
-        Err(RecvTimeoutError::Disconnected) => {
-            Err(format!("app-server resolver stopped before resolving {url}").into())
-        }
-    }
+    shared_app_server_resolver()?.resolve(host, port, timeout, url)
 }
 
 fn app_server_connection_time_remaining(
@@ -1253,7 +1371,14 @@ fn configure_tcp_socket_timeout(
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     timeout: Duration,
 ) -> std::io::Result<()> {
-    match socket.get_mut() {
+    configure_maybe_tls_stream_timeout(socket.get_mut(), timeout)
+}
+
+fn configure_maybe_tls_stream_timeout(
+    stream: &MaybeTlsStream<TcpStream>,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    match stream {
         tungstenite::stream::MaybeTlsStream::Plain(stream) => {
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))
@@ -4192,18 +4317,18 @@ fn default_codex_home() -> PathBuf {
 mod tests {
     use super::{
         APP_SERVER_ARCHIVE_SYNC_LIST_PAGE_SIZE, AUTO_RESOLUTION_RESPONSE_GRACE_MS,
-        AppServerCommandChannels, AppServerTurnOutput, HistorySession, InventoryScope,
-        SessionDraft, TitleSource, TurnInteractionInputAnswer, TurnInteractionResponse,
-        TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
+        AppServerCommandChannels, AppServerResolver, AppServerTurnOutput, HistorySession,
+        InventoryScope, SessionDraft, TitleSource, TurnInteractionInputAnswer,
+        TurnInteractionResponse, TurnInteractionResponseDelivery, TurnInteractionResponseDispatch,
         acknowledge_turn_interaction_delivery, app_server_client_request,
         app_server_command_result_events_with_cancel, app_server_health_check,
         app_server_sessions_from_response, app_server_thread_from_response,
         app_server_titles_from_response, build_host_session_backfill, build_host_sessions_report,
         connect_app_server, create_app_server_thread_at, ensure_app_server_host_session_at,
         ensure_app_server_host_session_at_with_auth, load_app_server_sessions, read_recent_lines,
-        remaining_app_server_archive_timeout, resolve_app_server_addresses_with, resolve_session,
-        rollout_paths, set_app_server_thread_archived_at,
-        set_app_server_thread_archived_at_with_rollout_lookup, unix_seconds_to_iso,
+        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
+        set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
+        unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
     use serde_json::{Value, json};
@@ -4339,20 +4464,104 @@ mod tests {
     }
 
     #[test]
-    fn app_server_dns_resolution_respects_connection_timeout() {
-        let started = Instant::now();
-        let error = resolve_app_server_addresses_with(
-            Duration::from_millis(50),
-            "wss://app.example.test",
-            || {
-                thread::sleep(Duration::from_millis(500));
-                Ok(Vec::new())
-            },
-        )
-        .expect_err("stalled resolver should time out");
+    fn app_server_websocket_handshake_respects_absolute_connection_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow websocket listener");
+        let address = listener.local_addr().expect("slow websocket address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept websocket client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("websocket request timeout");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read websocket request");
+            for byte in b"HTTP/1.1 101 Switching Protocols\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+        });
 
+        let started = Instant::now();
+        let error = match connect_app_server(
+            &format!("ws://{address}/"),
+            Duration::from_millis(200),
+            None,
+        ) {
+            Ok(_) => panic!("slow websocket handshake should time out"),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!error.to_string().is_empty());
+        server.join().expect("slow websocket server");
+    }
+
+    #[test]
+    fn app_server_dns_resolution_is_bounded_after_timeout() {
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let first_request = Arc::new(AtomicBool::new(true));
+        let resolver_first_request = Arc::clone(&first_request);
+        let resolver = AppServerResolver::start(move |_, _| {
+            if resolver_first_request.swap(false, Ordering::SeqCst) {
+                release_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("release resolver");
+            }
+            Ok(Vec::new())
+        })
+        .expect("start resolver");
+
+        let started = Instant::now();
+        let error = resolver
+            .resolve(
+                "app.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://app.example.test",
+            )
+            .expect_err("stalled resolver should time out");
         assert!(started.elapsed() < Duration::from_millis(250));
         assert!(error.to_string().contains("timed out resolving"));
+
+        resolver
+            .resolve(
+                "queued.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://queued.example.test",
+            )
+            .expect_err("queued resolver should time out");
+        let error = resolver
+            .resolve(
+                "overflow.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://overflow.example.test",
+            )
+            .expect_err("full resolver queue should be rejected");
+        assert!(error.to_string().contains("resolver is busy"));
+
+        release_sender.send(()).expect("release resolver worker");
+    }
+
+    #[test]
+    fn app_server_dns_resolution_returns_worker_results() {
+        let resolver = AppServerResolver::start(|_, _| {
+            Ok(vec!["127.0.0.1:443".parse().expect("socket address")])
+        })
+        .expect("start resolver");
+
+        let addresses = resolver
+            .resolve(
+                "app.example.test",
+                443,
+                Duration::from_millis(50),
+                "wss://app.example.test",
+            )
+            .expect("resolve address");
+
+        assert_eq!(addresses, vec!["127.0.0.1:443".parse().unwrap()]);
     }
 
     #[cfg(unix)]
