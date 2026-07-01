@@ -1155,8 +1155,8 @@ fn connect_tcp_app_server(
                         return Err("app-server websocket handshake was interrupted".into());
                     }
                 };
-                app_server_connection_time_remaining(deadline, url)?;
                 deadline_guard.cancel();
+                app_server_connection_time_remaining(deadline, url)?;
                 configure_tcp_socket_timeout(&mut socket, timeout)?;
                 return Ok(AppServerSocket::Tcp(socket));
             }
