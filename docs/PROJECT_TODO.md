@@ -34,3 +34,4 @@
 - [done] PR G: Add a low-cost connector and Budget Board preflight before daily dogfood work starts.
 - [planned] PR H: Add an explicit opt-in managed app-server thread E2E smoke for the real conversation path.
 - [planned] PR I: Polish Thread Centre for daily conversation focus without adding high-frequency polling.
+- [planned] PR J: Add the Permission MVP after PR G, separating permission scope from approval handling: Read only, Source edit, brokered commit/push/draft-PR delivery, Custom, and Dangerously allow everything; Ask me and Approve for me; turn/session-scoped grants, visible effective permissions, expiry, and audit events without exposing GitHub or signing credentials to the model.

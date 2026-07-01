@@ -542,6 +542,57 @@ test("dogfoodReadinessPreflight accepts exec-only connectors for selected attach
   assert.match(readiness.checks.find((check) => check.id === "connector")?.detail ?? "", /can run the selected app-server thread/);
 });
 
+test("dogfoodReadinessPreflight limits a selected attached thread to its owning connector", () => {
+  const data = payload({
+    workspaces: [workspace("workspace-api", ["connector-a", "connector-b"])],
+    threads: [thread("thread-api", "workspace-api")],
+    host_sessions: [
+      hostSession("session-api", {
+        connector_id: "connector-a",
+        workspace_id: "workspace-api",
+        attached_thread_id: "thread-api",
+        app_server_present: true
+      })
+    ],
+    connectors: [
+      connector("connector-a", ["codex_app_server_exec"]),
+      connector("connector-b", ["app_server_threads", "codex_app_server_exec"])
+    ],
+    app_server_instances: [appServerInstance("app-server-b", "healthy", "2026-06-12T10:01:00.000Z", "connector-b")]
+  });
+
+  const readiness = dogfoodReadinessPreflight(data, "thread-api");
+
+  assert.equal(readiness.state, "blocked");
+  assert.equal(readiness.checks.find((check) => check.id === "connector")?.state, "ready");
+  assert.equal(
+    readiness.checks.find((check) => check.id === "app_server")?.detail,
+    "No healthy app-server instance is reported by a connector linked to workspace-api."
+  );
+});
+
+test("dogfoodReadinessPreflight blocks a selected thread without an app-server attachment", () => {
+  const data = payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    threads: [thread("thread-api", "workspace-api")],
+    connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
+    app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")]
+  });
+
+  const readiness = dogfoodReadinessPreflight(data, "thread-api");
+
+  assert.equal(readiness.state, "blocked");
+  assert.equal(readiness.next_action.href, "#host-sessions");
+  assert.equal(
+    readiness.checks.find((check) => check.id === "connector")?.detail,
+    "The selected thread has no attached app-server Host Session."
+  );
+  assert.equal(
+    readiness.checks.find((check) => check.id === "app_server")?.detail,
+    "Attach an app-server Host Session before running the selected thread."
+  );
+});
+
 test("dogfoodReadinessPreflight requires a workspace-linked managed connector", () => {
   const readiness = dogfoodReadinessPreflight(payload({
     connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
@@ -578,6 +629,14 @@ test("dogfoodReadinessPreflight scopes readiness to the target workspace", () =>
       thread("thread-api", "workspace-api"),
       thread("thread-docs", "workspace-docs")
     ],
+    host_sessions: [
+      hostSession("session-docs", {
+        connector_id: "connector-b",
+        workspace_id: "workspace-docs",
+        attached_thread_id: "thread-docs",
+        app_server_present: true
+      })
+    ],
     connectors: [
       connector("connector-a", ["app_server_threads"]),
       connector("connector-b", ["app_server_threads", "codex_app_server_exec"])
@@ -602,6 +661,20 @@ test("dogfoodReadinessPreflight requires thread-scoped app-server instances to m
     threads: [
       thread("thread-api", "workspace-api"),
       thread("thread-docs", "workspace-api")
+    ],
+    host_sessions: [
+      hostSession("session-api", {
+        connector_id: "connector-a",
+        workspace_id: "workspace-api",
+        attached_thread_id: "thread-api",
+        app_server_present: true
+      }),
+      hostSession("session-docs", {
+        connector_id: "connector-a",
+        workspace_id: "workspace-api",
+        attached_thread_id: "thread-docs",
+        app_server_present: true
+      })
     ],
     connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
     app_server_instances: [

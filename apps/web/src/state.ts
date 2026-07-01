@@ -70,6 +70,12 @@ type ReadinessConnectorScope = {
   workspaceIds: Set<string>;
 };
 
+type ReadinessTarget =
+  | { kind: "workspace"; workspaceId: string | undefined }
+  | { kind: "missing_thread"; threadId: string }
+  | { kind: "unattached_thread"; threadId: string; workspaceId: string }
+  | { kind: "attached_thread"; threadId: string; workspaceId: string; connectorId: string };
+
 export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
 export const TURN_INTERACTION_OTHER_SELECT_VALUE = "other";
 
@@ -739,12 +745,11 @@ export function dogfoodReadinessPreflight(
   data: BootstrapPayload | undefined,
   selectedThreadId?: string
 ): ReadinessPreflight {
-  const workspaceId = localThreadWorkspaceId(data, selectedThreadId);
-  const selectedThreadCanRun = managedAppServerCommandAvailable(data, selectedThreadId);
+  const target = readinessTarget(data, selectedThreadId);
   const checks = [
     readinessCostCheck(data),
-    readinessConnectorCheck(data, workspaceId, selectedThreadCanRun),
-    readinessAppServerCheck(data, workspaceId, selectedThreadId, selectedThreadCanRun),
+    readinessConnectorCheck(data, target),
+    readinessAppServerCheck(data, target),
     readinessInventoryCheck(data)
   ];
   const state = checks.some((check) => check.state === "blocked")
@@ -830,19 +835,35 @@ function readinessCostCheck(data: BootstrapPayload | undefined): ReadinessPrefli
 
 function readinessConnectorCheck(
   data: BootstrapPayload | undefined,
-  workspaceId: string | undefined,
-  selectedThreadCanRun: boolean
+  target: ReadinessTarget
 ): ReadinessPreflightCheck {
+  if (target.kind === "missing_thread") {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "The selected thread is no longer available."
+    };
+  }
+  if (target.kind === "unattached_thread") {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "The selected thread has no attached app-server Host Session."
+    };
+  }
+  const workspaceId = target.workspaceId;
   const online = readinessConnectorScopes(data, workspaceId).filter((scope) => scope.connector.status === "online");
   const workspaceLinked = online.filter((scope) => scope.workspaceIds.size > 0);
-  const full = readinessEligibleConnectorScopes(data, workspaceId, selectedThreadCanRun);
+  const full = readinessEligibleConnectorScopes(data, target);
   const workspaceLabel = readinessWorkspaceLabel(data, workspaceId);
   if (full.length > 0) {
     return {
       id: "connector",
       label: "Connector",
       state: "ready",
-      detail: selectedThreadCanRun
+      detail: target.kind === "attached_thread"
         ? `${full.length} workspace connector${full.length === 1 ? "" : "s"} can run the selected app-server thread for ${workspaceLabel}.`
         : `${full.length} workspace connector${full.length === 1 ? "" : "s"} can create and run app-server threads for ${workspaceLabel}.`
     };
@@ -885,11 +906,27 @@ function readinessConnectorCheck(
 
 function readinessAppServerCheck(
   data: BootstrapPayload | undefined,
-  workspaceId: string | undefined,
-  selectedThreadId: string | undefined,
-  selectedThreadCanRun: boolean
+  target: ReadinessTarget
 ): ReadinessPreflightCheck {
-  const eligibleConnectorScopes = readinessEligibleConnectorScopes(data, workspaceId, selectedThreadCanRun);
+  if (target.kind === "missing_thread") {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "blocked",
+      detail: "No app-server can target a thread that is no longer available."
+    };
+  }
+  if (target.kind === "unattached_thread") {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "blocked",
+      detail: "Attach an app-server Host Session before running the selected thread."
+    };
+  }
+  const workspaceId = target.workspaceId;
+  const selectedThreadId = target.kind === "attached_thread" ? target.threadId : undefined;
+  const eligibleConnectorScopes = readinessEligibleConnectorScopes(data, target);
   const instances = (data?.app_server_instances ?? []).filter((instance) =>
     readinessInstanceMatchesEligibleConnector(data, instance, eligibleConnectorScopes, selectedThreadId)
   );
@@ -955,16 +992,49 @@ function readinessConnectorScopes(
 
 function readinessEligibleConnectorScopes(
   data: BootstrapPayload | undefined,
-  workspaceId: string | undefined,
-  selectedThreadCanRun = false
+  target: ReadinessTarget
 ): ReadinessConnectorScope[] {
-  return readinessConnectorScopes(data, workspaceId).filter(
-    (scope) =>
-      scope.workspaceIds.size > 0 &&
-      scope.connector.status === "online" &&
-      scope.connector.capabilities.includes("codex_app_server_exec") &&
-      (selectedThreadCanRun || scope.connector.capabilities.includes("app_server_threads"))
-  );
+  if (target.kind === "missing_thread" || target.kind === "unattached_thread") return [];
+  return readinessConnectorScopes(data, target.workspaceId).filter((scope) => {
+    if (
+      scope.workspaceIds.size === 0 ||
+      scope.connector.status !== "online" ||
+      !scope.connector.capabilities.includes("codex_app_server_exec")
+    ) {
+      return false;
+    }
+    if (target.kind === "attached_thread") {
+      return scope.connector.id === target.connectorId;
+    }
+    return scope.connector.capabilities.includes("app_server_threads");
+  });
+}
+
+function readinessTarget(
+  data: BootstrapPayload | undefined,
+  selectedThreadId: string | undefined
+): ReadinessTarget {
+  if (!selectedThreadId) {
+    return { kind: "workspace", workspaceId: localThreadWorkspaceId(data) };
+  }
+  const thread = data?.threads.find((item) => item.id === selectedThreadId);
+  if (!thread) {
+    return { kind: "missing_thread", threadId: selectedThreadId };
+  }
+  const session = attachedAppServerHostSession(data, selectedThreadId);
+  if (!session) {
+    return {
+      kind: "unattached_thread",
+      threadId: selectedThreadId,
+      workspaceId: thread.workspace_id
+    };
+  }
+  return {
+    kind: "attached_thread",
+    threadId: selectedThreadId,
+    workspaceId: thread.workspace_id,
+    connectorId: session.connector_id
+  };
 }
 
 function readinessInstanceMatchesEligibleConnector(

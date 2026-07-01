@@ -34,3 +34,4 @@
 - [done] PR G：在日常 dogfood 开始前，增加低成本 connector 和 Budget Board preflight。
 - [planned] PR H：为真实 conversation path 增加显式 opt-in 的 managed app-server thread E2E smoke。
 - [planned] PR I：围绕日常对话重点打磨 Thread Centre，同时不增加高频 polling。
+- [planned] PR J：在 PR G 之后增加 Permission MVP，将 permission scope 与 approval handling 分开：Read only、Source edit、通过 broker 完成 commit/push/draft PR 的 Delivery、Custom、Dangerously allow everything，以及 Ask me 与 Approve for me；支持 turn/session 范围的授权、可见的 effective permissions、自动过期和 audit events，同时不向 model 暴露 GitHub 或签名凭据。
