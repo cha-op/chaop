@@ -1039,11 +1039,17 @@ pub fn is_managed_listen_url(listen_url: &str) -> bool {
     let Some(uri) = app_server_websocket_uri(listen_url) else {
         return false;
     };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let Some(scheme_separator) = listen_url.find("://") else {
+        return false;
+    };
     if !uri
         .scheme_str()
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws"))
-        || uri.path() != "/"
-        || uri.query().is_some()
+        || authority.as_str().contains('@')
+        || scheme_separator + 3 + authority.as_str().len() != listen_url.len()
     {
         return false;
     }
@@ -1229,6 +1235,7 @@ mod tests {
         assert!(!is_managed_listen_url("wss://127.0.0.1:65530"));
         assert!(!is_managed_listen_url("ws://127.0.0.1"));
         assert!(!is_managed_listen_url("ws://127.0.0.1:0"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1:65530/"));
         assert!(!is_managed_listen_url("ws://127.0.0.1:65530/path"));
         assert!(!is_managed_listen_url("ws://127.0.0.1:65530?query"));
     }
