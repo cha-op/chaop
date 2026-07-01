@@ -1532,11 +1532,48 @@ fn connect_unix_stream_with_deadline(
         address.sun_len = address_len as u8;
     }
 
-    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    // Use the atomic close-on-exec socket flag where the target exposes it.
+    // Apple targets do not, so the descriptor flag below is also required as
+    // the portable fallback.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    let socket_type = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    let socket_type = libc::SOCK_STREAM;
+
+    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
     if raw_fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let socket = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let descriptor_flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if descriptor_flags & libc::FD_CLOEXEC == 0
+        && unsafe {
+            libc::fcntl(
+                socket.as_raw_fd(),
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
     let original_flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
     if original_flags < 0 {
         return Err(std::io::Error::last_os_error());
@@ -5007,6 +5044,24 @@ mod tests {
             )
             .expect("replacement resolver should recover");
         assert_eq!(addresses, vec!["127.0.0.1:443".parse().unwrap()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_unix_connection_is_close_on_exec() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("close-on-exec.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind Unix socket");
+
+        let client = connect_unix_stream_with_deadline(
+            &socket_path,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("connect Unix socket");
+        let descriptor_flags = unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) };
+
+        assert!(descriptor_flags >= 0, "read Unix socket descriptor flags");
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
     }
 
     #[cfg(unix)]
