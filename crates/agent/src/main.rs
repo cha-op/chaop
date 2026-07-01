@@ -12,8 +12,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_once = args.iter().any(|arg| arg == "--run-once");
     let print_placeholder = args.iter().any(|arg| arg == "--print-placeholder-events");
     let app_server_health_check = args.iter().any(|arg| arg == "--app-server-health-check");
+    let validate_config = args.iter().any(|arg| arg == "--validate-config");
 
     let config = AgentConfig::load(config_path)?;
+
+    if validate_config {
+        validate_deployment_config(&config)?;
+        println!("connector config: PASS");
+        return Ok(());
+    }
 
     if app_server_health_check {
         let url = app_server_health_target(&config)
@@ -68,6 +75,15 @@ fn app_server_health_target(config: &AgentConfig) -> Option<&str> {
     }
 }
 
+fn validate_deployment_config(config: &AgentConfig) -> Result<(), &'static str> {
+    if config.session_inventory.managed_app_server.enabled
+        && app_server_health_target(config).is_none()
+    {
+        return Err("managed app-server config requires a local listen URL");
+    }
+    Ok(())
+}
+
 fn arg_value<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
     args.windows(2).find_map(|pair| {
         (pair.first()? == key)
@@ -78,7 +94,7 @@ fn arg_value<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::app_server_health_target;
+    use super::{app_server_health_target, validate_deployment_config};
     use chaop_agent::config::{AgentConfig, BootstrapConfig};
 
     #[test]
@@ -105,6 +121,7 @@ mod tests {
             app_server_health_target(&config),
             Some("unix:///tmp/managed.sock")
         );
+        assert_eq!(validate_deployment_config(&config), Ok(()));
 
         config.session_inventory.managed_app_server.listen_url = None;
         assert_eq!(
@@ -114,11 +131,16 @@ mod tests {
 
         config.session_inventory.app_server_url = Some("wss://external.example.test".to_owned());
         assert_eq!(app_server_health_target(&config), None);
+        assert_eq!(
+            validate_deployment_config(&config),
+            Err("managed app-server config requires a local listen URL")
+        );
 
         config.session_inventory.managed_app_server.enabled = false;
         assert_eq!(
             app_server_health_target(&config),
             Some("wss://external.example.test")
         );
+        assert_eq!(validate_deployment_config(&config), Ok(()));
     }
 }
