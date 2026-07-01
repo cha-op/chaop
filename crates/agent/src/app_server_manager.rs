@@ -770,19 +770,7 @@ impl AppServerPreflightEndpoint {
         if let Some(path) = strip_unix_scheme(configured_listen_url) {
             let configured_path = Path::new(path);
             validate_managed_unix_socket_path(configured_path)?;
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos();
-            let cleanup_dir =
-                Path::new("/tmp").join(format!("chaop-pf-{}-{nonce:x}", std::process::id()));
-            std::fs::create_dir(&cleanup_dir)?;
-            if let Err(error) =
-                std::fs::set_permissions(&cleanup_dir, std::fs::Permissions::from_mode(0o700))
-            {
-                let _ = std::fs::remove_dir(&cleanup_dir);
-                return Err(error);
-            }
+            let cleanup_dir = create_private_preflight_dir(Path::new("/tmp"), "chaop-pf")?;
             let cleanup_path = cleanup_dir.join("s");
             return Ok(Self {
                 listen_url: format!("unix://{}", cleanup_path.display()),
@@ -845,18 +833,44 @@ fn validate_managed_unix_socket_path(path: &Path) -> io::Result<()> {
             "managed app-server Unix socket parent is not a directory",
         ));
     }
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let probe_dir = parent.join(format!(".chaop-pf-check-{}-{nonce:x}", std::process::id()));
-    std::fs::create_dir(&probe_dir)?;
-    let result = std::fs::set_permissions(&probe_dir, std::fs::Permissions::from_mode(0o700))
-        .and_then(|()| std::fs::remove_dir(&probe_dir));
+    let probe_dir = create_private_preflight_dir(parent, ".chaop-pf-check")?;
+    let result = std::fs::remove_dir(&probe_dir);
     if result.is_err() {
         let _ = std::fs::remove_dir(&probe_dir);
     }
     result
+}
+
+#[cfg(unix)]
+fn create_private_preflight_dir(parent: &Path, prefix: &str) -> io::Result<PathBuf> {
+    let base_nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0_u128..16 {
+        let path = parent.join(format!(
+            "{prefix}-{}-{:x}",
+            std::process::id(),
+            base_nonce.saturating_add(attempt)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                if let Err(error) =
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                {
+                    let _ = std::fs::remove_dir(&path);
+                    return Err(error);
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        ErrorKind::AlreadyExists,
+        "unable to allocate a unique managed app-server preflight directory",
+    ))
 }
 
 impl Drop for AppServerPreflightEndpoint {
@@ -1013,7 +1027,16 @@ pub fn is_app_server_url(url: &str) -> bool {
         let path = std::path::Path::new(path);
         return is_valid_unix_socket_path(path);
     }
-    app_server_websocket_uri(url).is_some()
+    let Some(uri) = app_server_websocket_uri(url) else {
+        return false;
+    };
+    if uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("wss"))
+    {
+        return true;
+    }
+    uri.host().is_some_and(is_loopback_host)
 }
 
 pub fn is_local_listen_url(listen_url: &str) -> bool {
@@ -1249,6 +1272,7 @@ mod tests {
         assert!(is_app_server_url("unix:///tmp/chaop-app-server.sock"));
         assert!(!is_app_server_url("ws://127.0.0.1:99999"));
         assert!(!is_app_server_url("ws://127.0.0.1:0"));
+        assert!(!is_app_server_url("ws://192.0.2.1:6174"));
         assert!(!is_app_server_url("http://codex.example.test"));
     }
 
@@ -1261,14 +1285,24 @@ mod tests {
 
         let endpoint = AppServerPreflightEndpoint::new(&configured_url).expect("endpoint");
         let cleanup_dir = endpoint.cleanup_dir.clone().expect("cleanup directory");
+        let second_endpoint =
+            AppServerPreflightEndpoint::new(&configured_url).expect("second endpoint");
+        let second_cleanup_dir = second_endpoint
+            .cleanup_dir
+            .clone()
+            .expect("second cleanup directory");
 
         assert_ne!(endpoint.listen_url, configured_url);
+        assert_ne!(second_endpoint.listen_url, endpoint.listen_url);
         assert_eq!(cleanup_dir.parent(), Some(std::path::Path::new("/tmp")));
         assert!(endpoint.listen_url.len() < 80);
         assert!(cleanup_dir.exists());
+        assert!(second_cleanup_dir.exists());
         assert!(!configured_path.exists());
         drop(endpoint);
+        drop(second_endpoint);
         assert!(!cleanup_dir.exists());
+        assert!(!second_cleanup_dir.exists());
 
         let missing_parent_url = format!(
             "unix://{}",
