@@ -1028,8 +1028,9 @@ pub fn app_server_health_check_with_auth(
     auth_token_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
+    let deadline = Instant::now() + timeout;
     let mut socket = connect_app_server(url, timeout, auth_token_file)?;
-    initialize_app_server_connection(&mut socket)
+    initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)
 }
 
 fn read_app_server_inventory_page(
@@ -5203,6 +5204,46 @@ mod tests {
         app_server_health_check(&format!("unix://{}", socket_path.display()), 1)
             .expect("unix socket health check");
         server.join().expect("unix app-server");
+    }
+
+    #[test]
+    fn app_server_health_check_has_absolute_initialisation_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind app-server listener");
+        let address = listener.local_addr().expect("app-server address");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            let stop = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < stop {
+                if socket
+                    .send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "server/heartbeat"
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let started = Instant::now();
+        let error = app_server_health_check(&format!("ws://{address}"), 1)
+            .expect_err("irrelevant messages must not extend the health deadline");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out"));
+        server.join().expect("app-server server");
     }
 
     fn turn_interaction_delivery(
