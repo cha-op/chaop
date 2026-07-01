@@ -40,12 +40,16 @@ import {
   primaryAppServerInstanceForConnector,
   safetyActionBlocked,
   safetyActionReason,
+  threadCentreCreateHash,
+  threadCentreCreateRequestedFromHashValue,
+  threadCentreThreadHash,
   threadIdFromHashValue,
   threadTurnsForDisplay,
   TURN_INTERACTION_OTHER_SELECT_VALUE,
   turnInteractionAnswerForSelectValue,
   turnInteractionOptionSelectValue,
   turnInteractionQuestionSelectValue,
+  workspaceIdFromHashValue,
   type PendingTurnInteractionQuestion
 } from "./state.ts";
 
@@ -55,6 +59,10 @@ test("budget board navigation carries only an explicit thread target", () => {
   assert.equal(threadIdFromHashValue("#budget-board"), undefined);
   assert.equal(threadIdFromHashValue("#budget-board?thread=thread%2Fone"), "thread/one");
   assert.equal(threadIdFromHashValue("#budget-board?thread="), undefined);
+  assert.equal(threadCentreCreateHash("workspace/one"), "#thread-centre?new=1&workspace=workspace%2Fone");
+  assert.equal(threadCentreThreadHash("thread/one"), "#thread-centre?thread=thread%2Fone");
+  assert.equal(threadCentreCreateRequestedFromHashValue("#thread-centre?new=1&workspace=workspace%2Fone"), true);
+  assert.equal(workspaceIdFromHashValue("#thread-centre?new=1&workspace=workspace%2Fone"), "workspace/one");
 });
 
 test("turn interaction select helpers keep answer values separate from UI sentinel values", () => {
@@ -411,7 +419,7 @@ test("dogfoodReadinessPreflight reports a ready managed path without refreshing 
   const readiness = dogfoodReadinessPreflight(data);
 
   assert.equal(readiness.state, "ready");
-  assert.equal(readiness.next_action.href, "#thread-centre");
+  assert.equal(readiness.next_action.href, "#thread-centre?new=1&workspace=workspace-api");
   assert.equal(readiness.checks.find((check) => check.id === "inventory")?.state, "ready");
   assert.match(
     readiness.checks.find((check) => check.id === "inventory")?.detail ?? "",
@@ -558,6 +566,7 @@ test("dogfoodReadinessPreflight accepts exec-only connectors for selected attach
   const readiness = dogfoodReadinessPreflight(data, "thread-api");
 
   assert.equal(readiness.state, "ready");
+  assert.equal(readiness.next_action.href, "#thread-centre?thread=thread-api");
   assert.match(readiness.checks.find((check) => check.id === "connector")?.detail ?? "", /can run the selected app-server thread/);
 });
 
@@ -646,7 +655,7 @@ test("dogfoodReadinessPreflight diagnoses an unavailable attached-thread owner",
   }
 });
 
-test("dogfoodReadinessPreflight blocks a selected thread without an app-server attachment", () => {
+test("dogfoodReadinessPreflight blocks a selected thread without a visible app-server attachment", () => {
   const data = payload({
     workspaces: [workspace("workspace-api", ["connector-a"])],
     threads: [thread("thread-api", "workspace-api")],
@@ -660,11 +669,11 @@ test("dogfoodReadinessPreflight blocks a selected thread without an app-server a
   assert.equal(readiness.next_action.href, "#host-sessions");
   assert.equal(
     readiness.checks.find((check) => check.id === "connector")?.detail,
-    "The selected thread has no attached app-server Host Session."
+    "No active app-server Host Session is visible for the selected thread."
   );
   assert.equal(
     readiness.checks.find((check) => check.id === "app_server")?.detail,
-    "Attach an app-server Host Session before running the selected thread."
+    "Refresh Host Sessions or attach an app-server session before running the selected thread."
   );
 });
 

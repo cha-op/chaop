@@ -70,12 +70,14 @@ import {
   normaliseCommandMode,
   safetyActionBlocked,
   safetyActionReason,
+  threadCentreCreateRequestedFromHashValue,
   threadIdFromHashValue,
   threadTurnsForDisplay,
   TURN_INTERACTION_OTHER_SELECT_VALUE,
   turnInteractionAnswerForSelectValue,
   turnInteractionOptionSelectValue,
   turnInteractionQuestionSelectValue,
+  workspaceIdFromHashValue,
   type CommandExecutionMode,
   type PendingTurnInteraction,
   type PendingTurnInteractionQuestion,
@@ -283,7 +285,13 @@ export class ChaopApp extends LitElement {
     }
     this.view = nextView;
     const nextThreadId = threadIdFromHash();
-    if (nextThreadId !== undefined && nextThreadId !== this.selectedThreadId) {
+    const createThreadRequested = nextView === "thread-centre"
+      && threadCentreCreateRequestedFromHashValue(window.location.hash);
+    if (createThreadRequested && this.selectedThreadId !== undefined) {
+      this.commandModeExplicit = false;
+      this.resetThreadCommandState();
+      this.selectedThreadId = undefined;
+    } else if (nextThreadId !== undefined && nextThreadId !== this.selectedThreadId) {
       this.commandModeExplicit = false;
       this.resetThreadCommandState();
       this.selectedThreadId = nextThreadId;
@@ -955,7 +963,11 @@ export class ChaopApp extends LitElement {
             <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
           </div>
           <p>Create a local app-server thread or choose an existing task from the Task Board.</p>
-          ${this.renderCreateThreadForm("stacked")}
+          ${this.renderCreateThreadForm(
+            "stacked",
+            undefined,
+            workspaceIdFromHashValue(window.location.hash)
+          )}
         </section>
         <aside class="panel">
           <div class="section-heading">
@@ -1327,8 +1339,14 @@ export class ChaopApp extends LitElement {
     }
   };
 
-  private renderCreateThreadForm(layout: "compact" | "stacked", selectedThreadId?: string) {
-    const workspaceId = localThreadWorkspaceId(this.data, selectedThreadId);
+  private renderCreateThreadForm(
+    layout: "compact" | "stacked",
+    selectedThreadId?: string,
+    requestedWorkspaceId?: string
+  ) {
+    const workspaceId = this.data?.workspaces.some((workspace) => workspace.id === requestedWorkspaceId)
+      ? requestedWorkspaceId
+      : localThreadWorkspaceId(this.data, selectedThreadId);
     const connectors = localThreadConnectors(this.data, workspaceId);
     const selectedConnectorId = localThreadConnectorId(this.data, workspaceId, this.newThreadConnectorId) ?? "";
     const canCreate = Boolean(workspaceId && connectors.length > 0);
@@ -1762,11 +1780,24 @@ export class ChaopApp extends LitElement {
 
   private selectedThread(): ThreadSummary | undefined {
     if (!this.data) return undefined;
+    if (
+      this.view === "thread-centre"
+      && threadCentreCreateRequestedFromHashValue(window.location.hash)
+    ) {
+      return undefined;
+    }
     return this.data.threads.find((thread) => thread.id === this.selectedThreadId) ?? this.activeThreads()[0] ?? this.data.threads[0];
   }
 
   private ensureSelectedThread(): void {
     if (!this.data || this.view !== "thread-centre") return;
+    if (threadCentreCreateRequestedFromHashValue(window.location.hash)) {
+      if (this.selectedThreadId !== undefined) {
+        this.selectedThreadId = undefined;
+        this.resetThreadCommandState();
+      }
+      return;
+    }
     const previousThreadId = this.selectedThreadId;
     const selected = this.selectedThread();
     this.selectedThreadId = selected?.id;

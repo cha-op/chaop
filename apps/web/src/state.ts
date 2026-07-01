@@ -59,7 +59,12 @@ export type ReadinessPreflight = {
   summary: string;
   next_action: {
     label: string;
-    href: "#budget-board" | `#budget-board?thread=${string}` | "#host-sessions" | "#thread-centre";
+    href:
+      | "#budget-board"
+      | `#budget-board?thread=${string}`
+      | "#host-sessions"
+      | "#thread-centre"
+      | `#thread-centre?${string}`;
     detail: string;
   };
   checks: ReadinessPreflightCheck[];
@@ -73,7 +78,7 @@ type ReadinessConnectorScope = {
 type ReadinessTarget =
   | { kind: "workspace"; workspaceId: string | undefined }
   | { kind: "missing_thread"; threadId: string }
-  | { kind: "unattached_thread"; threadId: string; workspaceId: string }
+  | { kind: "unavailable_attachment"; threadId: string; workspaceId: string }
   | { kind: "attached_thread"; threadId: string; workspaceId: string; connectorId: string };
 
 export const MANAGED_APP_SERVER_UNAVAILABLE =
@@ -89,9 +94,32 @@ export function budgetBoardHash(
 }
 
 export function threadIdFromHashValue(hash: string): string | undefined {
+  return hashSearchParams(hash)?.get("thread") || undefined;
+}
+
+export function threadCentreCreateHash(
+  workspaceId: string | undefined
+): "#thread-centre?new=1" | `#thread-centre?new=1&workspace=${string}` {
+  return workspaceId
+    ? `#thread-centre?new=1&workspace=${encodeURIComponent(workspaceId)}`
+    : "#thread-centre?new=1";
+}
+
+export function threadCentreThreadHash(threadId: string): `#thread-centre?thread=${string}` {
+  return `#thread-centre?thread=${encodeURIComponent(threadId)}`;
+}
+
+export function threadCentreCreateRequestedFromHashValue(hash: string): boolean {
+  return hashSearchParams(hash)?.get("new") === "1";
+}
+
+export function workspaceIdFromHashValue(hash: string): string | undefined {
+  return hashSearchParams(hash)?.get("workspace") || undefined;
+}
+
+function hashSearchParams(hash: string): URLSearchParams | undefined {
   const query = hash.split("?")[1];
-  if (!query) return undefined;
-  return new URLSearchParams(query).get("thread") || undefined;
+  return query ? new URLSearchParams(query) : undefined;
 }
 
 export function turnInteractionOptionSelectValue(index: number): string {
@@ -858,12 +886,12 @@ function readinessConnectorCheck(
       detail: "The selected thread is no longer available."
     };
   }
-  if (target.kind === "unattached_thread") {
+  if (target.kind === "unavailable_attachment") {
     return {
       id: "connector",
       label: "Connector",
       state: "blocked",
-      detail: "The selected thread has no attached app-server Host Session."
+      detail: "No active app-server Host Session is visible for the selected thread."
     };
   }
   const workspaceId = target.workspaceId;
@@ -964,12 +992,12 @@ function readinessAppServerCheck(
       detail: "No app-server can target a thread that is no longer available."
     };
   }
-  if (target.kind === "unattached_thread") {
+  if (target.kind === "unavailable_attachment") {
     return {
       id: "app_server",
       label: "App-server",
       state: "blocked",
-      detail: "Attach an app-server Host Session before running the selected thread."
+      detail: "Refresh Host Sessions or attach an app-server session before running the selected thread."
     };
   }
   const workspaceId = target.workspaceId;
@@ -1042,7 +1070,7 @@ function readinessEligibleConnectorScopes(
   data: BootstrapPayload | undefined,
   target: ReadinessTarget
 ): ReadinessConnectorScope[] {
-  if (target.kind === "missing_thread" || target.kind === "unattached_thread") return [];
+  if (target.kind === "missing_thread" || target.kind === "unavailable_attachment") return [];
   return readinessConnectorScopes(data, target.workspaceId).filter((scope) => {
     if (
       scope.workspaceIds.size === 0 ||
@@ -1072,7 +1100,7 @@ function readinessTarget(
   const session = attachedAppServerHostSession(data, selectedThreadId);
   if (!session) {
     return {
-      kind: "unattached_thread",
+      kind: "unavailable_attachment",
       threadId: selectedThreadId,
       workspaceId: thread.workspace_id
     };
@@ -1168,9 +1196,15 @@ function readinessNextAction(
     };
   }
   return {
-    label: "Open Thread Centre",
-    href: "#thread-centre",
-    detail: "Create or select an app-server thread and send a bounded prompt."
+    label: target.kind === "workspace" ? "Create local thread" : "Open Thread Centre",
+    href: target.kind === "workspace"
+      ? threadCentreCreateHash(target.workspaceId)
+      : target.kind === "attached_thread"
+        ? threadCentreThreadHash(target.threadId)
+        : "#thread-centre",
+    detail: target.kind === "workspace"
+      ? "Create a managed app-server thread in the preflighted workspace."
+      : "Open the selected app-server thread and send a bounded prompt."
   };
 }
 
