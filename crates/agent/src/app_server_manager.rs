@@ -4,6 +4,8 @@ use crate::shutdown::shutdown_requested;
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -22,6 +24,10 @@ const APP_SERVER_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(20);
 const APP_SERVER_EXTERNAL_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const APP_SERVER_DRAIN_TIMEOUT_DETAIL: &str =
     "Drain timeout elapsed while active turns were still running.";
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
 
 #[derive(Debug)]
 pub struct AppServerManager {
@@ -607,11 +613,13 @@ impl AppServerManager {
     }
 
     fn stop_child_checked(&mut self, reason: &str) -> io::Result<()> {
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.as_mut() else {
             return Ok(());
         };
         eprintln!("{reason}; stopping managed app-server");
-        (self.terminate_child)(&mut child)
+        (self.terminate_child)(child)?;
+        self.child.take();
+        Ok(())
     }
 
     fn can_attempt_start(&self, config: &AgentConfig) -> bool {
@@ -731,6 +739,7 @@ impl AppServerManager {
     }
 }
 
+#[derive(Debug)]
 struct AppServerPreflightEndpoint {
     listen_url: String,
     cleanup_path: Option<PathBuf>,
@@ -742,12 +751,7 @@ impl AppServerPreflightEndpoint {
         #[cfg(unix)]
         if let Some(path) = strip_unix_scheme(configured_listen_url) {
             let configured_path = Path::new(path);
-            configured_path.parent().ok_or_else(|| {
-                io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "managed app-server Unix socket has no parent directory",
-                )
-            })?;
+            validate_managed_unix_socket_path(configured_path)?;
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -801,6 +805,40 @@ impl AppServerPreflightEndpoint {
             cleanup_dir: None,
         })
     }
+}
+
+#[cfg(unix)]
+fn validate_managed_unix_socket_path(path: &Path) -> io::Result<()> {
+    if !is_valid_unix_socket_path(path) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "managed app-server Unix socket path is invalid or too long",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "managed app-server Unix socket has no parent directory",
+        )
+    })?;
+    if !std::fs::metadata(parent)?.is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::NotADirectory,
+            "managed app-server Unix socket parent is not a directory",
+        ));
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let probe_dir = parent.join(format!(".chaop-pf-check-{}-{nonce:x}", std::process::id()));
+    std::fs::create_dir(&probe_dir)?;
+    let result = std::fs::set_permissions(&probe_dir, std::fs::Permissions::from_mode(0o700))
+        .and_then(|()| std::fs::remove_dir(&probe_dir));
+    if result.is_err() {
+        let _ = std::fs::remove_dir(&probe_dir);
+    }
+    result
 }
 
 impl Drop for AppServerPreflightEndpoint {
@@ -955,7 +993,7 @@ pub fn is_app_server_url(url: &str) -> bool {
     #[cfg(unix)]
     if let Some(path) = strip_unix_scheme(url) {
         let path = std::path::Path::new(path);
-        return path.is_absolute() && path != std::path::Path::new("/");
+        return is_valid_unix_socket_path(path);
     }
     app_server_websocket_uri(url).is_some()
 }
@@ -964,7 +1002,7 @@ pub fn is_local_listen_url(listen_url: &str) -> bool {
     #[cfg(unix)]
     if let Some(path) = strip_unix_scheme(listen_url) {
         let path = std::path::Path::new(path);
-        return path.is_absolute() && path != std::path::Path::new("/");
+        return is_valid_unix_socket_path(path);
     }
     let Some(uri) = app_server_websocket_uri(listen_url) else {
         return false;
@@ -973,6 +1011,13 @@ pub fn is_local_listen_url(listen_url: &str) -> bool {
         return false;
     };
     is_loopback_host(host)
+}
+
+#[cfg(unix)]
+fn is_valid_unix_socket_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path != Path::new("/")
+        && path.as_os_str().as_bytes().len() <= UNIX_SOCKET_PATH_MAX_BYTES
 }
 
 fn app_server_websocket_uri(url: &str) -> Option<Uri> {
@@ -1114,6 +1159,11 @@ mod tests {
         assert!(!is_local_listen_url("ws://codex.example.test:65530"));
         assert!(!is_local_listen_url("ws://127.0.0.1:99999"));
         assert!(!is_local_listen_url("http://127.0.0.1:65530"));
+        #[cfg(unix)]
+        assert!(!is_local_listen_url(&format!(
+            "unix:///tmp/{}",
+            "x".repeat(super::UNIX_SOCKET_PATH_MAX_BYTES)
+        )));
     }
 
     #[test]
@@ -1144,13 +1194,22 @@ mod tests {
         assert!(!configured_path.exists());
         drop(endpoint);
         assert!(!cleanup_dir.exists());
+
+        let missing_parent_url = format!(
+            "unix://{}",
+            tempdir.path().join("missing/configured.sock").display()
+        );
+        assert_eq!(
+            AppServerPreflightEndpoint::new(&missing_parent_url)
+                .expect_err("missing configured parent must fail")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     #[test]
     fn managed_app_server_stop_propagates_termination_failure() {
-        fn terminate_then_fail(child: &mut std::process::Child) -> std::io::Result<()> {
-            let _ = child.kill();
-            let _ = child.wait();
+        fn fail_termination(_child: &mut std::process::Child) -> std::io::Result<()> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "injected termination failure",
@@ -1159,7 +1218,7 @@ mod tests {
 
         let config = config_with_managed(true);
         let mut manager = AppServerManager::new(&config);
-        manager.terminate_child = terminate_then_fail;
+        manager.terminate_child = fail_termination;
         let mut command = std::process::Command::new("sh");
         command.args(["-c", "sleep 30"]);
         #[cfg(unix)]
@@ -1174,6 +1233,12 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(error.to_string(), "injected termination failure");
+        assert!(manager.child.is_some());
+        manager.terminate_child = terminate_child;
+        manager
+            .stop_child_checked("clean up retained child")
+            .expect("retained child can be stopped");
+        assert!(manager.child.is_none());
     }
 
     #[test]
