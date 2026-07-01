@@ -983,7 +983,9 @@ fn app_server_websocket_uri(url: &str) -> Option<Uri> {
     }
     uri.host()?;
     if let Some(port) = app_server_explicit_port(&uri) {
-        port.parse::<u16>().ok()?;
+        if port.parse::<u16>().ok()? == 0 {
+            return None;
+        }
     }
     Some(uri)
 }
@@ -1121,6 +1123,7 @@ mod tests {
         #[cfg(unix)]
         assert!(is_app_server_url("unix:///tmp/chaop-app-server.sock"));
         assert!(!is_app_server_url("ws://127.0.0.1:99999"));
+        assert!(!is_app_server_url("ws://127.0.0.1:0"));
         assert!(!is_app_server_url("http://codex.example.test"));
     }
 

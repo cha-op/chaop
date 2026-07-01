@@ -1190,9 +1190,10 @@ fn connect_tcp_app_server(
 
 fn app_server_port(uri: &Uri, uses_tls: bool) -> Result<u16, Box<dyn std::error::Error>> {
     match app_server_explicit_port(uri) {
-        Some(port) => port
-            .parse::<u16>()
-            .map_err(|_| format!("app-server URL port is invalid: {port}").into()),
+        Some(port) => match port.parse::<u16>() {
+            Ok(0) | Err(_) => Err(format!("app-server URL port is invalid: {port}").into()),
+            Ok(port) => Ok(port),
+        },
         None => Ok(if uses_tls { 443 } else { 80 }),
     }
 }
@@ -4848,6 +4849,9 @@ mod tests {
         let invalid = "wss://app.example.test:99999"
             .parse::<Uri>()
             .expect("out-of-range port URI");
+        let zero = "ws://app.example.test:0"
+            .parse::<Uri>()
+            .expect("zero port URI");
 
         assert_eq!(app_server_port(&explicit, true).unwrap(), 8443);
         assert_eq!(app_server_port(&default_tls, true).unwrap(), 443);
@@ -4857,6 +4861,10 @@ mod tests {
         assert_eq!(
             app_server_port(&invalid, true).unwrap_err().to_string(),
             "app-server URL port is invalid: 99999"
+        );
+        assert_eq!(
+            app_server_port(&zero, false).unwrap_err().to_string(),
+            "app-server URL port is invalid: 0"
         );
     }
 
