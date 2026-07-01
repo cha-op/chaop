@@ -1124,7 +1124,7 @@ fn connect_tcp_app_server(
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or(host);
     let uses_tls = app_server_uri_scheme_is(uri, "wss");
-    let port = uri.port_u16().unwrap_or(if uses_tls { 443 } else { 80 });
+    let port = app_server_port(uri, uses_tls)?;
     let deadline = Instant::now() + timeout;
     let request = app_server_client_request(url, auth_token_file)?;
     let remaining = app_server_connection_time_remaining(deadline, url)?;
@@ -1186,6 +1186,27 @@ fn connect_tcp_app_server(
         Some(error) => format!("unable to connect to app-server {url}: {error}").into(),
         None => format!("app-server URL {url} resolved to no socket addresses").into(),
     })
+}
+
+fn app_server_port(uri: &Uri, uses_tls: bool) -> Result<u16, Box<dyn std::error::Error>> {
+    match app_server_explicit_port(uri) {
+        Some(port) => port
+            .parse::<u16>()
+            .map_err(|_| format!("app-server URL port is invalid: {port}").into()),
+        None => Ok(if uses_tls { 443 } else { 80 }),
+    }
+}
+
+fn app_server_explicit_port(uri: &Uri) -> Option<&str> {
+    let authority = uri.authority()?.as_str();
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, value)| value);
+    if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        let (_, suffix) = bracketed.split_once(']')?;
+        return suffix.strip_prefix(':');
+    }
+    host_and_port.rsplit_once(':').map(|(_, port)| port)
 }
 
 struct ConnectionDeadlineGuard {
@@ -4716,7 +4737,7 @@ mod tests {
         TurnInteractionInputAnswer, TurnInteractionResponse, TurnInteractionResponseDelivery,
         TurnInteractionResponseDispatch, acknowledge_turn_interaction_delivery,
         app_server_client_request, app_server_command_result_events_with_cancel,
-        app_server_health_check, app_server_sessions_from_response,
+        app_server_health_check, app_server_port, app_server_sessions_from_response,
         app_server_thread_from_response, app_server_titles_from_response,
         build_host_session_backfill, build_host_sessions_report, connect_app_server,
         create_app_server_thread_at, ensure_app_server_host_session_at,
@@ -4741,7 +4762,7 @@ mod tests {
     };
     use std::thread;
     use std::time::{Duration, Instant};
-    use tungstenite::{Message, accept};
+    use tungstenite::{Message, accept, http::Uri};
 
     #[test]
     fn app_server_client_request_reads_bearer_token_from_file() {
@@ -4807,6 +4828,36 @@ mod tests {
             .expect_err("plaintext token rejected");
 
         assert_eq!(error.to_string(), "app-server auth tokens require wss://");
+    }
+
+    #[test]
+    fn app_server_port_rejects_out_of_range_values_before_defaulting() {
+        let explicit = "wss://app.example.test:8443"
+            .parse::<Uri>()
+            .expect("explicit port URI");
+        let default_tls = "wss://app.example.test"
+            .parse::<Uri>()
+            .expect("default TLS URI");
+        let default_plaintext = "ws://app.example.test"
+            .parse::<Uri>()
+            .expect("default plaintext URI");
+        let explicit_ipv6 = "ws://[::1]:6174"
+            .parse::<Uri>()
+            .expect("explicit IPv6 port URI");
+        let default_ipv6 = "ws://[::1]".parse::<Uri>().expect("default IPv6 URI");
+        let invalid = "wss://app.example.test:99999"
+            .parse::<Uri>()
+            .expect("out-of-range port URI");
+
+        assert_eq!(app_server_port(&explicit, true).unwrap(), 8443);
+        assert_eq!(app_server_port(&default_tls, true).unwrap(), 443);
+        assert_eq!(app_server_port(&default_plaintext, false).unwrap(), 80);
+        assert_eq!(app_server_port(&explicit_ipv6, false).unwrap(), 6174);
+        assert_eq!(app_server_port(&default_ipv6, false).unwrap(), 80);
+        assert_eq!(
+            app_server_port(&invalid, true).unwrap_err().to_string(),
+            "app-server URL port is invalid: 99999"
+        );
     }
 
     #[test]
