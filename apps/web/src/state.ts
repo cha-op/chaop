@@ -115,7 +115,8 @@ export function threadCentreCreateRequestedFromHashValue(hash: string): boolean 
 }
 
 export function workspaceIdFromHashValue(hash: string): string | undefined {
-  return hashSearchParams(hash)?.get("workspace") || undefined;
+  const params = hashSearchParams(hash);
+  return params?.has("workspace") ? params.get("workspace") ?? "" : undefined;
 }
 
 function hashSearchParams(hash: string): URLSearchParams | undefined {
@@ -1205,13 +1206,6 @@ function readinessNextAction(
       detail: "Choose an available thread before evaluating app-server readiness."
     };
   }
-  if (target.kind === "archived_thread") {
-    return {
-      label: "Open Thread Centre",
-      href: threadCentreThreadHash(target.threadId),
-      detail: "Unarchive the selected thread before evaluating app-server readiness again."
-    };
-  }
   const budgetHref = budgetBoardHash(target.kind === "workspace" ? undefined : target.threadId);
   const blocked = checks.find((check) => check.state === "blocked");
   if (blocked?.id === "cost") {
@@ -1219,6 +1213,13 @@ function readinessNextAction(
       label: "Review Budget Board",
       href: budgetHref,
       detail: "Clear the cost posture before starting an app-server turn."
+    };
+  }
+  if (target.kind === "archived_thread") {
+    return {
+      label: "Open Thread Centre",
+      href: threadCentreThreadHash(target.threadId),
+      detail: "Unarchive the selected thread before evaluating app-server readiness again."
     };
   }
   if (blocked?.id === "connector" || blocked?.id === "app_server") {

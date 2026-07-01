@@ -64,6 +64,8 @@ test("budget board navigation carries only an explicit thread target", () => {
   assert.equal(threadCentreThreadHash("thread/one"), "#thread-centre?thread=thread%2Fone");
   assert.equal(threadCentreCreateRequestedFromHashValue("#thread-centre?new=1&workspace=workspace%2Fone"), true);
   assert.equal(workspaceIdFromHashValue("#thread-centre?new=1&workspace=workspace%2Fone"), "workspace/one");
+  assert.equal(workspaceIdFromHashValue("#thread-centre?new=1&workspace="), "");
+  assert.equal(workspaceIdFromHashValue("#thread-centre?new=1"), undefined);
 });
 
 test("turn interaction select helpers keep answer values separate from UI sentinel values", () => {
@@ -720,6 +722,30 @@ test("dogfoodReadinessPreflight blocks an archived selected thread until it is u
   assert.match(readiness.next_action.detail, /Unarchive/);
 });
 
+test("dogfoodReadinessPreflight clears a cost block before unarchiving a selected thread", () => {
+  const data = payload({
+    threads: [{ ...thread("thread-api", "workspace-api"), state: "archived" }],
+    safety: {
+      ...payload().safety,
+      state: "hard_limited",
+      summary: "D1 writes are hard limited.",
+      actions: payload().safety.actions.map((action) => ({
+        ...action,
+        state: "blocked",
+        reason: "D1 writes are hard limited.",
+        budget_state: "hard_limited"
+      }))
+    }
+  });
+
+  const readiness = dogfoodReadinessPreflight(data, "thread-api");
+
+  assert.equal(readiness.state, "blocked");
+  assert.equal(readiness.summary, "D1 writes are hard limited.");
+  assert.equal(readiness.next_action.href, "#budget-board?thread=thread-api");
+  assert.equal(readiness.next_action.detail, "Clear the cost posture before starting an app-server turn.");
+});
+
 test("dogfoodReadinessPreflight requires a workspace-linked managed connector", () => {
   const readiness = dogfoodReadinessPreflight(payload({
     connectors: [connector("connector-a", ["app_server_threads", "codex_app_server_exec"])],
@@ -1013,6 +1039,7 @@ test("localThreadCreateWorkspaceId rejects an unavailable explicit workspace", (
   });
 
   assert.equal(localThreadCreateWorkspaceId(data, undefined, "workspace-missing"), undefined);
+  assert.equal(localThreadCreateWorkspaceId(data, undefined, ""), undefined);
   assert.equal(localThreadCreateWorkspaceId(data, undefined, "workspace-api"), "workspace-api");
   assert.equal(localThreadCreateWorkspaceId(data, "thread-api"), "workspace-api");
 });

@@ -29,6 +29,7 @@ superseded_by:
 - Workspace-level preflight ready 后会打开绑定该 workspace 的显式新建 thread 模式；已 attach thread ready 后则携带精确 thread ID，因此 Thread Centre 不会静默选择另一个 workspace 中未经检查的 thread。
 - 如果显式请求的 workspace 在 Thread Centre 加载前消失，本机 thread 创建会保持禁用，不会回退到其它 workspace。Attached-thread 诊断也会先报告 owning connector 已离线，再判断 bootstrap payload 可能已经移除的 workspace 关联。
 - 已归档 thread 会保持 blocked，直到恢复归档；Worker connector 优先级测试现在会针对 SQLite 执行真实查询，并放入更新时间更晚的 busy connector 和 workspace 不匹配的候选，不再只匹配 SQL 文本。
+- 已归档目标同时被成本 hard block 时，会先引导恢复成本状态；显式空 `workspace=` 目标也和其它失效 workspace 一样 fail closed。
 
 ## 范围
 - 增加一个有测试覆盖的 Web state helper，返回简洁的 `ready`、`attention` 或 `blocked` preflight decision。
@@ -42,8 +43,8 @@ superseded_by:
 - 缺少 live 或 persisted budget samples 时会明确显示需要关注，因此首次使用的 operator 需要先 bootstrap 或检查 Budget Board，再依赖 readiness。
 
 ## 验证证据
-- `pnpm --filter @chaop/web test` 已通过 80 个 tests，覆盖 thread-scoped app-server instance 精确匹配、缺少真实预算采样、busy/idle app-server 混合状态、已选现有 attached app-server thread、多个 connectors 之间的 attachment-owner isolation 和诊断、显式 Budget Board URL target、拒绝已失效的显式 workspace、已归档 thread blocking，以及已选但未 attach 或已缺失 thread 的 blocked 和恢复导航场景。
-- 合入最新 `master` 后，`pnpm test` 已通过：48 个 script、3 个 protocol、80 个 Web、294 个 Worker 和 203 个 Rust tests。
+- `pnpm --filter @chaop/web test` 已通过 81 个 tests，覆盖 thread-scoped app-server instance 精确匹配、缺少真实预算采样、busy/idle app-server 混合状态、已选现有 attached app-server thread、多个 connectors 之间的 attachment-owner isolation 和诊断、显式 Budget Board URL target、拒绝已失效或显式空 workspace、已归档 thread blocking 与成本优先恢复，以及已选但未 attach 或已缺失 thread 的 blocked 和恢复导航场景。
+- 合入最新 `master` 后，`pnpm test` 已通过：48 个 script、3 个 protocol、81 个 Web、294 个 Worker 和 203 个 Rust tests。
 - `pnpm build` 已通过。
 - 本地 Playwright 视觉 smoke 已通过，桌面、窄桌面、断点边缘和移动端 Budget Board 渲染正常，没有横向溢出。
 - 本地 Playwright 导航 smoke 已确认：显式 workspace 失效时，hidden workspace target 为空，本机 thread 创建按钮禁用，并显示恢复提示，不会回退到其它 workspace。
