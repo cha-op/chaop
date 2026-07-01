@@ -668,7 +668,7 @@ impl AppServerManager {
             );
             return None;
         };
-        if !is_local_listen_url(&listen_url) {
+        if !is_managed_listen_url(&listen_url) {
             eprintln!(
                 "managed app-server listen URL must use an absolute unix:// socket path or a loopback IP address: {listen_url}"
             );
@@ -1031,6 +1031,40 @@ pub fn is_local_listen_url(listen_url: &str) -> bool {
     is_loopback_host(host)
 }
 
+pub fn is_managed_listen_url(listen_url: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(path) = strip_unix_scheme(listen_url) {
+        return is_valid_unix_socket_path(Path::new(path));
+    }
+    let Some(uri) = app_server_websocket_uri(listen_url) else {
+        return false;
+    };
+    if !uri
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws"))
+        || uri.path() != "/"
+        || uri.query().is_some()
+    {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let Ok(ip) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    else {
+        return false;
+    };
+    if !ip.is_loopback() {
+        return false;
+    }
+    app_server_explicit_port(&uri)
+        .and_then(|port| port.parse::<u16>().ok())
+        .is_some_and(|port| port > 0)
+}
+
 #[cfg(unix)]
 fn is_valid_unix_socket_path(path: &Path) -> bool {
     path.is_absolute()
@@ -1146,7 +1180,8 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
 mod tests {
     use super::{
         AppServerInstanceState, AppServerManager, AppServerPreflightEndpoint,
-        AppServerRestartReason, is_app_server_url, is_local_listen_url, terminate_child,
+        AppServerRestartReason, is_app_server_url, is_local_listen_url, is_managed_listen_url,
+        terminate_child,
     };
     use crate::config::{
         AgentConfig, BootstrapConfig, ExecutionConfig, ExecutionMode, ManagedAppServerConfig,
@@ -1182,6 +1217,20 @@ mod tests {
             "unix:///tmp/{}",
             "x".repeat(super::UNIX_SOCKET_PATH_MAX_BYTES)
         )));
+    }
+
+    #[test]
+    fn managed_listen_url_matches_codex_listener_contract() {
+        assert!(is_managed_listen_url("ws://127.0.0.1:65530"));
+        assert!(is_managed_listen_url("WS://[::1]:65530"));
+        #[cfg(unix)]
+        assert!(is_managed_listen_url("unix:///tmp/chaop-app-server.sock"));
+        assert!(!is_managed_listen_url("ws://localhost:65530"));
+        assert!(!is_managed_listen_url("wss://127.0.0.1:65530"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1:0"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1:65530/path"));
+        assert!(!is_managed_listen_url("ws://127.0.0.1:65530?query"));
     }
 
     #[test]

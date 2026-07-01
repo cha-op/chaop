@@ -987,22 +987,21 @@ fn load_app_server_sessions_with_auth(
     auth_token_file: Option<&Path>,
 ) -> Result<AppServerSessionInventory, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
+    let deadline = Instant::now() + timeout;
     let mut socket = connect_app_server(url, timeout, auth_token_file)?;
-    initialize_app_server_connection(&mut socket)?;
+    initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
     let session_limit = limit.max(1);
     let page_limit = session_limit.saturating_add(1);
-    socket.send(Message::Text(
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "thread/list",
-            "params": app_server_thread_list_params(page_limit, None, Some(false))
-        })
-        .to_string()
-        .into(),
-    ))?;
-
-    let value = read_app_server_inventory_page(&mut socket, 1)?;
+    let value = send_app_server_thread_list_request(
+        &mut socket,
+        1,
+        page_limit,
+        None,
+        Some(false),
+        timeout,
+        deadline,
+    )?;
+    validate_app_server_thread_list_response(&value)?;
     let sessions = app_server_sessions_from_response(&value);
     let raw_thread_count = app_server_thread_list_data(&value)
         .map(|threads| threads.len())
@@ -1031,31 +1030,6 @@ pub fn app_server_health_check_with_auth(
     let deadline = Instant::now() + timeout;
     let mut socket = connect_app_server(url, timeout, auth_token_file)?;
     initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)
-}
-
-fn read_app_server_inventory_page(
-    socket: &mut AppServerSocket,
-    request_id: i64,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    loop {
-        match socket.read()? {
-            Message::Text(text) => {
-                let value = serde_json::from_str::<Value>(text.as_ref())?;
-                if value.get("id").and_then(Value::as_i64) != Some(request_id) {
-                    continue;
-                }
-                if let Some(error) = value.get("error") {
-                    return Err(app_server_error("thread/list", error).into());
-                }
-                validate_app_server_thread_list_response(&value)?;
-                return Ok(value);
-            }
-            Message::Close(_) => {
-                return Err("app-server closed before thread/list response".into());
-            }
-            _ => {}
-        }
-    }
 }
 
 fn connect_app_server(
@@ -4292,9 +4266,10 @@ fn create_app_server_thread_at_with_auth(
     auth_token_file: Option<&Path>,
 ) -> Result<AgentHostSession, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
+    let deadline = Instant::now() + timeout;
     let mut socket = connect_app_server(url, timeout, auth_token_file)?;
-    initialize_app_server_connection(&mut socket)?;
-    let start_response = send_app_server_request(
+    initialize_app_server_connection_before_deadline(&mut socket, timeout, deadline)?;
+    let start_response = send_app_server_request_before_deadline(
         &mut socket,
         1,
         "thread/start",
@@ -4303,12 +4278,14 @@ fn create_app_server_thread_at_with_auth(
             "ephemeral": false,
             "threadSource": "user"
         }),
+        timeout,
+        deadline,
     )?;
     let started = app_server_thread_from_response(&start_response)?;
     let requested_title = compact_title(title);
 
     if let Some(title) = requested_title.as_deref() {
-        let _ = send_app_server_request(
+        let _ = send_app_server_request_before_deadline(
             &mut socket,
             2,
             "thread/name/set",
@@ -4316,6 +4293,8 @@ fn create_app_server_thread_at_with_auth(
                 "threadId": started.id,
                 "name": title
             }),
+            timeout,
+            deadline,
         );
     }
 
@@ -4369,45 +4348,6 @@ fn initialize_app_server_connection_before_deadline(
         .into(),
     ))?;
     Ok(())
-}
-
-fn initialize_app_server_connection(
-    socket: &mut AppServerSocket,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = send_app_server_request(
-        socket,
-        0,
-        "initialize",
-        serde_json::json!({
-            "clientInfo": {
-                "name": "chaop-agent",
-                "title": "Chaop connector",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "capabilities": {
-                "experimentalApi": true,
-                "requestAttestation": false
-            }
-        }),
-    )?;
-    socket.send(Message::Text(
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "initialized"
-        })
-        .to_string()
-        .into(),
-    ))?;
-    Ok(())
-}
-
-fn send_app_server_request(
-    socket: &mut AppServerSocket,
-    id: i64,
-    method: &str,
-    params: Value,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    send_app_server_request_inner(socket, id, method, params, None)
 }
 
 fn send_app_server_request_inner(
@@ -5299,6 +5239,32 @@ mod tests {
         let started = Instant::now();
         let error = app_server_health_check(&format!("ws://{address}"), 1)
             .expect_err("irrelevant messages must not extend the health deadline");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out"));
+        server.join().expect("app-server server");
+    }
+
+    #[test]
+    fn app_server_inventory_has_absolute_response_deadline() {
+        let (url, server) = spawn_irrelevant_message_app_server("thread/list");
+
+        let started = Instant::now();
+        let error = load_app_server_sessions(&url, 10, 1)
+            .expect_err("irrelevant messages must not extend the inventory deadline");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out"));
+        server.join().expect("app-server server");
+    }
+
+    #[test]
+    fn app_server_thread_create_has_absolute_response_deadline() {
+        let (url, server) = spawn_irrelevant_message_app_server("thread/start");
+
+        let started = Instant::now();
+        let error = create_app_server_thread_at(&url, None, "/tmp/project", 1)
+            .expect_err("irrelevant messages must not extend the thread-create deadline");
 
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(error.to_string().contains("timed out"));
@@ -10708,6 +10674,61 @@ mod tests {
             let _ = requests_tx.send(request);
         });
         (format!("ws://{address}"), requests_rx)
+    }
+
+    fn spawn_irrelevant_message_app_server(
+        expected_method: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind app-server listener");
+        let address = listener.local_addr().expect("app-server address");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept app-server client");
+            let mut socket = accept(stream).expect("accept websocket");
+            let initialize = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .expect("send initialize response");
+            let initialized = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                initialized.get("method").and_then(Value::as_str),
+                Some("initialized")
+            );
+            let request = read_fake_app_server_message(&mut socket);
+            assert_eq!(
+                request.get("method").and_then(Value::as_str),
+                Some(expected_method)
+            );
+            let stop = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < stop {
+                if socket
+                    .send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "server/heartbeat"
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        (format!("ws://{address}"), server)
     }
 
     fn read_fake_app_server_message<S: Read + Write>(

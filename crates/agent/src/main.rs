@@ -1,4 +1,4 @@
-use chaop_agent::app_server_manager::{AppServerManager, is_app_server_url, is_local_listen_url};
+use chaop_agent::app_server_manager::{AppServerManager, is_app_server_url, is_managed_listen_url};
 use chaop_agent::config::AgentConfig;
 use chaop_agent::connector::{RunMode, run_connector};
 use chaop_agent::placeholder::placeholder_event_stream;
@@ -79,7 +79,7 @@ fn app_server_health_target(config: &AgentConfig) -> Option<&str> {
             .listen_url
             .as_deref()
             .or(config.session_inventory.app_server_url.as_deref())?;
-        is_local_listen_url(url).then_some(url)
+        is_managed_listen_url(url).then_some(url)
     } else {
         config.session_inventory.app_server_url.as_deref()
     }
