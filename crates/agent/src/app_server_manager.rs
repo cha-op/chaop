@@ -327,7 +327,16 @@ impl AppServerManager {
             pending.reason.restarting_summary(force_restart),
             force_restart.then_some("Drain timeout elapsed while active turns were still running."),
         );
-        self.stop_child(pending.reason.stop_reason(force_restart));
+        if let Err(error) = self.stop_child_checked(pending.reason.stop_reason(force_restart)) {
+            eprintln!("failed to stop managed app-server for restart: {error}");
+            self.pending_restart = Some(pending);
+            self.set_state(
+                AppServerInstanceState::Degraded,
+                "Failed to stop managed app-server for restart.",
+                Some(&error.to_string()),
+            );
+            return None;
+        }
         if self.block_unowned_listener_restart(config, pending.reason) {
             self.pending_restart = Some(pending);
             return None;
@@ -524,7 +533,16 @@ impl AppServerManager {
                 "Restarting unhealthy managed app-server.",
                 None,
             );
-            self.stop_child("restarting unhealthy managed app-server");
+            if let Err(error) = self.stop_child_checked("restarting unhealthy managed app-server") {
+                eprintln!("failed to stop unhealthy managed app-server: {error}");
+                self.record_start_failure();
+                self.set_state(
+                    AppServerInstanceState::Degraded,
+                    "Failed to stop unhealthy managed app-server.",
+                    Some(&error.to_string()),
+                );
+                return None;
+            }
         }
 
         match self.spawn_app_server(config, &listen_url) {
@@ -1239,6 +1257,50 @@ mod tests {
             .stop_child_checked("clean up retained child")
             .expect("retained child can be stopped");
         assert!(manager.child.is_none());
+    }
+
+    #[test]
+    fn pending_restart_stops_when_child_termination_fails() {
+        fn fail_termination(_child: &mut std::process::Child) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected restart termination failure",
+            ))
+        }
+
+        let config = config_with_managed(true);
+        let mut manager = AppServerManager::new(&config);
+        manager.terminate_child = fail_termination;
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
+        let child = command.spawn().expect("spawn child");
+        let child_id = child.id();
+        manager.child = Some(child);
+        manager.request_restart(AppServerRestartReason::UpgradeMarker);
+
+        assert_eq!(manager.advance_pending_restart(&config), None);
+
+        assert_eq!(
+            manager.child.as_ref().map(std::process::Child::id),
+            Some(child_id)
+        );
+        assert_eq!(
+            manager.pending_restart.map(|pending| pending.reason),
+            Some(AppServerRestartReason::UpgradeMarker)
+        );
+        assert_eq!(manager.state, AppServerInstanceState::Degraded);
+        assert_eq!(
+            manager.last_error.as_deref(),
+            Some("injected restart termination failure")
+        );
+        manager.terminate_child = terminate_child;
+        manager
+            .stop_child_checked("clean up retained restart child")
+            .expect("retained restart child can be stopped");
     }
 
     #[test]
