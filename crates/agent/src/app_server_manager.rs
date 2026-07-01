@@ -815,7 +815,7 @@ fn upgrade_marker_modified(marker: Option<&std::path::PathBuf>) -> Option<System
         .and_then(|metadata| metadata.modified().ok())
 }
 
-fn is_local_listen_url(listen_url: &str) -> bool {
+pub fn is_local_listen_url(listen_url: &str) -> bool {
     #[cfg(unix)]
     if let Some(path) = strip_unix_scheme(listen_url) {
         let path = std::path::Path::new(path);

@@ -1,4 +1,4 @@
-use chaop_agent::app_server_manager::AppServerManager;
+use chaop_agent::app_server_manager::{AppServerManager, is_local_listen_url};
 use chaop_agent::config::AgentConfig;
 use chaop_agent::connector::{RunMode, run_connector};
 use chaop_agent::placeholder::placeholder_event_stream;
@@ -56,12 +56,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn app_server_health_target(config: &AgentConfig) -> Option<&str> {
     if config.session_inventory.managed_app_server.enabled {
-        config
+        let url = config
             .session_inventory
             .managed_app_server
             .listen_url
             .as_deref()
-            .or(config.session_inventory.app_server_url.as_deref())
+            .or(config.session_inventory.app_server_url.as_deref())?;
+        is_local_listen_url(url).then_some(url)
     } else {
         config.session_inventory.app_server_url.as_deref()
     }
@@ -95,7 +96,7 @@ mod tests {
             execution: Default::default(),
             session_inventory: Default::default(),
         };
-        config.session_inventory.app_server_url = Some("wss://external.example.test".to_owned());
+        config.session_inventory.app_server_url = Some("ws://127.0.0.1:6174".to_owned());
         config.session_inventory.managed_app_server.enabled = true;
         config.session_inventory.managed_app_server.listen_url =
             Some("unix:///tmp/managed.sock".to_owned());
@@ -108,8 +109,11 @@ mod tests {
         config.session_inventory.managed_app_server.listen_url = None;
         assert_eq!(
             app_server_health_target(&config),
-            Some("wss://external.example.test")
+            Some("ws://127.0.0.1:6174")
         );
+
+        config.session_inventory.app_server_url = Some("wss://external.example.test".to_owned());
+        assert_eq!(app_server_health_target(&config), None);
 
         config.session_inventory.managed_app_server.enabled = false;
         assert_eq!(
