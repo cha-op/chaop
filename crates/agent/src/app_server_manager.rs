@@ -31,6 +31,7 @@ pub struct AppServerManager {
     last_start_failure: Option<Instant>,
     last_external_probe: Option<Instant>,
     shutdown_requested: fn() -> bool,
+    terminate_child: fn(&mut Child) -> io::Result<()>,
     state: AppServerInstanceState,
     generation: u64,
     active_turn_count: u32,
@@ -57,6 +58,7 @@ impl AppServerManager {
             last_start_failure: None,
             last_external_probe: None,
             shutdown_requested,
+            terminate_child,
             state: AppServerInstanceState::Stopped,
             generation: 0,
             active_turn_count: 0,
@@ -115,7 +117,7 @@ impl AppServerManager {
                 "managed app-server preflight did not become healthy",
             ));
         }
-        manager.stop_child("managed app-server preflight passed");
+        manager.stop_child_checked("managed app-server preflight passed")?;
         Ok(())
     }
 
@@ -599,13 +601,17 @@ impl AppServerManager {
     }
 
     fn stop_child(&mut self, reason: &str) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        eprintln!("{reason}; stopping managed app-server");
-        if let Err(error) = terminate_child(&mut child) {
+        if let Err(error) = self.stop_child_checked(reason) {
             eprintln!("failed to stop managed app-server: {error}");
         }
+    }
+
+    fn stop_child_checked(&mut self, reason: &str) -> io::Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        eprintln!("{reason}; stopping managed app-server");
+        (self.terminate_child)(&mut child)
     }
 
     fn can_attempt_start(&self, config: &AgentConfig) -> bool {
@@ -736,7 +742,7 @@ impl AppServerPreflightEndpoint {
         #[cfg(unix)]
         if let Some(path) = strip_unix_scheme(configured_listen_url) {
             let configured_path = Path::new(path);
-            let parent = configured_path.parent().ok_or_else(|| {
+            configured_path.parent().ok_or_else(|| {
                 io::Error::new(
                     ErrorKind::InvalidInput,
                     "managed app-server Unix socket has no parent directory",
@@ -747,7 +753,7 @@ impl AppServerPreflightEndpoint {
                 .unwrap_or_default()
                 .subsec_nanos();
             let cleanup_dir =
-                parent.join(format!(".chaop-preflight-{}-{nonce:x}", std::process::id()));
+                Path::new("/tmp").join(format!("chaop-pf-{}-{nonce:x}", std::process::id()));
             std::fs::create_dir(&cleanup_dir)?;
             if let Err(error) =
                 std::fs::set_permissions(&cleanup_dir, std::fs::Permissions::from_mode(0o700))
@@ -1120,7 +1126,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn managed_app_server_preflight_uses_isolated_unix_socket() {
+    fn managed_app_server_preflight_uses_bounded_private_unix_socket() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let configured_path = tempdir.path().join("configured.sock");
         let configured_url = format!("unix://{}", configured_path.display());
@@ -1129,11 +1135,42 @@ mod tests {
         let cleanup_dir = endpoint.cleanup_dir.clone().expect("cleanup directory");
 
         assert_ne!(endpoint.listen_url, configured_url);
-        assert_eq!(cleanup_dir.parent(), configured_path.parent());
+        assert_eq!(cleanup_dir.parent(), Some(std::path::Path::new("/tmp")));
+        assert!(endpoint.listen_url.len() < 80);
         assert!(cleanup_dir.exists());
         assert!(!configured_path.exists());
         drop(endpoint);
         assert!(!cleanup_dir.exists());
+    }
+
+    #[test]
+    fn managed_app_server_stop_propagates_termination_failure() {
+        fn terminate_then_fail(child: &mut std::process::Child) -> std::io::Result<()> {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected termination failure",
+            ))
+        }
+
+        let config = config_with_managed(true);
+        let mut manager = AppServerManager::new(&config);
+        manager.terminate_child = terminate_then_fail;
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
+        manager.child = Some(command.spawn().expect("spawn child"));
+
+        let error = manager
+            .stop_child_checked("test termination failure")
+            .expect_err("termination failure must propagate");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "injected termination failure");
     }
 
     #[test]
