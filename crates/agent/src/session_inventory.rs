@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::{
     fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
@@ -1233,6 +1233,7 @@ type AppServerResolverFn =
 // Blocking system DNS calls cannot be cancelled portably. Replace a stalled
 // generation for recovery, but cap abandoned workers so retries stay bounded.
 const APP_SERVER_MAX_RETIRED_RESOLVER_WORKERS: usize = 2;
+const APP_SERVER_RESOLVER_QUEUE_CAPACITY: usize = 8;
 
 struct AppServerResolveRequest {
     host: String,
@@ -1278,8 +1279,9 @@ impl AppServerResolver {
         resolver: Arc<AppServerResolverFn>,
         generation: u64,
     ) -> std::io::Result<AppServerResolverWorker> {
-        let (request_sender, request_receiver) =
-            std::sync::mpsc::sync_channel::<AppServerResolveRequest>(1);
+        let (request_sender, request_receiver) = std::sync::mpsc::sync_channel::<
+            AppServerResolveRequest,
+        >(APP_SERVER_RESOLVER_QUEUE_CAPACITY);
         let handle = std::thread::Builder::new()
             .name(format!("chaop-app-server-resolver-{generation}"))
             .spawn(move || {
@@ -1441,6 +1443,9 @@ fn resolve_app_server_addresses(
     timeout: Duration,
     url: &str,
 ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(address, port)]);
+    }
     shared_app_server_resolver()?.resolve(host, port, timeout, url)
 }
 
@@ -4669,8 +4674,9 @@ mod tests {
         build_host_session_backfill, build_host_sessions_report, connect_app_server,
         create_app_server_thread_at, ensure_app_server_host_session_at,
         ensure_app_server_host_session_at_with_auth, load_app_server_sessions, read_recent_lines,
-        remaining_app_server_archive_timeout, resolve_session, rollout_paths,
-        set_app_server_thread_archived_at, set_app_server_thread_archived_at_with_rollout_lookup,
+        remaining_app_server_archive_timeout, resolve_app_server_addresses, resolve_session,
+        rollout_paths, set_app_server_thread_archived_at,
+        set_app_server_thread_archived_at_with_rollout_lookup,
         set_app_server_thread_archived_at_with_rollout_lookup_and_cwd, unix_seconds_to_iso,
     };
     use crate::config::{AgentConfig, BootstrapConfig, ExecutionConfig, SessionInventoryConfig};
@@ -4947,6 +4953,25 @@ mod tests {
             .expect("resolve address");
 
         assert_eq!(addresses, vec!["127.0.0.1:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn app_server_ip_literals_bypass_dns_resolution() {
+        assert_eq!(
+            resolve_app_server_addresses(
+                "127.0.0.1",
+                9876,
+                Duration::from_millis(1),
+                "ws://127.0.0.1:9876",
+            )
+            .expect("IPv4 address"),
+            vec!["127.0.0.1:9876".parse().unwrap()]
+        );
+        assert_eq!(
+            resolve_app_server_addresses("::1", 9876, Duration::from_millis(1), "ws://[::1]:9876",)
+                .expect("IPv6 address"),
+            vec!["[::1]:9876".parse().unwrap()]
+        );
     }
 
     #[test]
