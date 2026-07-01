@@ -1062,14 +1062,22 @@ fn connect_app_server(
     timeout: Duration,
     auth_token_file: Option<&Path>,
 ) -> Result<AppServerSocket, Box<dyn std::error::Error>> {
-    if let Some(path) = url.strip_prefix("unix://") {
+    if let Some(path) = strip_app_server_unix_scheme(url) {
         return connect_unix_app_server(Path::new(path), auth_token_file, timeout);
     }
     let uri = url.parse::<Uri>()?;
-    match uri.scheme_str() {
-        Some("ws" | "wss") => connect_tcp_app_server(url, auth_token_file, &uri, timeout),
-        _ => Err("app-server URL must use ws://, wss://, or unix://".into()),
+    if app_server_uri_scheme_is(&uri, "ws") || app_server_uri_scheme_is(&uri, "wss") {
+        connect_tcp_app_server(url, auth_token_file, &uri, timeout)
+    } else {
+        Err("app-server URL must use ws://, wss://, or unix://".into())
     }
+}
+
+fn strip_app_server_unix_scheme(url: &str) -> Option<&str> {
+    const PREFIX: &str = "unix://";
+    url.get(..PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+        .map(|_| &url[PREFIX.len()..])
 }
 
 fn app_server_client_request(
@@ -1095,7 +1103,12 @@ fn app_server_client_request(
 }
 
 fn app_server_auth_url_is_safe(uri: &Uri) -> bool {
-    uri.scheme_str() == Some("wss")
+    app_server_uri_scheme_is(uri, "wss")
+}
+
+fn app_server_uri_scheme_is(uri: &Uri, expected: &str) -> bool {
+    uri.scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(expected))
 }
 
 fn connect_tcp_app_server(
@@ -1109,13 +1122,8 @@ fn connect_tcp_app_server(
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or(host);
-    let port = uri
-        .port_u16()
-        .unwrap_or(if uri.scheme_str() == Some("wss") {
-            443
-        } else {
-            80
-        });
+    let uses_tls = app_server_uri_scheme_is(uri, "wss");
+    let port = uri.port_u16().unwrap_or(if uses_tls { 443 } else { 80 });
     let deadline = Instant::now() + timeout;
     let request = app_server_client_request(url, auth_token_file)?;
     let remaining = app_server_connection_time_remaining(deadline, url)?;
@@ -1135,7 +1143,7 @@ fn connect_tcp_app_server(
                 let remaining = app_server_connection_time_remaining(deadline, url)?;
                 stream.set_read_timeout(Some(remaining))?;
                 stream.set_write_timeout(Some(remaining))?;
-                let stream = if uri.scheme_str() == Some("wss") {
+                let stream = if uses_tls {
                     let connector = native_tls::TlsConnector::new()?;
                     let tls_stream = match connector.connect(host, stream) {
                         Ok(stream) => stream,
@@ -4743,6 +4751,25 @@ mod tests {
         let request =
             app_server_client_request("wss://app.example.test", Some(token_file.as_path()))
                 .expect("request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-capability-token")
+        );
+    }
+
+    #[test]
+    fn app_server_client_request_accepts_uppercase_wss_scheme() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let token_file = tempdir.path().join("app-server.token");
+        fs::write(&token_file, "test-capability-token\n").expect("write token");
+
+        let request =
+            app_server_client_request("WSS://app.example.test", Some(token_file.as_path()))
+                .expect("uppercase WSS request");
 
         assert_eq!(
             request

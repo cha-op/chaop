@@ -534,7 +534,7 @@ spool_db = "/Users/you/.chaop/connector-spool.sqlite"
 secret_file = "/Users/you/.chaop/bootstrap.secret"
 
 [session_inventory]
-app_server_url = "wss://app.example.com"
+app_server_url = "WSS://app.example.com"
 app_server_auth_token_file = "/Users/you/.chaop/app-server.token"
 "#,
         )
@@ -544,7 +544,7 @@ app_server_auth_token_file = "/Users/you/.chaop/app-server.token"
 
         assert_eq!(
             config.session_inventory.app_server_url.as_deref(),
-            Some("wss://app.example.com")
+            Some("WSS://app.example.com")
         );
         assert_eq!(
             config
