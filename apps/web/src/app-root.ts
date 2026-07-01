@@ -58,9 +58,9 @@ import {
   defaultCommandMode,
   dogfoodReadinessPreflight,
   historyBackfillNotice,
+  localThreadCreateWorkspaceId,
   localThreadConnectorId,
   localThreadConnectors,
-  localThreadWorkspaceId,
   MANAGED_APP_SERVER_UNAVAILABLE,
   managedAppServerCommandAvailable,
   mergeBootstrapPayload,
@@ -1344,9 +1344,8 @@ export class ChaopApp extends LitElement {
     selectedThreadId?: string,
     requestedWorkspaceId?: string
   ) {
-    const workspaceId = this.data?.workspaces.some((workspace) => workspace.id === requestedWorkspaceId)
-      ? requestedWorkspaceId
-      : localThreadWorkspaceId(this.data, selectedThreadId);
+    const workspaceId = localThreadCreateWorkspaceId(this.data, selectedThreadId, requestedWorkspaceId);
+    const requestedWorkspaceUnavailable = requestedWorkspaceId !== undefined && workspaceId === undefined;
     const connectors = localThreadConnectors(this.data, workspaceId);
     const selectedConnectorId = localThreadConnectorId(this.data, workspaceId, this.newThreadConnectorId) ?? "";
     const canCreate = Boolean(workspaceId && connectors.length > 0);
@@ -1383,7 +1382,9 @@ export class ChaopApp extends LitElement {
           ${this.newThreadState === "creating" ? "Creating..." : "New local thread"}
         </button>
         ${!canCreate
-          ? html`<p class="form-hint">${MANAGED_APP_SERVER_UNAVAILABLE}</p>`
+          ? html`<p class="form-hint">${requestedWorkspaceUnavailable
+              ? "The requested workspace is no longer available. Return to Budget Board and choose another target."
+              : MANAGED_APP_SERVER_UNAVAILABLE}</p>`
           : nothing}
       </form>
     `;

@@ -27,6 +27,7 @@ import {
   defaultCommandMode,
   dogfoodReadinessPreflight,
   historyBackfillNotice,
+  localThreadCreateWorkspaceId,
   localThreadConnectorId,
   localThreadConnectors,
   localThreadWorkspaceId,
@@ -615,7 +616,7 @@ test("dogfoodReadinessPreflight diagnoses an unavailable attached-thread owner",
     },
     {
       name: "offline",
-      workspaceConnectorIds: ["connector-a", "connector-b"],
+      workspaceConnectorIds: ["connector-b"],
       owner: connector("connector-a", ["codex_app_server_exec"], "offline"),
       detail: "The connector attached to the selected thread is offline."
     },
@@ -689,6 +690,34 @@ test("dogfoodReadinessPreflight sends a missing thread back to Thread Centre", (
   assert.equal(readiness.state, "blocked");
   assert.equal(readiness.next_action.href, "#thread-centre");
   assert.equal(readiness.next_action.detail, "Choose an available thread before evaluating app-server readiness.");
+});
+
+test("dogfoodReadinessPreflight blocks an archived selected thread until it is unarchived", () => {
+  const archivedThread = {
+    ...thread("thread-api", "workspace-api"),
+    state: "archived" as const
+  };
+  const data = payload({
+    workspaces: [workspace("workspace-api", ["connector-a"])],
+    threads: [archivedThread],
+    host_sessions: [
+      hostSession("session-api", {
+        connector_id: "connector-a",
+        workspace_id: "workspace-api",
+        attached_thread_id: "thread-api",
+        app_server_present: true
+      })
+    ],
+    connectors: [connector("connector-a", ["codex_app_server_exec"])],
+    app_server_instances: [appServerInstance("app-server-a", "healthy", "2026-06-12T10:01:00.000Z", "connector-a")]
+  });
+
+  const readiness = dogfoodReadinessPreflight(data, "thread-api");
+
+  assert.equal(readiness.state, "blocked");
+  assert.match(readiness.summary, /archived.*Unarchive/);
+  assert.equal(readiness.next_action.href, "#thread-centre?thread=thread-api");
+  assert.match(readiness.next_action.detail, /Unarchive/);
 });
 
 test("dogfoodReadinessPreflight requires a workspace-linked managed connector", () => {
@@ -975,6 +1004,17 @@ test("localThreadWorkspaceId falls back to the first workspace", () => {
   });
 
   assert.equal(localThreadWorkspaceId(data, "missing-thread"), "workspace-api");
+});
+
+test("localThreadCreateWorkspaceId rejects an unavailable explicit workspace", () => {
+  const data = payload({
+    workspaces: [workspace("workspace-api")],
+    threads: [thread("thread-api", "workspace-api")]
+  });
+
+  assert.equal(localThreadCreateWorkspaceId(data, undefined, "workspace-missing"), undefined);
+  assert.equal(localThreadCreateWorkspaceId(data, undefined, "workspace-api"), "workspace-api");
+  assert.equal(localThreadCreateWorkspaceId(data, "thread-api"), "workspace-api");
 });
 
 test("localThreadConnectors filters connectors by workspace", () => {

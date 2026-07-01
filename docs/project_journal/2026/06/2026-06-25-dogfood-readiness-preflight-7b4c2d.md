@@ -27,6 +27,8 @@ superseded_by:
 - The Thread Centre empty state now exposes the local app-server thread creation form, and local thread connector selection is aligned end-to-end: Web readiness, the create form, and Worker auto-selection all require create-and-exec capability on the same workspace connector.
 - Worker auto-selection prioritises connectors with a healthy idle connector- or workspace-scoped app-server instance before falling back to recency, so a different unhealthy connector cannot consume a workspace-level ready decision.
 - A ready workspace-level preflight opens an explicit new-thread mode bound to that workspace, while a ready attached-thread preflight carries the exact thread ID; Thread Centre therefore cannot silently choose an unchecked thread from another workspace.
+- If an explicitly requested workspace disappears before Thread Centre loads, local thread creation stays disabled instead of falling back to another workspace. Attached-thread diagnostics also report an offline owning connector before considering a workspace association that the bootstrap payload may already have removed.
+- Archived threads remain blocked until they are unarchived, and the Worker connector-priority test now executes the real query against SQLite with newer busy and wrong-workspace candidates instead of only matching SQL text.
 
 ## Scope
 - Add a tested Web state helper that returns a compact `ready`, `attention`, or `blocked` preflight decision.
@@ -40,7 +42,8 @@ superseded_by:
 - Missing live or persisted budget samples are intentionally shown as requiring attention, so first-run operators must bootstrap or inspect Budget Board before relying on readiness.
 
 ## Validation Evidence
-- `pnpm --filter @chaop/web test` passed with 78 tests covering exact matching for thread-scoped app-server instances, missing sampled budgets, mixed busy/idle app-server instances, selected existing attached app-server threads, attachment-owner isolation and diagnostics across multiple connectors, explicit Budget Board URL targets, and blocking or recovery navigation for selected unattached or missing threads.
-- `pnpm test` passed after merging the latest `master`: 48 script, 3 protocol, 78 Web, 294 Worker, and 203 Rust tests.
+- `pnpm --filter @chaop/web test` passed with 80 tests covering exact matching for thread-scoped app-server instances, missing sampled budgets, mixed busy/idle app-server instances, selected existing attached app-server threads, attachment-owner isolation and diagnostics across multiple connectors, explicit Budget Board URL targets, rejection of unavailable explicit workspaces, archived-thread blocking, and blocking or recovery navigation for selected unattached or missing threads.
+- `pnpm test` passed after merging the latest `master`: 48 script, 3 protocol, 80 Web, 294 Worker, and 203 Rust tests.
 - `pnpm build` passed.
 - Local Playwright visual smoke passed for desktop, narrow desktop, breakpoint-edge, and mobile Budget Board rendering, with no horizontal overflow.
+- Local Playwright navigation smoke confirmed that an unavailable explicit workspace leaves the hidden workspace target empty, disables local thread creation, and shows a recovery message instead of falling back.

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import test from "node:test";
 import {
   CommandTargetError,
@@ -2330,12 +2331,12 @@ test("listThreadEventsInDb returns a thread tail by seq independent of global ev
 
 test("chooseConnectorForLocalThread prioritises healthy idle app-server connectors", async () => {
   const connectorId = await chooseConnectorForLocalThread(
-    { DB: localThreadConnectorDb({ id: "connector-online" }) } as Env,
+    { DB: localThreadConnectorPriorityDb() } as Env,
     { id: "user-1", email: "operator@example.com", name: "Operator" },
     { workspace_id: "workspace-api" }
   );
 
-  assert.equal(connectorId, "connector-online");
+  assert.equal(connectorId, "connector-healthy-idle");
 });
 
 test("chooseConnectorForLocalThread rejects connectors without app-server support", async () => {
@@ -5247,6 +5248,80 @@ function localThreadConnectorDb(row: { id: string } | null): D1Database {
       }
 
       throw new Error(`Unexpected SQL in test fake: ${sql}`);
+    }
+  } as unknown as D1Database;
+}
+
+function localThreadConnectorPriorityDb(): D1Database {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`
+    CREATE TABLE users (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE workspaces (id TEXT PRIMARY KEY);
+    CREATE TABLE connectors (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      capabilities_json TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE workspace_connectors (
+      workspace_id TEXT NOT NULL,
+      connector_id TEXT NOT NULL,
+      can_execute INTEGER NOT NULL
+    );
+    CREATE TABLE app_server_instances (
+      connector_id TEXT NOT NULL,
+      state TEXT NOT NULL,
+      active_turn_count INTEGER NOT NULL,
+      scope TEXT NOT NULL,
+      workspace_id TEXT
+    );
+
+    INSERT INTO workspaces (id) VALUES ('workspace-api'), ('workspace-other');
+    INSERT INTO connectors (id, status, capabilities_json, last_seen_at, updated_at) VALUES
+      ('connector-healthy-idle', 'online', '["app_server_threads","codex_app_server_exec"]', '2026-06-12T10:00:00.000Z', '2026-06-12T10:00:00.000Z'),
+      ('connector-newer-busy', 'online', '["app_server_threads","codex_app_server_exec"]', '2026-06-12T12:00:00.000Z', '2026-06-12T12:00:00.000Z'),
+      ('connector-other-workspace', 'online', '["app_server_threads","codex_app_server_exec"]', '2026-06-12T13:00:00.000Z', '2026-06-12T13:00:00.000Z');
+    INSERT INTO workspace_connectors (workspace_id, connector_id, can_execute) VALUES
+      ('workspace-api', 'connector-healthy-idle', 1),
+      ('workspace-api', 'connector-newer-busy', 1),
+      ('workspace-api', 'connector-other-workspace', 1);
+    INSERT INTO app_server_instances (connector_id, state, active_turn_count, scope, workspace_id) VALUES
+      ('connector-healthy-idle', 'healthy', 0, 'workspace', 'workspace-api'),
+      ('connector-newer-busy', 'healthy', 1, 'workspace', 'workspace-api'),
+      ('connector-other-workspace', 'healthy', 0, 'workspace', 'workspace-other');
+  `);
+  return sqliteD1Database(sqlite);
+}
+
+function sqliteD1Database(sqlite: DatabaseSync): D1Database {
+  return {
+    prepare(sql: string) {
+      const statement = sqlite.prepare(sql);
+      let bound: SQLInputValue[] = [];
+      const prepared = {
+        bind(...values: SQLInputValue[]) {
+          bound = values;
+          return prepared;
+        },
+        async first<T>() {
+          return (statement.get(...bound) as T | undefined) ?? null;
+        },
+        async run() {
+          const result = statement.run(...bound);
+          return {
+            success: true,
+            meta: { changes: Number(result.changes) }
+          };
+        }
+      };
+      return prepared;
     }
   } as unknown as D1Database;
 }

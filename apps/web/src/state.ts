@@ -78,6 +78,7 @@ type ReadinessConnectorScope = {
 type ReadinessTarget =
   | { kind: "workspace"; workspaceId: string | undefined }
   | { kind: "missing_thread"; threadId: string }
+  | { kind: "archived_thread"; threadId: string; workspaceId: string }
   | { kind: "unavailable_attachment"; threadId: string; workspaceId: string }
   | { kind: "attached_thread"; threadId: string; workspaceId: string; connectorId: string };
 
@@ -718,6 +719,19 @@ export function localThreadWorkspaceId(
   return selectedThread?.workspace_id ?? data.workspaces[0]?.id;
 }
 
+export function localThreadCreateWorkspaceId(
+  data: BootstrapPayload | undefined,
+  selectedThreadId?: string,
+  requestedWorkspaceId?: string
+): string | undefined {
+  if (requestedWorkspaceId !== undefined) {
+    return data?.workspaces.some((workspace) => workspace.id === requestedWorkspaceId)
+      ? requestedWorkspaceId
+      : undefined;
+  }
+  return localThreadWorkspaceId(data, selectedThreadId);
+}
+
 export function localThreadConnectors(
   data: BootstrapPayload | undefined,
   workspaceId: string | undefined
@@ -886,6 +900,14 @@ function readinessConnectorCheck(
       detail: "The selected thread is no longer available."
     };
   }
+  if (target.kind === "archived_thread") {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "The selected thread is archived. Unarchive it before running another turn."
+    };
+  }
   if (target.kind === "unavailable_attachment") {
     return {
       id: "connector",
@@ -921,20 +943,20 @@ function readinessConnectorCheck(
         detail: "The connector attached to the selected thread is no longer reported."
       };
     }
-    if (owner.workspaceIds.size === 0) {
-      return {
-        id: "connector",
-        label: "Connector",
-        state: "blocked",
-        detail: `The connector attached to the selected thread is no longer linked to ${workspaceLabel}.`
-      };
-    }
     if (owner.connector.status !== "online") {
       return {
         id: "connector",
         label: "Connector",
         state: "blocked",
         detail: `The connector attached to the selected thread is ${owner.connector.status}.`
+      };
+    }
+    if (owner.workspaceIds.size === 0) {
+      return {
+        id: "connector",
+        label: "Connector",
+        state: "blocked",
+        detail: `The connector attached to the selected thread is no longer linked to ${workspaceLabel}.`
       };
     }
     return {
@@ -990,6 +1012,14 @@ function readinessAppServerCheck(
       label: "App-server",
       state: "blocked",
       detail: "No app-server can target a thread that is no longer available."
+    };
+  }
+  if (target.kind === "archived_thread") {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "blocked",
+      detail: "Unarchive the selected thread before evaluating its app-server target."
     };
   }
   if (target.kind === "unavailable_attachment") {
@@ -1070,7 +1100,11 @@ function readinessEligibleConnectorScopes(
   data: BootstrapPayload | undefined,
   target: ReadinessTarget
 ): ReadinessConnectorScope[] {
-  if (target.kind === "missing_thread" || target.kind === "unavailable_attachment") return [];
+  if (
+    target.kind === "missing_thread" ||
+    target.kind === "archived_thread" ||
+    target.kind === "unavailable_attachment"
+  ) return [];
   return readinessConnectorScopes(data, target.workspaceId).filter((scope) => {
     if (
       scope.workspaceIds.size === 0 ||
@@ -1096,6 +1130,13 @@ function readinessTarget(
   const thread = data?.threads.find((item) => item.id === selectedThreadId);
   if (!thread) {
     return { kind: "missing_thread", threadId: selectedThreadId };
+  }
+  if (thread.state === "archived") {
+    return {
+      kind: "archived_thread",
+      threadId: selectedThreadId,
+      workspaceId: thread.workspace_id
+    };
   }
   const session = attachedAppServerHostSession(data, selectedThreadId);
   if (!session) {
@@ -1162,6 +1203,13 @@ function readinessNextAction(
       label: "Open Thread Centre",
       href: "#thread-centre",
       detail: "Choose an available thread before evaluating app-server readiness."
+    };
+  }
+  if (target.kind === "archived_thread") {
+    return {
+      label: "Open Thread Centre",
+      href: threadCentreThreadHash(target.threadId),
+      detail: "Unarchive the selected thread before evaluating app-server readiness again."
     };
   }
   const budgetHref = budgetBoardHash(target.kind === "workspace" ? undefined : target.threadId);
