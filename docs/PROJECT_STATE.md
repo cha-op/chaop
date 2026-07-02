@@ -23,6 +23,7 @@
 - Deployed E2E smoke now has a documented Access-cookie browser path and a repo-local skill for repeatable low-cost API, Web, browser, and Budget Board validation.
 - Deployed E2E smoke now also has a tracked low-cost runner, `scripts/deployed-smoke.mjs`, with Budget Board gates for Cloudflare telemetry, sampled hard constraints, measured D1 rows-written activity, hard-limit/throttled posture, and high usage thresholds.
 - The dogfood usability roadmap through PR E is complete. The next daily dogfood readiness roadmap keeps cost safety first, then focuses on connector/app-server preflight, opt-in managed-thread E2E, and Thread Centre daily conversation polish.
+- Budget Board now includes a passive dogfood readiness preflight derived from existing bootstrap state, covering cost posture, connector capability, target-workspace app-server availability, and the next safe action without broad inventory refresh.
 - Local D1 rows-written guardrails now use the larger of Cloudflare telemetry and the local conservative estimate, with no-telemetry fallback budgeted at 26 rows per event.
 - Completed workstream state lives in `docs/project_journal/2026/06/2026-06-14-app-server-lifecycle-roadmap-9c3b2d.md`.
 
@@ -45,6 +46,7 @@
 - Dogfood E2E cost gates journal: `docs/project_journal/2026/06/2026-06-25-dogfood-e2e-cost-gates-5e8a12.md`
 - Dogfood usability roadmap: `docs/project_journal/2026/06/2026-06-23-dogfood-usability-roadmap-3f8a91.md`
 - Daily dogfood readiness roadmap: `docs/project_journal/2026/06/2026-06-25-dogfood-readiness-roadmap-2d6f8b.md`
+- Dogfood readiness preflight journal: `docs/project_journal/2026/06/2026-06-25-dogfood-readiness-preflight-7b4c2d.md`
 - Conservative D1 write guardrail: `docs/project_journal/2026/06/2026-06-23-conservative-d1-write-guardrail-6a4b8d.md`
 - Local journal index: optional generated `docs/project_journal/INDEX.md`; do not commit it.
 

@@ -25,6 +25,10 @@ superseded_by:
 - PR H，Opt-In Managed Thread E2E：为 managed app-server conversation path 增加显式 operator-triggered smoke：先跑 budget gate，创建或选择一个小的 test thread，提交一条有边界的 prompt，观察 assistant final answer，并 cleanup 或 archive。
 - PR I，Thread Centre Daily Polish：围绕一个重点收紧默认对话界面：current turn status、final answer、pending input/approval，以及可行动的 error messages。避免新增高频 polling。
 
+## 已完成切片
+- PR F 已收尾完成的 dogfood usability roadmap，并记录这一阶段计划。
+- PR G 增加 [Connector 和 Budget 预检](2026-06-25-dogfood-readiness-preflight-7b4c2d.zh-Hans.md) 中描述的被动 connector 和 Budget Board preflight。
+
 ## 成本规则
 - Passive readiness checks 可以读取 budget、connector 和 app-server state，但除非用户显式 opt in，否则不能刷新 broad Host Session inventory。
 - Write-path smoke 必须显式、有边界，并且在运行前后都受 Budget Board posture 保护。
@@ -32,7 +36,7 @@ superseded_by:
 - R2 继续延后，直到 artefact retention、budget alerts 和产品价值都明确。
 
 ## 下一步
-- 下一片实现 PR G。
+- 下一片实现 PR H。
 - PR H 继续放在显式 operator flag 后面，因为它会有意触发真实 app-server turn。
 - 任何 API、Web、Access、connector、app-server 或 cost-posture 变更后，都继续运行已跟踪的 deployed smoke。
 

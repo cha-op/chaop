@@ -48,6 +48,7 @@ import {
   appServerInstancesForDisplay,
   archiveSyncNotice,
   archiveSyncWarning,
+  budgetBoardHash,
   budgetPctLabel,
   budgetSourceLabel,
   codexCliFallbackAvailable,
@@ -55,10 +56,11 @@ import {
   commandModeLabel,
   commandTypeForMode,
   defaultCommandMode,
+  dogfoodReadinessPreflight,
   historyBackfillNotice,
+  localThreadCreateWorkspaceId,
   localThreadConnectorId,
   localThreadConnectors,
-  localThreadWorkspaceId,
   MANAGED_APP_SERVER_UNAVAILABLE,
   managedAppServerCommandAvailable,
   mergeBootstrapPayload,
@@ -68,14 +70,18 @@ import {
   normaliseCommandMode,
   safetyActionBlocked,
   safetyActionReason,
+  threadCentreCreateRequestedFromHashValue,
+  threadIdFromHashValue,
   threadTurnsForDisplay,
   TURN_INTERACTION_OTHER_SELECT_VALUE,
   turnInteractionAnswerForSelectValue,
   turnInteractionOptionSelectValue,
   turnInteractionQuestionSelectValue,
+  workspaceIdFromHashValue,
   type CommandExecutionMode,
   type PendingTurnInteraction,
   type PendingTurnInteractionQuestion,
+  type ReadinessPreflight,
   type ThreadTurnSummary
 } from "./state.js";
 
@@ -279,12 +285,17 @@ export class ChaopApp extends LitElement {
     }
     this.view = nextView;
     const nextThreadId = threadIdFromHash();
-    const threadChanged = nextThreadId !== this.selectedThreadId;
-    if (threadChanged) {
+    const createThreadRequested = nextView === "thread-centre"
+      && threadCentreCreateRequestedFromHashValue(window.location.hash);
+    if (createThreadRequested && this.selectedThreadId !== undefined) {
       this.commandModeExplicit = false;
       this.resetThreadCommandState();
+      this.selectedThreadId = undefined;
+    } else if (nextThreadId !== undefined && nextThreadId !== this.selectedThreadId) {
+      this.commandModeExplicit = false;
+      this.resetThreadCommandState();
+      this.selectedThreadId = nextThreadId;
     }
-    this.selectedThreadId = nextThreadId;
     this.ensureSelectedThread();
     void this.loadSelectedThreadEvents().catch((error) => {
       this.actionError = actionErrorMessage("Thread events refresh failed", error);
@@ -292,8 +303,9 @@ export class ChaopApp extends LitElement {
   };
 
   private navItem(view: View, label: string) {
+    const href = view === "budget-board" ? budgetBoardHash(this.selectedThreadId) : `#${view}`;
     return html`
-      <a class=${this.view === view ? "active" : ""} href=${`#${view}`}>${label}</a>
+      <a class=${this.view === view ? "active" : ""} href=${href}>${label}</a>
     `;
   }
 
@@ -950,7 +962,12 @@ export class ChaopApp extends LitElement {
             <h2>No thread selected</h2>
             <span class="chip ${this.realtimeState}">${realtimeLabel(this.realtimeState)}</span>
           </div>
-          <p>Waiting for connector activity.</p>
+          <p>Create a local app-server thread or choose an existing task from the Task Board.</p>
+          ${this.renderCreateThreadForm(
+            "stacked",
+            undefined,
+            workspaceIdFromHashValue(window.location.hash)
+          )}
         </section>
         <aside class="panel">
           <div class="section-heading">
@@ -1136,7 +1153,9 @@ export class ChaopApp extends LitElement {
     const generatedAt = budget.generated_at ?? this.data!.server_time;
     const windowSampleCount = budget.window_sample_count ?? windows.length;
     const constraintSampleCount = budget.constraint_sample_count ?? constraints.filter((constraint) => constraint.sampled).length;
+    const readiness = dogfoodReadinessPreflight(this.data, threadIdFromHash());
     return html`
+      ${this.renderDogfoodReadiness(readiness)}
       <section class="page-grid budget-grid">
         <section class="panel primary">
           <div class="section-heading">
@@ -1248,6 +1267,37 @@ export class ChaopApp extends LitElement {
     `;
   }
 
+  private renderDogfoodReadiness(readiness: ReadinessPreflight) {
+    return html`
+      <section class=${`readiness-panel ${readiness.state}`} aria-label="Dogfood readiness">
+        <div class="readiness-summary">
+          <div>
+            <span>Dogfood readiness</span>
+            <strong>${readiness.title}</strong>
+          </div>
+          <p>${readiness.summary}</p>
+        </div>
+        <div class="readiness-checks">
+          ${readiness.checks.map(
+            (check) => html`
+              <article class=${check.state}>
+                <span class=${`chip ${check.state === "ready" ? "normal" : check.state === "attention" ? "conservative" : "hard_limited"}`}>
+                  ${check.state}
+                </span>
+                <strong>${check.label}</strong>
+                <small>${check.detail}</small>
+              </article>
+            `
+          )}
+        </div>
+        <div class="readiness-action">
+          <a class="primary-action" href=${readiness.next_action.href}>${readiness.next_action.label}</a>
+          <span>${readiness.next_action.detail}</span>
+        </div>
+      </section>
+    `;
+  }
+
   private readonly submitCommand = async (): Promise<void> => {
     const thread = this.selectedThread();
     if (!thread) {
@@ -1289,8 +1339,13 @@ export class ChaopApp extends LitElement {
     }
   };
 
-  private renderCreateThreadForm(layout: "compact" | "stacked", selectedThreadId?: string) {
-    const workspaceId = localThreadWorkspaceId(this.data, selectedThreadId);
+  private renderCreateThreadForm(
+    layout: "compact" | "stacked",
+    selectedThreadId?: string,
+    requestedWorkspaceId?: string
+  ) {
+    const workspaceId = localThreadCreateWorkspaceId(this.data, selectedThreadId, requestedWorkspaceId);
+    const requestedWorkspaceUnavailable = requestedWorkspaceId !== undefined && workspaceId === undefined;
     const connectors = localThreadConnectors(this.data, workspaceId);
     const selectedConnectorId = localThreadConnectorId(this.data, workspaceId, this.newThreadConnectorId) ?? "";
     const canCreate = Boolean(workspaceId && connectors.length > 0);
@@ -1327,7 +1382,9 @@ export class ChaopApp extends LitElement {
           ${this.newThreadState === "creating" ? "Creating..." : "New local thread"}
         </button>
         ${!canCreate
-          ? html`<p class="form-hint">${MANAGED_APP_SERVER_UNAVAILABLE}</p>`
+          ? html`<p class="form-hint">${requestedWorkspaceUnavailable
+              ? "The requested workspace is no longer available. Return to Budget Board and choose another target."
+              : MANAGED_APP_SERVER_UNAVAILABLE}</p>`
           : nothing}
       </form>
     `;
@@ -1345,7 +1402,7 @@ export class ChaopApp extends LitElement {
     }
     if (localThreadConnectors(this.data, workspaceId).length === 0) {
       this.newThreadState = "failed";
-      this.actionError = `${MANAGED_APP_SERVER_UNAVAILABLE} Local thread creation requires app-server thread capability.`;
+      this.actionError = MANAGED_APP_SERVER_UNAVAILABLE;
       return;
     }
     if (!this.guardSafetyAction("local_thread_create")) {
@@ -1724,11 +1781,24 @@ export class ChaopApp extends LitElement {
 
   private selectedThread(): ThreadSummary | undefined {
     if (!this.data) return undefined;
+    if (
+      this.view === "thread-centre"
+      && threadCentreCreateRequestedFromHashValue(window.location.hash)
+    ) {
+      return undefined;
+    }
     return this.data.threads.find((thread) => thread.id === this.selectedThreadId) ?? this.activeThreads()[0] ?? this.data.threads[0];
   }
 
   private ensureSelectedThread(): void {
     if (!this.data || this.view !== "thread-centre") return;
+    if (threadCentreCreateRequestedFromHashValue(window.location.hash)) {
+      if (this.selectedThreadId !== undefined) {
+        this.selectedThreadId = undefined;
+        this.resetThreadCommandState();
+      }
+      return;
+    }
     const previousThreadId = this.selectedThreadId;
     const selected = this.selectedThread();
     this.selectedThreadId = selected?.id;
@@ -2077,9 +2147,7 @@ function viewFromHash(): View {
 }
 
 function threadIdFromHash(): string | undefined {
-  const query = window.location.hash.split("?")[1];
-  if (!query) return undefined;
-  return new URLSearchParams(query).get("thread") ?? undefined;
+  return threadIdFromHashValue(window.location.hash);
 }
 
 function hashPath(): string {

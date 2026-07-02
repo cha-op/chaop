@@ -1,6 +1,7 @@
 import type {
   AppServerInstanceSummary,
   BootstrapPayload,
+  BudgetConstraint,
   BudgetSummary,
   CommandSummary,
   CreateCommandRequest,
@@ -43,10 +44,85 @@ export type PendingTurnInteraction = {
 
 export type PendingTurnInteractionQuestion = NonNullable<TurnInteractionRequestPayload["questions"]>[number];
 
-export const MANAGED_APP_SERVER_UNAVAILABLE = "No managed app-server connector is online.";
+export type ReadinessPreflightState = "ready" | "attention" | "blocked";
+
+export type ReadinessPreflightCheck = {
+  id: "cost" | "connector" | "app_server" | "inventory";
+  label: string;
+  state: ReadinessPreflightState;
+  detail: string;
+};
+
+export type ReadinessPreflight = {
+  state: ReadinessPreflightState;
+  title: string;
+  summary: string;
+  next_action: {
+    label: string;
+    href:
+      | "#budget-board"
+      | `#budget-board?thread=${string}`
+      | "#host-sessions"
+      | "#thread-centre"
+      | `#thread-centre?${string}`;
+    detail: string;
+  };
+  checks: ReadinessPreflightCheck[];
+};
+
+type ReadinessConnectorScope = {
+  connector: ConnectorSummary;
+  workspaceIds: Set<string>;
+};
+
+type ReadinessTarget =
+  | { kind: "workspace"; workspaceId: string | undefined }
+  | { kind: "missing_thread"; threadId: string }
+  | { kind: "archived_thread"; threadId: string; workspaceId: string }
+  | { kind: "unavailable_attachment"; threadId: string; workspaceId: string }
+  | { kind: "attached_thread"; threadId: string; workspaceId: string; connectorId: string };
+
+export const MANAGED_APP_SERVER_UNAVAILABLE =
+  "No online connector can both create and run managed app-server threads.";
 export const TURN_INTERACTION_OTHER_SELECT_VALUE = "other";
 
 const TURN_INTERACTION_OPTION_SELECT_PREFIX = "option:";
+
+export function budgetBoardHash(
+  threadId: string | undefined
+): "#budget-board" | `#budget-board?thread=${string}` {
+  return threadId ? `#budget-board?thread=${encodeURIComponent(threadId)}` : "#budget-board";
+}
+
+export function threadIdFromHashValue(hash: string): string | undefined {
+  return hashSearchParams(hash)?.get("thread") || undefined;
+}
+
+export function threadCentreCreateHash(
+  workspaceId: string | undefined
+): "#thread-centre?new=1" | `#thread-centre?new=1&workspace=${string}` {
+  return workspaceId
+    ? `#thread-centre?new=1&workspace=${encodeURIComponent(workspaceId)}`
+    : "#thread-centre?new=1";
+}
+
+export function threadCentreThreadHash(threadId: string): `#thread-centre?thread=${string}` {
+  return `#thread-centre?thread=${encodeURIComponent(threadId)}`;
+}
+
+export function threadCentreCreateRequestedFromHashValue(hash: string): boolean {
+  return hashSearchParams(hash)?.get("new") === "1";
+}
+
+export function workspaceIdFromHashValue(hash: string): string | undefined {
+  const params = hashSearchParams(hash);
+  return params?.has("workspace") ? params.get("workspace") ?? "" : undefined;
+}
+
+function hashSearchParams(hash: string): URLSearchParams | undefined {
+  const query = hash.split("?")[1];
+  return query ? new URLSearchParams(query) : undefined;
+}
 
 export function turnInteractionOptionSelectValue(index: number): string {
   return `${TURN_INTERACTION_OPTION_SELECT_PREFIX}${index}`;
@@ -644,6 +720,19 @@ export function localThreadWorkspaceId(
   return selectedThread?.workspace_id ?? data.workspaces[0]?.id;
 }
 
+export function localThreadCreateWorkspaceId(
+  data: BootstrapPayload | undefined,
+  selectedThreadId?: string,
+  requestedWorkspaceId?: string
+): string | undefined {
+  if (requestedWorkspaceId !== undefined) {
+    return data?.workspaces.some((workspace) => workspace.id === requestedWorkspaceId)
+      ? requestedWorkspaceId
+      : undefined;
+  }
+  return localThreadWorkspaceId(data, selectedThreadId);
+}
+
 export function localThreadConnectors(
   data: BootstrapPayload | undefined,
   workspaceId: string | undefined
@@ -656,7 +745,8 @@ export function localThreadConnectors(
     (connector) =>
       connectorIds.has(connector.id) &&
       connector.status === "online" &&
-      connector.capabilities.includes("app_server_threads")
+      connector.capabilities.includes("app_server_threads") &&
+      connector.capabilities.includes("codex_app_server_exec")
   );
 }
 
@@ -705,6 +795,493 @@ export function managedAppServerCommandAvailable(
   if (!data || !session) return false;
   const connector = data.connectors.find((item) => item.id === session.connector_id);
   return Boolean(connector && connectorCanRunManagedAppServer(connector));
+}
+
+export function dogfoodReadinessPreflight(
+  data: BootstrapPayload | undefined,
+  selectedThreadId?: string
+): ReadinessPreflight {
+  const target = readinessTarget(data, selectedThreadId);
+  const checks = [
+    readinessCostCheck(data),
+    readinessConnectorCheck(data, target),
+    readinessAppServerCheck(data, target),
+    readinessInventoryCheck(data)
+  ];
+  const state = checks.some((check) => check.state === "blocked")
+    ? "blocked"
+    : checks.some((check) => check.state === "attention")
+      ? "attention"
+      : "ready";
+  const nextAction = readinessNextAction(state, checks, target);
+  return {
+    state,
+    title: readinessTitle(state),
+    summary: readinessSummary(state, checks),
+    next_action: nextAction,
+    checks
+  };
+}
+
+function readinessCostCheck(data: BootstrapPayload | undefined): ReadinessPreflightCheck {
+  if (!data) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "blocked",
+      detail: "Bootstrap data has not loaded yet."
+    };
+  }
+
+  const safety = data.safety;
+  const blockedReason =
+    safetyActionReason(data, "command_create") ??
+    safetyActionReason(data, "local_thread_create") ??
+    safetyActionReason(data, "host_session_attach");
+  if (safety.paused) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "blocked",
+      detail: safety.paused_reason ?? safety.summary
+    };
+  }
+  if (
+    safety.state === "hard_limited" ||
+    safety.state === "throttled" ||
+    data.budget.state === "hard_limited" ||
+    data.budget.state === "throttled" ||
+    blockedReason
+  ) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "blocked",
+      detail: blockedReason ?? safety.summary
+    };
+  }
+  if (
+    safety.state === "conservative" ||
+    safety.state === "recovery" ||
+    data.budget.state === "conservative" ||
+    data.budget.state === "recovery"
+  ) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "attention",
+      detail: safety.summary
+    };
+  }
+  if (!budgetHasSampledHardConstraint(data.budget)) {
+    return {
+      id: "cost",
+      label: "Cost posture",
+      state: "attention",
+      detail: "No sampled hard budget constraint is available yet."
+    };
+  }
+  return {
+    id: "cost",
+    label: "Cost posture",
+    state: "ready",
+    detail: safety.summary
+  };
+}
+
+function readinessConnectorCheck(
+  data: BootstrapPayload | undefined,
+  target: ReadinessTarget
+): ReadinessPreflightCheck {
+  if (target.kind === "missing_thread") {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "The selected thread is no longer available."
+    };
+  }
+  if (target.kind === "archived_thread") {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "The selected thread is archived. Unarchive it before running another turn."
+    };
+  }
+  if (target.kind === "unavailable_attachment") {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "No active app-server Host Session is visible for the selected thread."
+    };
+  }
+  const workspaceId = target.workspaceId;
+  const online = readinessConnectorScopes(data, workspaceId).filter((scope) => scope.connector.status === "online");
+  const workspaceLinked = online.filter((scope) => scope.workspaceIds.size > 0);
+  const full = readinessEligibleConnectorScopes(data, target);
+  const workspaceLabel = readinessWorkspaceLabel(data, workspaceId);
+  if (full.length > 0) {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "ready",
+      detail: target.kind === "attached_thread"
+        ? `${full.length} workspace connector${full.length === 1 ? "" : "s"} can run the selected app-server thread for ${workspaceLabel}.`
+        : `${full.length} workspace connector${full.length === 1 ? "" : "s"} can create and run app-server threads for ${workspaceLabel}.`
+    };
+  }
+  if (target.kind === "attached_thread") {
+    const owner = readinessConnectorScopes(data, workspaceId).find(
+      (scope) => scope.connector.id === target.connectorId
+    );
+    if (!owner) {
+      return {
+        id: "connector",
+        label: "Connector",
+        state: "blocked",
+        detail: "The connector attached to the selected thread is no longer reported."
+      };
+    }
+    if (owner.connector.status !== "online") {
+      return {
+        id: "connector",
+        label: "Connector",
+        state: "blocked",
+        detail: `The connector attached to the selected thread is ${owner.connector.status}.`
+      };
+    }
+    if (owner.workspaceIds.size === 0) {
+      return {
+        id: "connector",
+        label: "Connector",
+        state: "blocked",
+        detail: `The connector attached to the selected thread is no longer linked to ${workspaceLabel}.`
+      };
+    }
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "The connector attached to the selected thread does not report app-server execution capability."
+    };
+  }
+  if (online.length === 0) {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: "No online connector is reporting managed app-server capabilities."
+    };
+  }
+  if (workspaceLinked.length === 0) {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: `No online connector is linked to ${workspaceLabel} for app-server dogfood.`
+    };
+  }
+  const canCreate = workspaceLinked.some((scope) => scope.connector.capabilities.includes("app_server_threads"));
+  const canRun = workspaceLinked.some((scope) => scope.connector.capabilities.includes("codex_app_server_exec"));
+  if (!canCreate && !canRun) {
+    return {
+      id: "connector",
+      label: "Connector",
+      state: "blocked",
+      detail: `${workspaceLinked.length} workspace connector${workspaceLinked.length === 1 ? "" : "s"} online for ${workspaceLabel}, but none reports app-server capabilities.`
+    };
+  }
+  return {
+    id: "connector",
+    label: "Connector",
+    state: "attention",
+    detail: canCreate
+      ? `An online connector for ${workspaceLabel} can create app-server threads, but execution capability is not reported on the same connector.`
+      : `An online connector for ${workspaceLabel} can run app-server turns, but local thread creation is not reported on the same connector.`
+  };
+}
+
+function readinessAppServerCheck(
+  data: BootstrapPayload | undefined,
+  target: ReadinessTarget
+): ReadinessPreflightCheck {
+  if (target.kind === "missing_thread") {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "blocked",
+      detail: "No app-server can target a thread that is no longer available."
+    };
+  }
+  if (target.kind === "archived_thread") {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "blocked",
+      detail: "Unarchive the selected thread before evaluating its app-server target."
+    };
+  }
+  if (target.kind === "unavailable_attachment") {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "blocked",
+      detail: "Refresh Host Sessions or attach an app-server session before running the selected thread."
+    };
+  }
+  const workspaceId = target.workspaceId;
+  const selectedThreadId = target.kind === "attached_thread" ? target.threadId : undefined;
+  const eligibleConnectorScopes = readinessEligibleConnectorScopes(data, target);
+  const instances = (data?.app_server_instances ?? []).filter((instance) =>
+    readinessInstanceMatchesEligibleConnector(data, instance, eligibleConnectorScopes, selectedThreadId)
+  );
+  const healthy = instances.filter((instance) => instance.state === "healthy");
+  const idle = healthy.filter((instance) => instance.active_turn_count === 0);
+  const activeTurns = healthy.reduce((total, instance) => total + instance.active_turn_count, 0);
+  if (idle.length > 0) {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "ready",
+      detail: `${idle.length} healthy app-server instance${idle.length === 1 ? "" : "s"} idle.`
+    };
+  }
+  if (healthy.length > 0) {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "attention",
+      detail: `${healthy.length} healthy app-server instance${healthy.length === 1 ? "" : "s"} with ${activeTurns} active turn${activeTurns === 1 ? "" : "s"}.`
+    };
+  }
+  const edge = instances
+    .filter((instance) => instance.state !== "stopped")
+    .sort(compareAppServerInstancesForDisplay)[0];
+  if (edge) {
+    return {
+      id: "app_server",
+      label: "App-server",
+      state: "blocked",
+      detail: edge.last_error ?? edge.status_summary ?? `App-server is ${edge.state}.`
+    };
+  }
+  return {
+    id: "app_server",
+    label: "App-server",
+    state: "blocked",
+    detail: `No healthy app-server instance is reported by a connector linked to ${readinessWorkspaceLabel(data, workspaceId)}.`
+  };
+}
+
+function readinessConnectorScopes(
+  data: BootstrapPayload | undefined,
+  workspaceId: string | undefined
+): ReadinessConnectorScope[] {
+  if (!data) return [];
+  const workspaceIdsByConnector = new Map<string, Set<string>>();
+  const workspaces = workspaceId
+    ? data.workspaces.filter((workspace) => workspace.id === workspaceId)
+    : [];
+  for (const workspace of workspaces) {
+    for (const connectorId of workspace.connector_ids) {
+      const workspaceIds = workspaceIdsByConnector.get(connectorId) ?? new Set<string>();
+      workspaceIds.add(workspace.id);
+      workspaceIdsByConnector.set(connectorId, workspaceIds);
+    }
+  }
+  return data.connectors.map((connector) => ({
+    connector,
+    workspaceIds: workspaceIdsByConnector.get(connector.id) ?? new Set<string>()
+  }));
+}
+
+function readinessEligibleConnectorScopes(
+  data: BootstrapPayload | undefined,
+  target: ReadinessTarget
+): ReadinessConnectorScope[] {
+  if (
+    target.kind === "missing_thread" ||
+    target.kind === "archived_thread" ||
+    target.kind === "unavailable_attachment"
+  ) return [];
+  return readinessConnectorScopes(data, target.workspaceId).filter((scope) => {
+    if (
+      scope.workspaceIds.size === 0 ||
+      scope.connector.status !== "online" ||
+      !scope.connector.capabilities.includes("codex_app_server_exec")
+    ) {
+      return false;
+    }
+    if (target.kind === "attached_thread") {
+      return scope.connector.id === target.connectorId;
+    }
+    return scope.connector.capabilities.includes("app_server_threads");
+  });
+}
+
+function readinessTarget(
+  data: BootstrapPayload | undefined,
+  selectedThreadId: string | undefined
+): ReadinessTarget {
+  if (!selectedThreadId) {
+    return { kind: "workspace", workspaceId: localThreadWorkspaceId(data) };
+  }
+  const thread = data?.threads.find((item) => item.id === selectedThreadId);
+  if (!thread) {
+    return { kind: "missing_thread", threadId: selectedThreadId };
+  }
+  if (thread.state === "archived") {
+    return {
+      kind: "archived_thread",
+      threadId: selectedThreadId,
+      workspaceId: thread.workspace_id
+    };
+  }
+  const session = attachedAppServerHostSession(data, selectedThreadId);
+  if (!session) {
+    return {
+      kind: "unavailable_attachment",
+      threadId: selectedThreadId,
+      workspaceId: thread.workspace_id
+    };
+  }
+  return {
+    kind: "attached_thread",
+    threadId: selectedThreadId,
+    workspaceId: thread.workspace_id,
+    connectorId: session.connector_id
+  };
+}
+
+function readinessInstanceMatchesEligibleConnector(
+  data: BootstrapPayload | undefined,
+  instance: AppServerInstanceSummary,
+  eligibleConnectorScopes: ReadinessConnectorScope[],
+  selectedThreadId: string | undefined
+): boolean {
+  const scope = eligibleConnectorScopes.find((item) => item.connector.id === instance.connector_id);
+  if (!scope) return false;
+  if (instance.scope === "connector") return true;
+  if (instance.scope === "workspace") return Boolean(instance.workspace_id && scope.workspaceIds.has(instance.workspace_id));
+  if (!selectedThreadId) return false;
+  if (instance.thread_id !== selectedThreadId) return false;
+  const thread = data?.threads.find((item) => item.id === instance.thread_id);
+  return Boolean(thread && scope.workspaceIds.has(thread.workspace_id));
+}
+
+function readinessWorkspaceLabel(data: BootstrapPayload | undefined, workspaceId: string | undefined): string {
+  if (!workspaceId) return "the target workspace";
+  return data?.workspaces.find((workspace) => workspace.id === workspaceId)?.name ?? workspaceId;
+}
+
+function readinessInventoryCheck(data: BootstrapPayload | undefined): ReadinessPreflightCheck {
+  const reason = safetyActionReason(data, "host_session_refresh");
+  if (reason) {
+    return {
+      id: "inventory",
+      label: "Inventory sync",
+      state: "attention",
+      detail: `Broad Host Session refresh is blocked: ${reason}`
+    };
+  }
+  return {
+    id: "inventory",
+    label: "Inventory sync",
+    state: "ready",
+    detail: "Passive preflight uses existing state only; broad Host Session refresh remains opt-in."
+  };
+}
+
+function readinessNextAction(
+  state: ReadinessPreflightState,
+  checks: ReadinessPreflightCheck[],
+  target: ReadinessTarget
+): ReadinessPreflight["next_action"] {
+  if (target.kind === "missing_thread") {
+    return {
+      label: "Open Thread Centre",
+      href: "#thread-centre",
+      detail: "Choose an available thread before evaluating app-server readiness."
+    };
+  }
+  const budgetHref = budgetBoardHash(target.kind === "workspace" ? undefined : target.threadId);
+  const blocked = checks.find((check) => check.state === "blocked");
+  if (blocked?.id === "cost") {
+    return {
+      label: "Review Budget Board",
+      href: budgetHref,
+      detail: "Clear the cost posture before starting an app-server turn."
+    };
+  }
+  if (target.kind === "archived_thread") {
+    return {
+      label: "Open Thread Centre",
+      href: threadCentreThreadHash(target.threadId),
+      detail: "Unarchive the selected thread before evaluating app-server readiness again."
+    };
+  }
+  if (blocked?.id === "connector" || blocked?.id === "app_server") {
+    return {
+      label: "Open Host Sessions",
+      href: "#host-sessions",
+      detail: "Confirm connector and app-server state before attaching or creating a thread."
+    };
+  }
+  if (state === "attention") {
+    const attention = checks.find((check) => check.state === "attention");
+    if (attention?.id === "cost") {
+      return {
+        label: "Review Budget Board",
+        href: budgetHref,
+        detail: "Confirm the cost warning before starting daily dogfood work."
+      };
+    }
+    return {
+      label: "Open Host Sessions",
+      href: "#host-sessions",
+      detail: "Confirm the warning state before starting daily dogfood work."
+    };
+  }
+  return {
+    label: target.kind === "workspace" ? "Create local thread" : "Open Thread Centre",
+    href: target.kind === "workspace"
+      ? threadCentreCreateHash(target.workspaceId)
+      : target.kind === "attached_thread"
+        ? threadCentreThreadHash(target.threadId)
+        : "#thread-centre",
+    detail: target.kind === "workspace"
+      ? "Create a managed app-server thread in the preflighted workspace."
+      : "Open the selected app-server thread and send a bounded prompt."
+  };
+}
+
+function readinessTitle(state: ReadinessPreflightState): string {
+  if (state === "ready") return "Ready for app-server dogfood";
+  if (state === "attention") return "Ready with operator attention";
+  return "Not ready for app-server dogfood";
+}
+
+function readinessSummary(state: ReadinessPreflightState, checks: ReadinessPreflightCheck[]): string {
+  if (state === "ready") {
+    return "Cost, connector, and app-server state are aligned for a low-cost managed thread.";
+  }
+  const first = checks.find((check) => check.state === state) ?? checks.find((check) => check.state !== "ready");
+  return first?.detail ?? "Readiness state needs attention.";
+}
+
+function budgetHasSampledHardConstraint(budget: BudgetSummary): boolean {
+  if (budget.bottleneck_constraint && isSampledHardBudgetConstraint(budget.bottleneck_constraint)) return true;
+  if (budget.constraints?.some(isSampledHardBudgetConstraint)) return true;
+  if (budget.constraints || budget.constraint_sample_count !== undefined || budget.source === "empty") return false;
+  return [budget.daily_used_pct, budget.four_hour_used_pct, budget.burst_used_pct].some(
+    (value) => typeof value === "number" && Number.isFinite(value)
+  );
+}
+
+function isSampledHardBudgetConstraint(constraint: BudgetConstraint): boolean {
+  return constraint.hard && constraint.sampled && constraint.state !== "missing";
 }
 
 export function codexCliFallbackAvailable(
